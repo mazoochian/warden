@@ -120,6 +120,7 @@ pub fn render(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, words: 
         return error.RenderFailed;
     }
 
+    // std.debug.print("{s}\n", .{result.stderr});
     return result.stdout;
 }
 

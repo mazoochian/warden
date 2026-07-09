@@ -10,6 +10,13 @@
 // Diagnostics go to stderr so stdout stays pure image bytes.
 import { createCanvas } from "@napi-rs/canvas";
 import fs from "node:fs";
+import { GlobalFonts } from "@napi-rs/canvas";
+
+GlobalFonts.registerFromPath(
+  "./fonts/Peyda-Regular.ttf",
+  "Peyda"
+);
+console.error(GlobalFonts.families);
 
 const WIDTH = 800;
 const HEIGHT = 600;
@@ -75,7 +82,7 @@ function main() {
   let colorIdx = 0;
   for (const { word, count } of sorted) {
     const fontSize = fontSizeFor(count);
-    ctx.font = `bold ${fontSize}px sans-serif`;
+    ctx.font = `bold ${fontSize}px "Vazirmatn"`;
     const metrics = ctx.measureText(word);
     const w = metrics.width;
     const h = fontSize;

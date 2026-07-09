@@ -23,7 +23,8 @@ pub fn migrate(db: *Db) !void {
         \\CREATE TABLE IF NOT EXISTS users (
         \\  user_id TEXT PRIMARY KEY,
         \\  username TEXT,
-        \\  last_seen INTEGER
+        \\  last_seen INTEGER,
+        \\  tokens INTEGER
         \\);
     );
 

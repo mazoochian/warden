@@ -201,6 +201,11 @@ fn handleMessage(
 ) void {
     const text = msg.text orelse return;
     if (text.len == 0) return;
+    // var seed: u64 = undefined;
+    // io.random(std.mem.asBytes(&seed));
+    // var prng = std.Random.DefaultPrng.init(seed);
+    // const random = prng.random();
+    // const n = random.intRangeLessThan(u8, 0, 100);
 
     if (std.mem.eql(u8, text, "/ping")) {
         connector.sendMessage(a, msg.chat_id, "pong");
@@ -221,21 +226,69 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/delete")) {
         group_admin.deleteMessage(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/kick")) {
-        group_admin.requestConfirmation(connector, a, pending, now, msg, .kick);
+        group_admin.requestConfirmation(connector, a, chat_store, msg, .kick); // pending, now commented for now
     } else if (std.mem.eql(u8, text, "/ban")) {
-        group_admin.requestConfirmation(connector, a, pending, now, msg, .ban);
+        group_admin.requestConfirmation(connector, a, chat_store, msg, .ban);
     } else if (std.mem.eql(u8, text, "/confirm")) {
         group_admin.confirm(connector, a, pending, now, msg);
     } else if (std.mem.eql(u8, text, "/cancel")) {
         group_admin.cancel(connector, a, pending, msg);
+    } else if (std.mem.startsWith(u8, text, "/token")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
+        handleToken(connector, a, chat_store, msg, text);
     } else if (text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
         return;
     } else {
-        // if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
-        if (!containsAnyWord(text, &[_][]const u8{"@ameli_hassan_bot"})) return;
-        replyWithAnswer(connector, a, chat_store, llm_provider, tool_ctx, msg.chat_id, text);
+        // if (!containsAnyWord(text, &[_][]const u8{ "@ameli_hassan_bot", "Hassan", "hassan", "حسن" }) or (msg.reply_to_username != null and std.mem.eql(u8, msg.reply_to_username.?, "@ameli_hassan_bot"))) return;
+        // if(n < 30)
+        // {
+        // replyWithAnswer(connector, a, chat_store, llm_provider, tool_ctx, msg.chat_id, text);
+        // }
+    }
+}
+
+fn handleToken(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    chat_store: *ChatStore,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const target = replyTarget(msg) orelse {
+        reply(connector, a, msg.chat_id, "Reply to the user you want to view/change tokens for.");
+        return;
+    };
+    const arg = std.mem.trim(u8, text["/token".len..], " ");
+    const db = chat_store.get(msg.chat_id) catch |err| {
+        std.log.err("token: failed to open db for chat {s}: {t}", .{ msg.chat_id, err });
+        return;
+    };
+    // If there is no argument, get the current token count and reply with it.
+    if (arg.len == 0) {
+        const count = settings.getTokens(db, target.user_id, 0);
+        const message = std.fmt.allocPrint(a, "Current token count: {}", .{count}) catch |err| {
+            std.debug.print("Failed to allocate message string: {}\n", .{err});
+            return; // Exit the function early since we couldn't format the message
+        };
+        connector.sendMessage(a, msg.chat_id, message);
+        // replyWithAnswer(connector, a, chat_store, llm_provider, tool_ctx, chat_id, std.fmt.allocPrint(a, "Current token count: {}", .{count}) catch "");
+        return;
+    }
+    // Else just set the token count to the parsed value and reply with a confirmation.
+    else {
+        const count = std.fmt.parseInt(i64, arg, 10) catch 0;
+        std.log.info("Detected the count to be {}", .{count});
+        settings.setTokens(db, target.user_id, count) catch |err| {
+            std.log.err("Failed to set tokens on the databse: {}\n", .{err});
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "token count updated to {}", .{count}) catch |err| {
+            std.log.err("Failed to allocate message string: {}\n", .{err});
+            return; // Exit the function early since we couldn't format the message
+        };
+        connector.sendMessage(a, msg.chat_id, message);
     }
 }
 
@@ -434,4 +487,14 @@ fn containsAnyWord(haystack: []const u8, needles: []const []const u8) bool {
         }
     }
     return false;
+}
+
+fn replyTarget(msg: iface.Message) ?struct { user_id: []const u8, label: []const u8 } {
+    const user_id = msg.reply_to_user_id orelse return null;
+    const label = msg.reply_to_username orelse user_id;
+    return .{ .user_id = user_id, .label = label };
+}
+
+fn reply(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, comptime txt: []const u8) void {
+    connector.sendMessage(a, chat_id, txt);
 }

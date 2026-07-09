@@ -36,6 +36,25 @@ pub fn getInt(db: *Db, key: []const u8, default: i64) i64 {
     return std.fmt.parseInt(i64, stmt.columnText(0), 10) catch default;
 }
 
+pub fn getTokens(db: *Db, user_id: []const u8, default: i64) i64 {
+    var stmt = db.prepare("SELECT tokens FROM users WHERE user_id = ?;") catch return default;
+    defer stmt.finalize();
+    stmt.bindText(1, user_id);
+    const has_row = stmt.step() catch return default;
+    if (!has_row) return default;
+    return std.fmt.parseInt(i64, stmt.columnText(0), 10) catch default;
+}
+
+pub fn setTokens(db: *Db, user_id: []const u8, value: i64) !void {
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch unreachable;
+    var stmt = try db.prepare("UPDATE users SET tokens = ? WHERE user_id = ?;");
+    defer stmt.finalize();
+    stmt.bindText(1, text);
+    stmt.bindText(2, user_id);
+    _ = try stmt.step();
+}
+
 pub fn setInt(db: *Db, key: []const u8, value: i64) !void {
     var buf: [32]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch unreachable;

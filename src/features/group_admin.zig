@@ -1,6 +1,8 @@
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
+const settings = @import("../store/settings.zig");
+const ChatStore = @import("../store/chat_store.zig").ChatStore;
 
 pub const ActionKind = enum { ban, kick };
 
@@ -156,8 +158,7 @@ pub fn deleteMessage(connector: iface.Connector, a: std.mem.Allocator, msg: ifac
 pub fn requestConfirmation(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    pending: *PendingConfirmations,
-    now: i64,
+    chat_store: *ChatStore,
     msg: iface.Message,
     kind: ActionKind,
 ) void {
@@ -165,18 +166,30 @@ pub fn requestConfirmation(
         reply(connector, a, msg.chat_id, "Reply to the message of the person you want to {s}.", .{@tagName(kind)});
         return;
     };
-    pending.set(now, msg.chat_id, kind, target.user_id, target.label) catch |err| {
-        std.log.err("group_admin: failed to record pending {s}: {t}", .{ @tagName(kind), err });
-        connector.sendMessage(a, msg.chat_id, "Something went wrong queuing that — try again.");
+    const db = chat_store.get(msg.chat_id) catch |err| {
+        std.log.err("token: failed to open db for chat {s}: {t}", .{ msg.chat_id, err });
         return;
     };
-    reply(
-        connector,
-        a,
-        msg.chat_id,
-        "{s} {s}? Send /confirm within {d}s to proceed, or /cancel.",
-        .{ actionVerbTitled(kind), target.label, pending.timeout_seconds },
-    );
+    var count = settings.getTokens(db, msg.user_id, 0);
+    if (count <= 0) {
+        connector.sendMessage(a, msg.chat_id, "You do not have enough tokens to perform this action");
+        return;
+    }
+    if (kind == .kick) {
+        connector.kickUser(a, msg.chat_id, target.user_id) catch |err| {
+            reportFailure(connector, a, msg.chat_id, "kick", err);
+            return;
+        };
+    } else if (kind == .ban) {
+        connector.banUser(a, msg.chat_id, target.user_id) catch |err| {
+            reportFailure(connector, a, msg.chat_id, "ban", err);
+            return;
+        };
+    }
+    count -= 1;
+    settings.setTokens(db, msg.user_id, count) catch |err| {
+        std.log.err("Could not update user's token count: {}", .{err});
+    };
 }
 
 pub fn confirm(connector: iface.Connector, a: std.mem.Allocator, pending: *PendingConfirmations, now: i64, msg: iface.Message) void {
