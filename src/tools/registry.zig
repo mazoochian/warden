@@ -2,6 +2,18 @@ const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
 
+/// Scraper mode/endpoint for `scrape_site`. Defined here (rather than in
+/// `store/scraper_settings.zig`) so `registry.zig` — imported by every tool
+/// — has no dependency on the store layer; `scraper_settings.zig` produces
+/// values of this shape instead.
+pub const ScraperMode = enum { local, remote };
+
+pub const ScraperConfig = struct {
+    mode: ScraperMode = .local,
+    remote_url: ?[]const u8 = null,
+    remote_api_key: ?[]const u8 = null,
+};
+
 /// Most tools are pure request/response (fetch some data, return text to
 /// feed back to the model). A few — like rendering and sending a diagram —
 /// have a side effect (sending a photo to the chat), so the
@@ -15,6 +27,12 @@ pub const ToolContext = struct {
     chat_id: ?[]const u8 = null,
     /// Scratch directory for tools that shell out to an external renderer.
     tmp_dir: ?[]const u8 = null,
+    /// Base URL of a SearXNG instance for `web_search`; null when web
+    /// search isn't configured.
+    searxng_url: ?[]const u8 = null,
+    /// Owner-configurable mode/endpoint for `scrape_site`; defaults to
+    /// on-device extraction with no remote endpoint configured.
+    scraper: ScraperConfig = .{},
 };
 
 pub const ToolDef = struct {

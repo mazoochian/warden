@@ -98,7 +98,7 @@ pub const OpenAiCompatProvider = struct {
             break :blk &.{.{ .name = "Authorization", .value = value }};
         } else &.{};
 
-        const body = try http_util.postJson(&self.http_client, allocator, url, headers, payload);
+        const body = try http_util.postJsonWithTimeout(&self.http_client, allocator, url, headers, payload, http_util.llm_timeout_ns);
         defer allocator.free(body);
 
         // Deliberately never `.deinit()`'d — see the note on
@@ -106,12 +106,15 @@ pub const OpenAiCompatProvider = struct {
         // `arguments`) borrows from this arena and from a nested one built
         // below, both reclaimed together whenever the caller's own arena
         // resets.
-        const parsed = try json.parseFromSlice(
+        const parsed = json.parseFromSlice(
             ChatCompletionResponse,
             allocator,
             body,
             .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-        );
+        ) catch |err| {
+            std.log.err("openai-compatible response unparseable ({t}): {s}", .{ err, body[0..@min(body.len, 400)] });
+            return err;
+        };
 
         if (parsed.value.@"error") |err| {
             std.log.err("openai-compatible api error: {s}: {s}", .{ err.type, err.message });
@@ -125,7 +128,16 @@ pub const OpenAiCompatProvider = struct {
             if (c.len > 0) try blocks.append(allocator, .{ .text = c });
         }
         for (choice.message.tool_calls) |tc| {
-            const args = try json.parseFromSlice(json.Value, allocator, tc.function.arguments, .{});
+            // Some models emit an empty string (not "{}") for no-argument
+            // tool calls; treat it as an empty object instead of failing
+            // the entire answer on a JSON parse of "".
+            const args_src = if (tc.function.arguments.len == 0) "{}" else tc.function.arguments;
+            const args = json.parseFromSlice(json.Value, allocator, args_src, .{}) catch |err| {
+                std.log.err("tool call '{s}' has unparseable arguments ({t}): {s}", .{
+                    tc.function.name, err, args_src[0..@min(args_src.len, 400)],
+                });
+                return err;
+            };
             try blocks.append(allocator, .{ .tool_use = .{ .id = tc.id, .name = tc.function.name, .input = args.value } });
         }
 

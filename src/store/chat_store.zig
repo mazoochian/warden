@@ -9,11 +9,19 @@ const messages = @import("messages.zig");
 /// and kept for the process lifetime. This is the literal "local to each
 /// group/chat" isolation the bot was asked for, rather than one shared DB
 /// scoped by a chat_id column.
+///
+/// `get` is called from concurrently-running per-message tasks (the poll
+/// loop spawns one per incoming message), so `dbs` needs a lock — plain
+/// `std.StringHashMap` has no internal thread-safety, unlike the `*Db`
+/// values it holds (SQLite itself, built with `SQLITE_THREADSAFE=1`, is
+/// safe to use concurrently from multiple threads without an additional
+/// lock here).
 pub const ChatStore = struct {
     allocator: std.mem.Allocator,
     io: Io,
     data_dir: []const u8,
     dbs: std.StringHashMap(*Db),
+    mutex: Io.Mutex = .init,
     /// Prune to this many most-recent messages per chat after each insert.
     retention_messages: i64,
 
@@ -55,6 +63,9 @@ pub const ChatStore = struct {
     }
 
     pub fn get(self: *ChatStore, chat_id: []const u8) !*Db {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
         if (self.dbs.get(chat_id)) |db| return db;
 
         try Io.Dir.cwd().createDirPath(self.io, self.data_dir);

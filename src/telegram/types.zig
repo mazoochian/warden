@@ -21,6 +21,7 @@ pub const Chat = struct {
 pub const ReplyToMessage = struct {
     message_id: i64,
     from: ?User = null,
+    text: ?[]const u8 = null,
 };
 
 pub const Message = struct {
@@ -47,3 +48,24 @@ pub fn GetUpdatesResponse(comptime T: type) type {
 }
 
 pub const UpdatesResponse = GetUpdatesResponse(Update);
+
+/// Response shape of `getMe` — the bot's own identity.
+pub const MeResponse = struct {
+    ok: bool,
+    result: ?User = null,
+    description: ?[]const u8 = null,
+};
+
+/// Subset of Telegram's ChatMember shape — only what's needed to answer
+/// "is this user an admin of this chat right now" (see
+/// `Client.isChatAdmin`). `status` is one of "creator", "administrator",
+/// "member", "restricted", "left", "kicked".
+pub const ChatMember = struct {
+    status: []const u8 = "",
+};
+
+pub const ChatMemberResponse = struct {
+    ok: bool,
+    result: ?ChatMember = null,
+    description: ?[]const u8 = null,
+};

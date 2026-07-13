@@ -1,0 +1,10 @@
+# Minimal override merged onto SearXNG's built-in defaults. The only thing
+# Warden needs beyond stock is the JSON output format, which is disabled by
+# default. The instance secret comes from the SEARXNG_SECRET environment
+# variable (see compose.yaml) rather than being committed here.
+use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json

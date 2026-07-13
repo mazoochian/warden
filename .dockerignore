@@ -1,0 +1,11 @@
+.git
+.claude
+.zig-cache
+zig-out
+data
+.env
+bfg.jar
+**/node_modules
+Dockerfile
+compose.yaml
+.dockerignore

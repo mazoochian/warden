@@ -3,8 +3,31 @@ const llm = @import("provider.zig");
 const registry = @import("../tools/registry.zig");
 
 /// Hard cap on model<->tool round trips per question, so a confused model
-/// can't loop forever burning tokens.
+/// can't loop forever burning tokens. Hitting it doesn't fail the request:
+/// the model gets one final wrap-up turn (see end of `run`).
 const max_iterations = 6;
+
+/// Lets a caller observe what a `run` call is doing while it's in flight —
+/// e.g. main.zig uses this to keep an animated "thinking"/"using X" chat
+/// message up to date instead of the user staring at silence until the
+/// whole tool-calling loop finishes. `ptr`/`onEvent` null (the default) is
+/// a no-op, so existing callers don't need to change.
+pub const Progress = struct {
+    ptr: *anyopaque = undefined,
+    onEvent: ?*const fn (ptr: *anyopaque, event: Event) void = null,
+
+    pub const Event = union(enum) {
+        /// About to send a request to the model (first turn or a follow-up
+        /// after tool results).
+        thinking,
+        /// About to execute a tool the model asked for.
+        tool_use: []const u8,
+    };
+
+    pub fn report(self: Progress, event: Event) void {
+        if (self.onEvent) |f| f(self.ptr, event);
+    }
+};
 
 /// Drives one provider-agnostic conversation: sends `user_message`, and as
 /// long as the model keeps asking for tools, executes them against
@@ -17,6 +40,7 @@ pub fn run(
     system: ?[]const u8,
     user_message: []const u8,
     tool_defs: []const registry.ToolDef,
+    progress: Progress,
 ) ![]const u8 {
     const llm_tools = try toLlmTools(allocator, tool_defs);
 
@@ -28,6 +52,7 @@ pub fn run(
 
     var i: u32 = 0;
     while (i < max_iterations) : (i += 1) {
+        progress.report(.thinking);
         const response = try provider.chat(allocator, .{
             .system = system,
             .messages = messages.items,
@@ -50,6 +75,7 @@ pub fn run(
 
         var results: std.ArrayList(llm.ContentBlock) = .empty;
         for (tool_uses.items) |tu| {
+            progress.report(.{ .tool_use = tu.name });
             const result_text = executeTool(ctx, tool_defs, tu) catch |err| blk: {
                 std.log.err("tool '{s}' failed: {t}", .{ tu.name, err });
                 break :blk try std.fmt.allocPrint(allocator, "tool error: {t}", .{err});
@@ -58,6 +84,22 @@ pub fn run(
         }
         try messages.append(allocator, .{ .role = .user, .content = try results.toOwnedSlice(allocator) });
     }
+
+    // Cap hit (usually a model flailing at tools that keep erroring). One
+    // last call, told to wrap up, salvages whatever it has learned so far —
+    // a partial answer beats surfacing an error after all that work. Tools
+    // stay in the request (providers reject conversations containing
+    // tool_use blocks without them) but any further calls are ignored.
+    try messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(llm.ContentBlock, &.{
+        .{ .text = "You have reached the tool-call limit. Do not call any more tools — give your final answer now using what you already have, and say plainly what you couldn't complete." },
+    }) });
+    const response = try provider.chat(allocator, .{
+        .system = system,
+        .messages = messages.items,
+        .tools = llm_tools,
+    });
+    const text = try llm.textOf(allocator, response.content);
+    if (text.len > 0) return text;
     return error.ToolCallLoopExceeded;
 }
 
@@ -135,9 +177,59 @@ test "run executes a tool call and threads its result back to the model" {
     var fake = FakeProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool});
+    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{});
     try testing.expectEqualStrings("The answer is 4.", result);
     try testing.expectEqual(@as(u32, 2), fake.call_count);
+}
+
+/// Requests the calculator on every turn until it sees the wrap-up nudge —
+/// exercises the tool-call-limit path in `run`.
+const InsatiableProvider = struct {
+    call_count: u32 = 0,
+
+    fn provider(self: *InsatiableProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn };
+
+    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        const self: *InsatiableProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+
+        const last = request.messages[request.messages.len - 1];
+        if (last.content.len == 1 and last.content[0] == .text and
+            std.mem.indexOf(u8, last.content[0].text, "tool-call limit") != null)
+        {
+            return .{
+                .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = "best effort answer" }}),
+                .stop_reason = .end_turn,
+            };
+        }
+
+        const input = try std.json.parseFromSlice(std.json.Value, allocator, "{\"expression\":\"1+1\"}", .{});
+        const id = try std.fmt.allocPrint(allocator, "call_{d}", .{self.call_count});
+        return .{
+            .content = try allocator.dupe(llm.ContentBlock, &.{
+                .{ .tool_use = .{ .id = id, .name = "calculator", .input = input.value } },
+            }),
+            .stop_reason = .tool_use,
+        };
+    }
+};
+
+test "run salvages a final answer when the tool-call cap is hit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake = InsatiableProvider{};
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{});
+    try testing.expectEqualStrings("best effort answer", result);
+    // max_iterations tool turns plus the final wrap-up call.
+    try testing.expectEqual(@as(u32, 7), fake.call_count);
 }
 
 test "run returns the model's answer directly when it never calls a tool" {
@@ -162,6 +254,6 @@ test "run returns the model's answer directly when it never calls a tool" {
     var fake = NoToolProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, null, "hi", &.{});
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{});
     try testing.expectEqualStrings("no tools needed", result);
 }

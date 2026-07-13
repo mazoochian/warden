@@ -58,15 +58,40 @@ pub const Client = struct {
         );
     }
 
-    /// Sends a plain text message. Fire-and-forget: logs failures rather than
-    /// propagating them, since a failed reply shouldn't crash the poll loop.
-    pub fn sendMessage(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8) void {
-        self.sendMessageErr(allocator, chat_id, text) catch |err| {
+    /// Fetches the bot's own identity (id + username). Caller owns the
+    /// returned `Parsed` value and must call `.deinit()` on it.
+    pub fn getMe(self: *Client, allocator: std.mem.Allocator) !json.Parsed(types.MeResponse) {
+        const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/getMe", .{self.bot_token});
+        defer allocator.free(url);
+
+        const body = try http_util.get(&self.http_client, allocator, url);
+        defer allocator.free(body);
+
+        return json.parseFromSlice(
+            types.MeResponse,
+            allocator,
+            body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+    }
+
+    /// Sends a plain text message, threaded as a reply to `reply_to_message_id`
+    /// when set (`allow_sending_without_reply` so a reply target that's since
+    /// been deleted degrades to a plain message instead of failing outright).
+    /// Fire-and-forget: logs failures rather than propagating them, since a
+    /// failed reply shouldn't crash the poll loop.
+    pub fn sendMessage(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, reply_to_message_id: ?i64) void {
+        self.sendMessageErr(allocator, chat_id, text, reply_to_message_id) catch |err| {
             std.log.err("sendMessage failed: {t}", .{err});
         };
     }
 
-    fn sendMessageErr(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8) !void {
+    const ReplyParameters = struct {
+        message_id: i64,
+        allow_sending_without_reply: bool = true,
+    };
+
+    fn sendMessageErr(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, reply_to_message_id: ?i64) !void {
         const url = try std.fmt.allocPrint(
             allocator,
             "https://api.telegram.org/bot{s}/sendMessage",
@@ -74,10 +99,12 @@ pub const Client = struct {
         );
         defer allocator.free(url);
 
+        const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
+
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
         try json.Stringify.value(
-            .{ .chat_id = chat_id, .text = text },
+            .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters },
             .{},
             &payload_writer.writer,
         );
@@ -85,6 +112,64 @@ pub const Client = struct {
 
         const body = try http_util.postJson(&self.http_client, allocator, url, &.{}, payload);
         defer allocator.free(body);
+    }
+
+    const SendMessageResponse = struct {
+        ok: bool,
+        result: ?struct { message_id: i64 } = null,
+        description: ?[]const u8 = null,
+    };
+
+    /// Like `sendMessage`, but returns the sent message's id (needed to
+    /// edit it later — see `editMessage`) instead of being fire-and-forget.
+    pub fn sendMessageReturningId(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, reply_to_message_id: ?i64) !i64 {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "https://api.telegram.org/bot{s}/sendMessage",
+            .{self.bot_token},
+        );
+        defer allocator.free(url);
+
+        const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
+
+        var payload_writer: Io.Writer.Allocating = .init(allocator);
+        defer payload_writer.deinit();
+        try json.Stringify.value(
+            .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters },
+            .{},
+            &payload_writer.writer,
+        );
+        const payload = payload_writer.writer.buffered();
+
+        const body = try http_util.postJson(&self.http_client, allocator, url, &.{}, payload);
+        defer allocator.free(body);
+
+        var parsed = try json.parseFromSlice(
+            SendMessageResponse,
+            allocator,
+            body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+        defer parsed.deinit();
+
+        const result = parsed.value.result orelse {
+            std.log.err("telegram sendMessage failed: {?s}", .{parsed.value.description});
+            return error.TelegramApiError;
+        };
+        return result.message_id;
+    }
+
+    /// Replaces the text of a previously-sent message (the "thinking"
+    /// placeholder / progressive-answer editing flow — see main.zig's
+    /// `replyWithAnswer`). Telegram rejects an edit whose text is
+    /// byte-for-byte identical to the message's current content ("message
+    /// is not modified", HTTP 400) — `http_util`'s non-2xx handling
+    /// discards the response body, so that specific case can't be told
+    /// apart from a real failure here; callers must avoid sending an
+    /// identical edit in the first place (main.zig's ticker tracks the
+    /// last text it actually sent and skips a no-op edit).
+    pub fn editMessage(self: *Client, allocator: std.mem.Allocator, chat_id: i64, message_id: i64, text: []const u8) !void {
+        return self.callMethod(allocator, "editMessageText", .{ .chat_id = chat_id, .message_id = message_id, .text = text });
     }
 
     /// Sends a photo (e.g. a rendered word cloud/diagram). Fire-and-forget
@@ -212,6 +297,36 @@ pub const Client = struct {
 
     pub fn deleteMessage(self: *Client, allocator: std.mem.Allocator, chat_id: i64, message_id: i64) !void {
         return self.callMethod(allocator, "deleteMessage", .{ .chat_id = chat_id, .message_id = message_id });
+    }
+
+    /// True if `user_id` is currently the creator or an administrator of
+    /// `chat_id` — the live source of truth for group-management gating
+    /// (see `group_admin.zig`), queried fresh each time rather than cached
+    /// since admin status can change at any moment.
+    pub fn isChatAdmin(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64) !bool {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "https://api.telegram.org/bot{s}/getChatMember?chat_id={d}&user_id={d}",
+            .{ self.bot_token, chat_id, user_id },
+        );
+        defer allocator.free(url);
+
+        const body = try http_util.get(&self.http_client, allocator, url);
+        defer allocator.free(body);
+
+        var parsed = try json.parseFromSlice(
+            types.ChatMemberResponse,
+            allocator,
+            body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+        defer parsed.deinit();
+
+        const member = parsed.value.result orelse {
+            std.log.err("telegram getChatMember failed: {?s}", .{parsed.value.description});
+            return error.TelegramApiError;
+        };
+        return std.mem.eql(u8, member.status, "administrator") or std.mem.eql(u8, member.status, "creator");
     }
 
     const MethodResponse = struct {

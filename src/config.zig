@@ -52,14 +52,22 @@ pub const Config = struct {
     /// How often an opted-in chat gets a digest (interval-based, not
     /// wall-clock time-of-day — see `features/scheduler.zig`).
     digest_interval_seconds: i64,
+    /// Overrides the built-in Q&A system prompt when set — either inline
+    /// via WARDEN_SYSTEM_PROMPT or from a file via
+    /// WARDEN_SYSTEM_PROMPT_FILE (the file wins if both are set, since a
+    /// file is the "properly edited" variant).
+    system_prompt: ?[]const u8,
+    /// Base URL of a SearXNG instance (e.g. "http://searxng:8080") for the
+    /// web_search tool. Unset disables web search entirely.
+    searxng_url: ?[]const u8,
 
-    pub const LoadError = error{ MissingBotToken, MissingLlmConfig } || std.mem.Allocator.Error;
+    pub const LoadError = error{ MissingBotToken, MissingLlmConfig, BadSystemPromptFile } || std.mem.Allocator.Error;
 
     /// `env` is expected to be `init.environ_map` from `std.process.Init`.
     /// `arena` should be long-lived (e.g. `init.arena.allocator()`) since
     /// the returned Config borrows from both `env` and `arena` for its
-    /// lifetime.
-    pub fn load(env: *const std.process.Environ.Map, arena: std.mem.Allocator) LoadError!Config {
+    /// lifetime. `io` is only used to read WARDEN_SYSTEM_PROMPT_FILE.
+    pub fn load(env: *const std.process.Environ.Map, arena: std.mem.Allocator, io: std.Io) LoadError!Config {
         const telegram_bot_token = env.get("WARDEN_TELEGRAM_BOT_TOKEN") orelse return error.MissingBotToken;
 
         const telegram_owner_id = env.get("WARDEN_TELEGRAM_OWNER_ID") orelse default_telegram_owner_id;
@@ -89,6 +97,27 @@ pub const Config = struct {
         else
             default_digest_interval_seconds;
 
+        var system_prompt: ?[]const u8 = env.get("WARDEN_SYSTEM_PROMPT");
+        if (env.get("WARDEN_SYSTEM_PROMPT_FILE")) |path| {
+            // A configured-but-unreadable prompt file is a hard error: the
+            // operator clearly wanted a specific persona, so silently
+            // falling back to the default would be worse than not starting.
+            const contents = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_system_prompt_bytes)) catch |err| {
+                std.log.err("could not read WARDEN_SYSTEM_PROMPT_FILE '{s}': {t}", .{ path, err });
+                return error.BadSystemPromptFile;
+            };
+            system_prompt = std.mem.trim(u8, contents, " \t\r\n");
+        }
+        if (system_prompt) |p| {
+            if (p.len == 0) system_prompt = null;
+        }
+
+        var searxng_url: ?[]const u8 = env.get("WARDEN_SEARXNG_URL");
+        if (searxng_url) |u| {
+            const trimmed = std.mem.trimEnd(u8, u, "/");
+            searxng_url = if (trimmed.len == 0) null else trimmed;
+        }
+
         return .{
             .telegram_bot_token = telegram_bot_token,
             .owners = owners,
@@ -98,6 +127,8 @@ pub const Config = struct {
             .confirm_timeout_seconds = confirm_timeout_seconds,
             .tmp_dir = tmp_dir,
             .digest_interval_seconds = digest_interval_seconds,
+            .system_prompt = system_prompt,
+            .searxng_url = searxng_url,
         };
     }
 
@@ -120,6 +151,8 @@ pub const Config = struct {
             .model = env.get("WARDEN_ANTHROPIC_MODEL") orelse "claude-sonnet-5",
         } };
     }
+
+    pub const max_system_prompt_bytes = 64 * 1024;
 
     pub const default_retention_messages: i64 = 20_000;
     pub const default_confirm_timeout_seconds: i64 = 60;
