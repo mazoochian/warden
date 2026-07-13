@@ -30,6 +30,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/scrape_site.zig").tool,
     @import("tools/draw_diagram.zig").tool,
     @import("tools/qr_code.zig").tool,
+    @import("tools/word_cloud.zig").tool,
     @import("tools/dictionary.zig").tool,
     @import("tools/urban_dictionary.zig").tool,
     @import("tools/hackernews.zig").tool,
@@ -670,12 +671,15 @@ fn handleDigestCommand(
     }
 }
 
-/// Cycled while waiting on the model with nothing more specific to show
-/// (see `TickerState`/`tickerLoop`). Includes the word, not just the
-/// emoji+dots — Telegram renders an emoji-only (or emoji+punctuation-only)
-/// message in an oversized "jumbomoji" font, which looks wrong for
-/// something that's supposed to read as a status line.
-const thinking_frames = [_][]const u8{ "🤔 Thinking", "🤔 Thinking.", "🤔 Thinking..", "🤔 Thinking..." };
+/// Shown while waiting on the model with nothing more specific to show (see
+/// `TickerState`/`tickerLoop`). Used to cycle through several dot-count
+/// frames, re-editing the message every tick — but that meant the ticker
+/// kept hitting Telegram's edit rate limit even when nothing had actually
+/// changed, sometimes causing edits (including the final answer) to get
+/// dropped. Now static, so `tickerLoop`'s dedupe against `last_sent` means
+/// no edit is sent at all until real progress (a tool call) has something
+/// new to show.
+const thinking_text = "🤔 Thinking...";
 /// Telegram's edits are throttled to roughly 1/sec per chat in practice;
 /// this keeps a comfortable margin under that.
 const ticker_interval_ms: i64 = 1200;
@@ -741,14 +745,12 @@ fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
 /// (no reliance on arena-wholesale-free), so a plain thread-safe allocator
 /// works fine here — no arena needed.
 fn tickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []const u8, state: *TickerState) void {
-    var frame: usize = 0;
-    var last_sent: []const u8 = thinking_frames[0];
+    var last_sent: []const u8 = thinking_text;
     while (true) {
         Io.sleep(state.io, .fromMilliseconds(ticker_interval_ms), .awake) catch return;
 
         const status = state.getStatus();
-        const text = status orelse thinking_frames[frame % thinking_frames.len];
-        if (status == null) frame += 1;
+        const text = status orelse thinking_text;
 
         if (!std.mem.eql(u8, text, last_sent)) {
             connector.editMessage(std.heap.page_allocator, chat_id, message_id, text) catch |err| {
@@ -782,7 +784,7 @@ fn replyWithAnswer(
     // The placeholder + ticker only work when the platform supports
     // editing (Telegram does); anything that doesn't falls back to
     // exactly the old behavior — one blocking call, one send at the end.
-    const placeholder_id = connector.sendMessageReturningId(a, chat_id, thinking_frames[0], reply_to) catch |err| blk: {
+    const placeholder_id = connector.sendMessageReturningId(a, chat_id, thinking_text, reply_to) catch |err| blk: {
         std.log.warn("qa: couldn't send a placeholder for chat {s}, falling back to a plain reply: {t}", .{ chat_id, err });
         break :blk null;
     };
@@ -941,6 +943,7 @@ test {
     _ = @import("tools/air_quality.zig");
     _ = @import("tools/crypto_price.zig");
     _ = @import("tools/qr_code.zig");
+    _ = @import("tools/word_cloud.zig");
     _ = @import("tools/dictionary.zig");
     _ = @import("tools/urban_dictionary.zig");
     _ = @import("tools/hackernews.zig");

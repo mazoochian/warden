@@ -80,7 +80,8 @@ pub fn run(
                 std.log.err("tool '{s}' failed: {t}", .{ tu.name, err });
                 break :blk try std.fmt.allocPrint(allocator, "tool error: {t}", .{err});
             };
-            try results.append(allocator, .{ .tool_result = .{ .tool_use_id = tu.id, .content = result_text } });
+            const safe_text = try sanitizeUtf8(allocator, result_text);
+            try results.append(allocator, .{ .tool_result = .{ .tool_use_id = tu.id, .content = safe_text } });
         }
         try messages.append(allocator, .{ .role = .user, .content = try results.toOwnedSlice(allocator) });
     }
@@ -101,6 +102,40 @@ pub fn run(
     const text = try llm.textOf(allocator, response.content);
     if (text.len > 0) return text;
     return error.ToolCallLoopExceeded;
+}
+
+/// Tool results can carry arbitrary bytes from external sources — a
+/// scraped page served in an unexpected encoding, a botched HTML-entity
+/// decode — that aren't valid UTF-8. Zig's `json.Stringify` only emits a
+/// `[]const u8` as a JSON string when it validates as UTF-8 (see
+/// `std.json.Stringify.write`); otherwise it silently falls back to a raw
+/// array of byte integers, which Anthropic's API then rejects outright
+/// ("Input should be an object") — surfacing as a confusing 400 on the
+/// *next* turn, far from whichever tool actually produced the bad bytes.
+/// Replacing anything that doesn't decode cleanly with U+FFFD guarantees
+/// every tool result is valid UTF-8 by the time it reaches the wire.
+fn sanitizeUtf8(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return text;
+
+    const replacement = "\u{FFFD}";
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            try out.appendSlice(allocator, replacement);
+            i += 1;
+            continue;
+        };
+        const end = i + seq_len;
+        if (end <= text.len and std.unicode.utf8ValidateSlice(text[i..end])) {
+            try out.appendSlice(allocator, text[i..end]);
+            i = end;
+        } else {
+            try out.appendSlice(allocator, replacement);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn executeTool(ctx: registry.ToolContext, tool_defs: []const registry.ToolDef, tu: llm.ToolUse) ![]const u8 {
@@ -256,4 +291,20 @@ test "run returns the model's answer directly when it never calls a tool" {
 
     const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{});
     try testing.expectEqualStrings("no tools needed", result);
+}
+
+test "sanitizeUtf8 passes valid UTF-8 through untouched" {
+    const a = testing.allocator;
+    const out = try sanitizeUtf8(a, "=== \u{0635}\u{0641}\u{062d}\u{0647} ===");
+    try testing.expectEqualStrings("=== \u{0635}\u{0641}\u{062d}\u{0647} ===", out);
+}
+
+test "sanitizeUtf8 replaces invalid bytes with U+FFFD instead of corrupting the string" {
+    const a = testing.allocator;
+    const bad = "=== \xd8\x00 broken ===";
+    const out = try sanitizeUtf8(a, bad);
+    defer a.free(out);
+    try testing.expect(std.unicode.utf8ValidateSlice(out));
+    try testing.expect(std.mem.indexOf(u8, out, "\u{FFFD}") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "broken") != null);
 }

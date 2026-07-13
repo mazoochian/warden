@@ -42,6 +42,38 @@ fn isAllDigits(s: []const u8) bool {
     return true;
 }
 
+/// Tokenizes `text` into lowercased word counts, filtered of
+/// stopwords/digits/very short or long tokens, and merges the result into
+/// `counts`.
+fn tokenizeInto(counts: *std.StringHashMap(u32), allocator: std.mem.Allocator, text: []const u8) !void {
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n.,!?;:\"'()[]{}<>/\\|`~@#$%^&*_+=-");
+    while (it.next()) |raw| {
+        if (raw.len < min_word_len or raw.len > max_word_len) continue;
+        const lower = try std.ascii.allocLowerString(allocator, raw);
+        if (isStopword(lower) or isAllDigits(lower)) continue;
+
+        const gop = try counts.getOrPut(lower);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+    }
+}
+
+/// Sorts `counts` by frequency (descending) and caps it to the top `top_n`.
+fn rankTop(allocator: std.mem.Allocator, counts: std.StringHashMap(u32), top_n: usize) ![]WordCount {
+    var list: std.ArrayList(WordCount) = .empty;
+    var it = counts.iterator();
+    while (it.next()) |entry| {
+        try list.append(allocator, .{ .word = entry.key_ptr.*, .count = entry.value_ptr.* });
+    }
+
+    const items = try list.toOwnedSlice(allocator);
+    std.mem.sort(WordCount, items, {}, moreFrequentFirst);
+    return if (items.len > top_n) items[0..top_n] else items;
+}
+
 /// Tokenizes recent message text into lowercased word counts, filtered of
 /// stopwords/digits/very short or long tokens. Not `.deinit()`'d
 /// internally — callers are expected to run this against an arena (same
@@ -54,31 +86,20 @@ pub fn topWords(allocator: std.mem.Allocator, db: *Db, top_n: usize) ![]WordCoun
 
     var counts = std.StringHashMap(u32).init(allocator);
     while (try stmt.step()) {
-        const text = stmt.columnText(0);
-        var it = std.mem.tokenizeAny(u8, text, " \t\r\n.,!?;:\"'()[]{}<>/\\|`~@#$%^&*_+=-");
-        while (it.next()) |raw| {
-            if (raw.len < min_word_len or raw.len > max_word_len) continue;
-            const lower = try std.ascii.allocLowerString(allocator, raw);
-            if (isStopword(lower) or isAllDigits(lower)) continue;
-
-            const gop = try counts.getOrPut(lower);
-            if (gop.found_existing) {
-                gop.value_ptr.* += 1;
-            } else {
-                gop.value_ptr.* = 1;
-            }
-        }
+        try tokenizeInto(&counts, allocator, stmt.columnText(0));
     }
 
-    var list: std.ArrayList(WordCount) = .empty;
-    var it = counts.iterator();
-    while (it.next()) |entry| {
-        try list.append(allocator, .{ .word = entry.key_ptr.*, .count = entry.value_ptr.* });
-    }
+    return rankTop(allocator, counts, top_n);
+}
 
-    const items = try list.toOwnedSlice(allocator);
-    std.mem.sort(WordCount, items, {}, moreFrequentFirst);
-    return if (items.len > top_n) items[0..top_n] else items;
+/// Same tokenizing/ranking as `topWords`, but over caller-supplied text
+/// instead of a chat's logged history — used by the `word_cloud` tool so
+/// the model can build a cloud from an article, a scrape result, or
+/// anything else it has in hand, not just this group's own chat log.
+pub fn topWordsFromText(allocator: std.mem.Allocator, text: []const u8, top_n: usize) ![]WordCount {
+    var counts = std.StringHashMap(u32).init(allocator);
+    try tokenizeInto(&counts, allocator, text);
+    return rankTop(allocator, counts, top_n);
 }
 
 fn moreFrequentFirst(_: void, a: WordCount, b: WordCount) bool {
