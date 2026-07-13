@@ -61,7 +61,22 @@ pub fn setInt(db: *Db, key: []const u8, value: i64) !void {
     return setText(db, key, text);
 }
 
-fn setText(db: *Db, key: []const u8, value: []const u8) !void {
+/// Returns the setting's value duplicated into `allocator` (the column text
+/// itself dies with the statement — see the module comment above), or null
+/// when unset/empty. Empty is treated as unset so clearing a setting can be
+/// done by writing "".
+pub fn getTextAlloc(db: *Db, allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
+    var stmt = db.prepare("SELECT value FROM chat_settings WHERE key = ?;") catch return null;
+    defer stmt.finalize();
+    stmt.bindText(1, key);
+    const has_row = stmt.step() catch return null;
+    if (!has_row) return null;
+    const value = stmt.columnText(0);
+    if (value.len == 0) return null;
+    return allocator.dupe(u8, value) catch null;
+}
+
+pub fn setText(db: *Db, key: []const u8, value: []const u8) !void {
     var stmt = try db.prepare(
         \\INSERT INTO chat_settings (key, value) VALUES (?, ?)
         \\ON CONFLICT(key) DO UPDATE SET value=excluded.value;
@@ -90,4 +105,24 @@ test "getBool/setBool round trip with a default when unset" {
     try testing.expectEqual(@as(i64, 0), getInt(&db, "last_digest_ts", 0));
     try setInt(&db, "last_digest_ts", 12345);
     try testing.expectEqual(@as(i64, 12345), getInt(&db, "last_digest_ts", 0));
+}
+
+test "getTextAlloc/setText round trip; empty value reads back as unset" {
+    const dir = "zig-cache-test-settings-text";
+    defer std.Io.Dir.cwd().deleteTree(testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(testing.io, dir);
+
+    var db = try Db.open(dir ++ "/settings.db");
+    defer db.close();
+    try @import("schema.zig").migrate(&db);
+
+    try testing.expectEqual(@as(?[]const u8, null), getTextAlloc(&db, testing.allocator, "magic_word"));
+
+    try setText(&db, "magic_word", "hassan");
+    const value = getTextAlloc(&db, testing.allocator, "magic_word") orelse return error.TestExpectedValue;
+    defer testing.allocator.free(value);
+    try testing.expectEqualStrings("hassan", value);
+
+    try setText(&db, "magic_word", "");
+    try testing.expectEqual(@as(?[]const u8, null), getTextAlloc(&db, testing.allocator, "magic_word"));
 }

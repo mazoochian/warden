@@ -12,8 +12,10 @@ import { createCanvas } from "@napi-rs/canvas";
 import fs from "node:fs";
 import { GlobalFonts } from "@napi-rs/canvas";
 
+// Resolve relative to this script, not the cwd — the bot invokes us from
+// the project root, where ./fonts/ does not exist.
 GlobalFonts.registerFromPath(
-  "./fonts/Peyda-Regular.ttf",
+  new URL("./fonts/Peyda-Regular.ttf", import.meta.url).pathname,
   "Peyda"
 );
 console.error(GlobalFonts.families);
@@ -82,7 +84,7 @@ function main() {
   let colorIdx = 0;
   for (const { word, count } of sorted) {
     const fontSize = fontSizeFor(count);
-    ctx.font = `bold ${fontSize}px "Vazirmatn"`;
+    ctx.font = `bold ${fontSize}px "Peyda"`;
     const metrics = ctx.measureText(word);
     const w = metrics.width;
     const h = fontSize;

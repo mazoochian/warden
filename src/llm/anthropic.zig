@@ -74,12 +74,13 @@ pub const AnthropicProvider = struct {
             .{ .name = "x-api-key", .value = self.api_key },
             .{ .name = "anthropic-version", .value = "2023-06-01" },
         };
-        const body = try http_util.postJson(
+        const body = try http_util.postJsonWithTimeout(
             &self.http_client,
             allocator,
             "https://api.anthropic.com/v1/messages",
             &headers,
             payload,
+            http_util.llm_timeout_ns,
         );
         defer allocator.free(body);
 

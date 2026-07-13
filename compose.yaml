@@ -1,0 +1,83 @@
+services:
+  warden:
+    image: warden:latest
+    # `build` is only used where the source tree exists (your desktop).
+    # On the router, `docker load` the saved image first; compose then
+    # finds warden:latest locally and never needs to build or pull.
+    # `network: host` makes build-time RUNs resolve DNS through the host,
+    # where Tailscale MagicDNS works; bridge-networked build containers
+    # can't reach the 100.100.100.100 resolver Docker copies from the host.
+    build:
+      context: .
+      network: host
+    platform: linux/amd64
+    restart: unless-stopped
+    # Reap Chromium zombie processes left behind by mermaid-cli renders.
+    init: true
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    environment:
+      # Default to the bundled SearXNG service; a WARDEN_SEARXNG_URL in
+      # .env overrides this (the entrypoint sources .env last). Unset it
+      # with an empty value in .env to disable web search.
+      WARDEN_SEARXNG_URL: http://searxng:8080
+    depends_on:
+      - searxng
+
+  # Private metasearch instance backing the bot's web_search tool — no API
+  # keys, no bot checks, and never exposed outside the compose network.
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-warden-local-searxng-secret}
+
+  # Optional self-hosted LLM (see README's "Self-hosted local model"
+  # section) — a small model warden can talk to via WARDEN_LLM_PROVIDER=
+  # openai_compat instead of a paid/rate-limited API. Not started by
+  # default `docker compose up` invocations that don't reference it; only
+  # runs when explicitly brought up (e.g. `docker compose up -d llama-server
+  # warden searxng`) or once warden's .env points WARDEN_OPENAI_BASE_URL at
+  # it, since depends_on isn't set here (this service is opt-in, unlike
+  # searxng which every deployment wants).
+  llama-server:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    restart: unless-stopped
+    volumes:
+      - ./llama-server/models:/models:ro
+    # The image's baked-in healthcheck hardcodes port 8080; override it to
+    # match --port below, or `docker ps` reports this as permanently
+    # unhealthy despite working fine (confirmed: 404s hitting the wrong
+    # port, not an actual problem).
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+    # --host 0.0.0.0 so it's reachable from the warden container over the
+    # compose network by service name (http://llama-server:8090/v1); this
+    # is still never exposed to the host/LAN since no `ports:` is
+    # published here. `--threads` is deliberately unset (defaults to the
+    # container's visible core count) — set it explicitly if colocated
+    # with other CPU-hungry services and you want to leave them headroom.
+    command:
+      - --model
+      - /models/Qwen3.5-4B-Q4_K_M.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8090"
+      - --ctx-size
+      - "8192"
+      - --jinja
+      - --alias
+      - qwen3.5-4b
+      # Qwen3.5 defaults to an extended "thinking" trace before its real
+      # answer — confirmed by hand: a plain 2-sentence question burned a
+      # 300-token budget entirely on reasoning and never reached the
+      # actual reply. --reasoning off is this llama.cpp build's current
+      # flag for this (older docs/guides say --chat-template-kwargs
+      # '{"enable_thinking":false}', which still works but logs a
+      # deprecation warning on this image).
+      - --reasoning
+      - "off"

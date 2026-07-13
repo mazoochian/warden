@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 /// Tracks which chats have opted into periodic digests. Interval-based
 /// (every `interval_seconds` since that chat's last digest), not
@@ -11,14 +12,20 @@ const std = @import("std");
 /// `ChatStore.listExistingChatIds` + each chat's persisted
 /// `chat_settings.digest_enabled`), while the actual on/off state and
 /// last-sent timestamp are persisted per-chat so they survive restarts.
+///
+/// Accessed from concurrently-running per-message tasks (see `ChatStore`'s
+/// doc comment for why), so `enabled_chats` needs a lock.
 pub const DigestScheduler = struct {
     allocator: std.mem.Allocator,
+    io: Io,
     enabled_chats: std.StringHashMap(void),
+    mutex: Io.Mutex = .init,
     interval_seconds: i64,
 
-    pub fn init(allocator: std.mem.Allocator, interval_seconds: i64) DigestScheduler {
+    pub fn init(allocator: std.mem.Allocator, io: Io, interval_seconds: i64) DigestScheduler {
         return .{
             .allocator = allocator,
+            .io = io,
             .enabled_chats = std.StringHashMap(void).init(allocator),
             .interval_seconds = interval_seconds,
         };
@@ -31,6 +38,9 @@ pub const DigestScheduler = struct {
     }
 
     pub fn enable(self: *DigestScheduler, chat_id: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         if (self.enabled_chats.contains(chat_id)) return;
         const key = try self.allocator.dupe(u8, chat_id);
         errdefer self.allocator.free(key);
@@ -38,18 +48,42 @@ pub const DigestScheduler = struct {
     }
 
     pub fn disable(self: *DigestScheduler, chat_id: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         if (self.enabled_chats.fetchRemove(chat_id)) |entry| self.allocator.free(entry.key);
     }
 
     pub fn isEnabled(self: *DigestScheduler, chat_id: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         return self.enabled_chats.contains(chat_id);
+    }
+
+    /// Returns a snapshot of currently-enabled chat ids, duped into
+    /// `allocator`. Iterating `enabled_chats` directly from outside would
+    /// race with `enable`/`disable` running concurrently on another
+    /// message-handling task; this is the safe way to walk the set.
+    pub fn snapshotEnabledChatIds(self: *DigestScheduler, allocator: std.mem.Allocator) ![][]const u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var ids: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (ids.items) |id| allocator.free(id);
+            ids.deinit(allocator);
+        }
+        var it = self.enabled_chats.keyIterator();
+        while (it.next()) |k| try ids.append(allocator, try allocator.dupe(u8, k.*));
+        return ids.toOwnedSlice(allocator);
     }
 };
 
 const testing = std.testing;
 
 test "enable/disable/isEnabled" {
-    var sched = DigestScheduler.init(testing.allocator, 86400);
+    var sched = DigestScheduler.init(testing.allocator, testing.io, 86400);
     defer sched.deinit();
 
     try testing.expect(!sched.isEnabled("chat1"));

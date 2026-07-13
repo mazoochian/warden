@@ -38,7 +38,7 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
         .{history},
     );
 
-    const summary = toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}) catch |err| blk: {
+    const summary = toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}) catch |err| blk: {
         std.log.err("digest: llm summary failed: {t}", .{err});
         break :blk "";
     };

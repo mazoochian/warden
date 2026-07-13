@@ -24,6 +24,8 @@ test "isOwner matches only the configured platform+id pair" {
         .confirm_timeout_seconds = 60,
         .tmp_dir = "data/tmp",
         .digest_interval_seconds = 86_400,
+        .system_prompt = null,
+        .searxng_url = null,
     };
     try testing.expect(isOwner(&config, .telegram, "101573604"));
     try testing.expect(!isOwner(&config, .telegram, "1"));
