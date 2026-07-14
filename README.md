@@ -118,13 +118,34 @@ export WARDEN_ANTHROPIC_MODEL=claude-sonnet-5
 # export WARDEN_SYSTEM_PROMPT="You are Warden, ..."
 # export WARDEN_SYSTEM_PROMPT_FILE=system_prompt.txt
 
+# Database (required): a Postgres instance warden owns the schema of.
+# Provision one yourself (a managed cloud instance, or your own
+# self-hosted server) — compose.yaml does not bundle a Postgres service.
+export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
+
 # Optional knobs (defaults shown):
-# export WARDEN_DATA_DIR=data/chats
+# export WARDEN_POSTGRES_POOL_SIZE=10
 # export WARDEN_TMP_DIR=data/tmp
 # export WARDEN_RETENTION_MESSAGES=20000
 # export WARDEN_DIGEST_INTERVAL_SECONDS=86400
 # export WARDEN_CONFIRM_TIMEOUT_SECONDS=60
 ```
+
+## Migrating from an older SQLite-based install
+Versions before this one stored chat history in one SQLite file per chat
+under `data/chats/`. If you're upgrading from one of those, run the one-time
+migration tool once (with `WARDEN_POSTGRES_DSN` set, and `WARDEN_DATA_DIR`
+pointed at your existing `data/chats` directory if it isn't in the default
+location) before starting the new binary:
+
+```bash
+zig build migrate-data
+```
+
+This reads every `<chat_id>.db` file (plus the bot-wide `_global.db`) and
+writes their messages, per-chat token balances, digest/magic-word settings,
+and scraper config into Postgres, then it's done — nothing reads from the
+old SQLite files afterward.
 
 Once all is set up, run:
 ```bash

@@ -16,6 +16,10 @@ services:
     init: true
     volumes:
       - ./.env:/app/.env:ro
+      # No chat/message data lives here anymore (that's WARDEN_POSTGRES_DSN,
+      # an external managed Postgres instance — set it in .env, no compose
+      # service for it) — this now only persists WARDEN_TMP_DIR's scratch
+      # files across restarts.
       - ./data:/app/data
     environment:
       # Default to the bundled SearXNG service; a WARDEN_SEARXNG_URL in

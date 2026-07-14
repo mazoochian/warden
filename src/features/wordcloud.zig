@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const Db = @import("../store/db.zig").Db;
+const PgPool = @import("../store/pool.zig").PgPool;
 
 pub const WordCount = struct { word: []const u8, count: u32 };
 
@@ -79,10 +79,14 @@ fn rankTop(allocator: std.mem.Allocator, counts: std.StringHashMap(u32), top_n: 
 /// internally — callers are expected to run this against an arena (same
 /// pattern as `chat_store`/`toolcall`), so the hash map's storage rides
 /// along and gets reclaimed for free.
-pub fn topWords(allocator: std.mem.Allocator, db: *Db, top_n: usize) ![]WordCount {
-    var stmt = try db.prepare("SELECT text FROM messages WHERE text IS NOT NULL ORDER BY id DESC LIMIT ?;");
+pub fn topWords(allocator: std.mem.Allocator, pool: *PgPool, chat_id: i64, top_n: usize) ![]WordCount {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT text FROM messages WHERE chat_id = $1 AND text IS NOT NULL ORDER BY id DESC LIMIT $2;");
     defer stmt.finalize();
-    stmt.bindInt64(1, message_window);
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, message_window);
 
     var counts = std.StringHashMap(u32).init(allocator);
     while (try stmt.step()) {
@@ -146,19 +150,29 @@ pub fn render(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, words: 
 }
 
 const testing = std.testing;
+const test_support = @import("../store/test_support.zig");
+const chats = @import("../store/chats.zig");
+const identities = @import("../store/identities.zig");
+const messages = @import("../store/messages.zig");
 
 test "topWords ranks by frequency and filters stopwords/short tokens" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const tmp_path = "zig-cache-test-wordcloud/topwords.db";
-    defer Io.Dir.cwd().deleteTree(testing.io, "zig-cache-test-wordcloud") catch {};
-    try Io.Dir.cwd().createDirPath(testing.io, "zig-cache-test-wordcloud");
-
-    var db = try Db.open(tmp_path);
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
-    try @import("../store/schema.zig").migrate(&db);
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const identity_id = try identities.upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "1",
+        .display_name = "Someone",
+        .first_seen = 0,
+        .last_seen = 0,
+    });
 
     const texts = [_][]const u8{
         "zig is great and zig is fast",
@@ -167,14 +181,9 @@ test "topWords ranks by frequency and filters stopwords/short tokens" {
         "a", // too short, filtered
         "the and but", // all stopwords
     };
-    for (texts) |t| {
-        var stmt = try db.prepare("INSERT INTO messages (user_id, text, ts) VALUES ('1', ?, 0);");
-        defer stmt.finalize();
-        stmt.bindText(1, t);
-        _ = try stmt.step();
-    }
+    for (texts) |t| try messages.insert(&pool, chat_id, identity_id, null, t, 0);
 
-    const words = try topWords(a, &db, 10);
+    const words = try topWords(a, &pool, chat_id, 10);
     try testing.expect(words.len > 0);
     try testing.expectEqualStrings("zig", words[0].word);
     try testing.expectEqual(@as(u32, 4), words[0].count);

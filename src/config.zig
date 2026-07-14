@@ -38,16 +38,18 @@ pub const Config = struct {
     /// today; adding Matrix/Discord/WhatsApp later means adding another
     /// `OwnerEntry` here plus its own connector, not touching `auth.zig`.
     owners: []const OwnerEntry,
-    /// Directory holding one SQLite file per chat.
-    data_dir: []const u8,
+    /// libpq connection string/URI for the shared Postgres database.
+    postgres_dsn: []const u8,
+    /// Size of the Postgres connection pool (see `store/pool.zig`).
+    postgres_pool_size: usize,
     /// Per-chat message retention: keep only the most recent N messages.
     retention_messages: i64,
     llm: LlmConfig,
     /// How long a ban/kick confirmation stays valid before expiring.
     confirm_timeout_seconds: i64,
     /// Scratch directory for shelling out to external renderers (word
-    /// cloud/diagram scripts) — separate from `data_dir` since it's
-    /// throwaway, not per-chat state.
+    /// cloud/diagram scripts) — unrelated to the database, purely
+    /// throwaway local scratch space.
     tmp_dir: []const u8,
     /// How often an opted-in chat gets a digest (interval-based, not
     /// wall-clock time-of-day — see `features/scheduler.zig`).
@@ -61,7 +63,7 @@ pub const Config = struct {
     /// web_search tool. Unset disables web search entirely.
     searxng_url: ?[]const u8,
 
-    pub const LoadError = error{ MissingBotToken, MissingLlmConfig, BadSystemPromptFile } || std.mem.Allocator.Error;
+    pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile } || std.mem.Allocator.Error;
 
     /// `env` is expected to be `init.environ_map` from `std.process.Init`.
     /// `arena` should be long-lived (e.g. `init.arena.allocator()`) since
@@ -76,7 +78,12 @@ pub const Config = struct {
             .{ .platform = .telegram, .owner_id = telegram_owner_id },
         });
 
-        const data_dir = env.get("WARDEN_DATA_DIR") orelse "data/chats";
+        const postgres_dsn = env.get("WARDEN_POSTGRES_DSN") orelse return error.MissingPostgresDsn;
+
+        const postgres_pool_size: usize = if (env.get("WARDEN_POSTGRES_POOL_SIZE")) |raw|
+            std.fmt.parseInt(usize, raw, 10) catch default_postgres_pool_size
+        else
+            default_postgres_pool_size;
 
         const retention_messages: i64 = if (env.get("WARDEN_RETENTION_MESSAGES")) |raw|
             std.fmt.parseInt(i64, raw, 10) catch default_retention_messages
@@ -121,7 +128,8 @@ pub const Config = struct {
         return .{
             .telegram_bot_token = telegram_bot_token,
             .owners = owners,
-            .data_dir = data_dir,
+            .postgres_dsn = postgres_dsn,
+            .postgres_pool_size = postgres_pool_size,
             .retention_messages = retention_messages,
             .llm = llm,
             .confirm_timeout_seconds = confirm_timeout_seconds,
@@ -155,6 +163,7 @@ pub const Config = struct {
     pub const max_system_prompt_bytes = 64 * 1024;
 
     pub const default_retention_messages: i64 = 20_000;
+    pub const default_postgres_pool_size: usize = 10;
     pub const default_confirm_timeout_seconds: i64 = 60;
     pub const default_digest_interval_seconds: i64 = 86_400;
 

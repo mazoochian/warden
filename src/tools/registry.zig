@@ -3,9 +3,9 @@ const Io = std.Io;
 const iface = @import("../platform/interface.zig");
 
 /// Scraper mode/endpoint for `scrape_site`. Defined here (rather than in
-/// `store/scraper_settings.zig`) so `registry.zig` — imported by every tool
-/// — has no dependency on the store layer; `scraper_settings.zig` produces
-/// values of this shape instead.
+/// `store/bot_config.zig`) so `registry.zig` — imported by every tool — has
+/// no dependency on the store layer; `bot_config.zig` produces values of
+/// this shape instead.
 pub const ScraperMode = enum { local, remote };
 
 pub const ScraperConfig = struct {

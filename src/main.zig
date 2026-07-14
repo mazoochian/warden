@@ -5,7 +5,14 @@ const config_mod = @import("config.zig");
 const auth = @import("auth.zig");
 const iface = @import("platform/interface.zig");
 const telegram_platform = @import("platform/telegram.zig");
-const ChatStore = @import("store/chat_store.zig").ChatStore;
+const store_pool = @import("store/pool.zig");
+const migrate = @import("store/migrate.zig");
+const chats = @import("store/chats.zig");
+const identities = @import("store/identities.zig");
+const chat_members = @import("store/chat_members.zig");
+const chat_settings = @import("store/chat_settings.zig");
+const bot_config = @import("store/bot_config.zig");
+const messages = @import("store/messages.zig");
 const stats = @import("store/stats.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
@@ -17,8 +24,6 @@ const group_admin = @import("features/group_admin.zig");
 const wordcloud = @import("features/wordcloud.zig");
 const digest = @import("features/digest.zig");
 const scheduler = @import("features/scheduler.zig");
-const settings = @import("store/settings.zig");
-const scraper_settings = @import("store/scraper_settings.zig");
 
 const base_tools = [_]tool_registry.ToolDef{
     @import("tools/calculator.zig").tool,
@@ -42,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     const config = config_mod.Config.load(init.environ_map, init.arena.allocator(), io) catch |err| {
-        std.log.err("config error: {t} (did you set WARDEN_TELEGRAM_BOT_TOKEN?)", .{err});
+        std.log.err("config error: {t} (did you set WARDEN_TELEGRAM_BOT_TOKEN and WARDEN_POSTGRES_DSN?)", .{err});
         return err;
     };
 
@@ -66,15 +71,20 @@ pub fn main(init: std.process.Init) !void {
     defer telegram_adapter.deinit();
     const connectors = [_]iface.Connector{telegram_adapter.connector()};
 
-    var chat_store = ChatStore.init(gpa, io, config.data_dir, config.retention_messages);
-    defer chat_store.deinit();
+    var pool = try store_pool.PgPool.init(gpa, io, config.postgres_dsn, config.postgres_pool_size);
+    defer pool.deinit();
+    {
+        const db = try pool.acquire();
+        defer pool.release(db);
+        try migrate.migrate(db, gpa);
+    }
 
     var pending_confirmations = group_admin.PendingConfirmations.init(gpa, io, config.confirm_timeout_seconds);
     defer pending_confirmations.deinit();
 
     var digest_scheduler = scheduler.DigestScheduler.init(gpa, io, config.digest_interval_seconds);
     defer digest_scheduler.deinit();
-    loadDigestScheduleFromDisk(gpa, &chat_store, &digest_scheduler);
+    loadDigestScheduleFromDisk(gpa, &pool, &digest_scheduler);
 
     // Heap-allocated: whichever variant isn't selected never gets
     // constructed, and the process-lifetime singleton is fine to leave for
@@ -110,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
             defer poll_arena.deinit();
             const poll_a = poll_arena.allocator();
 
-            const messages = connector.poll(poll_a) catch |err| {
+            const polled_messages = connector.poll(poll_a) catch |err| {
                 switch (err) {
                     // A long poll whose connection died or never came up is
                     // operationally an empty poll: updates queue server-side
@@ -131,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             };
 
-            for (messages) |msg| {
+            for (polled_messages) |msg| {
                 const ts = Io.Timestamp.now(io, .real).toSeconds();
 
                 // Each task owns an arena for its whole lifetime, created
@@ -155,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
                 worker_group.async(io, processMessageTask, .{
                     connector,
                     &config,
-                    &chat_store,
+                    &pool,
                     llm_provider,
                     active_tools,
                     &pending_confirmations,
@@ -174,7 +184,7 @@ pub fn main(init: std.process.Init) !void {
             // connector; see `checkAndSendDueDigests`'s doc comment for the
             // multi-platform caveat.
             const now = Io.Timestamp.now(io, .real).toSeconds();
-            checkAndSendDueDigests(connector, gpa, io, &config, &chat_store, &digest_scheduler, llm_provider, now);
+            checkAndSendDueDigests(connector, gpa, io, &config, &pool, &digest_scheduler, llm_provider, now);
         }
     }
 }
@@ -186,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
 fn processMessageTask(
     connector: iface.Connector,
     config: *const config_mod.Config,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
     llm_provider: llm.Provider,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
@@ -203,10 +213,19 @@ fn processMessageTask(
     }
     const a = task_arena.allocator();
 
+    const chat_id = chats.upsertChat(pool, connector.platform(), msg.chat_id, msg.chat_type, msg.chat_title) catch |err| {
+        std.log.err("failed to upsert chat {s}: {t}", .{ msg.chat_id, err });
+        return;
+    };
+
     // Every group member's message counts toward this chat's local record
     // (stats/content recall), regardless of who sent it — only
     // replies/actions are owner-gated below.
-    chat_store.record(msg.chat_id, msg, ts);
+    const identity_id = resolveSenderIdentity(pool, connector, msg, ts) catch |err| {
+        std.log.err("failed to resolve identity for user {s}: {t}", .{ msg.user_id, err });
+        return;
+    };
+    recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, config.retention_messages);
 
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
@@ -215,32 +234,64 @@ fn processMessageTask(
         .chat_id = msg.chat_id,
         .tmp_dir = config.tmp_dir,
         .searxng_url = config.searxng_url,
-        .scraper = loadScraperSnapshot(chat_store, a),
+        .scraper = bot_config.loadScraperConfig(pool, a),
     };
-    handleMessage(connector, a, config, chat_store, llm_provider, tool_ctx, tools, pending, digest_scheduler, io, ts, msg);
+    handleMessage(connector, a, config, pool, chat_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, io, ts, msg);
 }
 
-/// Rebuilds the in-memory enabled-chat set from each existing chat db's
+/// Resolves (upserting as needed) the internal `identities.id` for a
+/// message's sender. Prefers the full `Identity`/`TelegramProfile` the
+/// connector already built from the platform's wire format; falls back to a
+/// minimal placeholder (e.g. `msg.identity` unset because `msg.from` was
+/// absent) so a message never fails to log just because identity data was
+/// thin.
+fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, msg: iface.Message, ts: i64) !i64 {
+    if (msg.identity) |identity| {
+        const identity_id = try identities.upsertIdentity(pool, identity);
+        if (msg.telegram_profile) |profile| {
+            identities.upsertTelegramProfile(pool, identity_id, profile) catch |err| {
+                std.log.err("failed to upsert telegram profile for identity {d}: {t}", .{ identity_id, err });
+            };
+        }
+        return identity_id;
+    }
+    return identities.getOrCreateMinimal(pool, connector.platform(), msg.user_id, msg.username orelse msg.user_id, false, ts);
+}
+
+/// Logs one message and bumps the sender's chat-membership record, then
+/// prunes to the retention window — replaces the old `ChatStore.record`.
+/// Errors are logged, not propagated: a storage hiccup shouldn't take down
+/// the poll loop.
+fn recordMessage(pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, message_id: ?[]const u8, text: ?[]const u8, ts: i64, retention: i64) void {
+    messages.insert(pool, chat_id, identity_id, message_id, text, ts) catch |err| {
+        std.log.err("failed to insert message for chat {d}: {t}", .{ chat_id, err });
+        return;
+    };
+    chat_members.touch(pool, chat_id, identity_id, ts) catch |err| {
+        std.log.err("failed to touch chat_members for chat {d}: {t}", .{ chat_id, err });
+    };
+    messages.pruneKeepLast(pool, chat_id, retention) catch |err| {
+        std.log.err("prune failed for chat {d}: {t}", .{ chat_id, err });
+    };
+}
+
+/// Rebuilds the in-memory enabled-chat set from every known chat's
 /// persisted `chat_settings.digest_enabled` — so digests opted into before
 /// a restart keep firing rather than silently going quiet.
-fn loadDigestScheduleFromDisk(gpa: std.mem.Allocator, chat_store: *ChatStore, digest_scheduler: *scheduler.DigestScheduler) void {
-    const ids = chat_store.listExistingChatIds(gpa) catch |err| {
+fn loadDigestScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, digest_scheduler: *scheduler.DigestScheduler) void {
+    const refs = chats.listAll(pool, gpa) catch |err| {
         std.log.err("digest: failed to scan existing chats: {t}", .{err});
         return;
     };
     defer {
-        for (ids) |id| gpa.free(id);
-        gpa.free(ids);
+        for (refs) |r| gpa.free(r.native_chat_id);
+        gpa.free(refs);
     }
 
-    for (ids) |chat_id| {
-        const db = chat_store.get(chat_id) catch |err| {
-            std.log.err("digest: failed to open db for chat {s}: {t}", .{ chat_id, err });
-            continue;
-        };
-        if (settings.getBool(db, "digest_enabled", false)) {
-            digest_scheduler.enable(chat_id) catch |err| {
-                std.log.err("digest: failed to restore schedule for chat {s}: {t}", .{ chat_id, err });
+    for (refs) |ref| {
+        if (chat_settings.getDigestEnabled(pool, ref.id)) {
+            digest_scheduler.enable(ref.native_chat_id) catch |err| {
+                std.log.err("digest: failed to restore schedule for chat {s}: {t}", .{ ref.native_chat_id, err });
             };
         }
     }
@@ -256,7 +307,7 @@ fn checkAndSendDueDigests(
     gpa: std.mem.Allocator,
     io: Io,
     config: *const config_mod.Config,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
     digest_scheduler: *scheduler.DigestScheduler,
     llm_provider: llm.Provider,
     now: i64,
@@ -270,55 +321,48 @@ fn checkAndSendDueDigests(
         gpa.free(enabled_chat_ids);
     }
 
-    for (enabled_chat_ids) |chat_id| {
+    for (enabled_chat_ids) |native_chat_id| {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
 
-        const db = chat_store.get(chat_id) catch |err| {
-            std.log.err("digest: failed to open db for chat {s}: {t}", .{ chat_id, err });
+        // `chat_type`/`title` null: this isn't a fresh inbound message, just
+        // a scheduled check, and `upsertChat` preserves whatever's already
+        // stored for those columns when passed null (see its doc comment).
+        const chat_id = chats.upsertChat(pool, connector.platform(), native_chat_id, null, null) catch |err| {
+            std.log.err("digest: failed to resolve chat {s}: {t}", .{ native_chat_id, err });
             continue;
         };
 
-        const last_sent = settings.getInt(db, "last_digest_ts", 0);
+        const last_sent = chat_settings.getLastDigestTs(pool, chat_id);
         if (now - last_sent < config.digest_interval_seconds) continue;
 
         const tool_ctx = tool_registry.ToolContext{
             .allocator = a,
             .io = io,
             .connector = connector,
-            .chat_id = chat_id,
+            .chat_id = native_chat_id,
             .tmp_dir = config.tmp_dir,
             .searxng_url = config.searxng_url,
-            .scraper = loadScraperSnapshot(chat_store, a),
+            .scraper = bot_config.loadScraperConfig(pool, a),
         };
-        const digest_text = digest.generate(llm_provider, a, tool_ctx, db) catch |err| {
-            std.log.err("digest: generate failed for chat {s}: {t}", .{ chat_id, err });
+        const digest_text = digest.generate(llm_provider, a, tool_ctx, pool, chat_id) catch |err| {
+            std.log.err("digest: generate failed for chat {s}: {t}", .{ native_chat_id, err });
             continue;
         };
-        connector.sendMessage(a, chat_id, digest_text, null);
-        settings.setInt(db, "last_digest_ts", now) catch |err| {
-            std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ chat_id, err });
+        connector.sendMessage(a, native_chat_id, digest_text, null);
+        chat_settings.setLastDigestTs(pool, chat_id, now) catch |err| {
+            std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
         };
     }
-}
-
-/// Reads the owner's current `/scraper` configuration for the `scrape_site`
-/// tool. Loaded fresh per message (rather than cached at startup) so a
-/// runtime change via `/scraper` takes effect on the very next message.
-fn loadScraperSnapshot(chat_store: *ChatStore, allocator: std.mem.Allocator) tool_registry.ScraperConfig {
-    const db = chat_store.get(scraper_settings.global_chat_id) catch |err| {
-        std.log.err("scraper: failed to open global settings db: {t}", .{err});
-        return .{};
-    };
-    return scraper_settings.load(db, allocator);
 }
 
 fn handleMessage(
     connector: iface.Connector,
     a: std.mem.Allocator,
     config: *const config_mod.Config,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
     llm_provider: llm.Provider,
     tool_ctx: tool_registry.ToolContext,
     tools: []const tool_registry.ToolDef,
@@ -334,11 +378,11 @@ fn handleMessage(
     if (std.mem.eql(u8, text, "/ping")) {
         connector.sendMessage(a, msg.chat_id, "pong", msg.message_id);
     } else if (std.mem.eql(u8, text, "/stats")) {
-        replyWithStats(connector, a, chat_store, msg.chat_id, msg.message_id);
+        replyWithStats(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/wordcloud")) {
-        replyWithWordcloud(connector, a, chat_store, config.tmp_dir, io, msg.chat_id, msg.message_id);
+        replyWithWordcloud(connector, a, pool, chat_id, config.tmp_dir, io, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/digest") or std.mem.startsWith(u8, text, "/digest ")) {
-        handleDigestCommand(connector, a, chat_store, digest_scheduler, llm_provider, tool_ctx, now, msg.chat_id, msg.message_id, text);
+        handleDigestCommand(connector, a, pool, chat_id, digest_scheduler, llm_provider, tool_ctx, now, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
         if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
         group_admin.mute(connector, a, msg, now);
@@ -356,10 +400,10 @@ fn handleMessage(
         group_admin.deleteMessage(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/kick")) {
         if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
-        group_admin.requestConfirmation(connector, a, chat_store, msg, .kick); // pending, now commented for now
+        group_admin.requestConfirmation(connector, a, pool, chat_id, now, msg, .kick);
     } else if (std.mem.eql(u8, text, "/ban")) {
         if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
-        group_admin.requestConfirmation(connector, a, chat_store, msg, .ban);
+        group_admin.requestConfirmation(connector, a, pool, chat_id, now, msg, .ban);
     } else if (std.mem.eql(u8, text, "/confirm")) {
         if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
         group_admin.confirm(connector, a, pending, now, msg);
@@ -368,24 +412,24 @@ fn handleMessage(
         group_admin.cancel(connector, a, pending, msg);
     } else if (std.mem.startsWith(u8, text, "/token")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
-        handleToken(connector, a, chat_store, msg, text);
+        handleToken(connector, a, pool, chat_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/magicword") or std.mem.startsWith(u8, text, "/magicword ")) {
-        handleMagicWord(connector, a, config, chat_store, msg, text);
+        handleMagicWord(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/scraper") or std.mem.startsWith(u8, text, "/scraper ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
-        handleScraperCommand(connector, a, chat_store, msg, text);
+        handleScraperCommand(connector, a, pool, msg, text);
     } else if (text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
         return;
-    } else if (isAddressedToBot(a, chat_store, msg, text)) {
+    } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
         // The bot's free-form LLM Q&A is owner-only — every other command
         // above this stays open to anyone (unchanged). Silent, not an
         // error reply: an unaddressed mention from someone else shouldn't
         // announce "I only answer my owner" to the whole group.
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
-        replyWithAnswer(connector, a, chat_store, llm_provider, tool_ctx, tools, config.system_prompt, io, now, msg.chat_id, msg.message_id, text, replied_to);
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, config.system_prompt, io, now, config.retention_messages, msg.chat_id, msg.message_id, text, replied_to);
     }
 }
 
@@ -410,12 +454,11 @@ fn isAuthorizedForGroupAdmin(connector: iface.Connector, a: std.mem.Allocator, c
 /// A non-command message deserves a reply when it's a DM, mentions the bot,
 /// replies to one of the bot's messages, or says the chat's configured
 /// magic word (a per-chat setting; see /magicword).
-fn isAddressedToBot(a: std.mem.Allocator, chat_store: *ChatStore, msg: iface.Message, text: []const u8) bool {
+fn isAddressedToBot(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) bool {
     if (!msg.is_group) return true;
     if (msg.mentions_me or msg.reply_to_is_me) return true;
 
-    const db = chat_store.get(msg.chat_id) catch return false;
-    const magic = settings.getTextAlloc(db, a, magic_word_key) orelse return false;
+    const magic = chat_settings.getMagicWord(pool, a, chat_id) orelse return false;
     return containsWordIgnoreCase(text, magic);
 }
 
@@ -426,18 +469,15 @@ fn handleMagicWord(
     connector: iface.Connector,
     a: std.mem.Allocator,
     config: *const config_mod.Config,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
     msg: iface.Message,
     text: []const u8,
 ) void {
-    const db = chat_store.get(msg.chat_id) catch |err| {
-        std.log.err("magicword: failed to open db for chat {s}: {t}", .{ msg.chat_id, err });
-        return;
-    };
     const arg = std.mem.trim(u8, text["/magicword".len..], " ");
 
     if (arg.len == 0) {
-        const reply_text = if (settings.getTextAlloc(db, a, magic_word_key)) |word|
+        const reply_text = if (chat_settings.getMagicWord(pool, a, chat_id)) |word|
             std.fmt.allocPrint(a, "Magic word: \"{s}\" — say it in any message and I'll answer. You can also mention me or reply to my messages. Change it with /magicword <word>, disable with /magicword off.", .{word}) catch return
         else
             "No magic word set — mention me or reply to my messages to get an answer. Set one with /magicword <word>.";
@@ -451,7 +491,7 @@ fn handleMagicWord(
     }
 
     if (std.mem.eql(u8, arg, "off")) {
-        settings.setText(db, magic_word_key, "") catch |err| {
+        chat_settings.setMagicWord(pool, chat_id, null) catch |err| {
             std.log.err("magicword: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
@@ -464,7 +504,7 @@ fn handleMagicWord(
         return;
     }
 
-    settings.setText(db, magic_word_key, arg) catch |err| {
+    chat_settings.setMagicWord(pool, chat_id, arg) catch |err| {
         std.log.err("magicword: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
         return;
     };
@@ -475,22 +515,18 @@ fn handleMagicWord(
 /// Owner-only, unlike /magicword: the whole command (including viewing) is
 /// gated in the dispatcher above, since the config here can include a
 /// remote endpoint/API key that shouldn't be visible to random chat
-/// members. Bot-wide, not per-chat — see `scraper_settings.global_chat_id`.
+/// members. Bot-wide, not per-chat — see `store/bot_config.zig`.
 fn handleScraperCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
     msg: iface.Message,
     text: []const u8,
 ) void {
-    const db = chat_store.get(scraper_settings.global_chat_id) catch |err| {
-        std.log.err("scraper: failed to open global settings db: {t}", .{err});
-        return;
-    };
     const arg = std.mem.trim(u8, text["/scraper".len..], " ");
 
     if (arg.len == 0) {
-        const snap = scraper_settings.load(db, a);
+        const snap = bot_config.loadScraperConfig(pool, a);
         const remote_desc = snap.remote_url orelse "(not set)";
         const key_desc = if (snap.remote_api_key != null) "set" else "not set";
         const status = std.fmt.allocPrint(
@@ -508,12 +544,12 @@ fn handleScraperCommand(
 
     if (std.mem.eql(u8, sub, "mode")) {
         if (std.mem.eql(u8, rest, "remote")) {
-            const snap = scraper_settings.load(db, a);
+            const snap = bot_config.loadScraperConfig(pool, a);
             if (snap.remote_url == null) {
                 reply(connector, a, msg.chat_id, msg.message_id, "Set a remote endpoint first with /scraper url <endpoint>.");
                 return;
             }
-            scraper_settings.setMode(db, .remote) catch |err| {
+            bot_config.setScraperMode(pool, .remote) catch |err| {
                 std.log.err("scraper: failed to set mode for global settings: {t}", .{err});
                 reply(connector, a, msg.chat_id, msg.message_id, "Couldn't update the scraper mode, try again.");
                 return;
@@ -521,7 +557,7 @@ fn handleScraperCommand(
             const confirmation = std.fmt.allocPrint(a, "Scraper mode set to remote ({s}).", .{snap.remote_url.?}) catch return;
             connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
         } else if (std.mem.eql(u8, rest, "local")) {
-            scraper_settings.setMode(db, .local) catch |err| {
+            bot_config.setScraperMode(pool, .local) catch |err| {
                 std.log.err("scraper: failed to set mode for global settings: {t}", .{err});
                 reply(connector, a, msg.chat_id, msg.message_id, "Couldn't update the scraper mode, try again.");
                 return;
@@ -535,7 +571,7 @@ fn handleScraperCommand(
             reply(connector, a, msg.chat_id, msg.message_id, "Usage: /scraper url <endpoint>");
             return;
         }
-        scraper_settings.setRemoteUrl(db, rest) catch |err| {
+        bot_config.setScraperRemoteUrl(pool, rest) catch |err| {
             std.log.err("scraper: failed to set remote url: {t}", .{err});
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that endpoint, try again.");
             return;
@@ -543,14 +579,14 @@ fn handleScraperCommand(
         reply(connector, a, msg.chat_id, msg.message_id, "Remote scraper endpoint saved. Switch to it with /scraper mode remote.");
     } else if (std.mem.eql(u8, sub, "apikey")) {
         if (rest.len == 0 or std.mem.eql(u8, rest, "off")) {
-            scraper_settings.setRemoteApiKey(db, "") catch |err| {
+            bot_config.setScraperRemoteApiKey(pool, null) catch |err| {
                 std.log.err("scraper: failed to clear remote api key: {t}", .{err});
                 reply(connector, a, msg.chat_id, msg.message_id, "Couldn't clear the API key, try again.");
                 return;
             };
             reply(connector, a, msg.chat_id, msg.message_id, "Remote scraper API key cleared.");
         } else {
-            scraper_settings.setRemoteApiKey(db, rest) catch |err| {
+            bot_config.setScraperRemoteApiKey(pool, rest) catch |err| {
                 std.log.err("scraper: failed to set remote api key: {t}", .{err});
                 reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save the API key, try again.");
                 return;
@@ -565,7 +601,9 @@ fn handleScraperCommand(
 fn handleToken(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    now: i64,
     msg: iface.Message,
     text: []const u8,
 ) void {
@@ -574,26 +612,25 @@ fn handleToken(
         return;
     };
     const arg = std.mem.trim(u8, text["/token".len..], " ");
-    const db = chat_store.get(msg.chat_id) catch |err| {
-        std.log.err("token: failed to open db for chat {s}: {t}", .{ msg.chat_id, err });
+    const target_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), target.user_id, target.label, false, now) catch |err| {
+        std.log.err("token: failed to resolve identity for user {s}: {t}", .{ target.user_id, err });
         return;
     };
     // If there is no argument, get the current token count and reply with it.
     if (arg.len == 0) {
-        const count = settings.getTokens(db, target.user_id, 0);
+        const count = chat_members.getTokens(pool, chat_id, target_identity_id, 0);
         const message = std.fmt.allocPrint(a, "Current token count: {}", .{count}) catch |err| {
             std.debug.print("Failed to allocate message string: {}\n", .{err});
             return; // Exit the function early since we couldn't format the message
         };
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
-        // replyWithAnswer(connector, a, chat_store, llm_provider, tool_ctx, chat_id, std.fmt.allocPrint(a, "Current token count: {}", .{count}) catch "");
         return;
     }
     // Else just set the token count to the parsed value and reply with a confirmation.
     else {
         const count = std.fmt.parseInt(i64, arg, 10) catch 0;
         std.log.info("Detected the count to be {}", .{count});
-        settings.setTokens(db, target.user_id, count) catch |err| {
+        chat_members.setTokens(pool, chat_id, target_identity_id, count) catch |err| {
             std.log.err("Failed to set tokens on the databse: {}\n", .{err});
             return;
         };
@@ -608,53 +645,49 @@ fn handleToken(
 fn handleDigestCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
     digest_scheduler: *scheduler.DigestScheduler,
     llm_provider: llm.Provider,
     tool_ctx: tool_registry.ToolContext,
     now: i64,
-    chat_id: []const u8,
+    native_chat_id: []const u8,
     reply_to: ?[]const u8,
     text: []const u8,
 ) void {
     const arg = std.mem.trim(u8, text["/digest".len..], " ");
 
-    const db = chat_store.get(chat_id) catch |err| {
-        std.log.err("digest: failed to open db for chat {s}: {t}", .{ chat_id, err });
-        return;
-    };
-
     if (std.mem.eql(u8, arg, "on")) {
-        digest_scheduler.enable(chat_id) catch |err| {
-            std.log.err("digest: failed to enable for chat {s}: {t}", .{ chat_id, err });
-            connector.sendMessage(a, chat_id, "Couldn't enable digests, try again.", reply_to);
+        digest_scheduler.enable(native_chat_id) catch |err| {
+            std.log.err("digest: failed to enable for chat {s}: {t}", .{ native_chat_id, err });
+            connector.sendMessage(a, native_chat_id, "Couldn't enable digests, try again.", reply_to);
             return;
         };
-        settings.setBool(db, "digest_enabled", true) catch |err| {
-            std.log.err("digest: failed to persist enabled flag for chat {s}: {t}", .{ chat_id, err });
+        chat_settings.setDigestEnabled(pool, chat_id, true) catch |err| {
+            std.log.err("digest: failed to persist enabled flag for chat {s}: {t}", .{ native_chat_id, err });
         };
         const hours = @divTrunc(digest_scheduler.interval_seconds, 3600);
         const msg_text = std.fmt.allocPrint(a, "Digest enabled — I'll post one roughly every {d}h.", .{hours}) catch return;
-        connector.sendMessage(a, chat_id, msg_text, reply_to);
+        connector.sendMessage(a, native_chat_id, msg_text, reply_to);
     } else if (std.mem.eql(u8, arg, "off")) {
-        digest_scheduler.disable(chat_id);
-        settings.setBool(db, "digest_enabled", false) catch |err| {
-            std.log.err("digest: failed to persist disabled flag for chat {s}: {t}", .{ chat_id, err });
+        digest_scheduler.disable(native_chat_id);
+        chat_settings.setDigestEnabled(pool, chat_id, false) catch |err| {
+            std.log.err("digest: failed to persist disabled flag for chat {s}: {t}", .{ native_chat_id, err });
         };
-        connector.sendMessage(a, chat_id, "Digest disabled.", reply_to);
+        connector.sendMessage(a, native_chat_id, "Digest disabled.", reply_to);
     } else if (std.mem.eql(u8, arg, "now")) {
-        const digest_text = digest.generate(llm_provider, a, tool_ctx, db) catch |err| {
-            std.log.err("digest: generate failed for chat {s}: {t}", .{ chat_id, err });
-            connector.sendMessage(a, chat_id, "Couldn't generate a digest just now.", reply_to);
+        const digest_text = digest.generate(llm_provider, a, tool_ctx, pool, chat_id) catch |err| {
+            std.log.err("digest: generate failed for chat {s}: {t}", .{ native_chat_id, err });
+            connector.sendMessage(a, native_chat_id, "Couldn't generate a digest just now.", reply_to);
             return;
         };
-        connector.sendMessage(a, chat_id, digest_text, reply_to);
-        settings.setInt(db, "last_digest_ts", now) catch |err| {
-            std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ chat_id, err });
+        connector.sendMessage(a, native_chat_id, digest_text, reply_to);
+        chat_settings.setLastDigestTs(pool, chat_id, now) catch |err| {
+            std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
         };
     } else {
-        const enabled = digest_scheduler.isEnabled(chat_id);
-        const last = settings.getInt(db, "last_digest_ts", 0);
+        const enabled = digest_scheduler.isEnabled(native_chat_id);
+        const last = chat_settings.getLastDigestTs(pool, chat_id);
         const msg_text = if (last == 0)
             std.fmt.allocPrint(
                 a,
@@ -667,7 +700,7 @@ fn handleDigestCommand(
                 "Digest is {s}. Last sent {d}s ago. Use /digest on, /digest off, or /digest now.",
                 .{ if (enabled) "on" else "off", now - last },
             ) catch return;
-        connector.sendMessage(a, chat_id, msg_text, reply_to);
+        connector.sendMessage(a, native_chat_id, msg_text, reply_to);
     }
 }
 
@@ -764,65 +797,62 @@ fn tickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []con
 fn replyWithAnswer(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
     llm_provider: llm.Provider,
     tool_ctx: tool_registry.ToolContext,
     tools: []const tool_registry.ToolDef,
     system_prompt: ?[]const u8,
     io: Io,
     now: i64,
-    chat_id: []const u8,
+    retention_messages: i64,
+    native_chat_id: []const u8,
     reply_to: ?[]const u8,
     question: []const u8,
     replied_to: ?[]const u8,
 ) void {
-    const db = chat_store.get(chat_id) catch |err| {
-        std.log.err("qa: failed to open db for chat {s}: {t}", .{ chat_id, err });
-        return;
-    };
-
     // The placeholder + ticker only work when the platform supports
     // editing (Telegram does); anything that doesn't falls back to
     // exactly the old behavior — one blocking call, one send at the end.
-    const placeholder_id = connector.sendMessageReturningId(a, chat_id, thinking_text, reply_to) catch |err| blk: {
-        std.log.warn("qa: couldn't send a placeholder for chat {s}, falling back to a plain reply: {t}", .{ chat_id, err });
+    const placeholder_id = connector.sendMessageReturningId(a, native_chat_id, thinking_text, reply_to) catch |err| blk: {
+        std.log.warn("qa: couldn't send a placeholder for chat {s}, falling back to a plain reply: {t}", .{ native_chat_id, err });
         break :blk null;
     };
-    std.log.info("qa: placeholder for chat {s} = {?s}", .{ chat_id, placeholder_id });
+    std.log.info("qa: placeholder for chat {s} = {?s}", .{ native_chat_id, placeholder_id });
 
     var state = TickerState{ .io = io, .allocator = a };
     var progress: toolcall.Progress = .{};
     var ticker_future: ?Io.Future(void) = null;
     if (placeholder_id) |pid| {
         progress = .{ .ptr = &state, .onEvent = onProgressEvent };
-        ticker_future = Io.concurrent(io, tickerLoop, .{ connector, chat_id, pid, &state }) catch |err| blk: {
-            std.log.warn("qa: couldn't start the thinking animation for chat {s}: {t}", .{ chat_id, err });
+        ticker_future = Io.concurrent(io, tickerLoop, .{ connector, native_chat_id, pid, &state }) catch |err| blk: {
+            std.log.warn("qa: couldn't start the thinking animation for chat {s}: {t}", .{ native_chat_id, err });
             break :blk null;
         };
     }
 
-    std.log.info("qa: calling the model for chat {s}", .{chat_id});
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, db, system_prompt, question, replied_to, progress);
+    std.log.info("qa: calling the model for chat {s}", .{native_chat_id});
+    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, question, replied_to, progress);
 
     // Stop the ticker before touching the placeholder ourselves — it's the
     // sole owner of that Future until this point (see `Future.cancel`'s
     // "not threadsafe" note), and cancel() blocks until it has actually
     // stopped, so there's no risk of it clobbering the final edit below.
     if (ticker_future) |*f| _ = f.cancel(io);
-    std.log.info("qa: model call for chat {s} returned", .{chat_id});
+    std.log.info("qa: model call for chat {s} returned", .{native_chat_id});
 
     const raw_answer = raw_answer_or_err catch |err| {
-        std.log.err("qa: failed to answer in chat {s}: {t}", .{ chat_id, err });
+        std.log.err("qa: failed to answer in chat {s}: {t}", .{ native_chat_id, err });
         const error_text = "Sorry, I couldn't reach the model just now.";
         if (placeholder_id) |pid| {
-            if (connector.editMessage(a, chat_id, pid, error_text)) |_| {
-                std.log.info("qa: error message edited into placeholder for chat {s}", .{chat_id});
+            if (connector.editMessage(a, native_chat_id, pid, error_text)) |_| {
+                std.log.info("qa: error message edited into placeholder for chat {s}", .{native_chat_id});
             } else |edit_err| {
-                std.log.warn("qa: editing error message into placeholder failed for chat {s}: {t}, sending a new message instead", .{ chat_id, edit_err });
-                connector.sendMessage(a, chat_id, error_text, reply_to);
+                std.log.warn("qa: editing error message into placeholder failed for chat {s}: {t}, sending a new message instead", .{ native_chat_id, edit_err });
+                connector.sendMessage(a, native_chat_id, error_text, reply_to);
             }
         } else {
-            connector.sendMessage(a, chat_id, error_text, reply_to);
+            connector.sendMessage(a, native_chat_id, error_text, reply_to);
         }
         return;
     };
@@ -832,78 +862,72 @@ fn replyWithAnswer(
     // empty text with a 400, so don't try to send it — and don't leave the
     // placeholder stuck showing "thinking" forever either.
     const answer = std.mem.trim(u8, raw_answer, " \t\r\n");
-    std.log.info("qa: answer for chat {s} is {d} bytes (raw {d})", .{ chat_id, answer.len, raw_answer.len });
+    std.log.info("qa: answer for chat {s} is {d} bytes (raw {d})", .{ native_chat_id, answer.len, raw_answer.len });
     if (answer.len == 0) {
-        std.log.info("qa: empty answer for chat {s}, deleting placeholder", .{chat_id});
-        if (placeholder_id) |pid| connector.deleteMessage(a, chat_id, pid) catch |err| {
+        std.log.info("qa: empty answer for chat {s}, deleting placeholder", .{native_chat_id});
+        if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |err| {
             // Previously swallowed silently — if this fails (network
             // hiccup, message already gone), the placeholder is stuck
             // showing "thinking" forever with zero trace of why. At least
             // log it; there's no good fallback text to edit in instead
             // since there was never a real answer to show.
-            std.log.warn("qa: failed to delete empty-answer placeholder for chat {s}: {t}", .{ chat_id, err });
+            std.log.warn("qa: failed to delete empty-answer placeholder for chat {s}: {t}", .{ native_chat_id, err });
         };
         return;
     }
 
     if (placeholder_id) |pid| {
-        if (connector.editMessage(a, chat_id, pid, answer)) |_| {
-            std.log.info("qa: final answer edited into placeholder for chat {s}", .{chat_id});
+        if (connector.editMessage(a, native_chat_id, pid, answer)) |_| {
+            std.log.info("qa: final answer edited into placeholder for chat {s}", .{native_chat_id});
         } else |err| {
-            std.log.warn("qa: final edit failed for chat {s}, sending a new message instead: {t}", .{ chat_id, err });
-            connector.sendMessage(a, chat_id, answer, reply_to);
+            std.log.warn("qa: final edit failed for chat {s}, sending a new message instead: {t}", .{ native_chat_id, err });
+            connector.sendMessage(a, native_chat_id, answer, reply_to);
         }
     } else {
-        connector.sendMessage(a, chat_id, answer, reply_to);
+        connector.sendMessage(a, native_chat_id, answer, reply_to);
     }
 
     // Log the bot's own reply too, so follow-up questions see it in the
     // history window (inbound polling never echoes our own sends back).
+    // Resolved to a real identity row (the bot's own), not the old
+    // hardcoded `user_id = "warden"` placeholder.
     const bot_username = connector.selfUsername() orelse "warden";
-    chat_store.record(chat_id, iface.Message{
-        .chat_id = chat_id,
-        .user_id = "warden",
-        .username = bot_username,
-        .text = answer,
-    }, now);
+    const bot_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), connector.selfId() orelse "warden", bot_username, true, now) catch |err| {
+        std.log.err("qa: failed to resolve bot identity for chat {s}: {t}", .{ native_chat_id, err });
+        return;
+    };
+    recordMessage(pool, chat_id, bot_identity_id, null, answer, now, retention_messages);
 }
 
 fn replyWithWordcloud(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    chat_store: *ChatStore,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
     tmp_dir: []const u8,
     io: Io,
-    chat_id: []const u8,
+    native_chat_id: []const u8,
     reply_to: ?[]const u8,
 ) void {
-    const db = chat_store.get(chat_id) catch |err| {
-        std.log.err("wordcloud: failed to open db for chat {s}: {t}", .{ chat_id, err });
-        return;
-    };
-    const words = wordcloud.topWords(a, db, 60) catch |err| {
-        std.log.err("wordcloud: tokenize failed for chat {s}: {t}", .{ chat_id, err });
+    const words = wordcloud.topWords(a, pool, chat_id, 60) catch |err| {
+        std.log.err("wordcloud: tokenize failed for chat {s}: {t}", .{ native_chat_id, err });
         return;
     };
     if (words.len == 0) {
-        connector.sendMessage(a, chat_id, "Not enough logged messages yet to build a word cloud.", reply_to);
+        connector.sendMessage(a, native_chat_id, "Not enough logged messages yet to build a word cloud.", reply_to);
         return;
     }
     const png = wordcloud.render(a, io, tmp_dir, words) catch |err| {
-        std.log.err("wordcloud: render failed for chat {s}: {t}", .{ chat_id, err });
-        connector.sendMessage(a, chat_id, "Couldn't render the word cloud (is Node installed?).", reply_to);
+        std.log.err("wordcloud: render failed for chat {s}: {t}", .{ native_chat_id, err });
+        connector.sendMessage(a, native_chat_id, "Couldn't render the word cloud (is Node installed?).", reply_to);
         return;
     };
-    connector.sendPhoto(a, chat_id, png, "Word cloud of recent messages");
+    connector.sendPhoto(a, native_chat_id, png, "Word cloud of recent messages");
 }
 
-fn replyWithStats(connector: iface.Connector, a: std.mem.Allocator, chat_store: *ChatStore, chat_id: []const u8, reply_to: ?[]const u8) void {
-    const db = chat_store.get(chat_id) catch |err| {
-        std.log.err("stats: failed to open db for chat {s}: {t}", .{ chat_id, err });
-        return;
-    };
-    const s = stats.compute(db, a, 5) catch |err| {
-        std.log.err("stats: query failed for chat {s}: {t}", .{ chat_id, err });
+fn replyWithStats(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, native_chat_id: []const u8, reply_to: ?[]const u8) void {
+    const s = stats.compute(pool, a, chat_id, 5) catch |err| {
+        std.log.err("stats: query failed for chat {s}: {t}", .{ native_chat_id, err });
         return;
     };
 
@@ -918,7 +942,7 @@ fn replyWithStats(connector: iface.Connector, a: std.mem.Allocator, chat_store: 
         }
     }
 
-    connector.sendMessage(a, chat_id, buf.writer.buffered(), reply_to);
+    connector.sendMessage(a, native_chat_id, buf.writer.buffered(), reply_to);
 }
 
 // Zig's test collector only walks `test` blocks reachable from the file
@@ -928,7 +952,15 @@ fn replyWithStats(connector: iface.Connector, a: std.mem.Allocator, chat_store: 
 // `zig build test` silently runs zero of its tests, no error, no warning).
 test {
     _ = auth;
-    _ = @import("store/chat_store.zig");
+    _ = @import("store/pool.zig");
+    _ = @import("store/migrate.zig");
+    _ = @import("store/identities.zig");
+    _ = @import("store/chats.zig");
+    _ = @import("store/chat_members.zig");
+    _ = @import("store/chat_settings.zig");
+    _ = @import("store/bot_config.zig");
+    _ = @import("store/messages.zig");
+    _ = @import("store/stats.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
     _ = @import("tools/calculator.zig");
@@ -948,14 +980,16 @@ test {
     _ = @import("tools/urban_dictionary.zig");
     _ = @import("tools/hackernews.zig");
     _ = @import("platform/telegram.zig");
-    _ = @import("store/settings.zig");
     _ = @import("http_util.zig");
     _ = @import("features/scheduler.zig");
     _ = @import("features/digest.zig");
     _ = @import("tools/html_extract.zig");
     _ = @import("tools/scrape_site.zig");
-    _ = @import("store/scraper_settings.zig");
     _ = @import("platform/interface.zig");
+    _ = @import("domain/identity.zig");
+    _ = @import("domain/telegram_profile.zig");
+    _ = @import("platform/matrix.zig");
+    _ = @import("platform/xmpp.zig");
 }
 
 /// ASCII whitespace/punctuation counts as a boundary; bytes >= 0x80 do NOT,

@@ -18,7 +18,8 @@ test "isOwner matches only the configured platform+id pair" {
     const config = Config{
         .telegram_bot_token = "x",
         .owners = &.{.{ .platform = .telegram, .owner_id = "101573604" }},
-        .data_dir = "data/chats",
+        .postgres_dsn = "postgresql:///warden_test",
+        .postgres_pool_size = 1,
         .retention_messages = 20_000,
         .llm = .{ .anthropic = .{ .api_key = "x", .model = "x" } },
         .confirm_timeout_seconds = 60,

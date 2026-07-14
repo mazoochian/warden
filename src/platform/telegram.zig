@@ -3,6 +3,9 @@ const Io = std.Io;
 
 const iface = @import("interface.zig");
 const raw = @import("../telegram/client.zig");
+const types = @import("../telegram/types.zig");
+const Identity = @import("../domain/identity.zig").Identity;
+const TelegramProfile = @import("../domain/telegram_profile.zig").TelegramProfile;
 
 /// Telegram implementation of `platform.Connector`, backed by long polling.
 pub const TelegramConnector = struct {
@@ -13,6 +16,7 @@ pub const TelegramConnector = struct {
     /// long-lived allocator, not the per-poll arena, since messages keep
     /// getting checked against them for the process lifetime.
     self_id: ?i64 = null,
+    self_id_str: ?[]const u8 = null,
     self_username: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, bot_token: []const u8) TelegramConnector {
@@ -21,6 +25,7 @@ pub const TelegramConnector = struct {
 
     pub fn deinit(self: *TelegramConnector) void {
         if (self.self_username) |u| self.client.allocator.free(u);
+        if (self.self_id_str) |s| self.client.allocator.free(s);
         self.client.deinit();
     }
 
@@ -33,9 +38,45 @@ pub const TelegramConnector = struct {
         defer me.deinit();
         const user = me.value.result orelse return;
         self.self_id = user.id;
+        self.self_id_str = std.fmt.allocPrint(self.client.allocator, "{d}", .{user.id}) catch null;
         if (user.username) |u| {
             self.self_username = self.client.allocator.dupe(u8, u) catch null;
         }
+    }
+
+    /// Builds the ancestor `Identity` plus Telegram-specific extension from
+    /// a fully-parsed Bot API `User` (Telegram sends the whole `User`
+    /// object on every message's `from` field, not just id/username, so
+    /// this is available per-message, not just from `getMe`/`getChatMember`).
+    /// Allocates out of `allocator` — same short-lived poll-cycle arena the
+    /// rest of `pollFn` uses; `iface.Message.dupe` deep-copies it into the
+    /// per-task arena along with everything else.
+    fn profileFromUser(allocator: std.mem.Allocator, user: types.User, now: i64) !TelegramProfile {
+        const native_id = try std.fmt.allocPrint(allocator, "{d}", .{user.id});
+        const display_name = if (user.last_name) |last|
+            try std.fmt.allocPrint(allocator, "{s} {s}", .{ user.first_name, last })
+        else
+            try allocator.dupe(u8, user.first_name);
+
+        return .{
+            .identity = .{
+                .platform = .telegram,
+                .native_id = native_id,
+                .display_name = display_name,
+                .username = if (user.username) |u| try allocator.dupe(u8, u) else null,
+                .is_bot = user.is_bot,
+                .first_seen = now,
+                .last_seen = now,
+            },
+            .first_name = try allocator.dupe(u8, user.first_name),
+            .last_name = if (user.last_name) |s| try allocator.dupe(u8, s) else null,
+            .language_code = if (user.language_code) |s| try allocator.dupe(u8, s) else null,
+            .is_premium = user.is_premium,
+            .added_to_attachment_menu = user.added_to_attachment_menu,
+            .can_join_groups = user.can_join_groups,
+            .can_read_all_group_messages = user.can_read_all_group_messages,
+            .supports_inline_queries = user.supports_inline_queries,
+        };
     }
 
     /// Case-insensitive "@botusername" scan with a right-boundary check, so
@@ -75,11 +116,17 @@ pub const TelegramConnector = struct {
         .deleteMessage = deleteMessageFn,
         .isGroupAdmin = isGroupAdminFn,
         .selfUsername = selfUsernameFn,
+        .selfId = selfIdFn,
     };
 
     fn selfUsernameFn(ptr: *anyopaque) ?[]const u8 {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         return self.self_username;
+    }
+
+    fn selfIdFn(ptr: *anyopaque) ?[]const u8 {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.self_id_str;
     }
 
     fn platformFn(ptr: *anyopaque) iface.Platform {
@@ -145,6 +192,11 @@ pub const TelegramConnector = struct {
             else
                 false;
 
+            const telegram_profile = if (msg.from) |from|
+                try profileFromUser(allocator, from, msg.date)
+            else
+                null;
+
             try messages.append(allocator, .{
                 .chat_id = chat_id,
                 .message_id = message_id,
@@ -156,8 +208,12 @@ pub const TelegramConnector = struct {
                 .reply_to_username = reply_to_username,
                 .reply_to_text = reply_to_text,
                 .is_group = is_group,
+                .chat_type = if (msg.chat.type.len > 0) try allocator.dupe(u8, msg.chat.type) else null,
+                .chat_title = if (msg.chat.title) |t| try allocator.dupe(u8, t) else null,
                 .reply_to_is_me = reply_to_is_me,
                 .mentions_me = mentions_me,
+                .identity = if (telegram_profile) |p| p.identity else null,
+                .telegram_profile = telegram_profile,
             });
         }
         return messages.toOwnedSlice(allocator);

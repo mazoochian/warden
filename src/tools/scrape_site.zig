@@ -1,7 +1,7 @@
 //! Extracts clean, readable text from a web page — unlike `fetch_url`,
 //! which hands back raw markup, this strips tags/scripts/nav and can
 //! follow same-site links a couple of pages deep. Two backends, selected
-//! by the owner via `/scraper` (see `store/scraper_settings.zig`):
+//! by the owner via `/scraper` (see `store/bot_config.zig`):
 //!
 //!  - `local` (default): fetches and parses HTML on-device with
 //!    `html_extract.zig`. No third-party dependency, works out of the box.
