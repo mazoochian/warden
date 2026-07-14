@@ -2,7 +2,7 @@ const std = @import("std");
 const llm = @import("../llm/provider.zig");
 const toolcall = @import("../llm/toolcall.zig");
 const registry = @import("../tools/registry.zig");
-const Db = @import("../store/db.zig").Db;
+const PgPool = @import("../store/pool.zig").PgPool;
 const messages = @import("../store/messages.zig");
 
 /// Used when the operator hasn't provided their own prompt via
@@ -60,13 +60,14 @@ pub fn answer(
     allocator: std.mem.Allocator,
     ctx: registry.ToolContext,
     tool_defs: []const registry.ToolDef,
-    db: *Db,
+    pool: *PgPool,
+    chat_id: i64,
     system_prompt: ?[]const u8,
     question: []const u8,
     replied_to: ?[]const u8,
     progress: toolcall.Progress,
 ) ![]const u8 {
-    const history = try messages.recentFormatted(db, allocator, history_window);
+    const history = try messages.recentFormatted(pool, allocator, chat_id, history_window);
 
     const user_content = if (replied_to) |earlier|
         try std.fmt.allocPrint(

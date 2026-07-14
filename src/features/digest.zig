@@ -2,7 +2,7 @@ const std = @import("std");
 const llm = @import("../llm/provider.zig");
 const toolcall = @import("../llm/toolcall.zig");
 const registry = @import("../tools/registry.zig");
-const Db = @import("../store/db.zig").Db;
+const PgPool = @import("../store/pool.zig").PgPool;
 const messages = @import("../store/messages.zig");
 const stats = @import("../store/stats.zig");
 
@@ -20,8 +20,8 @@ const history_window = 300;
 /// Local (non-LLM) stats + an LLM-written summary of recent discussion,
 /// grounded in this chat's own logged history. If nothing's been said
 /// since the last digest, skips the LLM call entirely.
-pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: registry.ToolContext, db: *Db) ![]const u8 {
-    const s = try stats.compute(db, allocator, 5);
+pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: registry.ToolContext, pool: *PgPool, chat_id: i64) ![]const u8 {
+    const s = try stats.compute(pool, allocator, chat_id, 5);
 
     var buf: std.Io.Writer.Allocating = .init(allocator);
     const w = &buf.writer;
@@ -31,7 +31,7 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
         return buf.writer.buffered();
     }
 
-    const history = try messages.recentFormatted(db, allocator, history_window);
+    const history = try messages.recentFormatted(pool, allocator, chat_id, history_window);
     const prompt = try std.fmt.allocPrint(
         allocator,
         "Recent chat history:\n{s}\n\nWrite the digest summary now.",
@@ -50,19 +50,19 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
 }
 
 const testing = std.testing;
+const test_support = @import("../store/test_support.zig");
+const chats = @import("../store/chats.zig");
 
 test "generate skips the LLM call entirely when the chat has no messages" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const dir = "zig-cache-test-digest";
-    defer std.Io.Dir.cwd().deleteTree(testing.io, dir) catch {};
-    try std.Io.Dir.cwd().createDirPath(testing.io, dir);
-
-    var db = try Db.open(dir ++ "/digest.db");
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
-    try @import("../store/schema.zig").migrate(&db);
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
 
     // Errors if ever actually called — proves the empty-chat short circuit
     // in `generate` really does skip the LLM, not just usually does.
@@ -81,6 +81,6 @@ test "generate skips the LLM call entirely when the chat has no messages" {
     var poison = PoisonProvider{};
 
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
-    const text = try generate(poison.provider(), a, ctx, &db);
+    const text = try generate(poison.provider(), a, ctx, &pool, chat_id);
     try testing.expect(std.mem.indexOf(u8, text, "0 messages") != null);
 }

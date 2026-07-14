@@ -9,7 +9,7 @@ ARG ZIG_VERSION=0.16.0
 # The retry loop and curl --retry exist because builds run on networks with
 # transient DNS/connection failures; downloading to a file (rather than
 # piping into tar) keeps a mid-stream retry from corrupting the extraction.
-RUN for i in 1 2 3 4 5; do apk add --no-cache curl xz && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+RUN for i in 1 2 3 4 5; do apk add --no-cache curl xz postgresql-dev && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && curl -fSL --retry 5 --retry-delay 2 --retry-all-errors -o /tmp/zig.tar.xz \
        "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
     && tar -xJf /tmp/zig.tar.xz -C /opt \
@@ -45,7 +45,7 @@ RUN cd wordcloud && npm ci --omit=dev
 # Final image: node runtime + system Chromium for mermaid-cli.
 # ---------------------------------------------------------------------------
 FROM node:22-alpine
-RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && test -x /usr/bin/chromium-browser
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
     PUPPETEER_SKIP_DOWNLOAD=true
@@ -58,6 +58,9 @@ COPY tools/wordcloud/render.mjs ./tools/wordcloud/render.mjs
 COPY tools/wordcloud/fonts ./tools/wordcloud/fonts
 COPY --from=node-deps /deps/wordcloud/node_modules ./tools/wordcloud/node_modules
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
+# Chat/message data lives in Postgres now (WARDEN_POSTGRES_DSN) — /app/data
+# only holds WARDEN_TMP_DIR's throwaway scratch files (wordcloud/diagram
+# rendering), not persistent state.
 RUN chmod +x ./docker-entrypoint.sh && mkdir -p /app/data
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

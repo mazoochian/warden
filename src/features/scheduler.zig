@@ -9,11 +9,11 @@ const Io = std.Io;
 /// local-time scheduling.
 ///
 /// The enabled-chat set lives in memory (rebuilt at startup via
-/// `ChatStore.listExistingChatIds` + each chat's persisted
-/// `chat_settings.digest_enabled`), while the actual on/off state and
-/// last-sent timestamp are persisted per-chat so they survive restarts.
+/// `chats.listAll` + each chat's persisted `chat_settings.digest_enabled`),
+/// while the actual on/off state and last-sent timestamp are persisted
+/// per-chat so they survive restarts.
 ///
-/// Accessed from concurrently-running per-message tasks (see `ChatStore`'s
+/// Accessed from concurrently-running per-message tasks (see `PgPool`'s
 /// doc comment for why), so `enabled_chats` needs a lock.
 pub const DigestScheduler = struct {
     allocator: std.mem.Allocator,

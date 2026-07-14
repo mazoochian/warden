@@ -1,4 +1,6 @@
 const std = @import("std");
+const Identity = @import("../domain/identity.zig").Identity;
+const TelegramProfile = @import("../domain/telegram_profile.zig").TelegramProfile;
 
 /// Chat platforms Warden can be wired up to. Only `.telegram` has an
 /// implementation right now; the others exist so config/auth code can
@@ -6,6 +8,7 @@ const std = @import("std");
 pub const Platform = enum {
     telegram,
     matrix,
+    xmpp,
     discord,
     whatsapp,
 };
@@ -39,12 +42,31 @@ pub const Message = struct {
     /// Drives the "don't answer everything in a group" gating: DMs always
     /// get a response.
     is_group: bool = false,
+    /// Platform-native chat type string (Telegram: "private"/"group"/
+    /// "supergroup"/"channel") and display title, when known — persisted
+    /// into the `chats` table. Both null when the platform doesn't surface
+    /// this (or hasn't changed since last seen; `chats.upsertChat` preserves
+    /// the existing stored value in that case rather than clobbering it).
+    chat_type: ?[]const u8 = null,
+    chat_title: ?[]const u8 = null,
     /// True when this message is a direct reply to something the bot sent.
     /// Set by the adapter, which knows its own platform identity.
     reply_to_is_me: bool = false,
     /// True when the message addresses the bot by name in the platform's
     /// native way (e.g. "@botusername" on Telegram). Set by the adapter.
     mentions_me: bool = false,
+    /// Ancestor identity for this message's sender — platform-neutral
+    /// (platform/native_id/display_name/username/is_bot/last_seen).
+    /// Populated by every connector (Telegram now; Matrix/XMPP once their
+    /// connectors are real). Kept alongside `user_id`/`username` above
+    /// rather than replacing them, to avoid a wholesale call-site rewrite.
+    identity: ?Identity = null,
+    /// Telegram-specific extension of `identity` (is_premium, language_code,
+    /// last_name, ...) — populated only by the Telegram connector, null for
+    /// every other platform. `identity` above stays the source of truth for
+    /// the shared fields; this just carries what Telegram's `User` object
+    /// has beyond them, for persisting into `telegram_profiles`.
+    telegram_profile: ?TelegramProfile = null,
 
     /// Deep-copies every string field into `allocator`. The poll loop
     /// spawns one concurrent task per message, each owning its own arena;
@@ -63,8 +85,12 @@ pub const Message = struct {
             .reply_to_username = if (self.reply_to_username) |s| try allocator.dupe(u8, s) else null,
             .reply_to_text = if (self.reply_to_text) |s| try allocator.dupe(u8, s) else null,
             .is_group = self.is_group,
+            .chat_type = if (self.chat_type) |s| try allocator.dupe(u8, s) else null,
+            .chat_title = if (self.chat_title) |s| try allocator.dupe(u8, s) else null,
             .reply_to_is_me = self.reply_to_is_me,
             .mentions_me = self.mentions_me,
+            .identity = if (self.identity) |id| try id.dupe(allocator) else null,
+            .telegram_profile = if (self.telegram_profile) |p| try p.dupe(allocator) else null,
         };
     }
 };
@@ -130,6 +156,11 @@ pub const Connector = struct {
         /// slice must stay valid for the connector's lifetime — used e.g.
         /// to attribute the bot's own answers in the chat log.
         selfUsername: ?*const fn (ptr: *anyopaque) ?[]const u8 = null,
+        /// The bot's own native platform id, as a string, if known — same
+        /// lazy-population/lifetime rules as `selfUsername`. Used to resolve
+        /// the bot's own `Identity` row so its own messages aren't logged
+        /// under a hardcoded placeholder id.
+        selfId: ?*const fn (ptr: *anyopaque) ?[]const u8 = null,
     };
 
     pub fn platform(self: Connector) Platform {
@@ -208,6 +239,11 @@ pub const Connector = struct {
         const f = self.vtable.selfUsername orelse return null;
         return f(self.ptr);
     }
+
+    pub fn selfId(self: Connector) ?[]const u8 {
+        const f = self.vtable.selfId orelse return null;
+        return f(self.ptr);
+    }
 };
 
 const testing = std.testing;
@@ -277,4 +313,56 @@ test "Message.dupe passes through null optional fields as null" {
     try testing.expectEqual(@as(?[]const u8, null), dst.message_id);
     try testing.expectEqual(@as(?[]const u8, null), dst.username);
     try testing.expectEqual(@as(?[]const u8, null), dst.text);
+    try testing.expectEqual(@as(?Identity, null), dst.identity);
+    try testing.expectEqual(@as(?TelegramProfile, null), dst.telegram_profile);
+}
+
+test "Message.dupe deep-copies identity and telegram_profile" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const src_a = arena.allocator();
+
+    const src = Message{
+        .chat_id = try src_a.dupe(u8, "1"),
+        .user_id = try src_a.dupe(u8, "42"),
+        .identity = .{
+            .platform = .telegram,
+            .native_id = try src_a.dupe(u8, "42"),
+            .display_name = try src_a.dupe(u8, "Alice"),
+            .username = try src_a.dupe(u8, "alice"),
+            .is_bot = false,
+            .first_seen = 1000,
+            .last_seen = 1000,
+        },
+        .telegram_profile = .{
+            .identity = .{
+                .platform = .telegram,
+                .native_id = try src_a.dupe(u8, "42"),
+                .display_name = try src_a.dupe(u8, "Alice"),
+                .username = try src_a.dupe(u8, "alice"),
+                .first_seen = 1000,
+                .last_seen = 1000,
+            },
+            .language_code = try src_a.dupe(u8, "en"),
+        },
+    };
+
+    const dst = try src.dupe(testing.allocator);
+    defer {
+        testing.allocator.free(dst.chat_id);
+        testing.allocator.free(dst.user_id);
+        testing.allocator.free(dst.identity.?.native_id);
+        testing.allocator.free(dst.identity.?.display_name);
+        testing.allocator.free(dst.identity.?.username.?);
+        testing.allocator.free(dst.telegram_profile.?.identity.native_id);
+        testing.allocator.free(dst.telegram_profile.?.identity.display_name);
+        testing.allocator.free(dst.telegram_profile.?.identity.username.?);
+        testing.allocator.free(dst.telegram_profile.?.language_code.?);
+    }
+
+    arena.deinit();
+
+    try testing.expectEqualStrings("42", dst.identity.?.native_id);
+    try testing.expectEqualStrings("Alice", dst.identity.?.display_name);
+    try testing.expectEqualStrings("alice", dst.identity.?.username.?);
+    try testing.expectEqualStrings("en", dst.telegram_profile.?.language_code.?);
 }

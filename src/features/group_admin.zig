@@ -1,8 +1,9 @@
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
-const settings = @import("../store/settings.zig");
-const ChatStore = @import("../store/chat_store.zig").ChatStore;
+const PgPool = @import("../store/pool.zig").PgPool;
+const identities = @import("../store/identities.zig");
+const chat_members = @import("../store/chat_members.zig");
 
 pub const ActionKind = enum { ban, kick };
 
@@ -20,7 +21,7 @@ const PendingAction = struct {
 /// act on immediately. One pending action per chat: a second confirmable
 /// command in the same chat simply replaces whatever was pending.
 ///
-/// Accessed from concurrently-running per-message tasks (see `ChatStore`'s
+/// Accessed from concurrently-running per-message tasks (see `PgPool`'s
 /// doc comment for why), so `map` needs a lock; `lockUncancelable` is used
 /// throughout since these are quick in-memory operations, not I/O, and
 /// keeping `set`/`take`/`clear`'s existing signatures (no new error to
@@ -176,7 +177,9 @@ pub fn deleteMessage(connector: iface.Connector, a: std.mem.Allocator, msg: ifac
 pub fn requestConfirmation(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    chat_store: *ChatStore,
+    pool: *PgPool,
+    chat_id: i64,
+    now: i64,
     msg: iface.Message,
     kind: ActionKind,
 ) void {
@@ -184,11 +187,14 @@ pub fn requestConfirmation(
         reply(connector, a, msg.chat_id, msg.message_id, "Reply to the message of the person you want to {s}.", .{@tagName(kind)});
         return;
     };
-    const db = chat_store.get(msg.chat_id) catch |err| {
-        std.log.err("token: failed to open db for chat {s}: {t}", .{ msg.chat_id, err });
+    // The actor (not the target) is who spends a token — resolved via
+    // `getOrCreateMinimal` rather than assuming they've already been seen,
+    // since token gating shouldn't depend on message-logging order.
+    const actor_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), msg.user_id, msg.username orelse msg.user_id, false, now) catch |err| {
+        std.log.err("token: failed to resolve identity for user {s}: {t}", .{ msg.user_id, err });
         return;
     };
-    var count = settings.getTokens(db, msg.user_id, 0);
+    var count = chat_members.getTokens(pool, chat_id, actor_identity_id, 0);
     if (count <= 0) {
         connector.sendMessage(a, msg.chat_id, "You do not have enough tokens to perform this action", msg.message_id);
         return;
@@ -205,7 +211,7 @@ pub fn requestConfirmation(
         };
     }
     count -= 1;
-    settings.setTokens(db, msg.user_id, count) catch |err| {
+    chat_members.setTokens(pool, chat_id, actor_identity_id, count) catch |err| {
         std.log.err("Could not update user's token count: {}", .{err});
     };
 }
