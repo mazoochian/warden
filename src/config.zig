@@ -62,6 +62,16 @@ pub const Config = struct {
     /// Base URL of a SearXNG instance (e.g. "http://searxng:8080") for the
     /// web_search tool. Unset disables web search entirely.
     searxng_url: ?[]const u8,
+    /// Gates the bot's free-form LLM Q&A to the configured owner(s) only.
+    /// Every other command keeps its own existing access control regardless
+    /// of this setting. Meant to be flipped on before switching to an
+    /// expensive model, off for an open assistant.
+    llm_owner_only: bool,
+    /// Whether a reasoning model's chain-of-thought is shown to the user.
+    /// When false, `<think>`/`<thinking>` tags and any `reasoning_content`/
+    /// `reasoning` field the OpenAI-compatible backend sends are filtered
+    /// out before the reply is shown — see `llm/openai_compat.zig`.
+    llm_show_thinking: bool,
 
     pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile } || std.mem.Allocator.Error;
 
@@ -125,6 +135,9 @@ pub const Config = struct {
             searxng_url = if (trimmed.len == 0) null else trimmed;
         }
 
+        const llm_owner_only = parseBoolEnv(env, "WARDEN_LLM_OWNER_ONLY", default_llm_owner_only);
+        const llm_show_thinking = parseBoolEnv(env, "WARDEN_LLM_SHOW_THINKING", default_llm_show_thinking);
+
         return .{
             .telegram_bot_token = telegram_bot_token,
             .owners = owners,
@@ -137,7 +150,19 @@ pub const Config = struct {
             .digest_interval_seconds = digest_interval_seconds,
             .system_prompt = system_prompt,
             .searxng_url = searxng_url,
+            .llm_owner_only = llm_owner_only,
+            .llm_show_thinking = llm_show_thinking,
         };
+    }
+
+    /// Accepts "true"/"1" and "false"/"0" (case-insensitive for the word
+    /// forms); anything else, including an unset var, falls back to
+    /// `default` rather than failing config load over a typo.
+    fn parseBoolEnv(env: *const std.process.Environ.Map, key: []const u8, default: bool) bool {
+        const raw = env.get(key) orelse return default;
+        if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+        if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+        return default;
     }
 
     fn loadLlmConfig(env: *const std.process.Environ.Map) LoadError!LlmConfig {
@@ -166,6 +191,8 @@ pub const Config = struct {
     pub const default_postgres_pool_size: usize = 10;
     pub const default_confirm_timeout_seconds: i64 = 60;
     pub const default_digest_interval_seconds: i64 = 86_400;
+    pub const default_llm_owner_only: bool = true;
+    pub const default_llm_show_thinking: bool = false;
 
     /// Armin's numeric Telegram user id, as a string. Deliberately not
     /// username-based, since usernames can change.

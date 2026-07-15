@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .openai_compat => |o| blk: {
             const p = try gpa.create(OpenAiCompatProvider);
-            p.* = OpenAiCompatProvider.init(gpa, io, o.base_url, o.api_key, o.model);
+            p.* = OpenAiCompatProvider.init(gpa, io, o.base_url, o.api_key, o.model, config.llm_show_thinking);
             break :blk p.provider();
         },
     };
@@ -423,11 +423,12 @@ fn handleMessage(
         // LLM as if it were a question.
         return;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
-        // The bot's free-form LLM Q&A is owner-only — every other command
-        // above this stays open to anyone (unchanged). Silent, not an
-        // error reply: an unaddressed mention from someone else shouldn't
-        // announce "I only answer my owner" to the whole group.
-        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
+        // The bot's free-form LLM Q&A is owner-only by default (toggle via
+        // WARDEN_LLM_OWNER_ONLY) — every other command above this stays
+        // open to anyone (unchanged). Silent, not an error reply: an
+        // unaddressed mention from someone else shouldn't announce "I only
+        // answer my owner" to the whole group.
+        if (config.llm_owner_only and !auth.isOwner(config, connector.platform(), msg.user_id)) return;
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
         replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, config.system_prompt, io, now, config.retention_messages, msg.chat_id, msg.message_id, text, replied_to);
     }
