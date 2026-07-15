@@ -21,6 +21,13 @@ const RawToolCall = struct {
 
 const RawMessage = struct {
     content: ?[]const u8 = null,
+    /// Reasoning-model backends surface chain-of-thought either as inline
+    /// `<think>`/`<thinking>` tags inside `content`, or as a separate field
+    /// — `reasoning_content` (DeepSeek, vLLM's reasoning parser) or
+    /// `reasoning` (OpenRouter). We check both field names; whichever one a
+    /// given backend actually sends, the other stays null and is ignored.
+    reasoning_content: ?[]const u8 = null,
+    reasoning: ?[]const u8 = null,
     tool_calls: []RawToolCall = &.{},
 };
 
@@ -50,13 +57,17 @@ pub const OpenAiCompatProvider = struct {
     /// local runtimes, which don't check one).
     api_key: []const u8,
     model: []const u8,
+    /// Whether a reasoning model's chain-of-thought is passed through to
+    /// the caller. See `filterThinking` for what gets stripped when false.
+    show_thinking: bool,
 
-    pub fn init(allocator: std.mem.Allocator, io: Io, base_url: []const u8, api_key: []const u8, model: []const u8) OpenAiCompatProvider {
+    pub fn init(allocator: std.mem.Allocator, io: Io, base_url: []const u8, api_key: []const u8, model: []const u8, show_thinking: bool) OpenAiCompatProvider {
         return .{
             .http_client = .{ .allocator = allocator, .io = io },
             .base_url = base_url,
             .api_key = api_key,
             .model = model,
+            .show_thinking = show_thinking,
         };
     }
 
@@ -124,8 +135,24 @@ pub const OpenAiCompatProvider = struct {
         const choice = parsed.value.choices[0];
 
         var blocks: std.ArrayList(llm.ContentBlock) = .empty;
-        if (choice.message.content) |c| {
-            if (c.len > 0) try blocks.append(allocator, .{ .text = c });
+        const reasoning = choice.message.reasoning_content orelse choice.message.reasoning;
+        if (self.show_thinking) {
+            if (reasoning) |r| {
+                if (r.len > 0) try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "\u{1F4AD} {s}\n\n", .{r}) });
+            }
+            if (choice.message.content) |c| {
+                if (c.len > 0) try blocks.append(allocator, .{ .text = c });
+            }
+        } else {
+            // reasoning/reasoning_content is dropped outright; inline
+            // <think>/<thinking> tags inside `content` are stripped instead
+            // of dropped, since the surrounding text is the real answer.
+            if (choice.message.content) |c0| {
+                var c = try stripThinkingBlock(allocator, c0, "think");
+                c = try stripThinkingBlock(allocator, c, "thinking");
+                c = std.mem.trim(u8, c, " \t\r\n");
+                if (c.len > 0) try blocks.append(allocator, .{ .text = c });
+            }
         }
         for (choice.message.tool_calls) |tc| {
             // Some models emit an empty string (not "{}") for no-argument
@@ -151,6 +178,34 @@ pub const OpenAiCompatProvider = struct {
         return .{ .content = try blocks.toOwnedSlice(allocator), .stop_reason = stop_reason };
     }
 };
+
+/// Removes every `<tag>...</tag>` span from `content` (used to strip
+/// `<think>`/`<thinking>` chain-of-thought some reasoning models inline
+/// directly into their answer text). An unterminated opening tag drops
+/// everything from that point on rather than leaking a half-written
+/// thinking block. Returns `content` unchanged (no allocation) when the
+/// open tag never appears.
+fn stripThinkingBlock(allocator: std.mem.Allocator, content: []const u8, comptime tag: []const u8) ![]const u8 {
+    const open_tag = "<" ++ tag ++ ">";
+    const close_tag = "</" ++ tag ++ ">";
+
+    if (std.mem.indexOf(u8, content, open_tag) == null) return content;
+
+    var out: std.ArrayList(u8) = .empty;
+    var rest = content;
+    while (std.mem.indexOf(u8, rest, open_tag)) |start| {
+        try out.appendSlice(allocator, rest[0..start]);
+        const after_open = rest[start + open_tag.len ..];
+        if (std.mem.indexOf(u8, after_open, close_tag)) |end| {
+            rest = after_open[end + close_tag.len ..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    try out.appendSlice(allocator, rest);
+    return out.toOwnedSlice(allocator);
+}
 
 /// Unlike Anthropic (one bundled `tool_result` array per turn), OpenAI
 /// expects one standalone `{"role":"tool",...}` message per result — so a
@@ -322,4 +377,28 @@ test "writeMessages expands tool_result blocks into standalone tool messages" {
     // system + user + assistant(tool_calls) + tool(result) = 4 messages.
     try testing.expectEqual(@as(usize, 4), parsed.value.array.items.len);
     try testing.expectEqualStrings("tool", parsed.value.array.items[3].object.get("role").?.string);
+}
+
+test "stripThinkingBlock removes a single <think> span" {
+    const out = try stripThinkingBlock(testing.allocator, "<think>pondering...</think>the answer is 4", "think");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("the answer is 4", out);
+}
+
+test "stripThinkingBlock removes multiple spans and leaves surrounding text" {
+    const out = try stripThinkingBlock(testing.allocator, "a<think>x</think>b<think>y</think>c", "think");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("abc", out);
+}
+
+test "stripThinkingBlock drops everything after an unterminated tag" {
+    const out = try stripThinkingBlock(testing.allocator, "before<think>never closes", "think");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("before", out);
+}
+
+test "stripThinkingBlock returns the input unchanged when the tag never appears" {
+    const input = "just a normal reply";
+    const out = try stripThinkingBlock(testing.allocator, input, "think");
+    try testing.expectEqualStrings(input, out);
 }
