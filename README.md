@@ -71,9 +71,49 @@ ScrapingBee, etc.:
 This whole command is owner-only, unlike `/magicword` — the configuration
 can include an API key, so even viewing it is gated.
 
+# Matrix
+Warden can also connect to a Matrix homeserver (matrix.org or self-hosted),
+alongside Telegram — both run at once when both are configured. Every
+feature works the same way as on Telegram (Q&A, group management, reminders,
+digests, file conversion, ...); see the env vars above to set it up.
+
+Authentication is a pre-provisioned access token (`WARDEN_MATRIX_ACCESS_TOKEN`)
+rather than a stored username/password — generate one from your client's
+account settings, or via `curl`:
+```bash
+curl -XPOST https://matrix.org/_matrix/client/v3/login -d '{
+  "type": "m.login.password",
+  "identifier": {"type": "m.id.user", "user": "your_bot_account"},
+  "password": "..."
+}'
+```
+The bot auto-joins any room it's invited to — there's no separate "add to
+group" step.
+
+**Encryption**: only plaintext (non-end-to-end-encrypted) rooms are
+supported. Matrix's E2E encryption (Olm/Megolm) is a real cryptographic
+protocol stack — key exchange, per-device sessions, group ratcheting — and
+hand-rolling that from scratch would be a serious way to get subtly-wrong
+crypto; support for it is tracked in `ROADMAP.md` as its own future phase,
+built on the audited `libolm` library rather than a reimplementation.
+Inviting the bot into an encrypted room won't error, but it won't be able to
+read or send anything meaningful there either.
+
+Two smaller simplifications versus Telegram, both worth knowing about:
+- Every Matrix room is treated as a "group" for the purposes of the
+  mention/reply/magic-word gating described above — a Matrix DM doesn't yet
+  get Telegram DMs' "answer everything, no trigger needed" treatment, since
+  telling a real 1:1 room apart from a small group needs an extra lookup
+  this doesn't do yet. Mention the bot or use the magic word even in a
+  Matrix DM.
+- Mute/unmute work via room power levels rather than a dedicated
+  "restricted" state, and have no expiry — `/mute` normally auto-expires
+  after an hour on Telegram, but on Matrix it lasts until explicitly
+  `/unmute`d.
+
 Supported Messaging Platforms:
 - Telegram
-- Matrix (comming soon)
+- Matrix (plaintext rooms only — see "Matrix" below)
 - WhatsApp (comming soon)
 
 Supported AI Providers:
@@ -91,9 +131,14 @@ zig build
 Next, set the following environment variables in your `.env` file (plain
 shell syntax — the file gets sourced):
 ```bash
-# Messaging platform (required):
+# Messaging platform (required — Telegram):
 export WARDEN_TELEGRAM_BOT_TOKEN=<your_telegram_bot_token>
 export WARDEN_TELEGRAM_OWNER_ID=<your_numeric_telegram_user_id>
+
+# Matrix (optional — see "Matrix" below; unset means Matrix stays disabled):
+# export WARDEN_MATRIX_HOMESERVER_URL=https://matrix.org
+# export WARDEN_MATRIX_ACCESS_TOKEN=<access token>
+# export WARDEN_MATRIX_OWNER_ID=@you:matrix.org
 
 # LLM provider — anthropic (default) or openai_compat:
 export WARDEN_LLM_PROVIDER=anthropic
