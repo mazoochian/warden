@@ -615,6 +615,8 @@ fn handleMessage(
         handleToken(connector, a, pool, chat_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/magicword") or std.mem.startsWith(u8, text, "/magicword ")) {
         handleMagicWord(connector, a, config, pool, chat_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/persona") or std.mem.startsWith(u8, text, "/persona ")) {
+        handlePersonaCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/scraper") or std.mem.startsWith(u8, text, "/scraper ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
         handleScraperCommand(connector, a, pool, msg, text);
@@ -656,7 +658,10 @@ fn handleMessage(
             attachmentPlaceholder(a, att) catch text
         else
             text;
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, config.system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, question, replied_to);
+        // Per-chat /persona override, falling back to the global default —
+        // see `store/chat_settings.zig`'s `getSystemPromptOverride`.
+        const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, question, replied_to);
     }
 }
 
@@ -737,6 +742,59 @@ fn handleMagicWord(
     };
     const confirmation = std.fmt.allocPrint(a, "Magic word set to \"{s}\" — I'll answer any message that contains it.", .{arg}) catch return;
     connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+const max_persona_len = 4000;
+
+/// Sets (or clears, or shows) this chat's own system-prompt override for
+/// the LLM Q&A path — viewing is open to anyone (no secret involved, unlike
+/// /scraper), but setting/clearing is owner-only, same precedent as
+/// /magicword: a chat member rewriting the bot's entire personality is a
+/// bigger lever than a magic word.
+fn handlePersonaCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/persona".len..], " ");
+
+    if (arg.len == 0) {
+        const reply_text = if (chat_settings.getSystemPromptOverride(pool, a, chat_id)) |prompt|
+            std.fmt.allocPrint(a, "This chat's persona:\n{s}\n\nChange it with /persona <text>, reset to the default with /persona off.", .{prompt}) catch return
+        else
+            "Using the default persona. Set a custom one for this chat with /persona <text>.";
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can change this chat's persona.");
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "off")) {
+        chat_settings.setSystemPromptOverride(pool, chat_id, null) catch |err| {
+            std.log.err("persona: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Persona reset to the default.");
+        return;
+    }
+
+    if (arg.len > max_persona_len) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That persona text is too long (max 4000 bytes).");
+        return;
+    }
+
+    chat_settings.setSystemPromptOverride(pool, chat_id, arg) catch |err| {
+        std.log.err("persona: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+        return;
+    };
+    reply(connector, a, msg.chat_id, msg.message_id, "Persona updated for this chat.");
 }
 
 /// Owner-only, unlike /magicword: the whole command (including viewing) is

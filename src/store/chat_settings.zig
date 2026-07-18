@@ -88,6 +88,36 @@ pub fn setMagicWord(pool: *PgPool, chat_id: i64, word: ?[]const u8) !void {
     _ = try stmt.step();
 }
 
+/// Returns the per-chat system-prompt override duped into `allocator`, or
+/// `null` if unset (the caller falls back to `config.system_prompt`) — see
+/// the `0006_persona.sql` migration comment.
+pub fn getSystemPromptOverride(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ?[]const u8 {
+    const db = pool.acquire() catch return null;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT system_prompt FROM chat_settings WHERE chat_id = $1;") catch return null;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return null;
+    if (!has_row or stmt.columnIsNull(0)) return null;
+    return allocator.dupe(u8, stmt.columnText(0)) catch null;
+}
+
+/// `null` clears it (falls back to the global default again).
+pub fn setSystemPromptOverride(pool: *PgPool, chat_id: i64, prompt: ?[]const u8) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, system_prompt) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET system_prompt = excluded.system_prompt;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    if (prompt) |p| stmt.bindText(2, p) else stmt.bindNull(2);
+    _ = try stmt.step();
+}
+
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const chats = @import("chats.zig");
@@ -116,4 +146,23 @@ test "digest_enabled/last_digest_ts/magic_word round trip with defaults when uns
 
     try setMagicWord(&pool, chat_id, null);
     try testing.expectEqual(@as(?[]const u8, null), getMagicWord(&pool, testing.allocator, chat_id));
+}
+
+test "system_prompt override round trips and clears back to null" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    try testing.expectEqual(@as(?[]const u8, null), getSystemPromptOverride(&pool, testing.allocator, chat_id));
+
+    try setSystemPromptOverride(&pool, chat_id, "You are a pirate.");
+    const prompt = getSystemPromptOverride(&pool, testing.allocator, chat_id) orelse return error.TestExpectedValue;
+    defer testing.allocator.free(prompt);
+    try testing.expectEqualStrings("You are a pirate.", prompt);
+
+    try setSystemPromptOverride(&pool, chat_id, null);
+    try testing.expectEqual(@as(?[]const u8, null), getSystemPromptOverride(&pool, testing.allocator, chat_id));
 }
