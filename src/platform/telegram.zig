@@ -158,6 +158,7 @@ pub const TelegramConnector = struct {
         .downloadFile = downloadFileFn,
         .sendMessageReturningId = sendMessageReturningIdFn,
         .editMessage = editMessageFn,
+        .sendChoicePrompt = sendChoicePromptFn,
         .muteUser = muteUserFn,
         .unmuteUser = unmuteUserFn,
         .kickUser = kickUserFn,
@@ -214,6 +215,40 @@ pub const TelegramConnector = struct {
         var messages: std.ArrayList(iface.Message) = .empty;
         for (updates.value.result) |update| {
             self.offset = @max(self.offset, update.update_id + 1);
+
+            if (update.callback_query) |cq| {
+                // Dismisses the client-side spinner regardless of whether
+                // the rest of this update is well-formed enough to act on.
+                self.client.answerCallbackQuery(allocator, cq.id);
+                const cq_message = cq.message orelse continue;
+                const from = cq.from orelse continue;
+                const data = cq.data orelse continue;
+
+                const chat_id = try std.fmt.allocPrint(allocator, "{d}", .{cq_message.chat.id});
+                const message_id = try std.fmt.allocPrint(allocator, "{d}", .{cq_message.message_id});
+                const now = Io.Timestamp.now(self.client.io, .real).toSeconds();
+                const telegram_profile = try profileFromUser(allocator, from, now);
+                const is_group = std.mem.eql(u8, cq_message.chat.type, "group") or
+                    std.mem.eql(u8, cq_message.chat.type, "supergroup");
+
+                try messages.append(allocator, .{
+                    .chat_id = chat_id,
+                    .message_id = message_id,
+                    .user_id = telegram_profile.identity.native_id,
+                    .username = telegram_profile.identity.username,
+                    .is_group = is_group,
+                    .chat_type = if (cq_message.chat.type.len > 0) try allocator.dupe(u8, cq_message.chat.type) else null,
+                    .chat_title = if (cq_message.chat.title) |t| try allocator.dupe(u8, t) else null,
+                    .identity = telegram_profile.identity,
+                    .telegram_profile = telegram_profile,
+                    .choice_picked = .{
+                        .prompt_message_id = message_id,
+                        .value = try allocator.dupe(u8, data),
+                    },
+                });
+                continue;
+            }
+
             const msg = update.message orelse continue;
 
             // `updates` (and any strings it owns) is freed via `defer` above,
@@ -305,6 +340,22 @@ pub const TelegramConnector = struct {
         const reply_id: ?i64 = if (reply_to_message_id) |r| parseId(r) catch null else null;
         const sent_id = try self.client.sendMessageReturningId(allocator, id, text, reply_id);
         return std.fmt.allocPrint(allocator, "{d}", .{sent_id});
+    }
+
+    fn sendChoicePromptFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, choices: []const iface.Choice, reply_to_message_id: ?[]const u8) anyerror!?[]const u8 {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        const id = try parseId(chat_id);
+        const reply_id: ?i64 = if (reply_to_message_id) |r| parseId(r) catch null else null;
+
+        var buttons: std.ArrayList(raw.Client.Button) = .empty;
+        defer buttons.deinit(allocator);
+        for (choices) |c| {
+            const label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ c.emoji, c.label });
+            try buttons.append(allocator, .{ .text = label, .callback_data = c.value });
+        }
+
+        const sent_id = try self.client.sendChoicePrompt(allocator, id, text, buttons.items, reply_id);
+        return try std.fmt.allocPrint(allocator, "{d}", .{sent_id});
     }
 
     fn editMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8, text: []const u8) anyerror!void {

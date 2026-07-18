@@ -133,6 +133,7 @@ pub const MatrixConnector = struct {
         .downloadFile = downloadFileFn,
         .sendMessageReturningId = sendMessageReturningIdFn,
         .editMessage = editMessageFn,
+        .sendChoicePrompt = sendChoicePromptFn,
         .muteUser = muteUserFn,
         .unmuteUser = unmuteUserFn,
         .kickUser = kickUserFn,
@@ -194,6 +195,38 @@ pub const MatrixConnector = struct {
         while (room_it.next()) |room_entry| {
             const room_id = room_entry.key_ptr.*;
             for (room_entry.value_ptr.timeline.events) |event| {
+                if (std.mem.eql(u8, event.type, "m.reaction")) {
+                    // Don't treat our own seed reactions (see
+                    // `sendChoicePromptFn`) as a user's pick.
+                    if (self.self_user_id) |me| if (std.mem.eql(u8, event.sender, me)) continue;
+                    const rel = event.content.@"m.relates_to" orelse continue;
+                    const target_event_id = rel.event_id orelse continue;
+                    const key = rel.key orelse continue;
+
+                    const display_name = try allocator.dupe(u8, displayNameFromUserId(event.sender));
+                    const identity = Identity{
+                        .platform = .matrix,
+                        .native_id = try allocator.dupe(u8, event.sender),
+                        .display_name = display_name,
+                        .is_bot = false,
+                        .first_seen = event.origin_server_ts,
+                        .last_seen = event.origin_server_ts,
+                    };
+
+                    try out.append(allocator, .{
+                        .chat_id = try allocator.dupe(u8, room_id),
+                        .message_id = try allocator.dupe(u8, target_event_id),
+                        .user_id = try allocator.dupe(u8, event.sender),
+                        .is_group = true,
+                        .chat_type = "room",
+                        .identity = identity,
+                        .choice_picked = .{
+                            .prompt_message_id = try allocator.dupe(u8, target_event_id),
+                            .value = try allocator.dupe(u8, key),
+                        },
+                    });
+                    continue;
+                }
                 if (!std.mem.eql(u8, event.type, "m.room.message")) continue;
                 if (self.self_user_id) |me| if (std.mem.eql(u8, event.sender, me)) continue;
                 if (isEdit(event.content)) continue;
@@ -274,6 +307,29 @@ pub const MatrixConnector = struct {
     fn editMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8, text: []const u8) anyerror!void {
         const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
         return self.client.editMessage(allocator, chat_id, message_id, text);
+    }
+
+    /// Sends the prompt text (choices spelled out as "{emoji} — {label}",
+    /// since a Matrix reaction alone carries no label) then self-reacts
+    /// once per choice to seed tappable pills — Matrix's nearest equivalent
+    /// of Telegram's inline-keyboard buttons. A single failed seed reaction
+    /// is logged and skipped rather than aborting the whole prompt.
+    fn sendChoicePromptFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, choices: []const iface.Choice, reply_to_message_id: ?[]const u8) anyerror!?[]const u8 {
+        const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
+
+        var body_writer: Io.Writer.Allocating = .init(allocator);
+        defer body_writer.deinit();
+        try body_writer.writer.print("{s}\n", .{text});
+        for (choices) |c| try body_writer.writer.print("{s} — {s}\n", .{ c.emoji, c.label });
+
+        const event_id = try self.client.sendMessageReturningId(allocator, chat_id, body_writer.writer.buffered(), reply_to_message_id);
+
+        for (choices) |c| {
+            self.client.sendReaction(allocator, chat_id, event_id, c.emoji) catch |err| {
+                std.log.warn("matrix: failed to seed reaction {s} on {s}: {t}", .{ c.emoji, event_id, err });
+            };
+        }
+        return event_id;
     }
 
     fn sendPhotoFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, image_bytes: []const u8, caption: ?[]const u8) void {

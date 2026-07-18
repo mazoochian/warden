@@ -89,6 +89,25 @@ pub const AlertSink = struct {
     }
 };
 
+/// Callback surface the `begin_file_conversion` tool uses to kick off the
+/// interactive multi-stage `/convert` flow (see `features/convert_flow.zig`)
+/// when the user expresses intent in natural language rather than typing
+/// bare `/convert` — same ptr+vtable boundary reasoning as `ReminderSink`/
+/// `AlertSink`: `registry.zig` is imported by every tool and must never
+/// depend on a specific feature module directly.
+pub const ConvertFlowSink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        beginAwaitingFile: *const fn (ptr: *anyopaque) anyerror!void,
+    };
+
+    pub fn beginAwaitingFile(self: ConvertFlowSink) !void {
+        return self.vtable.beginAwaitingFile(self.ptr);
+    }
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -112,6 +131,9 @@ pub const ToolContext = struct {
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `set_alert` tool.
     alerts: ?AlertSink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `begin_file_conversion` tool.
+    convert_flow: ?ConvertFlowSink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the

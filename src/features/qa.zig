@@ -36,7 +36,11 @@ pub const default_system_prompt =
     \\(set_reminder) — translate whatever natural-language time the user
     \\gave into that tool's required duration shorthand yourself — and
     \\converting a photo/document/voice/audio/video the user just sent to a
-    \\different format (convert_file). For anything
+    \\different format (convert_file), or starting the conversion flow
+    \\(begin_file_conversion) when they say they want to convert something
+    \\but haven't attached a file to this message yet — that tool just asks
+    \\them to send the file; don't use it if one's already attached here.
+    \\For anything
     \\factual you don't confidently know (current events, prices, releases,
     \\docs), use web_search rather than guessing or claiming you can't know;
     \\fetch a promising result with fetch_url when the snippet isn't enough.

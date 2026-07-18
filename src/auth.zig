@@ -23,6 +23,7 @@ test "isOwner matches only the configured platform+id pair" {
         .retention_messages = 20_000,
         .llm = .{ .anthropic = .{ .api_key = "x", .model = "x" } },
         .confirm_timeout_seconds = 60,
+        .convert_timeout_seconds = 300,
         .tmp_dir = "data/tmp",
         .digest_interval_seconds = 86_400,
         .system_prompt = null,

@@ -59,6 +59,11 @@ pub const Config = struct {
     llm: LlmConfig,
     /// How long a ban/kick confirmation stays valid before expiring.
     confirm_timeout_seconds: i64,
+    /// How long a pending interactive /convert flow (waiting for a file
+    /// upload, or waiting for a format pick) stays valid before expiring —
+    /// longer than `confirm_timeout_seconds` since the user needs time to
+    /// actually go find and upload a file, not just tap yes/no.
+    convert_timeout_seconds: i64,
     /// Scratch directory for shelling out to external renderers (word
     /// cloud/diagram scripts) — unrelated to the database, purely
     /// throwaway local scratch space.
@@ -141,6 +146,11 @@ pub const Config = struct {
         else
             default_confirm_timeout_seconds;
 
+        const convert_timeout_seconds: i64 = if (env.get("WARDEN_CONVERT_TIMEOUT_SECONDS")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_convert_timeout_seconds
+        else
+            default_convert_timeout_seconds;
+
         const tmp_dir = env.get("WARDEN_TMP_DIR") orelse "data/tmp";
 
         const digest_interval_seconds: i64 = if (env.get("WARDEN_DIGEST_INTERVAL_SECONDS")) |raw|
@@ -186,6 +196,7 @@ pub const Config = struct {
             .retention_messages = retention_messages,
             .llm = llm,
             .confirm_timeout_seconds = confirm_timeout_seconds,
+            .convert_timeout_seconds = convert_timeout_seconds,
             .tmp_dir = tmp_dir,
             .digest_interval_seconds = digest_interval_seconds,
             .system_prompt = system_prompt,
@@ -251,6 +262,7 @@ pub const Config = struct {
     pub const default_retention_messages: i64 = 20_000;
     pub const default_postgres_pool_size: usize = 10;
     pub const default_confirm_timeout_seconds: i64 = 60;
+    pub const default_convert_timeout_seconds: i64 = 300;
     pub const default_digest_interval_seconds: i64 = 86_400;
     pub const default_llm_owner_only: bool = true;
     pub const default_llm_show_thinking: bool = false;

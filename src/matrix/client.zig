@@ -190,6 +190,36 @@ pub const Client = struct {
         defer allocator.free(body);
     }
 
+    const ReactionPayload = struct {
+        @"m.relates_to": types.RelatesTo,
+    };
+
+    /// Reacts to `event_id` with `key` (an emoji) — used to self-seed
+    /// tappable "pills" on the bot's own choice-prompt message (see
+    /// `MatrixConnector.sendChoicePromptFn`), and by users tapping one to
+    /// pick a choice (read back via `pollFn`'s `m.reaction` handling).
+    /// Fire-and-forget like `sendMessage`.
+    pub fn sendReaction(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_id: []const u8, key: []const u8) !void {
+        const encoded_room = try encodeSegment(allocator, room_id);
+        defer allocator.free(encoded_room);
+        const txn = try self.nextTxnId(allocator);
+        defer allocator.free(txn);
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/send/m.reaction/{s}", .{ self.homeserver_url, encoded_room, txn });
+        defer allocator.free(url);
+
+        var payload_writer: Io.Writer.Allocating = .init(allocator);
+        defer payload_writer.deinit();
+        try json.Stringify.value(ReactionPayload{
+            .@"m.relates_to" = .{ .rel_type = "m.annotation", .event_id = event_id, .key = key },
+        }, .{}, &payload_writer.writer);
+        const payload = payload_writer.writer.buffered();
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        const body = try http_util.putJson(&self.http_client, allocator, url, &.{auth}, payload);
+        defer allocator.free(body);
+    }
+
     /// Uploads bytes and returns their `mxc://` content URI — the two-step
     /// process every image/document send needs: upload first, then send an
     /// `m.room.message` event pointing at the resulting URI.
