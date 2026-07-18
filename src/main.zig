@@ -910,11 +910,13 @@ fn handleDigestCommand(
 
 const max_reminder_message_len = 500;
 
-/// `/remind <duration> <message>` sets a one-off reminder; `/remind cancel
-/// <id>` cancels one. Open to anyone in the chat to create (utility-level,
-/// like /wordcloud), but only its own creator or the bot owner may cancel
-/// it — matches `/token`'s reply-to-target pattern of trusting the sender's
-/// own identity_id rather than requiring group-admin standing.
+/// `/remind <duration|clock-time> <message>` sets a one-off reminder;
+/// `/remind every <interval> <message>` sets a recurring one; `/remind
+/// cancel <id>` cancels one. Open to anyone in the chat to create
+/// (utility-level, like /wordcloud), but only its own creator or the bot
+/// owner may cancel it — matches `/token`'s reply-to-target pattern of
+/// trusting the sender's own identity_id rather than requiring group-admin
+/// standing.
 fn handleRemindCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -926,9 +928,10 @@ fn handleRemindCommand(
     msg: iface.Message,
     text: []const u8,
 ) void {
+    const usage = "Usage: /remind <duration e.g. 30m/2h/1d, or a clock time like 14:30> <message>, /remind every <interval> <message>, or /remind cancel <id>";
     const arg = std.mem.trim(u8, text["/remind".len..], " ");
     if (arg.len == 0) {
-        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /remind <duration e.g. 30m/2h/1d> <message>, or /remind cancel <id>");
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
         return;
     }
 
@@ -966,15 +969,22 @@ fn handleRemindCommand(
         return;
     }
 
-    const duration_str = first_word;
-    const message = std.mem.trim(u8, it.rest(), " ");
+    var recur_interval: ?i64 = null;
+    var when_str = first_word;
+    if (std.mem.eql(u8, first_word, "every")) {
+        when_str = it.next() orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /remind every <interval e.g. 1d> <message>");
+            return;
+        };
+        recur_interval = reminder_format.parseDuration(when_str) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that interval — use e.g. 30m, 2h, or 1d.");
+            return;
+        };
+    }
 
-    const duration_seconds = reminder_format.parseDuration(duration_str) orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that duration — use e.g. 30m, 2h, or 1d.");
-        return;
-    };
+    const message = std.mem.trim(u8, it.rest(), " ");
     if (message.len == 0) {
-        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /remind <duration e.g. 30m/2h/1d> <message>");
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
         return;
     }
     if (message.len > max_reminder_message_len) {
@@ -982,12 +992,26 @@ fn handleRemindCommand(
         return;
     }
 
-    const id = reminders.create(pool, chat_id, identity_id, message, now + duration_seconds) catch |err| {
+    const due_at = if (recur_interval) |interval|
+        now + interval
+    else
+        reminder_format.parseWhen(when_str, now) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that time — use a duration like 30m/2h/1d, or a 24h clock time like 14:30.");
+            return;
+        };
+
+    const id = reminders.create(pool, chat_id, identity_id, message, due_at, recur_interval) catch |err| {
         std.log.err("remind: failed to create reminder for chat {d}: {t}", .{ chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that reminder, try again.");
         return;
     };
-    const confirmation = std.fmt.allocPrint(a, "Reminder #{d} set for {s} from now.", .{ id, duration_str }) catch return;
+
+    const confirmation = if (recur_interval) |interval|
+        std.fmt.allocPrint(a, "Reminder #{d} set, repeating every {s}.", .{ id, reminder_format.formatInterval(a, interval) }) catch return
+    else if (reminder_format.parseDuration(when_str) != null)
+        std.fmt.allocPrint(a, "Reminder #{d} set for {s} from now.", .{ id, when_str }) catch return
+    else
+        std.fmt.allocPrint(a, "Reminder #{d} set for {s}.", .{ id, when_str }) catch return;
     connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
 }
 
@@ -1044,7 +1068,11 @@ fn formatPendingReminders(a: std.mem.Allocator, pending: []const reminders.Pendi
     const w = &buf.writer;
     w.print("Pending reminders:\n", .{}) catch return "";
     for (pending) |r| {
-        w.print("  #{d} in {s}: {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), r.message }) catch return "";
+        if (r.recur_interval_seconds) |interval| {
+            w.print("  #{d} in {s} (repeats every {s}): {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), reminder_format.formatInterval(a, interval), r.message }) catch return "";
+        } else {
+            w.print("  #{d} in {s}: {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), r.message }) catch return "";
+        }
     }
     return buf.writer.buffered();
 }
@@ -1071,10 +1099,10 @@ const ReminderToolAdapter = struct {
         .listPending = listPendingFn,
     };
 
-    fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, message: []const u8, due_at: i64) anyerror!i64 {
+    fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, message: []const u8, due_at: i64, recur_interval_seconds: ?i64) anyerror!i64 {
         const self: *ReminderToolAdapter = @ptrCast(@alignCast(ptr));
         _ = allocator;
-        return reminders.create(self.pool, self.chat_id, self.identity_id, message, due_at);
+        return reminders.create(self.pool, self.chat_id, self.identity_id, message, due_at, recur_interval_seconds);
     }
 
     fn cancelFn(ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!tool_registry.ReminderSink.CancelResult {
@@ -1128,9 +1156,17 @@ fn checkAndSendDueReminders(
 
         const text = std.fmt.allocPrint(a, "⏰ Reminder: {s}", .{r.message}) catch continue;
         connector.sendMessage(a, r.native_chat_id, text, null);
-        reminders.markDelivered(pool, r.id, now) catch |err| {
-            std.log.err("remind: failed to mark reminder {d} delivered: {t}", .{ r.id, err });
-        };
+
+        if (r.recur_interval_seconds) |interval| {
+            const next_due = reminder_format.nextOccurrence(r.due_at, interval, now);
+            reminders.reschedule(pool, r.id, next_due) catch |err| {
+                std.log.err("remind: failed to reschedule recurring reminder {d}: {t}", .{ r.id, err });
+            };
+        } else {
+            reminders.markDelivered(pool, r.id, now) catch |err| {
+                std.log.err("remind: failed to mark reminder {d} delivered: {t}", .{ r.id, err });
+            };
+        }
     }
 }
 

@@ -33,7 +33,9 @@ pub const ReminderSink = struct {
     pub const CancelResult = enum { canceled, not_found, not_authorized };
 
     pub const VTable = struct {
-        create: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, message: []const u8, due_at: i64) anyerror!i64,
+        /// `recur_interval_seconds` set makes this a recurring reminder —
+        /// see the `0003_reminders_recurrence.sql` migration comment.
+        create: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, message: []const u8, due_at: i64, recur_interval_seconds: ?i64) anyerror!i64,
         cancel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!CancelResult,
         /// Returns pending reminders for this chat, already formatted as a
         /// human-readable list (empty-case text included) — formatting
@@ -42,8 +44,8 @@ pub const ReminderSink = struct {
         listPending: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8,
     };
 
-    pub fn create(self: ReminderSink, allocator: std.mem.Allocator, message: []const u8, due_at: i64) !i64 {
-        return self.vtable.create(self.ptr, allocator, message, due_at);
+    pub fn create(self: ReminderSink, allocator: std.mem.Allocator, message: []const u8, due_at: i64, recur_interval_seconds: ?i64) !i64 {
+        return self.vtable.create(self.ptr, allocator, message, due_at, recur_interval_seconds);
     }
 
     pub fn cancel(self: ReminderSink, allocator: std.mem.Allocator, id: i64) !CancelResult {
