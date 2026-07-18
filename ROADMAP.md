@@ -9,9 +9,10 @@ Status as of writing: **Phase 1 is committed** (reminders and
 file-conversion landed in `fc3658d`), **Phase 2's core (unencrypted Matrix)
 is implemented** but not yet live-tested against a real homeserver (no
 credentials available this session; see Phase 2's note — Matrix E2E
-encryption was split out into its own Phase 2b rather than bundled in), and
-**Phase 3 (reminder recurrence + absolute time) is committed**. `zig build
-test` green (131/131). Phases 4 onward are unstarted.
+encryption was split out into its own Phase 2b rather than bundled in),
+**Phase 3 (reminder recurrence + absolute time) is committed**, and **Phase
+4 (price/metric alerts) is committed**. `zig build test` green (138/138).
+Phases 5 onward are unstarted.
 
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
@@ -163,31 +164,42 @@ limitations (relative-duration-only, no repeats).
   for recurring entries.
 
 ## Phase 4 — Price & metric alerts
-*Effort: L. Dependencies: Phase 1's sink pattern; Phase 2's chat-id fix.*
+*Effort: L. Dependencies: Phase 1's sink pattern; Phase 2's chat-id fix.
+Status: done.*
 
 The standout new feature, and the best fit for warden's personality: this
 composes the existing `crypto_price`/`weather`/`air_quality` tools with the
 reminders infrastructure's sink/scheduler pattern to support "ping me when
 BTC crosses 70k" or "tell me if Tehran's AQI gets bad."
 
-- New `src/store/alerts.zig` (chat_id, identity_id, kind, subject, condition,
-  threshold, cooldown, last_triggered_at) + migration, same shape as
-  `reminders.zig`.
-- New `AlertSink` ptr+vtable in `registry.zig` alongside the existing
+- `src/store/alerts.zig` + migration `0004_alerts.sql` (chat_id, identity_id,
+  kind, subject, currency, condition, threshold, check_interval_seconds,
+  cooldown_seconds, last_checked_at, last_triggered_at) — two separate
+  gates rather than one: `check_interval_seconds` (default 5m) bounds how
+  often the external API actually gets hit, `cooldown_seconds` (default 1h)
+  bounds how often an already-true condition re-notifies. `db.zig` gained
+  `bindFloat64`/`columnFloat64` for the threshold column (its first
+  non-integer bound parameter).
+- `AlertSink` ptr+vtable in `registry.zig` alongside the existing
   `ReminderSink` — same reasoning: `registry.zig` is imported by every tool
   and must never depend on `src/store/*` directly.
-- New `src/tools/set_alert.zig` (LLM-invocable, mirroring `set_reminder`'s
-  `action=create|list|cancel` shape).
-- New `src/features/alerts.zig`: a poll-loop hook (`checkAndDeliverAlerts`,
-  wired in next to `checkAndSendDueDigests`/`checkAndSendDueReminders`) that
-  batches pending watches by kind and calls each source tool's fetch-and-
-  parse core — refactored out of `execute()` into a plain function each tool
-  calls, so the alert loop can reuse it without going through the LLM
-  tool-call loop — then compares against the threshold and delivers on a
-  cooldown so a persistent condition doesn't spam every poll tick.
-- `/alert crypto bitcoin above 70000`, `/alerts`, `/alert cancel <id>`
-  commands, matching `/remind`'s authorization pattern (creator or owner may
-  cancel).
+- `src/tools/set_alert.zig` (LLM-invocable, `action=create|list|cancel`,
+  kind is one of crypto/weather/aqi).
+- `crypto_price.zig`/`weather.zig`/`air_quality.zig` each gained a plain
+  `fetchPrice`/`fetchWeather`/`fetchAirQuality` function alongside their
+  existing `execute()` — the same fetch-and-parse core, callable directly
+  without a JSON args round trip or the LLM tool-call loop.
+- `src/features/alerts.zig`'s `checkAndDeliverAlerts` — wired into the poll
+  loop next to `checkAndSendDueDigests`/`checkAndSendDueReminders` — queries
+  due alerts, dispatches to the right source by `kind`, and delivers through
+  whichever connector owns the alert's platform (same `findConnector`
+  pattern as Phase 2's chat-id fix).
+- `/alert crypto bitcoin above 70000`, `/alert weather Tehran above 35`,
+  `/alerts`, `/alert cancel <id>` commands, matching `/remind`'s
+  authorization pattern (creator or owner may cancel). The command syntax
+  joins every token between the kind and the trailing `<above|below>
+  <threshold>` pair back into `subject`, so multi-word city names work at
+  the command line too, not just through the LLM tool.
 
 ## Phase 5 — RSS/news watcher
 *Effort: M. Dependencies: Phase 2.*
