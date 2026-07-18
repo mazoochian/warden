@@ -6,12 +6,12 @@ this is a personal project built in spare time, so scope stays deliberately
 small per phase.
 
 Status as of writing: **Phase 1 is committed** (reminders and
-file-conversion landed in `fc3658d`) and **Phase 2's core (unencrypted
-Matrix) is implemented**, `zig build test` green (124/124) — not yet
-live-tested against a real homeserver (no credentials available this
-session; see Phase 2's note). Matrix E2E encryption was split out into its
-own Phase 2b rather than bundled in, per the libolm-not-hand-rolled-crypto
-decision below. Phases 3 onward are unstarted.
+file-conversion landed in `fc3658d`), **Phase 2's core (unencrypted Matrix)
+is implemented** but not yet live-tested against a real homeserver (no
+credentials available this session; see Phase 2's note — Matrix E2E
+encryption was split out into its own Phase 2b rather than bundled in), and
+**Phase 3 (reminder recurrence + absolute time) is committed**. `zig build
+test` green (131/131). Phases 4 onward are unstarted.
 
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
@@ -131,25 +131,36 @@ plaintext-room bugs.*
   own env-var block alongside Telegram's.
 
 ## Phase 3 — Reminders v2: recurrence and absolute time
-*Effort: M. Dependencies: Phase 1.*
+*Effort: M. Dependencies: Phase 1. Status: done.*
 
 Direct continuation of the reminders system, closing its two known
 limitations (relative-duration-only, no repeats).
 
-- Extend `reminder_format.zig`'s parser with a constrained absolute-time
-  format (e.g. `HH:MM` for "today/tomorrow at") — explicitly not full
-  natural-language date parsing or timezone awareness, matching
-  `scheduler.zig`'s own documented tradeoff for a single-owner personal bot.
-- New migration adding `recur_interval_seconds` to `reminders`
-  (interval-based recurrence — "every 1d", "every 2h" — not cron/day-of-week
+- `reminder_format.zig` gained `parseAbsoluteTime` (`HH:MM` 24h clock,
+  resolves to the next occurrence today-or-tomorrow), `parseWhen` (tries a
+  relative duration first, then an absolute time — the new unified entry
+  point both `/remind` and `set_reminder` use), and `nextOccurrence` (jumps
+  a recurring reminder straight to the next due time strictly after `now`,
+  so a reminder that missed several firings while the bot was down doesn't
+  fire once per missed interval in a burst). Deliberately still no real
+  calendar/timezone handling — `now` is treated as already being in
+  whatever clock the operator cares about, same tradeoff
+  `scheduler.zig` makes for digests.
+- Migration `0003_reminders_recurrence.sql` added `recur_interval_seconds`
+  to `reminders` (interval-based — "every 1d" — not cron/day-of-week
   scheduling, consistent with `DigestScheduler`'s interval-not-wall-clock
   philosophy).
-- `reminders.zig`'s `dueUndelivered`/`markDelivered`: reschedule
-  (`due_at += interval`) instead of clearing when a reminder recurs.
-- `set_reminder`'s tool schema and the `/remind` command syntax gain a
-  `recur` option.
-- Pending-reminders list formatting shows "(repeats every 1d)" for recurring
-  entries.
+- `reminders.zig`'s `dueUndelivered`/`listPending` now carry `due_at` and
+  `recur_interval_seconds`; a new `reschedule` advances `due_at` instead of
+  clearing the reminder when it recurs.
+- `set_reminder`'s tool schema gained an independent `recur` field
+  (`duration` always sets the first firing; `recur`, if set, is the repeat
+  cadence after that — e.g. `duration=1h, recur=1d` fires once in an hour,
+  then daily). The `/remind` command gained `every <interval> <message>`
+  (single interval reused for both first-fire and cadence, a simpler
+  command-line shape than the tool's two independent fields).
+- `/reminders` and the tool's `action=list` both show "(repeats every 1d)"
+  for recurring entries.
 
 ## Phase 4 — Price & metric alerts
 *Effort: L. Dependencies: Phase 1's sink pattern; Phase 2's chat-id fix.*
