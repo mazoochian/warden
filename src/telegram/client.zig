@@ -103,9 +103,17 @@ pub const Client = struct {
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
+        // `emit_null_optional_fields = false`: Telegram's API rejects an
+        // explicitly-present `"reply_parameters":null` ("Bad Request:
+        // object expected as reply parameters") rather than treating it
+        // like the field was never sent — Zig's default stringify options
+        // emit null optional fields as literal `null` rather than omitting
+        // the key, which silently broke every unprompted message (a
+        // reminder/alert/feed-watcher notification, anything not sent as a
+        // reply) until this was caught.
         try json.Stringify.value(
             .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters },
-            .{},
+            .{ .emit_null_optional_fields = false },
             &payload_writer.writer,
         );
         const payload = payload_writer.writer.buffered();
@@ -134,9 +142,11 @@ pub const Client = struct {
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
+        // See `sendMessageErr`'s doc comment on why this needs
+        // `emit_null_optional_fields = false`.
         try json.Stringify.value(
             .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters },
-            .{},
+            .{ .emit_null_optional_fields = false },
             &payload_writer.writer,
         );
         const payload = payload_writer.writer.buffered();
@@ -157,6 +167,87 @@ pub const Client = struct {
             return error.TelegramApiError;
         };
         return result.message_id;
+    }
+
+    /// One button on an inline keyboard, in this client's own local shape
+    /// rather than `iface.Choice` — this file stays free of any dependency
+    /// on `platform/interface.zig` (the raw-API layer never imports the
+    /// adapter layer); `platform/telegram.zig` translates.
+    pub const Button = struct {
+        text: []const u8,
+        callback_data: []const u8,
+    };
+
+    const InlineKeyboardButton = struct {
+        text: []const u8,
+        callback_data: ?[]const u8 = null,
+    };
+    const InlineKeyboardMarkup = struct {
+        inline_keyboard: []const []const InlineKeyboardButton,
+    };
+
+    /// Sends a message with an inline keyboard built from `buttons`,
+    /// arranged 2 per row (a single long row renders badly once there are
+    /// more than a handful of choices — "every supported format" can mean
+    /// close to a dozen). Returns the sent message's id, like
+    /// `sendMessageReturningId` — needed so a later button press can be
+    /// matched back to this specific prompt.
+    pub fn sendChoicePrompt(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, buttons: []const Button, reply_to_message_id: ?i64) !i64 {
+        const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{self.bot_token});
+        defer allocator.free(url);
+
+        const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
+
+        const buttons_per_row = 2;
+        var rows: std.ArrayList([]const InlineKeyboardButton) = .empty;
+        defer rows.deinit(allocator);
+        var i: usize = 0;
+        while (i < buttons.len) : (i += buttons_per_row) {
+            var row: std.ArrayList(InlineKeyboardButton) = .empty;
+            defer row.deinit(allocator);
+            const end = @min(i + buttons_per_row, buttons.len);
+            for (buttons[i..end]) |b| try row.append(allocator, .{ .text = b.text, .callback_data = b.callback_data });
+            try rows.append(allocator, try row.toOwnedSlice(allocator));
+        }
+        defer for (rows.items) |row| allocator.free(row);
+
+        var payload_writer: Io.Writer.Allocating = .init(allocator);
+        defer payload_writer.deinit();
+        // See `sendMessageErr`'s doc comment on why this needs
+        // `emit_null_optional_fields = false`.
+        try json.Stringify.value(
+            .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters, .reply_markup = InlineKeyboardMarkup{ .inline_keyboard = rows.items } },
+            .{ .emit_null_optional_fields = false },
+            &payload_writer.writer,
+        );
+        const payload = payload_writer.writer.buffered();
+
+        const body = try http_util.postJson(&self.http_client, allocator, url, &.{}, payload);
+        defer allocator.free(body);
+
+        var parsed = try json.parseFromSlice(
+            SendMessageResponse,
+            allocator,
+            body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+        defer parsed.deinit();
+
+        const result = parsed.value.result orelse {
+            std.log.err("telegram sendChoicePrompt failed: {?s}", .{parsed.value.description});
+            return error.TelegramApiError;
+        };
+        return result.message_id;
+    }
+
+    /// Dismisses the client-side loading spinner Telegram shows on a
+    /// pressed button until this is called. Fire-and-forget like
+    /// `sendMessage` — a failure here doesn't affect the button press
+    /// itself, which has already been delivered as an update either way.
+    pub fn answerCallbackQuery(self: *Client, allocator: std.mem.Allocator, callback_query_id: []const u8) void {
+        self.callMethod(allocator, "answerCallbackQuery", .{ .callback_query_id = callback_query_id }) catch |err| {
+            std.log.err("answerCallbackQuery failed: {t}", .{err});
+        };
     }
 
     /// Replaces the text of a previously-sent message (the "thinking"
@@ -443,7 +534,11 @@ pub const Client = struct {
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
-        try json.Stringify.value(payload_value, .{}, &payload_writer.writer);
+        // `emit_null_optional_fields = false` defensively — see
+        // `sendMessageErr`'s doc comment; `callMethod`'s callers today
+        // don't pass a null optional field, but this is a generic helper
+        // and should be safe by default for whichever one eventually does.
+        try json.Stringify.value(payload_value, .{ .emit_null_optional_fields = false }, &payload_writer.writer);
         const payload = payload_writer.writer.buffered();
 
         const body = try http_util.postJson(&self.http_client, allocator, url, &.{}, payload);
@@ -463,3 +558,31 @@ pub const Client = struct {
         }
     }
 };
+
+const testing = std.testing;
+
+test "reply_parameters is omitted entirely when null, not serialized as a literal null Telegram rejects" {
+    const reply_parameters: ?Client.ReplyParameters = null;
+    var writer: Io.Writer.Allocating = .init(testing.allocator);
+    defer writer.deinit();
+    try json.Stringify.value(
+        .{ .chat_id = @as(i64, 1), .text = "hi", .reply_parameters = reply_parameters },
+        .{ .emit_null_optional_fields = false },
+        &writer.writer,
+    );
+    const out = writer.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "reply_parameters") == null);
+}
+
+test "reply_parameters serializes as a real object when a reply target is set" {
+    const reply_parameters: ?Client.ReplyParameters = .{ .message_id = 42 };
+    var writer: Io.Writer.Allocating = .init(testing.allocator);
+    defer writer.deinit();
+    try json.Stringify.value(
+        .{ .chat_id = @as(i64, 1), .text = "hi", .reply_parameters = reply_parameters },
+        .{ .emit_null_optional_fields = false },
+        &writer.writer,
+    );
+    const out = writer.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "\"reply_parameters\":{\"message_id\":42") != null);
+}

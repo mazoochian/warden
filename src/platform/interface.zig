@@ -38,6 +38,42 @@ pub const Attachment = struct {
     }
 };
 
+/// One offered option in an interactive choice prompt — Telegram inline
+/// button / Matrix seeded reaction (see `Connector.VTable.sendChoicePrompt`).
+/// `emoji` doubles as the Matrix reaction key, so it must be an actual
+/// emoji, not arbitrary text. `label` is Telegram's button text
+/// (`"{emoji} {label}"`) and, since a Matrix reaction alone carries no
+/// label, is also spelled out in the prompt's body text there. `value` is
+/// the opaque result the application gets back via `ChoicePicked` — see
+/// that type's doc comment for why its meaning differs by platform.
+pub const Choice = struct {
+    emoji: []const u8,
+    label: []const u8,
+    value: []const u8,
+};
+
+/// A user picking one of a previous `sendChoicePrompt`'s options — carried
+/// on `Message.choice_picked` so a button press/reaction flows through the
+/// existing poll -> per-task-spawn -> handleMessage pipeline like any other
+/// message, rather than a parallel notification path.
+///
+/// `value`'s meaning is platform-dependent and deliberately left
+/// unresolved by the connector: Telegram's `callback_data` is a real
+/// opaque channel, so `value` there already IS the application's chosen
+/// `Choice.value`. Matrix reactions have no such channel — `value` there
+/// is the raw emoji `key` the user reacted with, and the application (not
+/// the connector, which has no visibility into app-level pending state)
+/// must map it back to a `Choice.value` using the same choice list it
+/// built when it sent that prompt (see `features/convert_flow.zig`'s
+/// `resolveTargetFormat`).
+pub const ChoicePicked = struct {
+    /// Native id of the message the choices were originally posted on —
+    /// scopes the picked value to one specific pending interaction, since
+    /// more than one prompt could be in flight in the same chat.
+    prompt_message_id: []const u8,
+    value: []const u8,
+};
+
 /// A platform-agnostic inbound message. Adapters translate their native
 /// wire format into this shape. IDs are kept as strings since native ID
 /// types vary wildly (Telegram: i64, Matrix: "!room:server"/"@user:server",
@@ -95,6 +131,12 @@ pub const Message = struct {
     /// Set when this message carries a photo/document/voice/audio/video —
     /// see `Attachment`'s doc comment on why only metadata lives here.
     attachment: ?Attachment = null,
+    /// Set when this "message" is actually a button press / reaction pick
+    /// on a previous `sendChoicePrompt` — see `ChoicePicked`'s doc comment.
+    /// A message with this set typically has no `text`/`attachment` of its
+    /// own, so callers that check this must do so before any "text or
+    /// attachment required" bail-out.
+    choice_picked: ?ChoicePicked = null,
 
     /// Deep-copies every string field into `allocator`. The poll loop
     /// spawns one concurrent task per message, each owning its own arena;
@@ -120,6 +162,10 @@ pub const Message = struct {
             .identity = if (self.identity) |id| try id.dupe(allocator) else null,
             .telegram_profile = if (self.telegram_profile) |p| try p.dupe(allocator) else null,
             .attachment = if (self.attachment) |att| try att.dupe(allocator) else null,
+            .choice_picked = if (self.choice_picked) |cp| .{
+                .prompt_message_id = try allocator.dupe(u8, cp.prompt_message_id),
+                .value = try allocator.dupe(u8, cp.value),
+            } else null,
         };
     }
 };
@@ -176,6 +222,14 @@ pub const Connector = struct {
         sendMessageReturningId: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to_message_id: ?[]const u8) anyerror![]const u8 = null,
         /// Replaces the text of a previously-sent message.
         editMessage: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8, text: []const u8) anyerror!void = null,
+
+        /// Sends an interactive choice prompt — Telegram inline-keyboard
+        /// buttons, Matrix self-seeded reactions (see the two connectors'
+        /// implementations). Returns the prompt message's native id (to
+        /// later match against `ChoicePicked.prompt_message_id`), or null
+        /// if the platform doesn't support the concept — see the wrapper
+        /// method's plain-text fallback for that case.
+        sendChoicePrompt: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, choices: []const Choice, reply_to_message_id: ?[]const u8) anyerror!?[]const u8 = null,
 
         /// Restricts a user from sending messages until `until_unix_time`
         /// (0 = forever, until explicitly unmuted).
@@ -258,6 +312,22 @@ pub const Connector = struct {
     pub fn editMessage(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8, text: []const u8) !void {
         const f = self.vtable.editMessage orelse return error.Unsupported;
         return f(self.ptr, allocator, chat_id, message_id, text);
+    }
+
+    /// Falls back to a plain numbered-list `sendMessage` when the platform
+    /// doesn't implement choice prompts — returns `null` in that case (no
+    /// prompt id exists to match a later pick against), matching
+    /// `sendPhoto`/`sendDocument`'s "unsupported platform" convention.
+    pub fn sendChoicePrompt(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, choices: []const Choice, reply_to_message_id: ?[]const u8) !?[]const u8 {
+        const f = self.vtable.sendChoicePrompt orelse {
+            var buf: std.Io.Writer.Allocating = .init(allocator);
+            defer buf.deinit();
+            buf.writer.print("{s}\n", .{text}) catch {};
+            for (choices) |c| buf.writer.print("  {s} {s}\n", .{ c.emoji, c.label }) catch {};
+            self.sendMessage(allocator, chat_id, buf.writer.buffered(), reply_to_message_id);
+            return null;
+        };
+        return try f(self.ptr, allocator, chat_id, text, choices, reply_to_message_id);
     }
 
     pub fn muteUser(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, until_unix_time: i64) !void {
@@ -380,6 +450,34 @@ test "Message.dupe passes through null optional fields as null" {
     try testing.expectEqual(@as(?[]const u8, null), dst.text);
     try testing.expectEqual(@as(?Identity, null), dst.identity);
     try testing.expectEqual(@as(?TelegramProfile, null), dst.telegram_profile);
+    try testing.expectEqual(@as(?ChoicePicked, null), dst.choice_picked);
+}
+
+test "Message.dupe deep-copies choice_picked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const src_a = arena.allocator();
+
+    const src = Message{
+        .chat_id = try src_a.dupe(u8, "1"),
+        .user_id = try src_a.dupe(u8, "2"),
+        .choice_picked = .{
+            .prompt_message_id = try src_a.dupe(u8, "555"),
+            .value = try src_a.dupe(u8, "png"),
+        },
+    };
+
+    const dst = try src.dupe(testing.allocator);
+    defer {
+        testing.allocator.free(dst.chat_id);
+        testing.allocator.free(dst.user_id);
+        testing.allocator.free(dst.choice_picked.?.prompt_message_id);
+        testing.allocator.free(dst.choice_picked.?.value);
+    }
+
+    arena.deinit();
+
+    try testing.expectEqualStrings("555", dst.choice_picked.?.prompt_message_id);
+    try testing.expectEqualStrings("png", dst.choice_picked.?.value);
 }
 
 test "Message.dupe deep-copies identity and telegram_profile" {

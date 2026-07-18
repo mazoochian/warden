@@ -22,6 +22,9 @@ pub const RelatesTo = struct {
     rel_type: ?[]const u8 = null,
     event_id: ?[]const u8 = null,
     @"m.in_reply_to": ?InReplyTo = null,
+    /// The reaction emoji, present when `rel_type` is "m.annotation" (an
+    /// `m.reaction` event) — see `MatrixConnector.pollFn`'s handling of it.
+    key: ?[]const u8 = null,
 };
 
 pub const InReplyTo = struct {
@@ -145,6 +148,19 @@ test "MessageContent parses m.relates_to for a reply and an edit" {
     defer edit_parsed.deinit();
     try testing.expectEqualStrings("m.replace", edit_parsed.value.@"m.relates_to".?.rel_type.?);
     try testing.expectEqualStrings("new", edit_parsed.value.@"m.new_content".?.body.?);
+}
+
+test "RoomEvent parses an m.reaction event's rel_type/event_id/key" {
+    const raw =
+        \\{"type":"m.reaction","sender":"@alice:server","event_id":"$r1","origin_server_ts":1000,
+        \\"content":{"m.relates_to":{"rel_type":"m.annotation","event_id":"$target","key":"📄"}}}
+    ;
+    var parsed = try json.parseFromSlice(RoomEvent, testing.allocator, raw, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const rel = parsed.value.content.@"m.relates_to".?;
+    try testing.expectEqualStrings("m.annotation", rel.rel_type.?);
+    try testing.expectEqualStrings("$target", rel.event_id.?);
+    try testing.expectEqualStrings("📄", rel.key.?);
 }
 
 test "SyncResponse parses a joined room's timeline via ArrayHashMap" {

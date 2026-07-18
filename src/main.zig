@@ -22,6 +22,7 @@ const alert_feature = @import("features/alerts.zig");
 const feed_watches = @import("store/feed_watches.zig");
 const feed_watcher = @import("features/feed_watcher.zig");
 const transcribe = @import("features/transcribe.zig");
+const convert_flow = @import("features/convert_flow.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
@@ -50,6 +51,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/hackernews.zig").tool,
     @import("tools/remind.zig").tool,
     @import("tools/set_alert.zig").tool,
+    @import("tools/begin_conversion.zig").tool,
     convert_file.tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
@@ -114,6 +116,9 @@ pub fn main(init: std.process.Init) !void {
     var digest_scheduler = scheduler.DigestScheduler.init(gpa, io, config.digest_interval_seconds);
     defer digest_scheduler.deinit();
     loadDigestScheduleFromDisk(gpa, &pool, &digest_scheduler);
+
+    var pending_conversions = convert_flow.PendingConversions.init(gpa, io, config.convert_timeout_seconds);
+    defer pending_conversions.deinit();
 
     // Heap-allocated: whichever variant isn't selected never gets
     // constructed, and the process-lifetime singleton is fine to leave for
@@ -199,6 +204,7 @@ pub fn main(init: std.process.Init) !void {
                     active_tools,
                     &pending_confirmations,
                     &digest_scheduler,
+                    &pending_conversions,
                     io,
                     gpa,
                     ts,
@@ -221,6 +227,7 @@ pub fn main(init: std.process.Init) !void {
         checkAndSendDueReminders(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
+        pending_conversions.sweepExpired(gpa, now);
     }
 }
 
@@ -279,6 +286,7 @@ fn processMessageTask(
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
+    pending_conversions: *convert_flow.PendingConversions,
     io: Io,
     gpa: std.mem.Allocator,
     ts: i64,
@@ -299,12 +307,17 @@ fn processMessageTask(
 
     // Every group member's message counts toward this chat's local record
     // (stats/content recall), regardless of who sent it — only
-    // replies/actions are owner-gated below.
+    // replies/actions are owner-gated below. A button press/reaction
+    // (`choice_picked`) isn't real conversational content — skip logging it
+    // so it doesn't show up as a stray empty-text row in /wordcloud or the
+    // LLM's history window.
     const identity_id = resolveSenderIdentity(pool, connector, msg, ts) catch |err| {
         std.log.err("failed to resolve identity for user {s}: {t}", .{ msg.user_id, err });
         return;
     };
-    recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, config.retention_messages);
+    if (msg.choice_picked == null) {
+        recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, config.retention_messages);
+    }
 
     // Downloaded eagerly (not lazily on first tool use) since it's cheap
     // relative to the LLM round trip this task is about to make anyway, and
@@ -333,6 +346,12 @@ fn processMessageTask(
         .identity_id = identity_id,
         .is_owner = auth.isOwner(config, connector.platform(), msg.user_id),
     };
+    var convert_flow_adapter: ConvertFlowToolAdapter = .{
+        .pending = pending_conversions,
+        .now = ts,
+        .chat_id = msg.chat_id,
+        .user_id = msg.user_id,
+    };
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
         .io = io,
@@ -344,11 +363,13 @@ fn processMessageTask(
         .now = ts,
         .reminders = reminder_adapter.sink(),
         .alerts = alert_adapter.sink(),
+        .convert_flow = convert_flow_adapter.sink(),
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
     };
-    handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, io, ts, max_message_len, msg);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, pending_conversions, io, ts, max_message_len, msg);
+    if (claimed) attachment_cleanup_path = null;
 }
 
 /// Downloads `att`'s bytes into `tmp_dir` and returns the local file path
@@ -433,23 +454,36 @@ fn attachmentPlaceholder(allocator: std.mem.Allocator, att: iface.Attachment) ![
 /// `attachmentPlaceholder` on any failure (whisper not configured, the
 /// attachment didn't download, the transcription call itself failed, or
 /// came back empty) rather than ever blocking the reply on it.
-fn resolveQuestion(a: std.mem.Allocator, io: Io, config: *const config_mod.Config, tool_ctx: tool_registry.ToolContext, msg: iface.Message, text: []const u8) []const u8 {
-    if (text.len > 0) return text;
-    const att = msg.attachment orelse return text;
+const ResolvedQuestion = struct {
+    text: []const u8,
+    /// Set when a "🎙️ Transcribing…" placeholder was already sent — handed
+    /// into `replyWithAnswer` so it morphs into the "🤔 Thinking..."
+    /// placeholder instead of a second message appearing right after it.
+    placeholder_id: ?[]const u8 = null,
+};
+
+fn resolveQuestion(connector: iface.Connector, a: std.mem.Allocator, io: Io, config: *const config_mod.Config, tool_ctx: tool_registry.ToolContext, msg: iface.Message, text: []const u8) ResolvedQuestion {
+    if (text.len > 0) return .{ .text = text };
+    const att = msg.attachment orelse return .{ .text = text };
 
     if (att.kind == .voice) {
         if (config.whisper_url) |whisper_url| {
             if (tool_ctx.attachment_path) |path| {
+                const placeholder_id = connector.sendMessageReturningId(a, msg.chat_id, "🎙️ Transcribing your voice message…", msg.message_id) catch |err| blk: {
+                    std.log.warn("transcribe: couldn't send a placeholder for chat {s}: {t}", .{ msg.chat_id, err });
+                    break :blk null;
+                };
                 if (transcribe.transcribe(a, io, whisper_url, config.tmp_dir, path)) |transcript| {
-                    if (transcript.len > 0) return transcript;
+                    if (transcript.len > 0) return .{ .text = transcript, .placeholder_id = placeholder_id };
                 } else |err| {
                     std.log.warn("transcribe: failed for chat {s}: {t}", .{ msg.chat_id, err });
                 }
+                return .{ .text = attachmentPlaceholder(a, att) catch text, .placeholder_id = placeholder_id };
             }
         }
     }
 
-    return attachmentPlaceholder(a, att) catch text;
+    return .{ .text = attachmentPlaceholder(a, att) catch text };
 }
 
 /// Resolves (upserting as needed) the internal `identities.id` for a
@@ -577,6 +611,11 @@ fn checkAndSendDueDigests(
     }
 }
 
+/// Returns whether this message's attachment (if any) was claimed by the
+/// interactive `/convert` flow — `processMessageTask` must not delete a
+/// claimed file via its own attachment-cleanup `defer` (see
+/// `features/convert_flow.zig`'s `PendingConversions`, which owns cleanup
+/// for a claimed file from here on).
 fn handleMessage(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -589,18 +628,40 @@ fn handleMessage(
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
+    pending_conversions: *convert_flow.PendingConversions,
     io: Io,
     now: i64,
     max_message_len: usize,
     msg: iface.Message,
-) void {
+) bool {
+    // A button press / reaction pick has neither text nor an attachment of
+    // its own, so this must run before the "neither" bail-out just below.
+    if (msg.choice_picked) |picked| {
+        convert_flow.handleChoicePicked(connector, a, io, config.tmp_dir, pending_conversions, now, msg, picked);
+        return false;
+    }
+
     // A photo/document/voice/audio/video with no caption has no `text` at
     // all (Telegram never sets it for those), but it still deserves a
     // reply when addressed to the bot — the attachment alone is enough for
     // e.g. convert_file to have something to work with. Only bail when
     // there's neither text nor an attachment to react to.
     const text = msg.text orelse "";
-    if (text.len == 0 and msg.attachment == null) return;
+    if (text.len == 0 and msg.attachment == null) return false;
+
+    // An attachment arriving while (chat, user) is mid-flow, waiting for a
+    // file — claimed here, before the big dispatch chain and before
+    // `isAddressedToBot`, so a captionless upload in a group (no mention/
+    // reply) isn't silently dropped by that gate the way it would be
+    // otherwise. Excludes the protected one-shot `/convert <format>`
+    // caption, which keeps working completely unchanged below.
+    if (msg.attachment != null and !isOneShotConvertCaption(text) and
+        pending_conversions.isAwaitingFile(a, now, msg.chat_id, msg.user_id))
+    {
+        if (convert_flow.claimAttachmentForConvert(connector, a, pending_conversions, now, msg, tool_ctx.attachment_path.?, tool_ctx.attachment_file_name)) return true;
+        // Claim failed (e.g. no candidate targets for this file type) —
+        // fall through to normal dispatch below.
+    }
 
     if (std.mem.eql(u8, text, "/ping")) {
         connector.sendMessage(a, msg.chat_id, "pong", msg.message_id);
@@ -611,47 +672,62 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/digest") or std.mem.startsWith(u8, text, "/digest ")) {
         handleDigestCommand(connector, a, pool, chat_id, digest_scheduler, llm_provider, tool_ctx, now, max_message_len, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
+        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.mute(connector, a, msg, now);
     } else if (std.mem.eql(u8, text, "/unmute")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
+        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.unmute(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/pin")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
+        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.pin(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/unpin")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
+        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.unpin(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/delete")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
+        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.deleteMessage(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/kick")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
+        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.requestConfirmation(connector, a, pool, chat_id, now, msg, .kick);
     } else if (std.mem.eql(u8, text, "/ban")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
+        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.requestConfirmation(connector, a, pool, chat_id, now, msg, .ban);
     } else if (std.mem.eql(u8, text, "/confirm")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
+        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.confirm(connector, a, pending, now, msg);
     } else if (std.mem.eql(u8, text, "/cancel")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
-        group_admin.cancel(connector, a, pending, msg);
+        // Dual-purpose: a pending conversion is per-user, not a moderation
+        // action, so it can only ever affect something the sender
+        // themselves started — no admin gate needed for that half. Falls
+        // through to the existing admin-gated ban/kick cancel, unchanged,
+        // only when there's nothing of the sender's own to cancel.
+        if (pending_conversions.cancel(a, msg.chat_id, msg.user_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Conversion cancelled.");
+        } else {
+            if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
+            group_admin.cancel(connector, a, pending, msg);
+        }
     } else if (std.mem.startsWith(u8, text, "/token")) {
-        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleToken(connector, a, pool, chat_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/magicword") or std.mem.startsWith(u8, text, "/magicword ")) {
         handleMagicWord(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/persona") or std.mem.startsWith(u8, text, "/persona ")) {
         handlePersonaCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/scraper") or std.mem.startsWith(u8, text, "/scraper ")) {
-        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleScraperCommand(connector, a, pool, msg, text);
     } else if (std.mem.eql(u8, text, "/remind") or std.mem.startsWith(u8, text, "/remind ")) {
         handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/reminders")) {
         handleRemindersList(connector, a, pool, chat_id, now, msg.chat_id, msg.message_id);
-    } else if (std.mem.eql(u8, text, "/convert") or std.mem.startsWith(u8, text, "/convert ")) {
+    } else if (std.mem.eql(u8, text, "/convert")) {
+        // Bare /convert, no attachment claimed above (either none present,
+        // or claiming it failed) — start (or restart) the multi-stage flow.
+        convert_flow.beginConvertFlow(connector, a, pending_conversions, now, msg);
+    } else if (std.mem.startsWith(u8, text, "/convert ")) {
+        // UNCHANGED one-shot path: /convert <format> as an attachment's
+        // caption, calling convert_file directly, no LLM round trip.
         handleConvertCommand(connector, a, tool_ctx, msg, text);
     } else if (std.mem.eql(u8, text, "/alert") or std.mem.startsWith(u8, text, "/alert ")) {
         handleAlertCommand(connector, a, config, pool, chat_id, identity_id, msg, text);
@@ -666,21 +742,31 @@ fn handleMessage(
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
-        return;
+        return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
         // The bot's free-form LLM Q&A is owner-only by default (toggle via
         // WARDEN_LLM_OWNER_ONLY) — every other command above this stays
         // open to anyone (unchanged). Silent, not an error reply: an
         // unaddressed mention from someone else shouldn't announce "I only
         // answer my owner" to the whole group.
-        if (config.llm_owner_only and !auth.isOwner(config, connector.platform(), msg.user_id)) return;
+        if (config.llm_owner_only and !auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
-        const question = resolveQuestion(a, io, config, tool_ctx, msg, text);
+        const resolved = resolveQuestion(connector, a, io, config, tool_ctx, msg, text);
         // Per-chat /persona override, falling back to the global default —
         // see `store/chat_settings.zig`'s `getSystemPromptOverride`.
         const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, question, replied_to);
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, resolved.text, replied_to, resolved.placeholder_id);
     }
+    return false;
+}
+
+/// True for the protected one-shot `/convert <format>` caption path (a
+/// non-empty argument after "/convert ") — must be excluded from the
+/// multi-stage flow's attachment-claim check so it keeps working exactly
+/// as before.
+fn isOneShotConvertCaption(text: []const u8) bool {
+    if (!std.mem.startsWith(u8, text, "/convert ")) return false;
+    return std.mem.trim(u8, text["/convert ".len..], " ").len > 0;
 }
 
 /// Gate for every group-management command (/mute, /kick, /ban, etc.) —
@@ -1341,13 +1427,19 @@ fn handleConvertCommand(
         reply(connector, a, msg.chat_id, msg.message_id, "Usage: send a photo, document, voice note, audio, or video with \"/convert <format>\" as its caption, e.g. /convert pdf.");
         return;
     }
+
+    const placeholder_id = connector.sendMessageReturningId(a, msg.chat_id, "🔄 Converting your file…", msg.message_id) catch |err| blk: {
+        std.log.warn("convert: couldn't send a placeholder for chat {s}: {t}", .{ msg.chat_id, err });
+        break :blk null;
+    };
+
     const input_json = std.json.Stringify.valueAlloc(a, .{ .target_format = arg }, .{}) catch return;
     const result = convert_file.tool.execute(tool_ctx, input_json) catch |err| {
         std.log.err("convert: /convert command failed: {t}", .{err});
-        reply(connector, a, msg.chat_id, msg.message_id, "Something went wrong converting that file, try again.");
+        convert_flow.finalizePlaceholder(connector, a, msg.chat_id, placeholder_id, msg.message_id, "Something went wrong converting that file, try again.");
         return;
     };
-    connector.sendMessage(a, msg.chat_id, result, msg.message_id);
+    convert_flow.finalizePlaceholder(connector, a, msg.chat_id, placeholder_id, msg.message_id, result);
 }
 
 /// Shared by `/reminders` and the `set_reminder` LLM tool's `action=list`.
@@ -1457,6 +1549,33 @@ const AlertToolAdapter = struct {
         const self: *AlertToolAdapter = @ptrCast(@alignCast(ptr));
         const pending = try alert_store.listPending(self.pool, allocator, self.chat_id);
         return formatPendingAlerts(allocator, pending);
+    }
+};
+
+/// Wires the `begin_file_conversion` LLM tool (see
+/// `tools/begin_conversion.zig`) to `PendingConversions` for one specific
+/// message's chat/sender — same per-message construction as
+/// `ReminderToolAdapter`/`AlertToolAdapter`. `chat_id`/`user_id` here are
+/// the native platform strings (`msg.chat_id`/`msg.user_id`), matching
+/// `PendingConversions`' own composite-key scheme, not the internal
+/// integer ids the other two adapters use.
+const ConvertFlowToolAdapter = struct {
+    pending: *convert_flow.PendingConversions,
+    now: i64,
+    chat_id: []const u8,
+    user_id: []const u8,
+
+    fn sink(self: *ConvertFlowToolAdapter) tool_registry.ConvertFlowSink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.ConvertFlowSink.VTable = .{
+        .beginAwaitingFile = beginAwaitingFileFn,
+    };
+
+    fn beginAwaitingFileFn(ptr: *anyopaque) anyerror!void {
+        const self: *ConvertFlowToolAdapter = @ptrCast(@alignCast(ptr));
+        return self.pending.beginAwaitingFile(self.now, self.chat_id, self.user_id);
     }
 };
 
@@ -1630,11 +1749,20 @@ fn replyWithAnswer(
     reply_to: ?[]const u8,
     question: []const u8,
     replied_to: ?[]const u8,
+    existing_placeholder_id: ?[]const u8,
 ) void {
     // The placeholder + ticker only work when the platform supports
     // editing (Telegram does); anything that doesn't falls back to
     // exactly the old behavior — one blocking call, one send at the end.
-    const placeholder_id = connector.sendMessageReturningId(a, native_chat_id, thinking_text, reply_to) catch |err| blk: {
+    // `existing_placeholder_id` (from `resolveQuestion`'s "🎙️
+    // Transcribing…" placeholder) is reused and morphed rather than
+    // sending a second message right after it.
+    const placeholder_id = if (existing_placeholder_id) |pid| blk: {
+        connector.editMessage(a, native_chat_id, pid, thinking_text) catch |err| {
+            std.log.warn("qa: couldn't morph the transcription placeholder for chat {s}: {t}", .{ native_chat_id, err });
+        };
+        break :blk pid;
+    } else connector.sendMessageReturningId(a, native_chat_id, thinking_text, reply_to) catch |err| blk: {
         std.log.warn("qa: couldn't send a placeholder for chat {s}, falling back to a plain reply: {t}", .{ native_chat_id, err });
         break :blk null;
     };
@@ -1802,6 +1930,8 @@ test {
     _ = @import("features/feed_watcher.zig");
     _ = @import("features/feed_parse.zig");
     _ = @import("features/transcribe.zig");
+    _ = @import("features/convert_flow.zig");
+    _ = @import("tools/begin_conversion.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
     _ = @import("tools/calculator.zig");
@@ -1821,6 +1951,7 @@ test {
     _ = @import("tools/urban_dictionary.zig");
     _ = @import("tools/hackernews.zig");
     _ = @import("platform/telegram.zig");
+    _ = @import("telegram/client.zig");
     _ = @import("http_util.zig");
     _ = @import("features/scheduler.zig");
     _ = @import("features/digest.zig");

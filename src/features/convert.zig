@@ -19,6 +19,40 @@ pub fn familyOfExt(ext: []const u8) Family {
     return .unknown;
 }
 
+/// Every valid target extension (bare, no leading dot — "png" not ".png")
+/// for a file whose source extension is `source_ext`, excluding
+/// `source_ext` itself — the choice list `features/convert_flow.zig` offers
+/// as buttons/reactions. Must stay in lockstep with `convert()`'s actual
+/// dispatch rules (family-equality plus the pdf-source-only-to-txt special
+/// case) or a button could offer a conversion that would just fail.
+/// Returned strings are static literals borrowed from the extension
+/// tables, not allocated — only the returned slice itself is owned by
+/// `allocator` and needs freeing.
+pub fn candidateTargets(allocator: std.mem.Allocator, source_ext: []const u8) ![]const []const u8 {
+    const family = familyOfExt(source_ext);
+    if (family == .unknown) return &.{};
+
+    // pdftotext is the only supported pdf-as-source path (see
+    // `convertDocument`) — txt is the sole valid target.
+    if (family == .document and std.ascii.eqlIgnoreCase(source_ext, ".pdf")) {
+        return allocator.dupe([]const u8, &.{"txt"});
+    }
+
+    const exts: []const []const u8 = switch (family) {
+        .document => &document_exts,
+        .image => &image_exts,
+        .audio_video => &av_exts,
+        .unknown => unreachable,
+    };
+
+    var out: std.ArrayList([]const u8) = .empty;
+    for (exts) |e| {
+        if (std.ascii.eqlIgnoreCase(e, source_ext)) continue;
+        try out.append(allocator, e[1..]);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Extension including the leading dot, or "" if `path` has none. Doesn't
 /// use `std.fs.path` to stay consistent with `main.zig`'s own hand-rolled
 /// extension lookup for downloaded attachments (`extensionFor`).
@@ -170,6 +204,46 @@ test "familyOfExt classifies known extensions and defaults to unknown" {
     try testing.expectEqual(Family.audio_video, familyOfExt(".mp3"));
     try testing.expectEqual(Family.unknown, familyOfExt(".exe"));
     try testing.expectEqual(Family.unknown, familyOfExt(""));
+}
+
+test "candidateTargets excludes the source extension and matches convert()'s accepted pairs" {
+    const a = testing.allocator;
+
+    const png_targets = try candidateTargets(a, ".png");
+    defer a.free(png_targets);
+    for (png_targets) |t| try testing.expect(!std.ascii.eqlIgnoreCase(t, "png"));
+    var found_jpg = false;
+    for (png_targets) |t| if (std.ascii.eqlIgnoreCase(t, "jpg")) {
+        found_jpg = true;
+    };
+    try testing.expect(found_jpg);
+    // Every offered target must round-trip through familyOfExt into the
+    // same family as the source, or convert() would reject it outright.
+    for (png_targets) |t| {
+        const with_dot = std.fmt.allocPrint(a, ".{s}", .{t}) catch unreachable;
+        defer a.free(with_dot);
+        try testing.expectEqual(Family.image, familyOfExt(with_dot));
+    }
+
+    // pdf-as-source is the one special case: only txt.
+    const pdf_targets = try candidateTargets(a, ".pdf");
+    defer a.free(pdf_targets);
+    try testing.expectEqual(@as(usize, 1), pdf_targets.len);
+    try testing.expectEqualStrings("txt", pdf_targets[0]);
+
+    // A non-pdf document source can target pdf (convertDocument's own
+    // special case), unlike image/audio_video which stay strictly
+    // same-family.
+    const txt_targets = try candidateTargets(a, ".txt");
+    defer a.free(txt_targets);
+    var found_pdf = false;
+    for (txt_targets) |t| if (std.ascii.eqlIgnoreCase(t, "pdf")) {
+        found_pdf = true;
+    };
+    try testing.expect(found_pdf);
+
+    const unknown_targets = try candidateTargets(a, ".exe");
+    try testing.expectEqual(@as(usize, 0), unknown_targets.len);
 }
 
 test "extensionOf finds the last dot, ignoring directory dots" {

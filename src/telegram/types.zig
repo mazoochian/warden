@@ -100,10 +100,23 @@ pub const FileResponse = struct {
     description: ?[]const u8 = null,
 };
 
+/// A button press on a message's inline keyboard (see
+/// `client.zig`'s `sendChoicePrompt`). Telegram never sets `message`
+/// alongside `update.message` — a callback query is its own update kind.
+pub const CallbackQuery = struct {
+    id: []const u8,
+    from: ?User = null,
+    /// The message the pressed button was attached to.
+    message: ?Message = null,
+    /// The pressed button's `callback_data`.
+    data: ?[]const u8 = null,
+};
+
 pub const Update = struct {
     update_id: i64,
     message: ?Message = null,
     edited_message: ?Message = null,
+    callback_query: ?CallbackQuery = null,
 };
 
 pub fn GetUpdatesResponse(comptime T: type) type {
