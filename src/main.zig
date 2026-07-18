@@ -17,6 +17,8 @@ const messages = @import("store/messages.zig");
 const stats = @import("store/stats.zig");
 const reminders = @import("store/reminders.zig");
 const reminder_format = @import("features/reminder_format.zig");
+const alert_store = @import("store/alerts.zig");
+const alert_feature = @import("features/alerts.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
@@ -44,6 +46,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/urban_dictionary.zig").tool,
     @import("tools/hackernews.zig").tool,
     @import("tools/remind.zig").tool,
+    @import("tools/set_alert.zig").tool,
     convert_file.tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
@@ -213,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
         const now = Io.Timestamp.now(io, .real).toSeconds();
         checkAndSendDueDigests(connectors, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
         checkAndSendDueReminders(connectors, gpa, &pool, now);
+        alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
     }
 }
 
@@ -319,6 +323,12 @@ fn processMessageTask(
         .is_owner = auth.isOwner(config, connector.platform(), msg.user_id),
         .now = ts,
     };
+    var alert_adapter: AlertToolAdapter = .{
+        .pool = pool,
+        .chat_id = chat_id,
+        .identity_id = identity_id,
+        .is_owner = auth.isOwner(config, connector.platform(), msg.user_id),
+    };
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
         .io = io,
@@ -329,6 +339,7 @@ fn processMessageTask(
         .scraper = bot_config.loadScraperConfig(pool, a),
         .now = ts,
         .reminders = reminder_adapter.sink(),
+        .alerts = alert_adapter.sink(),
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -610,6 +621,10 @@ fn handleMessage(
         handleRemindersList(connector, a, pool, chat_id, now, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/convert") or std.mem.startsWith(u8, text, "/convert ")) {
         handleConvertCommand(connector, a, tool_ctx, msg, text);
+    } else if (std.mem.eql(u8, text, "/alert") or std.mem.startsWith(u8, text, "/alert ")) {
+        handleAlertCommand(connector, a, config, pool, chat_id, identity_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/alerts")) {
+        handleAlertsList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
@@ -1032,6 +1047,118 @@ fn handleRemindersList(
     connector.sendMessage(a, native_chat_id, formatPendingReminders(a, pending, now), reply_to);
 }
 
+/// `/alert <crypto|weather|aqi> <subject> <above|below> <threshold>` sets a
+/// standing alert; `/alert cancel <id>` cancels one. Subject may contain
+/// spaces (city names) — everything between the kind and the trailing
+/// `<above|below> <threshold>` pair is joined back together. Same
+/// open-to-create/creator-or-owner-to-cancel authorization as `/remind`.
+fn handleAlertCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const usage = "Usage: /alert <crypto|weather|aqi> <subject> <above|below> <threshold>, or /alert cancel <id>";
+    const arg = std.mem.trim(u8, text["/alert".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const first_word = it.first();
+
+    if (std.mem.eql(u8, first_word, "cancel")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /alert cancel <id> (see /alerts for ids).");
+            return;
+        };
+        const al = (alert_store.get(pool, a, id) catch |err| {
+            std.log.err("alert: lookup failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that alert, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No alert with that id.");
+            return;
+        };
+        if (al.chat_id != chat_id) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No alert with that id.");
+            return;
+        }
+        if (al.identity_id != identity_id and !auth.isOwner(config, connector.platform(), msg.user_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only whoever set that alert (or the owner) can cancel it.");
+            return;
+        }
+        alert_store.cancel(pool, id) catch |err| {
+            std.log.err("alert: cancel failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't cancel that alert, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Alert canceled.");
+        return;
+    }
+
+    const kind_str = first_word;
+    const kind = std.meta.stringToEnum(alert_store.Kind, kind_str) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Unknown kind — use crypto, weather, or aqi.");
+        return;
+    };
+
+    var tokens: std.ArrayList([]const u8) = .empty;
+    defer tokens.deinit(a);
+    while (it.next()) |tok| {
+        if (tok.len > 0) tokens.append(a, tok) catch return;
+    }
+    if (tokens.items.len < 3) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    const threshold_str = tokens.items[tokens.items.len - 1];
+    const condition_str = tokens.items[tokens.items.len - 2];
+    const subject = std.mem.join(a, " ", tokens.items[0 .. tokens.items.len - 2]) catch return;
+
+    const condition = std.meta.stringToEnum(alert_store.Condition, condition_str) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Unknown condition — use above or below.");
+        return;
+    };
+    const threshold = std.fmt.parseFloat(f64, threshold_str) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that threshold — it should be a plain number.");
+        return;
+    };
+
+    const currency: ?[]const u8 = if (kind == .crypto) "usd" else null;
+    const id = alert_store.create(pool, chat_id, identity_id, kind, subject, currency, condition, threshold) catch |err| {
+        std.log.err("alert: failed to create alert for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that alert, try again.");
+        return;
+    };
+    const unit = if (kind == .crypto) "usd" else if (kind == .weather) "°C" else "AQI";
+    const confirmation = std.fmt.allocPrint(a, "Alert #{d} set: notify when {s} is {s} {d} {s}.", .{ id, subject, condition_str, threshold, unit }) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+fn handleAlertsList(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    native_chat_id: []const u8,
+    reply_to: ?[]const u8,
+) void {
+    const pending = alert_store.listPending(pool, a, chat_id) catch |err| {
+        std.log.err("alerts: list failed for chat {d}: {t}", .{ chat_id, err });
+        connector.sendMessage(a, native_chat_id, "Couldn't load alerts, try again.", reply_to);
+        return;
+    };
+    connector.sendMessage(a, native_chat_id, formatPendingAlerts(a, pending), reply_to);
+}
+
 /// Direct entry point to `convert_file` (see `tools/convert_file.zig`) for
 /// people who'd rather type an explicit command than phrase a request in
 /// natural language — same file (`tool_ctx.attachment_path`, downloaded by
@@ -1120,6 +1247,69 @@ const ReminderToolAdapter = struct {
         return formatPendingReminders(allocator, pending, self.now);
     }
 };
+
+/// Wires the `set_alert` LLM tool (see `tools/set_alert.zig`) to real
+/// Postgres-backed alerts — same shape/reasoning as `ReminderToolAdapter`.
+const AlertToolAdapter = struct {
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    is_owner: bool,
+
+    fn sink(self: *AlertToolAdapter) tool_registry.AlertSink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.AlertSink.VTable = .{
+        .create = createFn,
+        .cancel = cancelFn,
+        .listPending = listPendingFn,
+    };
+
+    fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, kind: []const u8, subject: []const u8, currency: ?[]const u8, condition: []const u8, threshold: f64) anyerror!i64 {
+        const self: *AlertToolAdapter = @ptrCast(@alignCast(ptr));
+        _ = allocator;
+        return alert_store.create(
+            self.pool,
+            self.chat_id,
+            self.identity_id,
+            std.meta.stringToEnum(alert_store.Kind, kind) orelse return error.InvalidAlertKind,
+            subject,
+            currency,
+            std.meta.stringToEnum(alert_store.Condition, condition) orelse return error.InvalidAlertCondition,
+            threshold,
+        );
+    }
+
+    fn cancelFn(ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!tool_registry.AlertSink.CancelResult {
+        const self: *AlertToolAdapter = @ptrCast(@alignCast(ptr));
+        const al = (try alert_store.get(self.pool, allocator, id)) orelse return .not_found;
+        if (al.chat_id != self.chat_id) return .not_found;
+        if (al.identity_id != self.identity_id and !self.is_owner) return .not_authorized;
+        try alert_store.cancel(self.pool, id);
+        return .canceled;
+    }
+
+    fn listPendingFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8 {
+        const self: *AlertToolAdapter = @ptrCast(@alignCast(ptr));
+        const pending = try alert_store.listPending(self.pool, allocator, self.chat_id);
+        return formatPendingAlerts(allocator, pending);
+    }
+};
+
+/// Shared by `/alerts` and the `set_alert` LLM tool's `action=list`.
+fn formatPendingAlerts(a: std.mem.Allocator, pending: []const alert_store.PendingAlert) []const u8 {
+    if (pending.len == 0) return "No alerts set. Set one with /alert <crypto|weather|aqi> <subject> <above|below> <threshold> (or just ask).";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Alerts:\n", .{}) catch return "";
+    for (pending) |al| {
+        const unit = if (al.currency) |c| c else if (al.kind == .weather) "°C" else "AQI";
+        w.print("  #{d} {s} {s} {s} {d} {s}\n", .{ al.id, @tagName(al.kind), al.subject, @tagName(al.condition), al.threshold, unit }) catch return "";
+    }
+    return buf.writer.buffered();
+}
 
 /// Delivers through whichever of `connectors` owns each due reminder's
 /// platform — see `checkAndSendDueDigests`'s doc comment for the same
@@ -1442,6 +1632,9 @@ test {
     _ = @import("tools/remind.zig");
     _ = @import("features/convert.zig");
     _ = @import("tools/convert_file.zig");
+    _ = @import("store/alerts.zig");
+    _ = @import("features/alerts.zig");
+    _ = @import("tools/set_alert.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
     _ = @import("tools/calculator.zig");

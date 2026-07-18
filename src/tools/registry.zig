@@ -57,6 +57,38 @@ pub const ReminderSink = struct {
     }
 };
 
+/// Same ptr+vtable shape as `ReminderSink`, for the `set_alert` tool — kept
+/// as its own type (rather than folding into `ReminderSink`) since alerts
+/// have a materially different shape (kind/subject/condition/threshold vs.
+/// message/due_at) and no shared behavior beyond "persisted, chat-scoped,
+/// cancelable thing".
+pub const AlertSink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const CancelResult = enum { canceled, not_found, not_authorized };
+
+    pub const VTable = struct {
+        create: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, kind: []const u8, subject: []const u8, currency: ?[]const u8, condition: []const u8, threshold: f64) anyerror!i64,
+        cancel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!CancelResult,
+        /// Same "sink formats its own listing" reasoning as
+        /// `ReminderSink.VTable.listPending`.
+        listPending: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8,
+    };
+
+    pub fn create(self: AlertSink, allocator: std.mem.Allocator, kind: []const u8, subject: []const u8, currency: ?[]const u8, condition: []const u8, threshold: f64) !i64 {
+        return self.vtable.create(self.ptr, allocator, kind, subject, currency, condition, threshold);
+    }
+
+    pub fn cancel(self: AlertSink, allocator: std.mem.Allocator, id: i64) !CancelResult {
+        return self.vtable.cancel(self.ptr, allocator, id);
+    }
+
+    pub fn listPending(self: AlertSink, allocator: std.mem.Allocator) ![]const u8 {
+        return self.vtable.listPending(self.ptr, allocator);
+    }
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -77,6 +109,9 @@ pub const ToolContext = struct {
     /// tools needing reminder persistence (e.g. digest generation, which
     /// always passes an empty tool list anyway).
     reminders: ?ReminderSink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `set_alert` tool.
+    alerts: ?AlertSink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the
