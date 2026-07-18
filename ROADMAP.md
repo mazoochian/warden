@@ -10,9 +10,10 @@ file-conversion landed in `fc3658d`), **Phase 2's core (unencrypted Matrix)
 is implemented** but not yet live-tested against a real homeserver (no
 credentials available this session; see Phase 2's note — Matrix E2E
 encryption was split out into its own Phase 2b rather than bundled in),
-**Phase 3 (reminder recurrence + absolute time) is committed**, and **Phase
-4 (price/metric alerts) is committed**. `zig build test` green (138/138).
-Phases 5 onward are unstarted.
+**Phase 3 (reminder recurrence + absolute time) is committed**, **Phase 4
+(price/metric alerts) is committed**, and **Phase 5 (RSS/news watcher) is
+committed**. `zig build test` green (143/143). Phases 6 onward are
+unstarted.
 
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
@@ -202,21 +203,38 @@ BTC crosses 70k" or "tell me if Tehran's AQI gets bad."
   the command line too, not just through the LLM tool.
 
 ## Phase 5 — RSS/news watcher
-*Effort: M. Dependencies: Phase 2.*
+*Effort: M. Dependencies: Phase 2. Status: done (core; see deferred item
+below).*
 
-Composes `scrape_site`/`web_search` and the digest infrastructure into a
-standing feed-watcher.
+Composes a small hand-rolled feed parser with the digest infrastructure's
+LLM-summarization pattern into a standing feed-watcher.
 
-- New `src/store/feed_watches.zig` (chat_id, feed_url, last_seen_guid_or_ts).
-- New `src/features/feed_watcher.zig`: poll each watched feed (plain HTTP GET
-  + a small hand-rolled RSS/Atom parse — no new dependency needed given
-  `http_util.zig` already exists), diff against last-seen, and reuse
-  `digest.zig`'s pattern of an LLM call over a small text blob to write a
-  one-paragraph "here's what's new" blurb instead of dumping raw items.
-- `/watch <feed_url>`, `/unwatch <feed_url>`, `/watches` commands, same shape
-  as `/digest on|off`.
-- Optional: let the LLM tool-call into `web_search`/`scrape_site` first to
-  *find* a feed URL from a plain-language "watch TechCrunch" request.
+- `src/store/feed_watches.zig` + migration `0005_feed_watches.sql` — keyed
+  by `(chat_id, feed_url)` rather than an id, since `/unwatch <url>` is a
+  more natural command than needing to look up an id first, and unlike
+  reminders/alerts, watching is open to anyone in the chat (not restricted
+  to whoever added it) — same precedent as `/digest on|off`.
+- `src/features/feed_parse.zig`: a deliberately small, non-namespace-aware
+  RSS 2.0 / Atom parser extracting each entry's title + a stable identifier
+  (`<guid>`/`<link>` for RSS, `<id>` for Atom) in document order. Not a real
+  XML parser — good enough for diffing "what's new," not general feed
+  reading.
+- `src/features/feed_watcher.zig`'s `checkAndNotifyFeeds` (wired into the
+  poll loop next to the other three checks): fetches each due feed (plain
+  `http_util.get`, no new dependency), diffs against `last_seen_guid`, and
+  for genuinely new items reuses `digest.zig`'s pattern of an LLM call over
+  a short text blob to write a 1-2 sentence blurb instead of dumping raw
+  titles. The very first check of a newly-added feed only records a
+  baseline without announcing anything — same "don't replay history"
+  reasoning as Phase 2's discarded first Matrix `/sync`.
+- `/watch <feed_url>`, `/unwatch <feed_url>`, `/watches` commands, same
+  shape as `/digest on|off`.
+- **Deferred, not built this pass**: letting the LLM tool-call into
+  `web_search`/`scrape_site` to *find* a feed URL from a plain-language
+  "watch TechCrunch" request. `/watch` needs an explicit feed URL for now —
+  consistent with `/digest` itself also having no corresponding LLM tool,
+  but worth adding if "watch X" without a URL turns out to be how people
+  actually want to use this.
 
 ## Phase 6 — Per-chat persona / system-prompt override
 *Effort: S. Dependencies: Phase 1.*
