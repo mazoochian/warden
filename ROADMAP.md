@@ -5,9 +5,10 @@ are meant to ship incrementally, one at a time, not as a big-bang rewrite —
 this is a personal project built in spare time, so scope stays deliberately
 small per phase.
 
-Status as of writing: **Phase 1 is in progress** (the reminders and
-file-conversion features described below already exist in the working tree
-but aren't committed yet). Everything from Phase 2 onward is unstarted.
+Status as of writing: **Phase 1 is committed** — reminders and
+file-conversion landed in `fc3658d`, `zig build test` is green (114/114),
+and a live smoke test against the dev bot is in progress. Everything from
+Phase 2 onward is unstarted.
 
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
