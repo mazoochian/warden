@@ -5,10 +5,13 @@ are meant to ship incrementally, one at a time, not as a big-bang rewrite —
 this is a personal project built in spare time, so scope stays deliberately
 small per phase.
 
-Status as of writing: **Phase 1 is committed** — reminders and
-file-conversion landed in `fc3658d`, `zig build test` is green (114/114),
-and a live smoke test against the dev bot is in progress. Everything from
-Phase 2 onward is unstarted.
+Status as of writing: **Phase 1 is committed** (reminders and
+file-conversion landed in `fc3658d`) and **Phase 2's core (unencrypted
+Matrix) is implemented**, `zig build test` green (124/124) — not yet
+live-tested against a real homeserver (no credentials available this
+session; see Phase 2's note). Matrix E2E encryption was split out into its
+own Phase 2b rather than bundled in, per the libolm-not-hand-rolled-crypto
+decision below. Phases 3 onward are unstarted.
 
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
@@ -37,26 +40,83 @@ making one explicit scoping call, not writing new code.
 - Close the phase with `zig build test` green and a manual smoke test against
   a real Telegram chat (`/remind 1m ping me`, convert a sent photo).
 
-## Phase 2 — Real Matrix connector, parity with Telegram
-*Effort: L. Dependencies: Phase 1.*
+## Phase 2 — Real Matrix connector, parity with Telegram (plaintext rooms)
+*Effort: L. Dependencies: Phase 1. Status: implemented, not live-verified.*
 
 The biggest lift on this list, and worth doing early: every scheduled feature
 after this point (alerts, RSS watching) currently carries a latent
 multi-connector bug that's cheap to fix once and expensive to keep
 re-discovering.
 
-- Replace the ~60-line `src/platform/matrix.zig` stub (today: `poll` returns
-  empty, `sendMessage` just logs and drops) with a real Client-Server API
-  implementation at roughly `telegram.zig`'s scale (~400+ lines): login,
-  `/sync` long-poll for incoming events, message send, `m.replace` edits (for
-  the live-editing "thinking..." reply flow), media upload/download for
-  `mxc://` URIs (`sendPhoto`/`sendDocument`/`downloadFile`), and power-level-
-  based moderation (mute via power-level demotion, since Matrix has no native
-  mute).
-- Add `WARDEN_MATRIX_HOMESERVER_URL`, `WARDEN_MATRIX_ACCESS_TOKEN` (or
-  user/pass), `WARDEN_MATRIX_OWNER_ID` to `config.zig` — purely additive,
-  since `auth.isOwner` already takes a platform argument and iterates
+Encryption was explicitly scoped out of this phase after a mid-session
+check-in: Matrix's E2E encryption (Olm/Megolm) is a full cryptographic
+protocol stack, and hand-rolling it from scratch carries real risk of
+subtly-wrong crypto with no way to catch it without a security review and
+test vectors. The agreed approach is to bind the audited `libolm` C library
+via Zig FFI (same pattern as linking `libpq`) rather than reimplement the
+ratchets — tracked as **Phase 2b** below, deliberately kept separate so the
+plaintext-room connector could ship without waiting on it.
+
+Done:
+- Replaced the ~60-line `src/platform/matrix.zig` stub with a real
+  Client-Server API implementation (`src/matrix/client.zig` +
+  `src/matrix/types.zig`, ~650 lines together): access-token auth, `/sync`
+  long-poll (discarding the first response's room backlog so a restart
+  doesn't re-answer old messages), message send/reply, `m.replace` edits for
+  the live-editing "thinking..." flow, media upload/download for `mxc://`
+  URIs, auto-join on invite, and power-level-based moderation (kick/ban
+  natively; mute/unmute via power-level demotion, since Matrix has no native
+  mute or mute expiry).
+- Added `WARDEN_MATRIX_HOMESERVER_URL`, `WARDEN_MATRIX_ACCESS_TOKEN`,
+  `WARDEN_MATRIX_OWNER_ID` to `config.zig` — purely additive, since
+  `auth.isOwner` already took a platform argument and iterated
   `config.owners`.
+- `main.zig` now builds its connector list at runtime (Telegram always,
+  Matrix only when configured) instead of a fixed one-element array.
+- Fixed the multi-connector chat-id collision the old code flagged in a doc
+  comment: `DigestScheduler` and `reminders.dueUndelivered` were keyed by
+  bare `native_chat_id`, so a due digest/reminder would get matched against
+  whichever connector happened to be polling, not the one that actually owns
+  that chat's platform. Both now carry `platform` end to end (`chats.zig`'s
+  `ChatRef`, `reminders.zig`'s `DueReminder`, `DigestScheduler`'s composite
+  keys) and `checkAndSendDueDigests`/`checkAndSendDueReminders` pick the
+  matching connector via a small `findConnector` lookup.
+- Two documented simplifications versus Telegram parity (see README's
+  "Matrix" section): every room is treated as a "group" (no DM
+  auto-engagement) since telling a real 1:1 room apart needs an extra
+  `m.direct` lookup not implemented yet; mute has no expiry.
+
+Not done / next step: **live-test against a real homeserver** — this
+session had no Matrix credentials to verify the login/sync/send/moderation
+round trip against, so treat it as best-effort-correct-per-spec rather than
+proven. Get a homeserver + access token (matrix.org account or self-hosted
+Synapse/Dendrite), then run through: DM the bot, get invited/auto-joined to
+a room, send/receive text, send a photo/document both directions, `/mute`
++`/unmute`, `/kick`/`/ban`, `/pin`/`/unpin`, `/delete`, and the live-editing
+reply flow.
+
+## Phase 2b — Matrix end-to-end encryption via libolm
+*Effort: L (new — split out of Phase 2). Dependencies: Phase 2's live
+verification, ideally, so encrypted-room bugs aren't confused with
+plaintext-room bugs.*
+
+- Bind `libolm` via Zig's C interop (`link_libc` + `linkSystemLibrary`, same
+  shape as `build.zig`'s existing `pq` linkage) rather than a from-scratch
+  Olm/Megolm reimplementation — this is the load-bearing decision from this
+  phase's scoping discussion and shouldn't be revisited without a strong
+  reason.
+- Device identity keys (Ed25519) and one-time keys (Curve25519), published
+  via `/keys/upload` and claimed via `/keys/claim`.
+- Per-device Olm sessions for the to-device key-exchange traffic, and
+  Megolm inbound/outbound group sessions for actual room message
+  encrypt/decrypt.
+- Session/key persistence across restarts (a new store table, likely) —
+  losing Megolm session state means losing the ability to decrypt history,
+  so this isn't optional the way most of warden's other state is.
+- Device verification is explicitly out of scope for a first pass (an
+  unverified-but-functional bot account is an acceptable starting point);
+  note the gap in README rather than silently pretending it's handled.
+- New Dockerfile dependency: `libolm` (and its headers) in the build image.
 - `main.zig`: generalize the currently fixed-size connector array
   (`const connectors = [_]iface.Connector{telegram_adapter.connector()}`)
   into something built at runtime, so Matrix is included only when its env
