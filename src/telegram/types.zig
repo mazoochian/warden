@@ -40,13 +40,64 @@ pub const ReplyToMessage = struct {
     text: ?[]const u8 = null,
 };
 
+/// One size variant of an inbound photo — Telegram sends several
+/// resolutions per photo; the largest (by pixel area) is what Warden
+/// downloads.
+pub const PhotoSize = struct {
+    file_id: []const u8,
+    width: i64 = 0,
+    height: i64 = 0,
+};
+
+pub const Document = struct {
+    file_id: []const u8,
+    file_name: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+};
+
+pub const Voice = struct {
+    file_id: []const u8,
+    mime_type: ?[]const u8 = null,
+};
+
+pub const Audio = struct {
+    file_id: []const u8,
+    file_name: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+};
+
+pub const Video = struct {
+    file_id: []const u8,
+    file_name: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+};
+
 pub const Message = struct {
     message_id: i64,
     from: ?User = null,
     chat: Chat,
     date: i64 = 0,
     text: ?[]const u8 = null,
+    /// Telegram never sends `text` on a photo/document/voice/audio/video
+    /// message — any caption the user typed alongside the attachment
+    /// arrives here instead. `attachmentFromMessage`'s caller folds this
+    /// into `iface.Message.text` so callers don't need to know which field
+    /// a given message actually populated.
+    caption: ?[]const u8 = null,
     reply_to_message: ?ReplyToMessage = null,
+    /// Multiple resolutions when present; adapters pick the largest.
+    photo: ?[]PhotoSize = null,
+    document: ?Document = null,
+    voice: ?Voice = null,
+    audio: ?Audio = null,
+    video: ?Video = null,
+};
+
+/// Response shape of `getFile` — resolves a `file_id` to a downloadable path.
+pub const FileResponse = struct {
+    ok: bool,
+    result: ?struct { file_path: ?[]const u8 = null } = null,
+    description: ?[]const u8 = null,
 };
 
 pub const Update = struct {

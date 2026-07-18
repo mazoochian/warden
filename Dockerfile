@@ -42,10 +42,16 @@ COPY tools/wordcloud/package.json tools/wordcloud/package-lock.json ./wordcloud/
 RUN cd wordcloud && npm ci --omit=dev
 
 # ---------------------------------------------------------------------------
-# Final image: node runtime + system Chromium for mermaid-cli.
+# Final image: node runtime + system Chromium for mermaid-cli, plus the
+# file-conversion tool's backends: pandoc (docs: txt/md/html/docx/odt),
+# poppler-utils' pdftotext (reading pdf input — pandoc can't parse pdf
+# itself), imagemagick (image format/resize), and ffmpeg (audio/video).
+# pdf *output* reuses the chromium already installed here (pandoc -> html,
+# then chromium --headless --print-to-pdf) rather than pulling in a whole
+# separate LaTeX toolchain just for that one direction.
 # ---------------------------------------------------------------------------
 FROM node:22-alpine
-RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq pandoc poppler-utils imagemagick ffmpeg && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && test -x /usr/bin/chromium-browser
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
     PUPPETEER_SKIP_DOWNLOAD=true

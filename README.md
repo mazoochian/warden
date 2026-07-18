@@ -12,6 +12,8 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Dictionaries: English definitions (dictionaryapi.dev) and slang (Urban Dictionary)
 - Hacker News: Searches HN stories and discussions
 - Site Scraping: Reads a page's clean text (not raw HTML), optionally crawling a few same-site links deep. Runs on-device by default; the owner can point it at an external scraping service instead
+- Reminders: `/remind 30m walk the dog` (or just ask in natural language) sets a one-off reminder; `/reminders` lists what's pending, `/remind cancel <id>` cancels one — restricted to whoever set it, or the bot owner
+- File Conversion: send a photo, document, voice note, audio, or video with `/convert <format>` as its caption (or ask for it in natural language) to get it back in a different format — images (jpg/png/webp/gif/bmp/tiff), audio/video (mp3/wav/ogg/mp4/webm/...), and documents (txt/md/html/docx/odt/rtf/pdf) each convert within their own family; a PDF source can only become plain text
 - Live Answers: Replies to your questions arrive as a threaded reply that updates in place — an animated "thinking" indicator while the model works, switching to "using <tool>…" while it calls a tool, then editing into the final answer. Each chat's messages are handled independently and concurrently, so one slow or stuck reply never blocks the rest of the bot
 
 # Talking to the bot
