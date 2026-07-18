@@ -11,9 +11,9 @@ is implemented** but not yet live-tested against a real homeserver (no
 credentials available this session; see Phase 2's note — Matrix E2E
 encryption was split out into its own Phase 2b rather than bundled in),
 **Phase 3 (reminder recurrence + absolute time) is committed**, **Phase 4
-(price/metric alerts) is committed**, and **Phase 5 (RSS/news watcher) is
-committed**. `zig build test` green (143/143). Phases 6 onward are
-unstarted.
+(price/metric alerts) is committed**, **Phase 5 (RSS/news watcher) is
+committed**, and **Phase 6 (per-chat persona) is committed**. `zig build
+test` green (144/144). Phase 7 and 2b are unstarted.
 
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
@@ -237,22 +237,24 @@ LLM-summarization pattern into a standing feed-watcher.
   actually want to use this.
 
 ## Phase 6 — Per-chat persona / system-prompt override
-*Effort: S. Dependencies: Phase 1.*
+*Effort: S. Dependencies: Phase 1. Status: done.*
 
 Small, high-value, and a near-perfect fit for the existing `chat_settings`
 typed-column pattern (`magic_word`, `digest_enabled` already live there).
 
-- Extend `chat_settings.zig` with a nullable per-chat system-prompt override,
-  same `INSERT ... ON CONFLICT DO UPDATE` idiom as `setMagicWord`.
-- `/persona <text>` (owner-only, matching `/magicword`'s and `/scraper`'s
-  owner-gating precedent — a chat member setting the bot's entire
-  personality is a bigger lever than a magic word) and `/persona off` to
-  fall back to `config.system_prompt`.
-- `qa.zig`'s answer path takes the per-chat override when set, global
-  default otherwise.
-- Cool factor: different group chats get a genuinely different bot
-  ("sarcastic assistant" in one, "terse and formal" in another) without
-  redeploying — cheap to build, visible payoff.
+- Migration `0006_persona.sql` added a nullable `system_prompt` column to
+  `chat_settings`; `getSystemPromptOverride`/`setSystemPromptOverride` use
+  the same `INSERT ... ON CONFLICT DO UPDATE` idiom as `setMagicWord`.
+- `/persona <text>` and `/persona off` (owner-only to change — a chat
+  member rewriting the bot's entire personality is a bigger lever than a
+  magic word) reset to `config.system_prompt`. Viewing the current persona
+  (`/persona` with no argument) is open to anyone, same as `/magicword`'s
+  own view/change split — no secret involved, unlike `/scraper`.
+- The Q&A call site in `main.zig` (where `handleMessage` calls
+  `replyWithAnswer`) resolves `chat_settings.getSystemPromptOverride` first,
+  falling back to `config.system_prompt` when unset — one line, no changes
+  needed inside `qa.zig` itself since it already just takes whatever
+  `system_prompt: ?[]const u8` its caller hands it.
 
 ## Phase 7 — Voice message transcription (+ optional TTS)
 *Effort: M/L depending on TTS scope. Dependencies: Phase 1 (attachment
