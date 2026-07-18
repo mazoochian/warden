@@ -11,7 +11,7 @@ pub const tool: registry.ToolDef = .{
     .name = "weather",
     .description = "Gets current weather (temperature, wind) for a city name. No API key required (Open-Meteo).",
     .input_schema_json =
-        \\{"type":"object","properties":{"location":{"type":"string","description":"City name, e.g. \"Berlin\" or \"Tokyo\""}},"required":["location"]}
+    \\{"type":"object","properties":{"location":{"type":"string","description":"City name, e.g. \"Berlin\" or \"Tokyo\""}},"required":["location"]}
     ,
     .execute = execute,
 };
@@ -46,64 +46,88 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
     );
     defer parsed.deinit();
 
-    var client: http.Client = .{ .allocator = ctx.allocator, .io = ctx.io };
-    defer client.deinit();
-
-    const encoded_location = try http_util.encodeQueryComponent(ctx.allocator, parsed.value.location);
-    defer ctx.allocator.free(encoded_location);
-
-    const geocode_url = try std.fmt.allocPrint(
-        ctx.allocator,
-        "https://geocoding-api.open-meteo.com/v1/search?count=1&name={s}",
-        .{encoded_location},
-    );
-    defer ctx.allocator.free(geocode_url);
-
-    const geocode_body = try http_util.get(&client, ctx.allocator, geocode_url);
-    defer ctx.allocator.free(geocode_body);
-
-    var geocode = try json.parseFromSlice(
-        GeocodeResponse,
-        ctx.allocator,
-        geocode_body,
-        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-    );
-    defer geocode.deinit();
-
-    if (geocode.value.results.len == 0) {
+    const reading = (try fetchWeather(ctx.allocator, ctx.io, parsed.value.location)) orelse
         return std.fmt.allocPrint(ctx.allocator, "No location found matching '{s}'.", .{parsed.value.location});
-    }
-    const place = geocode.value.results[0];
-
-    const forecast_url = try std.fmt.allocPrint(
-        ctx.allocator,
-        "https://api.open-meteo.com/v1/forecast?latitude={d}&longitude={d}&current=temperature_2m,wind_speed_10m,weather_code",
-        .{ place.latitude, place.longitude },
-    );
-    defer ctx.allocator.free(forecast_url);
-
-    const forecast_body = try http_util.get(&client, ctx.allocator, forecast_url);
-    defer ctx.allocator.free(forecast_body);
-
-    var forecast = try json.parseFromSlice(
-        ForecastResponse,
-        ctx.allocator,
-        forecast_body,
-        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-    );
-    defer forecast.deinit();
 
     return std.fmt.allocPrint(
         ctx.allocator,
         "{s}, {s}: {s}, {d:.1}°C, wind {d:.1} km/h",
         .{
-            place.name,
-            place.country,
-            describeWeatherCode(forecast.value.current.weather_code),
-            forecast.value.current.temperature_2m,
-            forecast.value.current.wind_speed_10m,
+            reading.name,
+            reading.country,
+            describeWeatherCode(reading.weather_code),
+            reading.temperature_2m,
+            reading.wind_speed_10m,
         },
     );
+}
+
+pub const Reading = struct {
+    name: []const u8,
+    country: []const u8,
+    temperature_2m: f64,
+    wind_speed_10m: f64,
+    weather_code: i64,
+};
+
+/// Geocodes `location` then fetches its current conditions — the
+/// fetch-and-parse core `execute` formats into prose, and
+/// `features/alerts.zig` reads `temperature_2m` from directly, skipping the
+/// tool-call loop for something this simple. Null (not an error) when the
+/// location doesn't geocode to anything.
+pub fn fetchWeather(allocator: std.mem.Allocator, io: std.Io, location: []const u8) !?Reading {
+    var client: http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const encoded_location = try http_util.encodeQueryComponent(allocator, location);
+    defer allocator.free(encoded_location);
+
+    const geocode_url = try std.fmt.allocPrint(
+        allocator,
+        "https://geocoding-api.open-meteo.com/v1/search?count=1&name={s}",
+        .{encoded_location},
+    );
+    defer allocator.free(geocode_url);
+
+    const geocode_body = try http_util.get(&client, allocator, geocode_url);
+    defer allocator.free(geocode_body);
+
+    var geocode = try json.parseFromSlice(
+        GeocodeResponse,
+        allocator,
+        geocode_body,
+        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+    );
+    defer geocode.deinit();
+
+    if (geocode.value.results.len == 0) return null;
+    const place = geocode.value.results[0];
+
+    const forecast_url = try std.fmt.allocPrint(
+        allocator,
+        "https://api.open-meteo.com/v1/forecast?latitude={d}&longitude={d}&current=temperature_2m,wind_speed_10m,weather_code",
+        .{ place.latitude, place.longitude },
+    );
+    defer allocator.free(forecast_url);
+
+    const forecast_body = try http_util.get(&client, allocator, forecast_url);
+    defer allocator.free(forecast_body);
+
+    var forecast = try json.parseFromSlice(
+        ForecastResponse,
+        allocator,
+        forecast_body,
+        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+    );
+    defer forecast.deinit();
+
+    return .{
+        .name = try allocator.dupe(u8, place.name),
+        .country = try allocator.dupe(u8, place.country),
+        .temperature_2m = forecast.value.current.temperature_2m,
+        .wind_speed_10m = forecast.value.current.wind_speed_10m,
+        .weather_code = forecast.value.current.weather_code,
+    };
 }
 
 /// WMO weather codes (https://open-meteo.com/en/docs), condensed to the

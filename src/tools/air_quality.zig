@@ -11,7 +11,7 @@ pub const tool: registry.ToolDef = .{
     .name = "air_quality",
     .description = "Gets current air quality (US AQI, PM2.5, PM10) for a city name. No API key required (Open-Meteo).",
     .input_schema_json =
-        \\{"type":"object","properties":{"location":{"type":"string","description":"City name, e.g. \"Tehran\" or \"Beijing\""}},"required":["location"]}
+    \\{"type":"object","properties":{"location":{"type":"string","description":"City name, e.g. \"Tehran\" or \"Beijing\""}},"required":["location"]}
     ,
     .execute = execute,
 };
@@ -46,70 +46,92 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
     );
     defer parsed.deinit();
 
-    var client: http.Client = .{ .allocator = ctx.allocator, .io = ctx.io };
-    defer client.deinit();
-
-    const encoded_location = try http_util.encodeQueryComponent(ctx.allocator, parsed.value.location);
-    defer ctx.allocator.free(encoded_location);
-
-    const geocode_url = try std.fmt.allocPrint(
-        ctx.allocator,
-        "https://geocoding-api.open-meteo.com/v1/search?count=1&name={s}",
-        .{encoded_location},
-    );
-    defer ctx.allocator.free(geocode_url);
-
-    const geocode_body = try http_util.get(&client, ctx.allocator, geocode_url);
-    defer ctx.allocator.free(geocode_body);
-
-    var geocode = try json.parseFromSlice(
-        GeocodeResponse,
-        ctx.allocator,
-        geocode_body,
-        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-    );
-    defer geocode.deinit();
-
-    if (geocode.value.results.len == 0) {
+    const reading = (try fetchAirQuality(ctx.allocator, ctx.io, parsed.value.location)) orelse
         return std.fmt.allocPrint(ctx.allocator, "No location found matching '{s}'.", .{parsed.value.location});
-    }
-    const place = geocode.value.results[0];
 
-    const aq_url = try std.fmt.allocPrint(
-        ctx.allocator,
-        "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={d}&longitude={d}&current=us_aqi,pm2_5,pm10",
-        .{ place.latitude, place.longitude },
-    );
-    defer ctx.allocator.free(aq_url);
-
-    const aq_body = try http_util.get(&client, ctx.allocator, aq_url);
-    defer ctx.allocator.free(aq_body);
-
-    var aq = try json.parseFromSlice(
-        AirQualityResponse,
-        ctx.allocator,
-        aq_body,
-        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
-    );
-    defer aq.deinit();
-
-    const current = aq.value.current;
-    const aqi = current.us_aqi orelse {
-        return std.fmt.allocPrint(ctx.allocator, "No air quality data available for {s}, {s}.", .{ place.name, place.country });
+    const aqi = reading.us_aqi orelse {
+        return std.fmt.allocPrint(ctx.allocator, "No air quality data available for {s}, {s}.", .{ reading.name, reading.country });
     };
 
     return std.fmt.allocPrint(
         ctx.allocator,
         "{s}, {s}: US AQI {d:.0} ({s}), PM2.5 {d:.1} µg/m³, PM10 {d:.1} µg/m³",
         .{
-            place.name,
-            place.country,
+            reading.name,
+            reading.country,
             aqi,
             describeAqi(aqi),
-            current.pm2_5 orelse 0,
-            current.pm10 orelse 0,
+            reading.pm2_5 orelse 0,
+            reading.pm10 orelse 0,
         },
     );
+}
+
+pub const Reading = struct {
+    name: []const u8,
+    country: []const u8,
+    us_aqi: ?f64,
+    pm2_5: ?f64,
+    pm10: ?f64,
+};
+
+/// Geocodes `location` then fetches its current air quality — same
+/// fetch-and-parse-core-extracted-from-execute shape as
+/// `weather.fetchWeather`, for the same reason (`features/alerts.zig` reads
+/// `us_aqi` directly). Null when the location doesn't geocode to anything.
+pub fn fetchAirQuality(allocator: std.mem.Allocator, io: std.Io, location: []const u8) !?Reading {
+    var client: http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const encoded_location = try http_util.encodeQueryComponent(allocator, location);
+    defer allocator.free(encoded_location);
+
+    const geocode_url = try std.fmt.allocPrint(
+        allocator,
+        "https://geocoding-api.open-meteo.com/v1/search?count=1&name={s}",
+        .{encoded_location},
+    );
+    defer allocator.free(geocode_url);
+
+    const geocode_body = try http_util.get(&client, allocator, geocode_url);
+    defer allocator.free(geocode_body);
+
+    var geocode = try json.parseFromSlice(
+        GeocodeResponse,
+        allocator,
+        geocode_body,
+        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+    );
+    defer geocode.deinit();
+
+    if (geocode.value.results.len == 0) return null;
+    const place = geocode.value.results[0];
+
+    const aq_url = try std.fmt.allocPrint(
+        allocator,
+        "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={d}&longitude={d}&current=us_aqi,pm2_5,pm10",
+        .{ place.latitude, place.longitude },
+    );
+    defer allocator.free(aq_url);
+
+    const aq_body = try http_util.get(&client, allocator, aq_url);
+    defer allocator.free(aq_body);
+
+    var aq = try json.parseFromSlice(
+        AirQualityResponse,
+        allocator,
+        aq_body,
+        .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+    );
+    defer aq.deinit();
+
+    return .{
+        .name = try allocator.dupe(u8, place.name),
+        .country = try allocator.dupe(u8, place.country),
+        .us_aqi = aq.value.current.us_aqi,
+        .pm2_5 = aq.value.current.pm2_5,
+        .pm10 = aq.value.current.pm10,
+    };
 }
 
 /// US EPA AQI categories.

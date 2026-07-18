@@ -84,6 +84,12 @@ pub const Stmt = struct {
         self.bindText(idx, if (value) "true" else "false");
     }
 
+    pub fn bindFloat64(self: *Stmt, idx: c_int, value: f64) void {
+        const i: usize = @intCast(idx - 1);
+        self.values[i] = std.fmt.allocPrintSentinel(self.arena.allocator(), "{d}", .{value}, 0) catch unreachable;
+        self.count = @max(self.count, i + 1);
+    }
+
     /// Runs the query against whatever's been bound so far — called lazily
     /// on the first `step()`, since libpq (unlike SQLite) executes all at
     /// once rather than being fed parameters incrementally.
@@ -139,6 +145,10 @@ pub const Stmt = struct {
 
     pub fn columnIsNull(self: Stmt, idx: c_int) bool {
         return self.result == null or c.PQgetisnull(self.result.?, self.row_idx, idx) != 0;
+    }
+
+    pub fn columnFloat64(self: Stmt, idx: c_int) f64 {
+        return std.fmt.parseFloat(f64, self.columnText(idx)) catch 0;
     }
 
     /// Postgres's text-format boolean output is a single 't'/'f' char.

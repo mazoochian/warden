@@ -14,7 +14,7 @@ pub const tool: registry.ToolDef = .{
     .name = "crypto_price",
     .description = "Gets current cryptocurrency prices with 24h change from CoinGecko (no API key). Use full CoinGecko ids, not ticker symbols: \"bitcoin\", \"ethereum\", \"solana\", \"dogecoin\", \"tether\" — comma-separated for several at once.",
     .input_schema_json =
-        \\{"type":"object","properties":{"coins":{"type":"string","description":"Comma-separated CoinGecko coin ids, e.g. \"bitcoin,ethereum\""},"currency":{"type":"string","description":"Quote currency code, default \"usd\""}},"required":["coins"]}
+    \\{"type":"object","properties":{"coins":{"type":"string","description":"Comma-separated CoinGecko coin ids, e.g. \"bitcoin,ethereum\""},"currency":{"type":"string","description":"Quote currency code, default \"usd\""}},"required":["coins"]}
     ,
     .execute = execute,
 };
@@ -47,6 +47,36 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
     defer ctx.allocator.free(body);
 
     return formatPrices(ctx.allocator, body, parsed.value.currency);
+}
+
+/// Fetches a single coin's current price — the plain, non-LLM-tool-call
+/// path `features/alerts.zig` uses so checking a price alert doesn't need
+/// to go through the tool-call loop for something this simple.
+pub fn fetchPrice(allocator: std.mem.Allocator, io: std.Io, coin: []const u8, currency: []const u8) !f64 {
+    var client: http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const encoded_coin = try http_util.encodeQueryComponent(allocator, coin);
+    defer allocator.free(encoded_coin);
+    const encoded_currency = try http_util.encodeQueryComponent(allocator, currency);
+    defer allocator.free(encoded_currency);
+
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "https://api.coingecko.com/api/v3/simple/price?ids={s}&vs_currencies={s}",
+        .{ encoded_coin, encoded_currency },
+    );
+    defer allocator.free(url);
+
+    const body = try http_util.get(&client, allocator, url);
+    defer allocator.free(body);
+
+    var parsed = try json.parseFromSlice(json.Value, allocator, body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.PriceNotFound;
+    const coin_obj = parsed.value.object.get(coin) orelse return error.PriceNotFound;
+    if (coin_obj != .object) return error.PriceNotFound;
+    return asF64(coin_obj.object.get(currency)) orelse error.PriceNotFound;
 }
 
 /// Renders CoinGecko's `{"bitcoin":{"usd":63685,"usd_24h_change":-0.72}}`
