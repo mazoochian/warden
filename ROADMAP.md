@@ -15,7 +15,26 @@ encryption was split out into its own Phase 2b rather than bundled in),
 committed**, **Phase 6 (per-chat persona) is committed**, and **Phase 7
 (voice transcription; TTS deliberately not included, see its note) is
 committed**. `zig build test` green (145/145). Phase 2b (Matrix E2E
-encryption) is the only thing left unstarted.
+encryption) is the only originally-planned item left unstarted.
+
+**Unplanned, shipped outside the phase sequence** (direct user request):
+interactive choice prompts — Telegram inline-keyboard buttons, and Matrix
+self-seeded emoji reactions as the equivalent, since Matrix has no button
+concept — applied to a new multi-stage `/convert` flow (say `/convert` alone
+or ask in natural language, upload a file, pick a target format from every
+valid option) layered on top of the existing one-shot `/convert <format>`
+caption command, which keeps working unchanged. Also added matching
+"🔄 Converting…"/"🎙️ Transcribing…" progress placeholders to the two
+operations that previously had none. `zig build test` green (158/158).
+While verifying this live, also found and fixed a real pre-existing bug:
+Telegram's API rejects an explicitly-serialized `"reply_parameters":null`
+(Zig's JSON stringifier writes null optional fields by default rather than
+omitting them), which silently broke *every* unprompted message — reminders,
+alerts, feed-watcher notifications, digests — since none of those are sent
+as a reply to anything. Fixed in `telegram/client.zig` with
+`emit_null_optional_fields = false` and two regression tests; verified live
+by inserting a due reminder directly into the database and confirming
+clean delivery.
 
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*

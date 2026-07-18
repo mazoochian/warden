@@ -16,8 +16,8 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Alerts: `/alert crypto bitcoin above 70000`, `/alert weather Tehran above 35`, `/alert aqi Beijing above 150` (or just ask) set a standing watch, checked every few minutes in the background and delivered as a message once true — `/alerts` lists what's set, `/alert cancel <id>` cancels one, re-notifies only after a cooldown once already triggered — restricted to whoever set it, or the bot owner
 - Feed Watching: `/watch <feed url>` watches an RSS/Atom feed and posts a short AI-written blurb here whenever something new shows up (checked every 15 minutes); `/watches` lists what's watched, `/unwatch <feed url>` removes one — open to anyone in the chat, like `/digest`
 - Per-Chat Persona: `/persona <text>` overrides the bot's system prompt for just this chat — a sarcastic assistant in one group, a terse formal one in another — without redeploying; `/persona off` resets to the global default. Viewing the current persona is open to anyone; changing it is owner-only, like `/magicword`
-- File Conversion: send a photo, document, voice note, audio, or video with `/convert <format>` as its caption (or ask for it in natural language) to get it back in a different format — images (jpg/png/webp/gif/bmp/tiff), audio/video (mp3/wav/ogg/mp4/webm/...), and documents (txt/md/html/docx/odt/rtf/pdf) each convert within their own family; a PDF source can only become plain text
-- Voice Transcription: send a captionless voice message addressed to the bot and it transcribes it (via an optional self-hosted whisper.cpp instance) and answers the actual question, instead of just noticing "a voice message arrived" — see "Voice transcription" below to set it up
+- File Conversion: send a photo, document, voice note, audio, or video with `/convert <format>` as its caption (or ask for it in natural language) to get it back in a different format in one shot — images (jpg/png/webp/gif/bmp/tiff), audio/video (mp3/wav/ogg/mp4/webm/...), and documents (txt/md/html/docx/odt/rtf/pdf) each convert within their own family; a PDF source can only become plain text. Or say `/convert` alone (or just "I want to convert a file") and the bot walks you through it interactively — asks you to send the file, then shows every valid target format as tap-to-pick buttons (Telegram) or emoji reactions (Matrix); a "🔄 Converting…" placeholder shows while it works
+- Voice Transcription: send a captionless voice message addressed to the bot and it transcribes it (via an optional self-hosted whisper.cpp instance) and answers the actual question, instead of just noticing "a voice message arrived" — a "🎙️ Transcribing…" placeholder shows while it works, morphing into "🤔 Thinking..." once the model takes over — see "Voice transcription" below to set it up
 - Live Answers: Replies to your questions arrive as a threaded reply that updates in place — an animated "thinking" indicator while the model works, switching to "using <tool>…" while it calls a tool, then editing into the final answer. Each chat's messages are handled independently and concurrently, so one slow or stuck reply never blocks the rest of the bot
 
 # Talking to the bot
@@ -49,6 +49,25 @@ Telegram admins/creator, or the bot owner — checked live via Telegram's
 `getChatMember` on every use (not cached, since admin status can change at
 any moment). Anyone else's attempt is silently ignored, matching how owner-
 only commands like `/token` and `/scraper` already behave.
+
+# Interactive prompts (buttons / reactions)
+Some flows — right now, the interactive `/convert` — ask you to pick one of
+several options instead of typing a command. On Telegram this is a real
+inline keyboard: tap a button and you're done. Matrix has no button
+concept, so the bot instead posts the options as text and reacts to its own
+message with each choice's emoji, seeding tappable "pills" — react with the
+same emoji as your pick and the bot detects it the same way it would a
+button press.
+
+`/convert` alone (no attachment, no format) starts the flow: send the file
+you want converted, then pick a target format from the buttons/reactions
+the bot offers — every valid format for that file type, not a curated
+subset. `/cancel` backs out of a pending conversion (checked before, and
+independently of, the existing admin-only ban/kick `/cancel`, so anyone can
+cancel their own in-progress conversion). A pending conversion expires
+after `WARDEN_CONVERT_TIMEOUT_SECONDS` (default 5 minutes) if left
+untouched. The existing one-shot `/convert <format>`-as-caption command
+keeps working exactly as before — this is additive, not a replacement.
 
 # Site scraping
 The `scrape_site` tool reads a page's clean, readable text — title and body
@@ -185,6 +204,7 @@ export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
 # export WARDEN_RETENTION_MESSAGES=20000
 # export WARDEN_DIGEST_INTERVAL_SECONDS=86400
 # export WARDEN_CONFIRM_TIMEOUT_SECONDS=60
+# export WARDEN_CONVERT_TIMEOUT_SECONDS=300
 ```
 
 ## Migrating from an older SQLite-based install
