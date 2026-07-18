@@ -85,3 +85,30 @@ services:
       # deprecation warning on this image).
       - --reasoning
       - "off"
+
+  # Optional voice-message transcription (see README's "Voice transcription"
+  # section) — whisper.cpp's own server, same opt-in-sidecar shape as
+  # llama-server above: not started by a plain `docker compose up -d`,
+  # only once warden's .env points WARDEN_WHISPER_URL at it.
+  whisper-server:
+    image: ghcr.io/ggml-org/whisper.cpp:main
+    restart: unless-stopped
+    volumes:
+      - ./whisper-server/models:/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/"]
+    # This image's ENTRYPOINT is `["bash", "-c"]` (unlike llama.cpp's, which
+    # exec's its server binary directly): Compose always resolves `command:`
+    # to an array before handing it to Docker, whether written as a YAML
+    # list or a bare scalar (a scalar just gets shell-word-split into one
+    # array element per word first) — and `bash -c` treats array[0] alone
+    # as its script, feeding every element after it in as unused positional
+    # parameters ($1, $2, ...) rather than appending them to the command
+    # (confirmed: the server started fine but silently ignored
+    # --model/--host/--port and fell back to its own baked-in defaults).
+    # The fix is a YAML list containing exactly *one* string — Compose
+    # doesn't re-split an already-list value, so this is the one way to
+    # make the whole line land in bash's $0 script slot as a single piece.
+    # --host 0.0.0.0 so it's reachable from the warden container over the
+    # compose network by service name (http://whisper-server:8091).
+    command: ["whisper-server --model /models/ggml-base.bin --host 0.0.0.0 --port 8091"]

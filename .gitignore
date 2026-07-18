@@ -6,4 +6,5 @@ node_modules/
 bfg.jar
 compose.override.yaml
 llama-server/models/
+whisper-server/models/
 warden.log
