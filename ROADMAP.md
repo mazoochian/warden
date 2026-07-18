@@ -12,8 +12,10 @@ credentials available this session; see Phase 2's note — Matrix E2E
 encryption was split out into its own Phase 2b rather than bundled in),
 **Phase 3 (reminder recurrence + absolute time) is committed**, **Phase 4
 (price/metric alerts) is committed**, **Phase 5 (RSS/news watcher) is
-committed**, and **Phase 6 (per-chat persona) is committed**. `zig build
-test` green (144/144). Phase 7 and 2b are unstarted.
+committed**, **Phase 6 (per-chat persona) is committed**, and **Phase 7
+(voice transcription; TTS deliberately not included, see its note) is
+committed**. `zig build test` green (145/145). Phase 2b (Matrix E2E
+encryption) is the only thing left unstarted.
 
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
@@ -258,20 +260,52 @@ typed-column pattern (`magic_word`, `digest_enabled` already live there).
 
 ## Phase 7 — Voice message transcription (+ optional TTS)
 *Effort: M/L depending on TTS scope. Dependencies: Phase 1 (attachment
-plumbing, ffmpeg already in the image).*
+plumbing, ffmpeg already in the image). Status: transcription done, TTS
+not built.*
 
-- Add `whisper.cpp` (or a small server) to the Dockerfile, same "add the
-  binary, shell out to it" pattern `convert.zig` already established for
-  pandoc/ffmpeg/ImageMagick.
-- New `src/features/transcribe.zig`: given `ctx.attachment_path` for a
-  voice/audio attachment, normalize to 16kHz mono wav via ffmpeg (reusing
-  `convert.zig`'s process-running helper), then shell out to whisper.cpp.
-- Wire into `main.zig`'s attachment-handling path so a voice note addressed
-  to the bot gets transcribed and fed to the LLM as the actual question,
-  instead of today's generic "[The user sent a voice message...]"
-  placeholder.
-- Optional stretch: TTS replies (piper or similar) — lower priority than
-  transcription, call out as a nice-to-have rather than a hard deliverable.
+Landed as a sidecar HTTP service, not a binary shelled out to from inside
+the warden image — `compose.yaml` already established this exact shape for
+`llama-server` (the local LLM), and whisper.cpp ships an equivalent
+official server image (`ghcr.io/ggml-org/whisper.cpp:main`, a simple
+`POST /inference` multipart endpoint), so following that precedent avoided
+adding a from-source native build to the Dockerfile entirely — no
+Dockerfile changes were needed at all, since ffmpeg was already in the
+image from Phase 1.
+
+- `src/features/transcribe.zig`: given `ctx.attachment_path` for a voice
+  attachment, normalizes to 16kHz mono wav via ffmpeg (whisper.cpp's own
+  preferred input shape), then POSTs it to a configured `whisper-server`'s
+  `/inference` endpoint (`response_format=text`, so the response is the
+  raw transcript with no JSON to parse).
+- `WARDEN_WHISPER_URL` (`config.zig`) is the base URL of the whisper-server
+  instance; unset (the default) disables transcription entirely.
+- `main.zig`'s new `resolveQuestion` helper wires this into the Q&A path:
+  a captionless voice message with `WARDEN_WHISPER_URL` configured gets
+  transcribed and the transcript becomes the model's question, falling
+  back to the existing generic `attachmentPlaceholder` on any failure
+  (not configured, download failed, transcription errored or came back
+  empty) rather than ever blocking the reply on it.
+- `compose.yaml` gained an opt-in `whisper-server` sidecar (same
+  not-started-by-a-plain-`up`-shape as `llama-server`), defaulting to
+  `ggml-base.bin` — the multilingual base model, picked over the
+  `.en`-suffixed English-only variants given warden's other model choices
+  already prioritize non-English (including Persian) quality.
+- **Not built: TTS replies** — stays exactly as deprioritized as the
+  original phase note called out; no work attempted this pass.
+- **Live-verified this pass** (unlike Matrix in Phase 2, this one had
+  real credentials to test with): downloaded `ggml-base.bin`, brought the
+  sidecar up, and POSTed a synthesized speech sample straight to
+  `/inference` over the compose network, matching `transcribe.zig`'s exact
+  request shape — got a real (if imperfect, as expected from robotic
+  TTS + the small base model) transcript back. This caught a real bug:
+  the whisper.cpp image's `ENTRYPOINT` is `["bash", "-c"]`, and Compose
+  always resolves `command:` to an array before handing it to Docker —
+  `bash -c` treats array[0] alone as its script and silently discards
+  every element after it as unused positional parameters, so the server
+  started fine but ignored every flag and fell back to its own defaults.
+  Fixed in `compose.yaml` by wrapping the whole command in a one-element
+  YAML list, which is documented there since it's a genuinely
+  non-obvious gotcha specific to this image.
 
 ## Phase 8 — Backlog
 
