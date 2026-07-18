@@ -17,6 +17,7 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Feed Watching: `/watch <feed url>` watches an RSS/Atom feed and posts a short AI-written blurb here whenever something new shows up (checked every 15 minutes); `/watches` lists what's watched, `/unwatch <feed url>` removes one — open to anyone in the chat, like `/digest`
 - Per-Chat Persona: `/persona <text>` overrides the bot's system prompt for just this chat — a sarcastic assistant in one group, a terse formal one in another — without redeploying; `/persona off` resets to the global default. Viewing the current persona is open to anyone; changing it is owner-only, like `/magicword`
 - File Conversion: send a photo, document, voice note, audio, or video with `/convert <format>` as its caption (or ask for it in natural language) to get it back in a different format — images (jpg/png/webp/gif/bmp/tiff), audio/video (mp3/wav/ogg/mp4/webm/...), and documents (txt/md/html/docx/odt/rtf/pdf) each convert within their own family; a PDF source can only become plain text
+- Voice Transcription: send a captionless voice message addressed to the bot and it transcribes it (via an optional self-hosted whisper.cpp instance) and answers the actual question, instead of just noticing "a voice message arrived" — see "Voice transcription" below to set it up
 - Live Answers: Replies to your questions arrive as a threaded reply that updates in place — an animated "thinking" indicator while the model works, switching to "using <tool>…" while it calls a tool, then editing into the final answer. Each chat's messages are handled independently and concurrently, so one slow or stuck reply never blocks the rest of the bot
 
 # Talking to the bot
@@ -163,6 +164,11 @@ export WARDEN_ANTHROPIC_MODEL=claude-sonnet-5
 # automatically to its bundled searxng service.)
 # export WARDEN_SEARXNG_URL=http://localhost:8080
 
+# Voice transcription — base URL of a whisper.cpp whisper-server instance
+# (see "Voice transcription" below). Unset means a voice message just gets
+# the generic "a voice message arrived" placeholder, same as today.
+# export WARDEN_WHISPER_URL=http://whisper-server:8091
+
 # System prompt — override the built-in persona, either inline or (better)
 # from a file you can properly edit. The file wins if both are set.
 # export WARDEN_SYSTEM_PROMPT="You are Warden, ..."
@@ -271,6 +277,37 @@ properly (e.g. behind a Tailscale exit node with policy routing — this bit
 the desktop this was developed on), see `compose.override.yaml`, which is
 gitignored on purpose: it's a local networking workaround, not something to
 ship anywhere else, including the router.
+
+## Voice transcription
+Compose can also run [whisper.cpp](https://github.com/ggml-org/whisper.cpp)'s
+official server (`whisper-server`) to transcribe voice messages — same
+opt-in-sidecar shape as the local LLM above, not started by a plain
+`docker compose up -d`. A captionless voice message addressed to the bot
+gets transcribed and answered for real, instead of the bot just noticing
+"a voice message arrived."
+
+1. Download the model once, wherever you have a good connection:
+   ```bash
+   mkdir -p whisper-server/models
+   curl -L -o whisper-server/models/ggml-base.bin \
+     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+   ```
+   `ggml-base.bin` (~148 MB) is the multilingual base model — picked over the
+   `.en`-suffixed English-only variants since warden's other model choices
+   already prioritize solid non-English (including Persian) quality. Bigger
+   multilingual models (`ggml-small.bin` at ~466 MB, `ggml-medium.bin` at
+   ~1.5 GB) trade more RAM/CPU for better accuracy if a captionless voice
+   message's transcription quality matters enough to be worth it.
+2. Bring it up explicitly (`docker compose up -d whisper-server warden
+   searxng`), or just set `WARDEN_WHISPER_URL` in `.env` and let
+   `docker compose up -d` start whatever it needs.
+3. Point warden at it (see the `.env` example above):
+   ```bash
+   export WARDEN_WHISPER_URL=http://whisper-server:8091
+   ```
+
+Swapping in a different model means changing the filename in both the
+download command and `compose.yaml`'s `whisper-server` `--model` arg.
 
 ## Deploying to a machine without a registry (e.g. an OpenWRT router)
 Compose references the image by name (`warden:latest`). Docker always checks
