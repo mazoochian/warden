@@ -35,6 +35,11 @@ pub fn upsertChat(pool: *PgPool, platform: Platform, native_chat_id: []const u8,
 pub const ChatRef = struct {
     id: i64,
     native_chat_id: []const u8,
+    /// Which connector this chat belongs to — needed so a scheduled feature
+    /// (digests, reminders) can find the right connector to deliver through
+    /// once more than one platform is active, instead of assuming whichever
+    /// connector happens to be polling matches every chat_id it sees.
+    platform: Platform,
 };
 
 /// Lists every known chat — replaces `ChatStore.listExistingChatIds`'s
@@ -43,7 +48,7 @@ pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]ChatRef {
     const db = try pool.acquire();
     defer pool.release(db);
 
-    var stmt = try db.prepare("SELECT id, native_chat_id FROM chats;");
+    var stmt = try db.prepare("SELECT id, native_chat_id, platform FROM chats;");
     defer stmt.finalize();
 
     var out: std.ArrayList(ChatRef) = .empty;
@@ -51,6 +56,7 @@ pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]ChatRef {
         try out.append(allocator, .{
             .id = stmt.columnInt64(0),
             .native_chat_id = try allocator.dupe(u8, stmt.columnText(1)),
+            .platform = std.meta.stringToEnum(Platform, stmt.columnText(2)) orelse .telegram,
         });
     }
     return out.toOwnedSlice(allocator);
