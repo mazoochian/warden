@@ -14,6 +14,8 @@ const chat_settings = @import("store/chat_settings.zig");
 const bot_config = @import("store/bot_config.zig");
 const messages = @import("store/messages.zig");
 const stats = @import("store/stats.zig");
+const reminders = @import("store/reminders.zig");
+const reminder_format = @import("features/reminder_format.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
@@ -24,6 +26,7 @@ const group_admin = @import("features/group_admin.zig");
 const wordcloud = @import("features/wordcloud.zig");
 const digest = @import("features/digest.zig");
 const scheduler = @import("features/scheduler.zig");
+const convert_file = @import("tools/convert_file.zig");
 
 const base_tools = [_]tool_registry.ToolDef{
     @import("tools/calculator.zig").tool,
@@ -39,6 +42,8 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/dictionary.zig").tool,
     @import("tools/urban_dictionary.zig").tool,
     @import("tools/hackernews.zig").tool,
+    @import("tools/remind.zig").tool,
+    convert_file.tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
@@ -70,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
     var telegram_adapter = telegram_platform.TelegramConnector.init(gpa, io, config.telegram_bot_token);
     defer telegram_adapter.deinit();
     const connectors = [_]iface.Connector{telegram_adapter.connector()};
+    const max_message_len = effectiveMaxMessageLength(&connectors);
 
     var pool = try store_pool.PgPool.init(gpa, io, config.postgres_dsn, config.postgres_pool_size);
     defer pool.deinit();
@@ -173,6 +179,7 @@ pub fn main(init: std.process.Init) !void {
                     io,
                     gpa,
                     ts,
+                    max_message_len,
                     task_arena,
                     duped_msg,
                 });
@@ -184,9 +191,42 @@ pub fn main(init: std.process.Init) !void {
             // connector; see `checkAndSendDueDigests`'s doc comment for the
             // multi-platform caveat.
             const now = Io.Timestamp.now(io, .real).toSeconds();
-            checkAndSendDueDigests(connector, gpa, io, &config, &pool, &digest_scheduler, llm_provider, now);
+            checkAndSendDueDigests(connector, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
+            checkAndSendDueReminders(connector, gpa, &pool, now);
         }
     }
+}
+
+/// Fallback used when no connector declares a `maxMessageLength` (shouldn't
+/// happen today — Telegram always does) — Telegram's own limit, the
+/// tightest of any platform actually implemented so far (see
+/// `iface.Connector.VTable.maxMessageLength`'s doc comment).
+const default_max_message_length: usize = 4096;
+
+/// The tightest `maxMessageLength` across every active connector. A single
+/// deployment could eventually run more than one platform connector at
+/// once, each with its own limit (see `iface.Platform`); capping generated
+/// text to the smallest of them keeps it valid everywhere without the
+/// answer/digest generation paths needing to know which platforms are
+/// actually active.
+fn effectiveMaxMessageLength(connectors: []const iface.Connector) usize {
+    var min_len: usize = default_max_message_length;
+    for (connectors) |c| {
+        if (c.maxMessageLength()) |len| min_len = @min(min_len, len);
+    }
+    return min_len;
+}
+
+/// Sends `text` normally if it fits within `max_len`, otherwise attaches it
+/// as a `.txt` file instead — the fallback for text too long for the
+/// active platform(s)' limit (LLM answers, digests). `filename` names the
+/// attachment when the fallback fires.
+fn sendTextOrFile(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to: ?[]const u8, max_len: usize, filename: []const u8) void {
+    if (text.len <= max_len) {
+        connector.sendMessage(a, chat_id, text, reply_to);
+        return;
+    }
+    connector.sendDocument(a, chat_id, text, filename, "That was too long for a single message — attached as a file.");
 }
 
 /// Body of one spawned per-message task (see `worker_group` above). Owns
@@ -204,6 +244,7 @@ fn processMessageTask(
     io: Io,
     gpa: std.mem.Allocator,
     ts: i64,
+    max_message_len: usize,
     task_arena: *std.heap.ArenaAllocator,
     msg: iface.Message,
 ) void {
@@ -227,6 +268,27 @@ fn processMessageTask(
     };
     recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, config.retention_messages);
 
+    // Downloaded eagerly (not lazily on first tool use) since it's cheap
+    // relative to the LLM round trip this task is about to make anyway, and
+    // keeps `convert_file`'s execute() simple (just read ctx.attachment_path,
+    // never fetch bytes itself). Deleted once this task is done regardless
+    // of whether any tool actually touched it — `task_arena`'s deinit only
+    // frees memory, not files on disk.
+    var attachment_cleanup_path: ?[]const u8 = null;
+    defer if (attachment_cleanup_path) |p| Io.Dir.cwd().deleteFile(io, p) catch {};
+    const attachment_path = if (msg.attachment) |att| blk: {
+        const path = downloadAttachment(connector, io, a, config.tmp_dir, att);
+        attachment_cleanup_path = path;
+        break :blk path;
+    } else null;
+
+    var reminder_adapter: ReminderToolAdapter = .{
+        .pool = pool,
+        .chat_id = chat_id,
+        .identity_id = identity_id,
+        .is_owner = auth.isOwner(config, connector.platform(), msg.user_id),
+        .now = ts,
+    };
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
         .io = io,
@@ -235,8 +297,88 @@ fn processMessageTask(
         .tmp_dir = config.tmp_dir,
         .searxng_url = config.searxng_url,
         .scraper = bot_config.loadScraperConfig(pool, a),
+        .now = ts,
+        .reminders = reminder_adapter.sink(),
+        .attachment_path = attachment_path,
+        .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
+        .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
     };
-    handleMessage(connector, a, config, pool, chat_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, io, ts, msg);
+    handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, io, ts, max_message_len, msg);
+}
+
+/// Downloads `att`'s bytes into `tmp_dir` and returns the local file path
+/// (allocated in `allocator`), or null on any failure (connector doesn't
+/// support downloads, network error, disk write error) — all logged, none
+/// propagated, since a failed download shouldn't stop the rest of message
+/// handling (LLM Q&A, other tools) from running; `convert_file` just
+/// reports "no file attached" when `ctx.attachment_path` ends up null.
+/// Written straight to disk rather than kept in memory and handed back,
+/// since document/video attachments can run tens of MB.
+fn downloadAttachment(connector: iface.Connector, io: Io, allocator: std.mem.Allocator, tmp_dir: []const u8, att: iface.Attachment) ?[]const u8 {
+    const bytes = connector.downloadFile(allocator, att.file_id) catch |err| {
+        std.log.warn("attachment: download failed for file_id {s}: {t}", .{ att.file_id, err });
+        return null;
+    };
+    defer allocator.free(bytes);
+
+    Io.Dir.cwd().createDirPath(io, tmp_dir) catch |err| {
+        std.log.warn("attachment: failed to create tmp dir {s}: {t}", .{ tmp_dir, err });
+        return null;
+    };
+
+    const ts = Io.Timestamp.now(io, .real).toNanoseconds();
+    const path = std.fmt.allocPrint(allocator, "{s}/attach_{d}{s}", .{ tmp_dir, ts, extensionFor(att) }) catch return null;
+
+    var file = Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+        std.log.warn("attachment: failed to create {s}: {t}", .{ path, err });
+        return null;
+    };
+    defer file.close(io);
+    var file_writer = file.writer(io, &.{});
+    file_writer.interface.writeAll(bytes) catch |err| {
+        std.log.warn("attachment: failed to write {s}: {t}", .{ path, err });
+        return null;
+    };
+    file_writer.interface.flush() catch |err| {
+        std.log.warn("attachment: failed to flush {s}: {t}", .{ path, err });
+        return null;
+    };
+
+    return path;
+}
+
+/// Best-effort extension (leading dot included) for a downloaded
+/// attachment's local file name — prefers the original filename's own
+/// extension when Telegram sent one, falling back to a kind-appropriate
+/// default so `convert_file` still has something plausible to dispatch on.
+fn extensionFor(att: iface.Attachment) []const u8 {
+    if (att.file_name) |name| {
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i..];
+    }
+    return switch (att.kind) {
+        .photo => ".jpg",
+        .document => "",
+        .voice => ".ogg",
+        .audio => ".mp3",
+        .video => ".mp4",
+    };
+}
+
+/// Stand-in `qa.answer` question for a captionless attachment, so the
+/// model's `user_content` still names what just arrived instead of reading
+/// "Question: " with nothing after it.
+fn attachmentPlaceholder(allocator: std.mem.Allocator, att: iface.Attachment) ![]const u8 {
+    const kind_desc = switch (att.kind) {
+        .photo => "a photo",
+        .document => "a document",
+        .voice => "a voice message",
+        .audio => "an audio file",
+        .video => "a video",
+    };
+    if (att.file_name) |name| {
+        return std.fmt.allocPrint(allocator, "[The user sent {s} named \"{s}\", with no caption.]", .{ kind_desc, name });
+    }
+    return std.fmt.allocPrint(allocator, "[The user sent {s}, with no caption.]", .{kind_desc});
 }
 
 /// Resolves (upserting as needed) the internal `identities.id` for a
@@ -310,6 +452,7 @@ fn checkAndSendDueDigests(
     pool: *store_pool.PgPool,
     digest_scheduler: *scheduler.DigestScheduler,
     llm_provider: llm.Provider,
+    max_message_len: usize,
     now: i64,
 ) void {
     const enabled_chat_ids = digest_scheduler.snapshotEnabledChatIds(gpa) catch |err| {
@@ -350,7 +493,7 @@ fn checkAndSendDueDigests(
             std.log.err("digest: generate failed for chat {s}: {t}", .{ native_chat_id, err });
             continue;
         };
-        connector.sendMessage(a, native_chat_id, digest_text, null);
+        sendTextOrFile(connector, a, native_chat_id, digest_text, null, max_message_len, "digest.txt");
         chat_settings.setLastDigestTs(pool, chat_id, now) catch |err| {
             std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
         };
@@ -363,6 +506,7 @@ fn handleMessage(
     config: *const config_mod.Config,
     pool: *store_pool.PgPool,
     chat_id: i64,
+    identity_id: i64,
     llm_provider: llm.Provider,
     tool_ctx: tool_registry.ToolContext,
     tools: []const tool_registry.ToolDef,
@@ -370,10 +514,16 @@ fn handleMessage(
     digest_scheduler: *scheduler.DigestScheduler,
     io: Io,
     now: i64,
+    max_message_len: usize,
     msg: iface.Message,
 ) void {
-    const text = msg.text orelse return;
-    if (text.len == 0) return;
+    // A photo/document/voice/audio/video with no caption has no `text` at
+    // all (Telegram never sets it for those), but it still deserves a
+    // reply when addressed to the bot — the attachment alone is enough for
+    // e.g. convert_file to have something to work with. Only bail when
+    // there's neither text nor an attachment to react to.
+    const text = msg.text orelse "";
+    if (text.len == 0 and msg.attachment == null) return;
 
     if (std.mem.eql(u8, text, "/ping")) {
         connector.sendMessage(a, msg.chat_id, "pong", msg.message_id);
@@ -382,7 +532,7 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/wordcloud")) {
         replyWithWordcloud(connector, a, pool, chat_id, config.tmp_dir, io, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/digest") or std.mem.startsWith(u8, text, "/digest ")) {
-        handleDigestCommand(connector, a, pool, chat_id, digest_scheduler, llm_provider, tool_ctx, now, msg.chat_id, msg.message_id, text);
+        handleDigestCommand(connector, a, pool, chat_id, digest_scheduler, llm_provider, tool_ctx, now, max_message_len, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
         if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return;
         group_admin.mute(connector, a, msg, now);
@@ -418,7 +568,13 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/scraper") or std.mem.startsWith(u8, text, "/scraper ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return;
         handleScraperCommand(connector, a, pool, msg, text);
-    } else if (text[0] == '/') {
+    } else if (std.mem.eql(u8, text, "/remind") or std.mem.startsWith(u8, text, "/remind ")) {
+        handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/reminders")) {
+        handleRemindersList(connector, a, pool, chat_id, now, msg.chat_id, msg.message_id);
+    } else if (std.mem.eql(u8, text, "/convert") or std.mem.startsWith(u8, text, "/convert ")) {
+        handleConvertCommand(connector, a, tool_ctx, msg, text);
+    } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
         return;
@@ -430,7 +586,17 @@ fn handleMessage(
         // answer my owner" to the whole group.
         if (config.llm_owner_only and !auth.isOwner(config, connector.platform(), msg.user_id)) return;
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, config.system_prompt, io, now, config.retention_messages, msg.chat_id, msg.message_id, text, replied_to);
+        // Captionless attachment: give the model something to read instead
+        // of an empty "Question: " (see `qa.answer`'s `user_content`
+        // formatting) so it still knows a file just came in and can reach
+        // for convert_file if that's what makes sense.
+        const question = if (text.len > 0)
+            text
+        else if (msg.attachment) |att|
+            attachmentPlaceholder(a, att) catch text
+        else
+            text;
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, config.system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, question, replied_to);
     }
 }
 
@@ -652,6 +818,7 @@ fn handleDigestCommand(
     llm_provider: llm.Provider,
     tool_ctx: tool_registry.ToolContext,
     now: i64,
+    max_message_len: usize,
     native_chat_id: []const u8,
     reply_to: ?[]const u8,
     text: []const u8,
@@ -682,7 +849,7 @@ fn handleDigestCommand(
             connector.sendMessage(a, native_chat_id, "Couldn't generate a digest just now.", reply_to);
             return;
         };
-        connector.sendMessage(a, native_chat_id, digest_text, reply_to);
+        sendTextOrFile(connector, a, native_chat_id, digest_text, reply_to, max_message_len, "digest.txt");
         chat_settings.setLastDigestTs(pool, chat_id, now) catch |err| {
             std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
         };
@@ -702,6 +869,225 @@ fn handleDigestCommand(
                 .{ if (enabled) "on" else "off", now - last },
             ) catch return;
         connector.sendMessage(a, native_chat_id, msg_text, reply_to);
+    }
+}
+
+const max_reminder_message_len = 500;
+
+/// `/remind <duration> <message>` sets a one-off reminder; `/remind cancel
+/// <id>` cancels one. Open to anyone in the chat to create (utility-level,
+/// like /wordcloud), but only its own creator or the bot owner may cancel
+/// it — matches `/token`'s reply-to-target pattern of trusting the sender's
+/// own identity_id rather than requiring group-admin standing.
+fn handleRemindCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    now: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/remind".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /remind <duration e.g. 30m/2h/1d> <message>, or /remind cancel <id>");
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const first_word = it.first();
+
+    if (std.mem.eql(u8, first_word, "cancel")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /remind cancel <id> (see /reminders for ids).");
+            return;
+        };
+        const rem = (reminders.get(pool, a, id) catch |err| {
+            std.log.err("remind: lookup failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that reminder, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No pending reminder with that id.");
+            return;
+        };
+        if (rem.chat_id != chat_id) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No pending reminder with that id.");
+            return;
+        }
+        if (rem.identity_id != identity_id and !auth.isOwner(config, connector.platform(), msg.user_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only whoever set that reminder (or the owner) can cancel it.");
+            return;
+        }
+        reminders.cancel(pool, id) catch |err| {
+            std.log.err("remind: cancel failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't cancel that reminder, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Reminder canceled.");
+        return;
+    }
+
+    const duration_str = first_word;
+    const message = std.mem.trim(u8, it.rest(), " ");
+
+    const duration_seconds = reminder_format.parseDuration(duration_str) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that duration — use e.g. 30m, 2h, or 1d.");
+        return;
+    };
+    if (message.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /remind <duration e.g. 30m/2h/1d> <message>");
+        return;
+    }
+    if (message.len > max_reminder_message_len) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That reminder text is too long (max 500 bytes).");
+        return;
+    }
+
+    const id = reminders.create(pool, chat_id, identity_id, message, now + duration_seconds) catch |err| {
+        std.log.err("remind: failed to create reminder for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that reminder, try again.");
+        return;
+    };
+    const confirmation = std.fmt.allocPrint(a, "Reminder #{d} set for {s} from now.", .{ id, duration_str }) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+fn handleRemindersList(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    now: i64,
+    native_chat_id: []const u8,
+    reply_to: ?[]const u8,
+) void {
+    const pending = reminders.listPending(pool, a, chat_id) catch |err| {
+        std.log.err("reminders: list failed for chat {d}: {t}", .{ chat_id, err });
+        connector.sendMessage(a, native_chat_id, "Couldn't load reminders, try again.", reply_to);
+        return;
+    };
+    connector.sendMessage(a, native_chat_id, formatPendingReminders(a, pending, now), reply_to);
+}
+
+/// Direct entry point to `convert_file` (see `tools/convert_file.zig`) for
+/// people who'd rather type an explicit command than phrase a request in
+/// natural language — same file (`tool_ctx.attachment_path`, downloaded by
+/// `processMessageTask` before `handleMessage` ever runs) and same
+/// conversion logic, just skipping the LLM round trip. `text` is the
+/// caption Telegram delivered on the attached photo/document/voice/audio/
+/// video, e.g. "/convert pdf".
+fn handleConvertCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    tool_ctx: tool_registry.ToolContext,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/convert".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: send a photo, document, voice note, audio, or video with \"/convert <format>\" as its caption, e.g. /convert pdf.");
+        return;
+    }
+    const input_json = std.json.Stringify.valueAlloc(a, .{ .target_format = arg }, .{}) catch return;
+    const result = convert_file.tool.execute(tool_ctx, input_json) catch |err| {
+        std.log.err("convert: /convert command failed: {t}", .{err});
+        reply(connector, a, msg.chat_id, msg.message_id, "Something went wrong converting that file, try again.");
+        return;
+    };
+    connector.sendMessage(a, msg.chat_id, result, msg.message_id);
+}
+
+/// Shared by `/reminders` and the `set_reminder` LLM tool's `action=list`.
+fn formatPendingReminders(a: std.mem.Allocator, pending: []const reminders.PendingReminder, now: i64) []const u8 {
+    if (pending.len == 0) return "No pending reminders. Set one with /remind <duration> <message> (or just ask).";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Pending reminders:\n", .{}) catch return "";
+    for (pending) |r| {
+        w.print("  #{d} in {s}: {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), r.message }) catch return "";
+    }
+    return buf.writer.buffered();
+}
+
+/// Wires the `set_reminder` LLM tool (see `tools/remind.zig`) to real
+/// Postgres-backed reminders for one specific message's chat/sender —
+/// constructed fresh per message in `processMessageTask` since `chat_id`/
+/// `identity_id`/`is_owner` all vary per sender, then handed to the tool
+/// loop as a `registry.ReminderSink`.
+const ReminderToolAdapter = struct {
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    is_owner: bool,
+    now: i64,
+
+    fn sink(self: *ReminderToolAdapter) tool_registry.ReminderSink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.ReminderSink.VTable = .{
+        .create = createFn,
+        .cancel = cancelFn,
+        .listPending = listPendingFn,
+    };
+
+    fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, message: []const u8, due_at: i64) anyerror!i64 {
+        const self: *ReminderToolAdapter = @ptrCast(@alignCast(ptr));
+        _ = allocator;
+        return reminders.create(self.pool, self.chat_id, self.identity_id, message, due_at);
+    }
+
+    fn cancelFn(ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!tool_registry.ReminderSink.CancelResult {
+        const self: *ReminderToolAdapter = @ptrCast(@alignCast(ptr));
+        const rem = (try reminders.get(self.pool, allocator, id)) orelse return .not_found;
+        if (rem.chat_id != self.chat_id) return .not_found;
+        if (rem.identity_id != self.identity_id and !self.is_owner) return .not_authorized;
+        try reminders.cancel(self.pool, id);
+        return .canceled;
+    }
+
+    fn listPendingFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8 {
+        const self: *ReminderToolAdapter = @ptrCast(@alignCast(ptr));
+        const pending = try reminders.listPending(self.pool, allocator, self.chat_id);
+        return formatPendingReminders(allocator, pending, self.now);
+    }
+};
+
+/// Only sends via `connector` — same single-connector simplification as
+/// `checkAndSendDueDigests` (see its doc comment); revisit once a second
+/// platform is wired up.
+fn checkAndSendDueReminders(
+    connector: iface.Connector,
+    gpa: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    now: i64,
+) void {
+    const due = reminders.dueUndelivered(pool, gpa, now) catch |err| {
+        std.log.err("remind: failed to query due reminders: {t}", .{err});
+        return;
+    };
+    defer {
+        for (due) |r| {
+            gpa.free(r.native_chat_id);
+            gpa.free(r.message);
+        }
+        gpa.free(due);
+    }
+
+    for (due) |r| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const text = std.fmt.allocPrint(a, "⏰ Reminder: {s}", .{r.message}) catch continue;
+        connector.sendMessage(a, r.native_chat_id, text, null);
+        reminders.markDelivered(pool, r.id, now) catch |err| {
+            std.log.err("remind: failed to mark reminder {d} delivered: {t}", .{ r.id, err });
+        };
     }
 }
 
@@ -807,6 +1193,7 @@ fn replyWithAnswer(
     io: Io,
     now: i64,
     retention_messages: i64,
+    max_message_len: usize,
     native_chat_id: []const u8,
     reply_to: ?[]const u8,
     question: []const u8,
@@ -833,7 +1220,7 @@ fn replyWithAnswer(
     }
 
     std.log.info("qa: calling the model for chat {s}", .{native_chat_id});
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, question, replied_to, progress);
+    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, question, replied_to, progress);
 
     // Stop the ticker before touching the placeholder ourselves — it's the
     // sole owner of that Future until this point (see `Future.cancel`'s
@@ -877,7 +1264,16 @@ fn replyWithAnswer(
         return;
     }
 
-    if (placeholder_id) |pid| {
+    if (answer.len > max_message_len) {
+        // Too long for this platform's limit — editing the placeholder
+        // in-place with it would just fail the same way sending it fresh
+        // would, so drop the placeholder and attach it as a file instead.
+        std.log.info("qa: answer for chat {s} exceeds max_message_len ({d} > {d}), sending as a file", .{ native_chat_id, answer.len, max_message_len });
+        if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |err| {
+            std.log.warn("qa: failed to delete placeholder before file fallback for chat {s}: {t}", .{ native_chat_id, err });
+        };
+        sendTextOrFile(connector, a, native_chat_id, answer, reply_to, max_message_len, "answer.txt");
+    } else if (placeholder_id) |pid| {
         if (connector.editMessage(a, native_chat_id, pid, answer)) |_| {
             std.log.info("qa: final answer edited into placeholder for chat {s}", .{native_chat_id});
         } else |err| {
@@ -962,6 +1358,11 @@ test {
     _ = @import("store/bot_config.zig");
     _ = @import("store/messages.zig");
     _ = @import("store/stats.zig");
+    _ = @import("store/reminders.zig");
+    _ = @import("features/reminder_format.zig");
+    _ = @import("tools/remind.zig");
+    _ = @import("features/convert.zig");
+    _ = @import("tools/convert_file.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
     _ = @import("tools/calculator.zig");

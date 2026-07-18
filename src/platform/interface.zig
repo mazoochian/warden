@@ -13,6 +13,31 @@ pub const Platform = enum {
     whatsapp,
 };
 
+pub const AttachmentKind = enum { photo, document, voice, audio, video };
+
+/// Metadata for an inbound file/media attachment — deliberately just enough
+/// to *locate* the bytes (via `Connector.downloadFile`), not the bytes
+/// themselves: not every message with an attachment needs it downloaded
+/// (e.g. one the user never asks the bot to act on), so downloading is done
+/// lazily by `main.zig` only when a message is actually addressed to the
+/// bot.
+pub const Attachment = struct {
+    kind: AttachmentKind,
+    /// Platform-native id `Connector.downloadFile` resolves to bytes.
+    file_id: []const u8,
+    file_name: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+
+    pub fn dupe(self: Attachment, allocator: std.mem.Allocator) !Attachment {
+        return .{
+            .kind = self.kind,
+            .file_id = try allocator.dupe(u8, self.file_id),
+            .file_name = if (self.file_name) |s| try allocator.dupe(u8, s) else null,
+            .mime_type = if (self.mime_type) |s| try allocator.dupe(u8, s) else null,
+        };
+    }
+};
+
 /// A platform-agnostic inbound message. Adapters translate their native
 /// wire format into this shape. IDs are kept as strings since native ID
 /// types vary wildly (Telegram: i64, Matrix: "!room:server"/"@user:server",
@@ -67,6 +92,9 @@ pub const Message = struct {
     /// the shared fields; this just carries what Telegram's `User` object
     /// has beyond them, for persisting into `telegram_profiles`.
     telegram_profile: ?TelegramProfile = null,
+    /// Set when this message carries a photo/document/voice/audio/video —
+    /// see `Attachment`'s doc comment on why only metadata lives here.
+    attachment: ?Attachment = null,
 
     /// Deep-copies every string field into `allocator`. The poll loop
     /// spawns one concurrent task per message, each owning its own arena;
@@ -91,6 +119,7 @@ pub const Message = struct {
             .mentions_me = self.mentions_me,
             .identity = if (self.identity) |id| try id.dupe(allocator) else null,
             .telegram_profile = if (self.telegram_profile) |p| try p.dupe(allocator) else null,
+            .attachment = if (self.attachment) |att| try att.dupe(allocator) else null,
         };
     }
 };
@@ -123,6 +152,22 @@ pub const Connector = struct {
         /// since not every platform this bot might target necessarily
         /// supports rich media the same way.
         sendPhoto: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, image_bytes: []const u8, caption: ?[]const u8) void = null,
+        /// Sends an arbitrary file as a document attachment — the fallback
+        /// for text too long for this platform's `maxMessageLength`, and
+        /// how `convert_file` delivers a converted file. Optional like
+        /// `sendPhoto`, with the same "unsupported platform" fallback.
+        sendDocument: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, file_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void = null,
+        /// This platform's hard limit on a single text message's length, in
+        /// bytes, if it enforces one. Optional/null when a platform has no
+        /// small fixed limit (e.g. Matrix/XMPP cap on total event/stanza
+        /// *size*, tens of KB including markup, not a small character
+        /// count) — `effectiveMaxMessageLength` in main.zig takes the
+        /// minimum across every connector that does declare one.
+        maxMessageLength: ?*const fn (ptr: *anyopaque) usize = null,
+        /// Downloads a previously-seen attachment's bytes by its
+        /// platform-native file id (see `Message.Attachment`). Optional:
+        /// a platform without inbound-file support just doesn't get one.
+        downloadFile: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, file_id: []const u8) anyerror![]u8 = null,
         /// Like `sendMessage`, but returns the id of the sent message so it
         /// can later be `editMessage`d — the "thinking" placeholder /
         /// progressive-answer flow. Optional: a platform without a message-
@@ -181,6 +226,26 @@ pub const Connector = struct {
             return;
         };
         f(self.ptr, allocator, chat_id, image_bytes, caption);
+    }
+
+    pub fn sendDocument(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, file_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void {
+        const f = self.vtable.sendDocument orelse {
+            self.sendMessage(allocator, chat_id, "This platform doesn't support sending files.", null);
+            return;
+        };
+        f(self.ptr, allocator, chat_id, file_bytes, file_name, caption);
+    }
+
+    /// `null` when this connector doesn't declare a limit — see
+    /// `VTable.maxMessageLength`'s doc comment.
+    pub fn maxMessageLength(self: Connector) ?usize {
+        const f = self.vtable.maxMessageLength orelse return null;
+        return f(self.ptr);
+    }
+
+    pub fn downloadFile(self: Connector, allocator: std.mem.Allocator, file_id: []const u8) ![]u8 {
+        const f = self.vtable.downloadFile orelse return error.Unsupported;
+        return f(self.ptr, allocator, file_id);
     }
 
     /// Returns `null` when the platform doesn't support it (caller should

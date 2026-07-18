@@ -10,6 +10,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.link_libc = true;
+    // Explicit -Dtarget builds (e.g. the Docker cross-build) skip the
+    // default system library search paths even when the target matches
+    // the host, so libpq isn't found without these even though it's
+    // right there in /usr/lib.
+    exe_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     exe_mod.linkSystemLibrary("pq", .{});
 
     const exe = b.addExecutable(.{
@@ -39,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     migrate_mod.link_libc = true;
+    migrate_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     migrate_mod.linkSystemLibrary("pq", .{});
     migrate_mod.addIncludePath(b.path("third_party/sqlite"));
     migrate_mod.addCSourceFile(.{

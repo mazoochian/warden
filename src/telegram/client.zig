@@ -225,6 +225,103 @@ pub const Client = struct {
         }
     }
 
+    /// Sends an arbitrary file as a document (e.g. a converted file from
+    /// `convert_file`, or the text-too-long fallback). Fire-and-forget like
+    /// `sendMessage`/`sendPhoto`.
+    pub fn sendDocument(self: *Client, allocator: std.mem.Allocator, chat_id: i64, file_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void {
+        self.sendDocumentErr(allocator, chat_id, file_bytes, file_name, caption) catch |err| {
+            std.log.err("sendDocument failed: {t}", .{err});
+        };
+    }
+
+    fn sendDocumentErr(self: *Client, allocator: std.mem.Allocator, chat_id: i64, file_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) !void {
+        const boundary = "----WardenBoundary7f3a9c2e";
+
+        var body_writer: Io.Writer.Allocating = .init(allocator);
+        defer body_writer.deinit();
+        const w = &body_writer.writer;
+
+        try w.print("--{s}\r\n", .{boundary});
+        try w.print("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{chat_id});
+
+        if (caption) |c| {
+            try w.print("--{s}\r\n", .{boundary});
+            try w.print("Content-Disposition: form-data; name=\"caption\"\r\n\r\n{s}\r\n", .{c});
+        }
+
+        try w.print("--{s}\r\n", .{boundary});
+        try w.print("Content-Disposition: form-data; name=\"document\"; filename=\"{s}\"\r\nContent-Type: application/octet-stream\r\n\r\n", .{file_name});
+        try w.writeAll(file_bytes);
+        try w.writeAll("\r\n");
+        try w.print("--{s}--\r\n", .{boundary});
+        const body = w.buffered();
+
+        const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendDocument", .{self.bot_token});
+        defer allocator.free(url);
+
+        const content_type = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{boundary});
+        defer allocator.free(content_type);
+
+        const resp_body = try http_util.postRaw(&self.http_client, allocator, url, content_type, body);
+        defer allocator.free(resp_body);
+
+        var parsed = try json.parseFromSlice(
+            MethodResponse,
+            allocator,
+            resp_body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+        defer parsed.deinit();
+
+        if (!parsed.value.ok) {
+            std.log.err("telegram sendDocument failed: {?s}", .{parsed.value.description});
+            return error.TelegramApiError;
+        }
+    }
+
+    /// Resolves a `file_id` (from an inbound photo/document/voice/audio/
+    /// video) to downloadable bytes — Telegram's two-step process: look up
+    /// the file's `file_path` via `getFile`, then GET it from the separate
+    /// file-serving host. Bot API file downloads cap at 20MB; `.limited`
+    /// below matches that so a pathological response can't exhaust memory.
+    pub fn downloadFile(self: *Client, allocator: std.mem.Allocator, file_id: []const u8) ![]u8 {
+        const encoded_id = try http_util.encodeQueryComponent(allocator, file_id);
+        defer allocator.free(encoded_id);
+
+        const get_file_url = try std.fmt.allocPrint(
+            allocator,
+            "https://api.telegram.org/bot{s}/getFile?file_id={s}",
+            .{ self.bot_token, encoded_id },
+        );
+        defer allocator.free(get_file_url);
+
+        const body = try http_util.get(&self.http_client, allocator, get_file_url);
+        defer allocator.free(body);
+
+        var parsed = try json.parseFromSlice(
+            types.FileResponse,
+            allocator,
+            body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+        defer parsed.deinit();
+
+        const result = parsed.value.result orelse {
+            std.log.err("telegram getFile failed: {?s}", .{parsed.value.description});
+            return error.TelegramApiError;
+        };
+        const file_path = result.file_path orelse return error.TelegramApiError;
+
+        const download_url = try std.fmt.allocPrint(
+            allocator,
+            "https://api.telegram.org/file/bot{s}/{s}",
+            .{ self.bot_token, file_path },
+        );
+        defer allocator.free(download_url);
+
+        return http_util.get(&self.http_client, allocator, download_url);
+    }
+
     pub fn banChatMember(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64) !void {
         return self.callMethod(allocator, "banChatMember", .{ .chat_id = chat_id, .user_id = user_id });
     }

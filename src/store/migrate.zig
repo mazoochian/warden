@@ -13,6 +13,7 @@ const Migration = struct {
 /// Add new entries here, never edit an already-shipped one.
 const migrations = [_]Migration{
     .{ .version = 1, .name = "0001_init", .sql = @embedFile("migrations/0001_init.sql") },
+    .{ .version = 2, .name = "0002_reminders", .sql = @embedFile("migrations/0002_reminders.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each

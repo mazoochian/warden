@@ -32,7 +32,11 @@ pub const default_system_prompt =
     \\and air quality, currency and crypto prices, a calculator, English and
     \\slang dictionaries, Hacker News search, QR code generation, drawing
     \\diagrams, building a word cloud out of text you provide, web search,
-    \\and fetching a URL's content. For anything
+    \\fetching a URL's content, setting/listing/canceling reminders
+    \\(set_reminder) — translate whatever natural-language time the user
+    \\gave into that tool's required duration shorthand yourself — and
+    \\converting a photo/document/voice/audio/video the user just sent to a
+    \\different format (convert_file). For anything
     \\factual you don't confidently know (current events, prices, releases,
     \\docs), use web_search rather than guessing or claiming you can't know;
     \\fetch a promising result with fetch_url when the snippet isn't enough.
@@ -63,6 +67,7 @@ pub fn answer(
     pool: *PgPool,
     chat_id: i64,
     system_prompt: ?[]const u8,
+    max_answer_len: usize,
     question: []const u8,
     replied_to: ?[]const u8,
     progress: toolcall.Progress,
@@ -82,5 +87,15 @@ pub fn answer(
             .{ history, question },
         );
 
-    return toolcall.run(provider, allocator, ctx, system_prompt orelse default_system_prompt, user_content, tool_defs, progress);
+    // A hard file-fallback exists for whatever slips through (see
+    // `main.zig`'s `sendTextOrFile`), but steering the model to stay under
+    // budget up front means that rarely has to fire — most answers should
+    // just read as normal chat messages, not surprise file attachments.
+    const system_with_budget = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n\nLength budget: keep replies under {d} characters when at all possible — that's the active platform's message-size limit. If the answer genuinely needs to be longer (e.g. the user asked for something long-form), that's fine: anything over the limit is sent as a file attachment automatically, so don't refuse or truncate awkwardly instead of finishing your answer.",
+        .{ system_prompt orelse default_system_prompt, max_answer_len },
+    );
+
+    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress);
 }

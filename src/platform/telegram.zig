@@ -79,6 +79,54 @@ pub const TelegramConnector = struct {
         };
     }
 
+    /// Telegram sends at most one of photo/document/voice/audio/video per
+    /// message; checked in this order since only `photo` is ever a list
+    /// (multiple resolutions) rather than a single object. Duped into
+    /// `allocator` — the same short-lived poll-cycle arena the rest of
+    /// `pollFn` uses.
+    fn attachmentFromMessage(allocator: std.mem.Allocator, msg: types.Message) !?iface.Attachment {
+        if (msg.document) |doc| {
+            return .{
+                .kind = .document,
+                .file_id = try allocator.dupe(u8, doc.file_id),
+                .file_name = if (doc.file_name) |n| try allocator.dupe(u8, n) else null,
+                .mime_type = if (doc.mime_type) |m| try allocator.dupe(u8, m) else null,
+            };
+        }
+        if (msg.photo) |sizes| {
+            if (sizes.len == 0) return null;
+            var largest = sizes[0];
+            for (sizes[1..]) |s| {
+                if (s.width * s.height > largest.width * largest.height) largest = s;
+            }
+            return .{ .kind = .photo, .file_id = try allocator.dupe(u8, largest.file_id) };
+        }
+        if (msg.voice) |voice| {
+            return .{
+                .kind = .voice,
+                .file_id = try allocator.dupe(u8, voice.file_id),
+                .mime_type = if (voice.mime_type) |m| try allocator.dupe(u8, m) else null,
+            };
+        }
+        if (msg.audio) |audio| {
+            return .{
+                .kind = .audio,
+                .file_id = try allocator.dupe(u8, audio.file_id),
+                .file_name = if (audio.file_name) |n| try allocator.dupe(u8, n) else null,
+                .mime_type = if (audio.mime_type) |m| try allocator.dupe(u8, m) else null,
+            };
+        }
+        if (msg.video) |video| {
+            return .{
+                .kind = .video,
+                .file_id = try allocator.dupe(u8, video.file_id),
+                .file_name = if (video.file_name) |n| try allocator.dupe(u8, n) else null,
+                .mime_type = if (video.mime_type) |m| try allocator.dupe(u8, m) else null,
+            };
+        }
+        return null;
+    }
+
     /// Case-insensitive "@botusername" scan with a right-boundary check, so
     /// "@warden_bot" matches but "@warden_bot2" (a different account) does
     /// not. Telegram usernames are [A-Za-z0-9_], so ASCII handling suffices.
@@ -105,6 +153,9 @@ pub const TelegramConnector = struct {
         .poll = pollFn,
         .sendMessage = sendMessageFn,
         .sendPhoto = sendPhotoFn,
+        .sendDocument = sendDocumentFn,
+        .maxMessageLength = maxMessageLengthFn,
+        .downloadFile = downloadFileFn,
         .sendMessageReturningId = sendMessageReturningIdFn,
         .editMessage = editMessageFn,
         .muteUser = muteUserFn,
@@ -118,6 +169,16 @@ pub const TelegramConnector = struct {
         .selfUsername = selfUsernameFn,
         .selfId = selfIdFn,
     };
+
+    /// Telegram's documented hard cap on `sendMessage`'s `text` — see
+    /// `Connector.VTable.maxMessageLength`'s doc comment for how this feeds
+    /// into the cross-platform minimum.
+    const max_message_length = 4096;
+
+    fn maxMessageLengthFn(ptr: *anyopaque) usize {
+        _ = ptr;
+        return max_message_length;
+    }
 
     fn selfUsernameFn(ptr: *anyopaque) ?[]const u8 {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
@@ -167,7 +228,16 @@ pub const TelegramConnector = struct {
                 (if (from.username) |u| try allocator.dupe(u8, u) else null)
             else
                 null;
-            const text = if (msg.text) |t| try allocator.dupe(u8, t) else null;
+            // Telegram puts a caption typed alongside a photo/document/
+            // voice/audio/video in `caption`, never `text` — the two are
+            // mutually exclusive on any given message, so this always picks
+            // the one Telegram actually populated.
+            const text = if (msg.text) |t|
+                try allocator.dupe(u8, t)
+            else if (msg.caption) |c|
+                try allocator.dupe(u8, c)
+            else
+                null;
 
             var reply_to_message_id: ?[]const u8 = null;
             var reply_to_user_id: ?[]const u8 = null;
@@ -197,6 +267,8 @@ pub const TelegramConnector = struct {
             else
                 null;
 
+            const attachment = try attachmentFromMessage(allocator, msg);
+
             try messages.append(allocator, .{
                 .chat_id = chat_id,
                 .message_id = message_id,
@@ -214,6 +286,7 @@ pub const TelegramConnector = struct {
                 .mentions_me = mentions_me,
                 .identity = if (telegram_profile) |p| p.identity else null,
                 .telegram_profile = telegram_profile,
+                .attachment = attachment,
             });
         }
         return messages.toOwnedSlice(allocator);
@@ -243,6 +316,17 @@ pub const TelegramConnector = struct {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         const id = parseChatId(chat_id) orelse return;
         self.client.sendPhoto(allocator, id, image_bytes, caption);
+    }
+
+    fn sendDocumentFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, file_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        const id = parseChatId(chat_id) orelse return;
+        self.client.sendDocument(allocator, id, file_bytes, file_name, caption);
+    }
+
+    fn downloadFileFn(ptr: *anyopaque, allocator: std.mem.Allocator, file_id: []const u8) anyerror![]u8 {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.client.downloadFile(allocator, file_id);
     }
 
     fn muteUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, until_unix_time: i64) anyerror!void {
@@ -299,6 +383,41 @@ pub const TelegramConnector = struct {
 };
 
 const testing = std.testing;
+
+test "attachmentFromMessage prefers document, then the largest photo size" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var small_photo = [_]types.PhotoSize{.{ .file_id = "small", .width = 90, .height = 90 }};
+    const with_document = types.Message{
+        .message_id = 1,
+        .chat = .{ .id = 1 },
+        .document = .{ .file_id = "doc1", .file_name = "report.pdf", .mime_type = "application/pdf" },
+        .photo = small_photo[0..],
+    };
+    const att1 = (try TelegramConnector.attachmentFromMessage(a, with_document)).?;
+    try testing.expectEqual(iface.AttachmentKind.document, att1.kind);
+    try testing.expectEqualStrings("doc1", att1.file_id);
+    try testing.expectEqualStrings("report.pdf", att1.file_name.?);
+
+    var photo_sizes = [_]types.PhotoSize{
+        .{ .file_id = "small", .width = 90, .height = 90 },
+        .{ .file_id = "big", .width = 800, .height = 600 },
+        .{ .file_id = "medium", .width = 300, .height = 300 },
+    };
+    const with_photo = types.Message{
+        .message_id = 2,
+        .chat = .{ .id = 1 },
+        .photo = photo_sizes[0..],
+    };
+    const att2 = (try TelegramConnector.attachmentFromMessage(a, with_photo)).?;
+    try testing.expectEqual(iface.AttachmentKind.photo, att2.kind);
+    try testing.expectEqualStrings("big", att2.file_id);
+
+    const with_nothing = types.Message{ .message_id = 3, .chat = .{ .id = 1 } };
+    try testing.expectEqual(@as(?iface.Attachment, null), try TelegramConnector.attachmentFromMessage(a, with_nothing));
+}
 
 test "textMentions matches @username case-insensitively at word boundaries" {
     const mentions = TelegramConnector.textMentions;
