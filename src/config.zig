@@ -74,6 +74,12 @@ pub const Config = struct {
     /// Base URL of a SearXNG instance (e.g. "http://searxng:8080") for the
     /// web_search tool. Unset disables web search entirely.
     searxng_url: ?[]const u8,
+    /// Base URL of a whisper.cpp `whisper-server` instance (e.g.
+    /// "http://whisper-server:8091") for transcribing inbound voice
+    /// messages. Unset disables transcription entirely — a voice message
+    /// then just gets `main.zig`'s generic attachment placeholder, same as
+    /// today.
+    whisper_url: ?[]const u8,
     /// Gates the bot's free-form LLM Q&A to the configured owner(s) only.
     /// Every other command keeps its own existing access control regardless
     /// of this setting. Meant to be flipped on before switching to an
@@ -163,6 +169,12 @@ pub const Config = struct {
             searxng_url = if (trimmed.len == 0) null else trimmed;
         }
 
+        var whisper_url: ?[]const u8 = env.get("WARDEN_WHISPER_URL");
+        if (whisper_url) |u| {
+            const trimmed = std.mem.trimEnd(u8, u, "/");
+            whisper_url = if (trimmed.len == 0) null else trimmed;
+        }
+
         const llm_owner_only = parseBoolEnv(env, "WARDEN_LLM_OWNER_ONLY", default_llm_owner_only);
         const llm_show_thinking = parseBoolEnv(env, "WARDEN_LLM_SHOW_THINKING", default_llm_show_thinking);
 
@@ -178,6 +190,7 @@ pub const Config = struct {
             .digest_interval_seconds = digest_interval_seconds,
             .system_prompt = system_prompt,
             .searxng_url = searxng_url,
+            .whisper_url = whisper_url,
             .llm_owner_only = llm_owner_only,
             .llm_show_thinking = llm_show_thinking,
             .matrix = matrix,

@@ -21,6 +21,7 @@ const alert_store = @import("store/alerts.zig");
 const alert_feature = @import("features/alerts.zig");
 const feed_watches = @import("store/feed_watches.zig");
 const feed_watcher = @import("features/feed_watcher.zig");
+const transcribe = @import("features/transcribe.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
@@ -425,6 +426,32 @@ fn attachmentPlaceholder(allocator: std.mem.Allocator, att: iface.Attachment) ![
     return std.fmt.allocPrint(allocator, "[The user sent {s}, with no caption.]", .{kind_desc});
 }
 
+/// The question text `qa.answer` gets for this message. A captionless
+/// voice message is transcribed (via a configured `whisper-server`) and the
+/// transcript becomes the question, same role Telegram's own `text` field
+/// plays for a typed message — falling back to the generic
+/// `attachmentPlaceholder` on any failure (whisper not configured, the
+/// attachment didn't download, the transcription call itself failed, or
+/// came back empty) rather than ever blocking the reply on it.
+fn resolveQuestion(a: std.mem.Allocator, io: Io, config: *const config_mod.Config, tool_ctx: tool_registry.ToolContext, msg: iface.Message, text: []const u8) []const u8 {
+    if (text.len > 0) return text;
+    const att = msg.attachment orelse return text;
+
+    if (att.kind == .voice) {
+        if (config.whisper_url) |whisper_url| {
+            if (tool_ctx.attachment_path) |path| {
+                if (transcribe.transcribe(a, io, whisper_url, config.tmp_dir, path)) |transcript| {
+                    if (transcript.len > 0) return transcript;
+                } else |err| {
+                    std.log.warn("transcribe: failed for chat {s}: {t}", .{ msg.chat_id, err });
+                }
+            }
+        }
+    }
+
+    return attachmentPlaceholder(a, att) catch text;
+}
+
 /// Resolves (upserting as needed) the internal `identities.id` for a
 /// message's sender. Prefers the full `Identity`/`TelegramProfile` the
 /// connector already built from the platform's wire format; falls back to a
@@ -648,16 +675,7 @@ fn handleMessage(
         // answer my owner" to the whole group.
         if (config.llm_owner_only and !auth.isOwner(config, connector.platform(), msg.user_id)) return;
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
-        // Captionless attachment: give the model something to read instead
-        // of an empty "Question: " (see `qa.answer`'s `user_content`
-        // formatting) so it still knows a file just came in and can reach
-        // for convert_file if that's what makes sense.
-        const question = if (text.len > 0)
-            text
-        else if (msg.attachment) |att|
-            attachmentPlaceholder(a, att) catch text
-        else
-            text;
+        const question = resolveQuestion(a, io, config, tool_ctx, msg, text);
         // Per-chat /persona override, falling back to the global default —
         // see `store/chat_settings.zig`'s `getSystemPromptOverride`.
         const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
@@ -1783,6 +1801,7 @@ test {
     _ = @import("store/feed_watches.zig");
     _ = @import("features/feed_watcher.zig");
     _ = @import("features/feed_parse.zig");
+    _ = @import("features/transcribe.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
     _ = @import("tools/calculator.zig");
