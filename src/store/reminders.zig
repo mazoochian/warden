@@ -1,13 +1,17 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
+const Platform = @import("../platform/interface.zig").Platform;
 
 /// A reminder due for delivery, joined with `chats` for the native chat id
 /// `connector.sendMessage` needs — the delivery path never touches the
-/// internal `chats.id`.
+/// internal `chats.id`. `platform` lets the caller pick the matching
+/// connector once more than one is active (see `chats.ChatRef`'s doc
+/// comment for the same reasoning).
 pub const DueReminder = struct {
     id: i64,
     native_chat_id: []const u8,
+    platform: Platform,
     message: []const u8,
 };
 
@@ -55,7 +59,7 @@ pub fn dueUndelivered(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT r.id, c.native_chat_id, r.message
+        \\SELECT r.id, c.native_chat_id, c.platform, r.message
         \\FROM reminders r JOIN chats c ON c.id = r.chat_id
         \\WHERE r.delivered_at IS NULL AND r.due_at <= to_timestamp($1);
     );
@@ -67,7 +71,8 @@ pub fn dueUndelivered(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]
         try out.append(allocator, .{
             .id = stmt.columnInt64(0),
             .native_chat_id = try allocator.dupe(u8, stmt.columnText(1)),
-            .message = try allocator.dupe(u8, stmt.columnText(2)),
+            .platform = std.meta.stringToEnum(Platform, stmt.columnText(2)) orelse .telegram,
+            .message = try allocator.dupe(u8, stmt.columnText(3)),
         });
     }
     return out.toOwnedSlice(allocator);

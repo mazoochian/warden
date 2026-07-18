@@ -150,9 +150,20 @@ pub fn get(client: *http.Client, allocator: std.mem.Allocator, url: []const u8) 
 /// doc comment for why an interactive-tool fetch needs a much shorter
 /// budget than this module's other callers.
 pub fn getWithTimeout(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, timeout_ns: u64) ![]u8 {
+    return getWithHeadersTimeout(client, allocator, url, &.{}, timeout_ns);
+}
+
+/// Like `get`, but with extra headers (e.g. an `Authorization: Bearer ...`
+/// a bot-token-in-the-URL API like Telegram's doesn't need, but Matrix's
+/// does on every request).
+pub fn getWithHeaders(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, extra_headers: []const http.Header) ![]u8 {
+    return getWithHeadersTimeout(client, allocator, url, extra_headers, default_timeout_ns);
+}
+
+pub fn getWithHeadersTimeout(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, extra_headers: []const http.Header, timeout_ns: u64) ![]u8 {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        return getOnce(client, allocator, url, timeout_ns) catch |err| {
+        return getOnce(client, allocator, url, extra_headers, timeout_ns) catch |err| {
             if (attempt + 1 >= max_attempts or !isTransient(err)) return err;
             try backoff(client, attempt);
             continue;
@@ -160,12 +171,13 @@ pub fn getWithTimeout(client: *http.Client, allocator: std.mem.Allocator, url: [
     }
 }
 
-fn getOnce(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, timeout_ns: u64) ![]u8 {
+fn getOnce(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, extra_headers: []const http.Header, timeout_ns: u64) ![]u8 {
     var response_writer: Io.Writer.Allocating = .init(allocator);
     errdefer response_writer.deinit();
 
     const result = try fetchWithTimeout(client, .{
         .location = .{ .url = url },
+        .extra_headers = extra_headers,
         .keep_alive = false,
         .response_writer = &response_writer.writer,
     }, timeout_ns);
@@ -242,17 +254,20 @@ fn postJsonOnce(
 
 /// Like `postJson`, but for an arbitrary content type (e.g.
 /// multipart/form-data with binary bytes) rather than always
-/// application/json.
+/// application/json. `extra_headers` is almost always `&.{}` (Telegram
+/// needs nothing extra); Matrix's media upload needs its bearer token here
+/// since it can't embed one in the URL the way Telegram's bot token is.
 pub fn postRaw(
     client: *http.Client,
     allocator: std.mem.Allocator,
     url: []const u8,
     content_type: []const u8,
+    extra_headers: []const http.Header,
     payload: []const u8,
 ) ![]u8 {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        return postRawOnce(client, allocator, url, content_type, payload) catch |err| {
+        return postRawOnce(client, allocator, url, content_type, extra_headers, payload) catch |err| {
             if (attempt + 1 >= max_attempts or !isTransient(err)) return err;
             try backoff(client, attempt);
             continue;
@@ -265,6 +280,7 @@ fn postRawOnce(
     allocator: std.mem.Allocator,
     url: []const u8,
     content_type: []const u8,
+    extra_headers: []const http.Header,
     payload: []const u8,
 ) ![]u8 {
     var response_writer: Io.Writer.Allocating = .init(allocator);
@@ -274,11 +290,55 @@ fn postRawOnce(
         .location = .{ .url = url },
         .method = .POST,
         .payload = payload,
+        .extra_headers = extra_headers,
         .headers = .{ .content_type = .{ .override = content_type } },
         .keep_alive = false,
         .response_writer = &response_writer.writer,
     }, default_timeout_ns);
     try checkStatus("POST", url, result.status, response_writer.writer.buffered());
+    return response_writer.toOwnedSlice();
+}
+
+/// Like `postJson`, but with `PUT` — Matrix's `/send`/`/state` endpoints use
+/// PUT (the client picks the transaction/state key, making the request
+/// naturally idempotent), unlike Telegram's POST-only Bot API.
+pub fn putJson(
+    client: *http.Client,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    extra_headers: []const http.Header,
+    payload: []const u8,
+) ![]u8 {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        return putJsonOnce(client, allocator, url, extra_headers, payload) catch |err| {
+            if (attempt + 1 >= max_attempts or !isTransient(err)) return err;
+            try backoff(client, attempt);
+            continue;
+        };
+    }
+}
+
+fn putJsonOnce(
+    client: *http.Client,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    extra_headers: []const http.Header,
+    payload: []const u8,
+) ![]u8 {
+    var response_writer: Io.Writer.Allocating = .init(allocator);
+    errdefer response_writer.deinit();
+
+    const result = try fetchWithTimeout(client, .{
+        .location = .{ .url = url },
+        .method = .PUT,
+        .payload = payload,
+        .extra_headers = extra_headers,
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .keep_alive = false,
+        .response_writer = &response_writer.writer,
+    }, default_timeout_ns);
+    try checkStatus("PUT", url, result.status, response_writer.writer.buffered());
     return response_writer.toOwnedSlice();
 }
 

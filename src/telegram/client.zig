@@ -208,7 +208,7 @@ pub const Client = struct {
         const content_type = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{boundary});
         defer allocator.free(content_type);
 
-        const resp_body = try http_util.postRaw(&self.http_client, allocator, url, content_type, body);
+        const resp_body = try http_util.postRaw(&self.http_client, allocator, url, content_type, &.{}, body);
         defer allocator.free(resp_body);
 
         var parsed = try json.parseFromSlice(
@@ -262,7 +262,7 @@ pub const Client = struct {
         const content_type = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{boundary});
         defer allocator.free(content_type);
 
-        const resp_body = try http_util.postRaw(&self.http_client, allocator, url, content_type, body);
+        const resp_body = try http_util.postRaw(&self.http_client, allocator, url, content_type, &.{}, body);
         defer allocator.free(resp_body);
 
         var parsed = try json.parseFromSlice(

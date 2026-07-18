@@ -23,6 +23,18 @@ pub const OpenAiCompatConfig = struct {
     model: []const u8,
 };
 
+/// Matrix connector config — both fields required together (see `load`'s
+/// handling of `WARDEN_MATRIX_HOMESERVER_URL`/`WARDEN_MATRIX_ACCESS_TOKEN`).
+/// A pre-provisioned access token rather than username/password: same shape
+/// as Telegram's bot token, avoids the bot ever holding a real password, and
+/// sidesteps needing to implement the interactive `m.login.password` flow
+/// (device management, refresh tokens) for what's meant to run unattended.
+pub const MatrixConfig = struct {
+    /// No trailing slash (trimmed in `load`).
+    homeserver_url: []const u8,
+    access_token: []const u8,
+};
+
 pub const LlmConfig = union(LlmProviderKind) {
     anthropic: AnthropicConfig,
     openai_compat: OpenAiCompatConfig,
@@ -72,6 +84,10 @@ pub const Config = struct {
     /// `reasoning` field the OpenAI-compatible backend sends are filtered
     /// out before the reply is shown — see `llm/openai_compat.zig`.
     llm_show_thinking: bool,
+    /// Null when Matrix isn't configured — `main.zig` only constructs a
+    /// `MatrixConnector` (and adds it to the active connector list) when
+    /// this is set.
+    matrix: ?MatrixConfig = null,
 
     pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile } || std.mem.Allocator.Error;
 
@@ -84,9 +100,21 @@ pub const Config = struct {
 
         const telegram_owner_id = env.get("WARDEN_TELEGRAM_OWNER_ID") orelse default_telegram_owner_id;
 
-        const owners = try arena.dupe(OwnerEntry, &.{
-            .{ .platform = .telegram, .owner_id = telegram_owner_id },
-        });
+        const matrix = loadMatrixConfig(env);
+
+        var owners_buf: [2]OwnerEntry = undefined;
+        var owners_len: usize = 0;
+        owners_buf[owners_len] = .{ .platform = .telegram, .owner_id = telegram_owner_id };
+        owners_len += 1;
+        if (matrix != null) {
+            if (env.get("WARDEN_MATRIX_OWNER_ID")) |matrix_owner_id| {
+                owners_buf[owners_len] = .{ .platform = .matrix, .owner_id = matrix_owner_id };
+                owners_len += 1;
+            } else {
+                std.log.warn("WARDEN_MATRIX_HOMESERVER_URL/WARDEN_MATRIX_ACCESS_TOKEN are set but WARDEN_MATRIX_OWNER_ID isn't — owner-gated Q&A will reject the Matrix owner until it's set", .{});
+            }
+        }
+        const owners = try arena.dupe(OwnerEntry, owners_buf[0..owners_len]);
 
         const postgres_dsn = env.get("WARDEN_POSTGRES_DSN") orelse return error.MissingPostgresDsn;
 
@@ -152,6 +180,7 @@ pub const Config = struct {
             .searxng_url = searxng_url,
             .llm_owner_only = llm_owner_only,
             .llm_show_thinking = llm_show_thinking,
+            .matrix = matrix,
         };
     }
 
@@ -163,6 +192,25 @@ pub const Config = struct {
         if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
         if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
         return default;
+    }
+
+    /// `null` when neither var is set. When only one of the pair is set,
+    /// logs an error and also returns `null` — a half-configured Matrix
+    /// connector (e.g. a homeserver URL with no token) would otherwise fail
+    /// obscurely on its first API call instead of just not starting.
+    fn loadMatrixConfig(env: *const std.process.Environ.Map) ?MatrixConfig {
+        const homeserver_url = env.get("WARDEN_MATRIX_HOMESERVER_URL");
+        const access_token = env.get("WARDEN_MATRIX_ACCESS_TOKEN");
+        if (homeserver_url == null and access_token == null) return null;
+        const hs = homeserver_url orelse {
+            std.log.err("WARDEN_MATRIX_ACCESS_TOKEN is set but WARDEN_MATRIX_HOMESERVER_URL isn't — Matrix stays disabled", .{});
+            return null;
+        };
+        const token = access_token orelse {
+            std.log.err("WARDEN_MATRIX_HOMESERVER_URL is set but WARDEN_MATRIX_ACCESS_TOKEN isn't — Matrix stays disabled", .{});
+            return null;
+        };
+        return .{ .homeserver_url = std.mem.trimEnd(u8, hs, "/"), .access_token = token };
     }
 
     fn loadLlmConfig(env: *const std.process.Environ.Map) LoadError!LlmConfig {

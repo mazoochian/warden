@@ -5,6 +5,7 @@ const config_mod = @import("config.zig");
 const auth = @import("auth.zig");
 const iface = @import("platform/interface.zig");
 const telegram_platform = @import("platform/telegram.zig");
+const matrix_platform = @import("platform/matrix.zig");
 const store_pool = @import("store/pool.zig");
 const migrate = @import("store/migrate.zig");
 const chats = @import("store/chats.zig");
@@ -69,13 +70,29 @@ pub fn main(init: std.process.Init) !void {
     }
     const active_tools = tools_buf[0..tools_len];
 
-    // Only Telegram is wired up today. Adding another platform means
-    // constructing its connector here too and looping over all of them —
-    // `handleMessage` below is already platform-agnostic.
     var telegram_adapter = telegram_platform.TelegramConnector.init(gpa, io, config.telegram_bot_token);
     defer telegram_adapter.deinit();
-    const connectors = [_]iface.Connector{telegram_adapter.connector()};
-    const max_message_len = effectiveMaxMessageLength(&connectors);
+
+    // Matrix only joins the active connector list when configured (see
+    // `config.zig`'s `matrix` field) — `matrix_adapter` lives in `main`'s own
+    // stack frame for the whole run, so `&matrix_adapter.?` below stays valid
+    // for as long as its `Connector` does.
+    var matrix_adapter: ?matrix_platform.MatrixConnector = if (config.matrix) |mc|
+        matrix_platform.MatrixConnector.init(gpa, io, mc.homeserver_url, mc.access_token)
+    else
+        null;
+    defer if (matrix_adapter) |*m| m.deinit();
+
+    var connectors_buf: [2]iface.Connector = undefined;
+    var connectors_len: usize = 0;
+    connectors_buf[connectors_len] = telegram_adapter.connector();
+    connectors_len += 1;
+    if (matrix_adapter) |*m| {
+        connectors_buf[connectors_len] = m.connector();
+        connectors_len += 1;
+    }
+    const connectors: []const iface.Connector = connectors_buf[0..connectors_len];
+    const max_message_len = effectiveMaxMessageLength(connectors);
 
     var pool = try store_pool.PgPool.init(gpa, io, config.postgres_dsn, config.postgres_pool_size);
     defer pool.deinit();
@@ -184,17 +201,30 @@ pub fn main(init: std.process.Init) !void {
                     duped_msg,
                 });
             }
-
-            // Piggybacks on the poll loop's natural ~30s cadence (Telegram's
-            // long-poll timeout) rather than a separate timer/thread — fine
-            // granularity for a daily-ish interval. Only sends via this one
-            // connector; see `checkAndSendDueDigests`'s doc comment for the
-            // multi-platform caveat.
-            const now = Io.Timestamp.now(io, .real).toSeconds();
-            checkAndSendDueDigests(connector, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
-            checkAndSendDueReminders(connector, gpa, &pool, now);
         }
+
+        // Piggybacks on the poll loop's natural ~30s cadence (Telegram's
+        // long-poll timeout) rather than a separate timer/thread — fine
+        // granularity for a daily-ish interval. Runs once per lap over every
+        // connector (not once per connector) since a due digest/reminder
+        // needs to be matched to whichever connector actually owns its
+        // chat's platform, not delivered through whichever connector
+        // happened to be polling most recently.
+        const now = Io.Timestamp.now(io, .real).toSeconds();
+        checkAndSendDueDigests(connectors, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
+        checkAndSendDueReminders(connectors, gpa, &pool, now);
     }
+}
+
+/// Finds the connector whose platform matches `platform` among `connectors`
+/// — the lookup `checkAndSendDueDigests`/`checkAndSendDueReminders` need to
+/// deliver a due item through the right connector once more than one is
+/// active (see `chats.ChatRef`'s doc comment).
+fn findConnector(connectors: []const iface.Connector, platform: iface.Platform) ?iface.Connector {
+    for (connectors) |c| {
+        if (c.platform() == platform) return c;
+    }
+    return null;
 }
 
 /// Fallback used when no connector declares a `maxMessageLength` (shouldn't
@@ -432,20 +462,20 @@ fn loadDigestScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, 
 
     for (refs) |ref| {
         if (chat_settings.getDigestEnabled(pool, ref.id)) {
-            digest_scheduler.enable(ref.native_chat_id) catch |err| {
+            digest_scheduler.enable(ref.platform, ref.native_chat_id) catch |err| {
                 std.log.err("digest: failed to restore schedule for chat {s}: {t}", .{ ref.native_chat_id, err });
             };
         }
     }
 }
 
-/// Only sends via `connector` — correct as long as there's exactly one
-/// connector (true today). Once a second platform is wired up, the
-/// scheduler will need to track which connector each chat_id belongs to
-/// (chat_id alone isn't namespaced by platform anywhere in this codebase
-/// yet) rather than assuming a single global connector.
+/// Delivers through whichever of `connectors` actually owns each due chat's
+/// platform (see `findConnector`) — a chat whose platform has no active
+/// connector (shouldn't normally happen; guards against a stale/removed
+/// platform's leftover `chat_settings` row) is skipped with a log line
+/// rather than silently misdelivered through an unrelated connector.
 fn checkAndSendDueDigests(
-    connector: iface.Connector,
+    connectors: []const iface.Connector,
     gpa: std.mem.Allocator,
     io: Io,
     config: *const config_mod.Config,
@@ -455,16 +485,22 @@ fn checkAndSendDueDigests(
     max_message_len: usize,
     now: i64,
 ) void {
-    const enabled_chat_ids = digest_scheduler.snapshotEnabledChatIds(gpa) catch |err| {
+    const enabled_chats = digest_scheduler.snapshotEnabledChatIds(gpa) catch |err| {
         std.log.err("digest: failed to snapshot enabled chats: {t}", .{err});
         return;
     };
     defer {
-        for (enabled_chat_ids) |id| gpa.free(id);
-        gpa.free(enabled_chat_ids);
+        for (enabled_chats) |k| gpa.free(k.native_chat_id);
+        gpa.free(enabled_chats);
     }
 
-    for (enabled_chat_ids) |native_chat_id| {
+    for (enabled_chats) |key| {
+        const native_chat_id = key.native_chat_id;
+        const connector = findConnector(connectors, key.platform) orelse {
+            std.log.warn("digest: no active connector for platform {s}, skipping chat {s}", .{ @tagName(key.platform), native_chat_id });
+            continue;
+        };
+
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -826,7 +862,7 @@ fn handleDigestCommand(
     const arg = std.mem.trim(u8, text["/digest".len..], " ");
 
     if (std.mem.eql(u8, arg, "on")) {
-        digest_scheduler.enable(native_chat_id) catch |err| {
+        digest_scheduler.enable(connector.platform(), native_chat_id) catch |err| {
             std.log.err("digest: failed to enable for chat {s}: {t}", .{ native_chat_id, err });
             connector.sendMessage(a, native_chat_id, "Couldn't enable digests, try again.", reply_to);
             return;
@@ -838,7 +874,7 @@ fn handleDigestCommand(
         const msg_text = std.fmt.allocPrint(a, "Digest enabled — I'll post one roughly every {d}h.", .{hours}) catch return;
         connector.sendMessage(a, native_chat_id, msg_text, reply_to);
     } else if (std.mem.eql(u8, arg, "off")) {
-        digest_scheduler.disable(native_chat_id);
+        digest_scheduler.disable(a, connector.platform(), native_chat_id);
         chat_settings.setDigestEnabled(pool, chat_id, false) catch |err| {
             std.log.err("digest: failed to persist disabled flag for chat {s}: {t}", .{ native_chat_id, err });
         };
@@ -854,7 +890,7 @@ fn handleDigestCommand(
             std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
         };
     } else {
-        const enabled = digest_scheduler.isEnabled(native_chat_id);
+        const enabled = digest_scheduler.isEnabled(a, connector.platform(), native_chat_id);
         const last = chat_settings.getLastDigestTs(pool, chat_id);
         const msg_text = if (last == 0)
             std.fmt.allocPrint(
@@ -1057,11 +1093,13 @@ const ReminderToolAdapter = struct {
     }
 };
 
-/// Only sends via `connector` — same single-connector simplification as
-/// `checkAndSendDueDigests` (see its doc comment); revisit once a second
-/// platform is wired up.
+/// Delivers through whichever of `connectors` owns each due reminder's
+/// platform — see `checkAndSendDueDigests`'s doc comment for the same
+/// reasoning. A reminder whose platform has no active connector is left
+/// undelivered (not marked delivered) so it retries next cycle instead of
+/// being silently lost.
 fn checkAndSendDueReminders(
-    connector: iface.Connector,
+    connectors: []const iface.Connector,
     gpa: std.mem.Allocator,
     pool: *store_pool.PgPool,
     now: i64,
@@ -1079,6 +1117,11 @@ fn checkAndSendDueReminders(
     }
 
     for (due) |r| {
+        const connector = findConnector(connectors, r.platform) orelse {
+            std.log.warn("remind: no active connector for platform {s}, leaving reminder {d} pending", .{ @tagName(r.platform), r.id });
+            continue;
+        };
+
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
