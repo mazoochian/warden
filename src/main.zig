@@ -19,6 +19,8 @@ const reminders = @import("store/reminders.zig");
 const reminder_format = @import("features/reminder_format.zig");
 const alert_store = @import("store/alerts.zig");
 const alert_feature = @import("features/alerts.zig");
+const feed_watches = @import("store/feed_watches.zig");
+const feed_watcher = @import("features/feed_watcher.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
@@ -217,6 +219,7 @@ pub fn main(init: std.process.Init) !void {
         checkAndSendDueDigests(connectors, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
         checkAndSendDueReminders(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
+        feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
     }
 }
 
@@ -625,6 +628,12 @@ fn handleMessage(
         handleAlertCommand(connector, a, config, pool, chat_id, identity_id, msg, text);
     } else if (std.mem.eql(u8, text, "/alerts")) {
         handleAlertsList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
+    } else if (std.mem.eql(u8, text, "/watch") or std.mem.startsWith(u8, text, "/watch ")) {
+        handleWatchCommand(connector, a, pool, chat_id, identity_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/unwatch") or std.mem.startsWith(u8, text, "/unwatch ")) {
+        handleUnwatchCommand(connector, a, pool, chat_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/watches")) {
+        handleWatchesList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
@@ -1159,6 +1168,84 @@ fn handleAlertsList(
     connector.sendMessage(a, native_chat_id, formatPendingAlerts(a, pending), reply_to);
 }
 
+/// `/watch <feed_url>` adds an RSS/Atom watch for this chat. Open to
+/// anyone in the chat, same as `/digest on|off` — not restricted to
+/// whoever added it (see `store/feed_watches.zig`'s doc comment on why
+/// `/unwatch` works the same way).
+fn handleWatchCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const feed_url = std.mem.trim(u8, text["/watch".len..], " ");
+    if (feed_url.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /watch <feed url>");
+        return;
+    }
+    const created = feed_watches.create(pool, chat_id, identity_id, feed_url) catch |err| {
+        std.log.err("watch: failed to add feed {s} for chat {d}: {t}", .{ feed_url, chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't add that watch, try again.");
+        return;
+    };
+    if (created) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Watching — I'll post here when something new shows up.");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Already watching that feed in this chat.");
+    }
+}
+
+fn handleUnwatchCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const feed_url = std.mem.trim(u8, text["/unwatch".len..], " ");
+    if (feed_url.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /unwatch <feed url>");
+        return;
+    }
+    const removed = feed_watches.remove(pool, chat_id, feed_url) catch |err| {
+        std.log.err("unwatch: failed to remove feed {s} for chat {d}: {t}", .{ feed_url, chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't remove that watch, try again.");
+        return;
+    };
+    if (removed) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Unwatched.");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Wasn't watching that feed in this chat.");
+    }
+}
+
+fn handleWatchesList(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    native_chat_id: []const u8,
+    reply_to: ?[]const u8,
+) void {
+    const pending = feed_watches.listPending(pool, a, chat_id) catch |err| {
+        std.log.err("watches: list failed for chat {d}: {t}", .{ chat_id, err });
+        connector.sendMessage(a, native_chat_id, "Couldn't load watches, try again.", reply_to);
+        return;
+    };
+    if (pending.len == 0) {
+        connector.sendMessage(a, native_chat_id, "No feeds watched. Add one with /watch <feed url>.", reply_to);
+        return;
+    }
+    var buf: std.Io.Writer.Allocating = .init(a);
+    buf.writer.print("Watched feeds:\n", .{}) catch {};
+    for (pending) |fw| buf.writer.print("  #{d} {s}\n", .{ fw.id, fw.feed_url }) catch {};
+    connector.sendMessage(a, native_chat_id, buf.writer.buffered(), reply_to);
+}
+
 /// Direct entry point to `convert_file` (see `tools/convert_file.zig`) for
 /// people who'd rather type an explicit command than phrase a request in
 /// natural language — same file (`tool_ctx.attachment_path`, downloaded by
@@ -1635,6 +1722,9 @@ test {
     _ = @import("store/alerts.zig");
     _ = @import("features/alerts.zig");
     _ = @import("tools/set_alert.zig");
+    _ = @import("store/feed_watches.zig");
+    _ = @import("features/feed_watcher.zig");
+    _ = @import("features/feed_parse.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
     _ = @import("tools/calculator.zig");
