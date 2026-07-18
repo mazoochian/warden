@@ -17,6 +17,7 @@ const migrations = [_]Migration{
     .{ .version = 3, .name = "0003_reminders_recurrence", .sql = @embedFile("migrations/0003_reminders_recurrence.sql") },
     .{ .version = 4, .name = "0004_alerts", .sql = @embedFile("migrations/0004_alerts.sql") },
     .{ .version = 5, .name = "0005_feed_watches", .sql = @embedFile("migrations/0005_feed_watches.sql") },
+    .{ .version = 6, .name = "0006_persona", .sql = @embedFile("migrations/0006_persona.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each
