@@ -517,6 +517,32 @@ pub const Client = struct {
         return std.mem.eql(u8, member.status, "administrator") or std.mem.eql(u8, member.status, "creator");
     }
 
+    /// Every owner/administrator of `chat_id`, full `User` objects included.
+    /// This is the *only* Bot API call that hands back more than one
+    /// member at a time — Telegram deliberately gives bots no way to
+    /// enumerate a group's regular (non-admin) membership, so this is used
+    /// to seed the local roster with at least the admin subset rather than
+    /// relying purely on who happens to message/get mentioned/get replied
+    /// to. Caller owns the returned `Parsed` value.
+    pub fn getChatAdministrators(self: *Client, allocator: std.mem.Allocator, chat_id: i64) !json.Parsed(types.ChatAdministratorsResponse) {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "https://api.telegram.org/bot{s}/getChatAdministrators?chat_id={d}",
+            .{ self.bot_token, chat_id },
+        );
+        defer allocator.free(url);
+
+        const body = try http_util.get(&self.http_client, allocator, url);
+        defer allocator.free(body);
+
+        return json.parseFromSlice(
+            types.ChatAdministratorsResponse,
+            allocator,
+            body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+    }
+
     const MethodResponse = struct {
         ok: bool,
         description: ?[]const u8 = null,

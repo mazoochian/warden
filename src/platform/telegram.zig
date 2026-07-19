@@ -44,6 +44,31 @@ pub const TelegramConnector = struct {
         }
     }
 
+    /// Builds just the ancestor `Identity` from a Bot API `User` — the
+    /// common core `profileFromUser` below extends with Telegram-specific
+    /// fields, and what's used directly for users Warden only glimpses in
+    /// passing (a reply target, a text-mention, a join/leave event, an
+    /// admin-list entry) where the fuller `TelegramProfile` extension isn't
+    /// worth building. Allocates out of `allocator` — same short-lived
+    /// poll-cycle arena `profileFromUser`'s callers use.
+    fn identityFromUser(allocator: std.mem.Allocator, user: types.User, now: i64) !Identity {
+        const native_id = try std.fmt.allocPrint(allocator, "{d}", .{user.id});
+        const display_name = if (user.last_name) |last|
+            try std.fmt.allocPrint(allocator, "{s} {s}", .{ user.first_name, last })
+        else
+            try allocator.dupe(u8, user.first_name);
+
+        return .{
+            .platform = .telegram,
+            .native_id = native_id,
+            .display_name = display_name,
+            .username = if (user.username) |u| try allocator.dupe(u8, u) else null,
+            .is_bot = user.is_bot,
+            .first_seen = now,
+            .last_seen = now,
+        };
+    }
+
     /// Builds the ancestor `Identity` plus Telegram-specific extension from
     /// a fully-parsed Bot API `User` (Telegram sends the whole `User`
     /// object on every message's `from` field, not just id/username, so
@@ -52,22 +77,8 @@ pub const TelegramConnector = struct {
     /// rest of `pollFn` uses; `iface.Message.dupe` deep-copies it into the
     /// per-task arena along with everything else.
     fn profileFromUser(allocator: std.mem.Allocator, user: types.User, now: i64) !TelegramProfile {
-        const native_id = try std.fmt.allocPrint(allocator, "{d}", .{user.id});
-        const display_name = if (user.last_name) |last|
-            try std.fmt.allocPrint(allocator, "{s} {s}", .{ user.first_name, last })
-        else
-            try allocator.dupe(u8, user.first_name);
-
         return .{
-            .identity = .{
-                .platform = .telegram,
-                .native_id = native_id,
-                .display_name = display_name,
-                .username = if (user.username) |u| try allocator.dupe(u8, u) else null,
-                .is_bot = user.is_bot,
-                .first_seen = now,
-                .last_seen = now,
-            },
+            .identity = try identityFromUser(allocator, user, now),
             .first_name = try allocator.dupe(u8, user.first_name),
             .last_name = if (user.last_name) |s| try allocator.dupe(u8, s) else null,
             .language_code = if (user.language_code) |s| try allocator.dupe(u8, s) else null,
@@ -77,6 +88,45 @@ pub const TelegramConnector = struct {
             .can_read_all_group_messages = user.can_read_all_group_messages,
             .supports_inline_queries = user.supports_inline_queries,
         };
+    }
+
+    /// Collects every identity a message reveals *besides* its own sender —
+    /// see `iface.Message.observed_users`'s doc comment for why this exists.
+    /// Skips the bot's own account (it's not a "participant" worth
+    /// surfacing to `find_chat_member`) and de-dupes by native id within
+    /// this one message, since e.g. a reply target who's also
+    /// text-mentioned in the same message would otherwise appear twice.
+    fn observedUsersFromMessage(self: *TelegramConnector, allocator: std.mem.Allocator, msg: types.Message, now: i64) ![]Identity {
+        var out: std.ArrayList(Identity) = .empty;
+
+        const addUser = struct {
+            fn call(conn: *TelegramConnector, list: *std.ArrayList(Identity), alloc: std.mem.Allocator, user: types.User, ts: i64) !void {
+                if (conn.self_id) |me| if (user.id == me) return;
+                var buf: [24]u8 = undefined;
+                const id_str = std.fmt.bufPrint(&buf, "{d}", .{user.id}) catch return;
+                for (list.items) |existing| {
+                    if (std.mem.eql(u8, existing.native_id, id_str)) return;
+                }
+                try list.append(alloc, try identityFromUser(alloc, user, ts));
+            }
+        }.call;
+
+        if (msg.reply_to_message) |reply| {
+            if (reply.from) |from| try addUser(self, &out, allocator, from, now);
+        }
+        if (msg.entities) |entities| {
+            for (entities) |entity| {
+                if (!std.mem.eql(u8, entity.type, "text_mention")) continue;
+                const user = entity.user orelse continue;
+                try addUser(self, &out, allocator, user, now);
+            }
+        }
+        if (msg.new_chat_members) |joined| {
+            for (joined) |user| try addUser(self, &out, allocator, user, now);
+        }
+        if (msg.left_chat_member) |user| try addUser(self, &out, allocator, user, now);
+
+        return out.toOwnedSlice(allocator);
     }
 
     /// Telegram sends at most one of photo/document/voice/audio/video per
@@ -169,6 +219,7 @@ pub const TelegramConnector = struct {
         .isGroupAdmin = isGroupAdminFn,
         .selfUsername = selfUsernameFn,
         .selfId = selfIdFn,
+        .listChatAdmins = listChatAdminsFn,
     };
 
     /// Telegram's documented hard cap on `sendMessage`'s `text` — see
@@ -303,6 +354,7 @@ pub const TelegramConnector = struct {
                 null;
 
             const attachment = try attachmentFromMessage(allocator, msg);
+            const observed_users = try self.observedUsersFromMessage(allocator, msg, msg.date);
 
             try messages.append(allocator, .{
                 .chat_id = chat_id,
@@ -322,6 +374,7 @@ pub const TelegramConnector = struct {
                 .identity = if (telegram_profile) |p| p.identity else null,
                 .telegram_profile = telegram_profile,
                 .attachment = attachment,
+                .observed_users = observed_users,
             });
         }
         return messages.toOwnedSlice(allocator);
@@ -421,6 +474,25 @@ pub const TelegramConnector = struct {
         return self.client.isChatAdmin(allocator, try parseId(chat_id), try parseId(user_id));
     }
 
+    fn listChatAdminsFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8) anyerror![]Identity {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        var parsed = try self.client.getChatAdministrators(allocator, try parseId(chat_id));
+        defer parsed.deinit();
+
+        if (!parsed.value.ok) {
+            std.log.err("telegram getChatAdministrators not-ok: {?s}", .{parsed.value.description});
+            return error.TelegramApiError;
+        }
+
+        const now = Io.Timestamp.now(self.client.io, .real).toSeconds();
+        var out: std.ArrayList(Identity) = .empty;
+        for (parsed.value.result) |member| {
+            const user = member.user orelse continue;
+            try out.append(allocator, try identityFromUser(allocator, user, now));
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     fn parseId(s: []const u8) !i64 {
         return std.fmt.parseInt(i64, s, 10);
     }
@@ -484,4 +556,55 @@ test "textMentions matches @username case-insensitively at word boundaries" {
     // Earlier non-matching @ must not stop the scan.
     try testing.expect(mentions("@someone and @warden_bot", "warden_bot"));
     try testing.expect(!mentions("anything", ""));
+}
+
+test "observedUsersFromMessage collects reply target, text-mentions, and join/leave, deduped and self-excluded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var conn = TelegramConnector.init(testing.allocator, testing.io, "test-token");
+    defer conn.deinit();
+    conn.self_id = 999; // the bot's own account, must never show up
+
+    const bob = types.User{ .id = 42, .first_name = "Bob" };
+    const carol = types.User{ .id = 7, .first_name = "Carol", .username = "carol_c" };
+    const the_bot = types.User{ .id = 999, .first_name = "Warden", .is_bot = true };
+
+    var entities = [_]types.MessageEntity{
+        .{ .type = "text_mention", .user = carol },
+        // A reply target who's also text-mentioned in the same message
+        // must not be double-counted.
+        .{ .type = "text_mention", .user = bob },
+        .{ .type = "bold" }, // no `user` — must not crash or add a bogus entry
+    };
+    var joined = [_]types.User{the_bot}; // the join event includes the bot itself
+
+    const msg = types.Message{
+        .message_id = 1,
+        .chat = .{ .id = 1 },
+        .reply_to_message = .{ .message_id = 0, .from = bob },
+        .entities = entities[0..],
+        .new_chat_members = joined[0..],
+    };
+
+    const observed = try conn.observedUsersFromMessage(a, msg, 1000);
+    try testing.expectEqual(@as(usize, 2), observed.len);
+    try testing.expectEqualStrings("42", observed[0].native_id);
+    try testing.expectEqualStrings("Bob", observed[0].display_name);
+    try testing.expectEqualStrings("7", observed[1].native_id);
+    try testing.expectEqualStrings("carol_c", observed[1].username.?);
+}
+
+test "observedUsersFromMessage is empty for a plain message with nothing extra to observe" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var conn = TelegramConnector.init(testing.allocator, testing.io, "test-token");
+    defer conn.deinit();
+
+    const msg = types.Message{ .message_id = 1, .chat = .{ .id = 1 } };
+    const observed = try conn.observedUsersFromMessage(a, msg, 1000);
+    try testing.expectEqual(@as(usize, 0), observed.len);
 }

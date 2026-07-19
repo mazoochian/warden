@@ -137,6 +137,14 @@ pub const Message = struct {
     /// own, so callers that check this must do so before any "text or
     /// attachment required" bail-out.
     choice_picked: ?ChoicePicked = null,
+    /// Other identities this one message happened to reveal, beyond its own
+    /// sender — e.g. a reply target, a name-mention with no `@username`
+    /// (Telegram's `text_mention` entity), or a join/leave service message's
+    /// subject. `main.zig` upserts each into `chat_members` alongside the
+    /// sender, so the chat's known-participant roster (see the
+    /// `find_chat_member` tool) grows from more than just who's actually
+    /// spoken. Empty for platforms/messages that reveal nothing extra.
+    observed_users: []const Identity = &.{},
 
     /// Deep-copies every string field into `allocator`. The poll loop
     /// spawns one concurrent task per message, each owning its own arena;
@@ -166,6 +174,12 @@ pub const Message = struct {
                 .prompt_message_id = try allocator.dupe(u8, cp.prompt_message_id),
                 .value = try allocator.dupe(u8, cp.value),
             } else null,
+            .observed_users = blk: {
+                if (self.observed_users.len == 0) break :blk &.{};
+                const out = try allocator.alloc(Identity, self.observed_users.len);
+                for (self.observed_users, 0..) |id, i| out[i] = try id.dupe(allocator);
+                break :blk out;
+            },
         };
     }
 };
@@ -260,6 +274,14 @@ pub const Connector = struct {
         /// the bot's own `Identity` row so its own messages aren't logged
         /// under a hardcoded placeholder id.
         selfId: ?*const fn (ptr: *anyopaque) ?[]const u8 = null,
+        /// Every owner/administrator of `chat_id`, if this platform exposes
+        /// such a call — the closest thing to a bulk member listing bots
+        /// get (see `telegram/client.zig`'s `getChatAdministrators` doc
+        /// comment: there is no bulk call for regular members). Used to
+        /// seed the local roster (`chat_members`) with admins who may never
+        /// have sent a message themselves. Optional: a platform without the
+        /// concept just reports `error.Unsupported`.
+        listChatAdmins: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8) anyerror![]Identity = null,
     };
 
     pub fn platform(self: Connector) Platform {
@@ -378,6 +400,11 @@ pub const Connector = struct {
     pub fn selfId(self: Connector) ?[]const u8 {
         const f = self.vtable.selfId orelse return null;
         return f(self.ptr);
+    }
+
+    pub fn listChatAdmins(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8) ![]Identity {
+        const f = self.vtable.listChatAdmins orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id);
     }
 };
 
@@ -528,4 +555,48 @@ test "Message.dupe deep-copies identity and telegram_profile" {
     try testing.expectEqualStrings("Alice", dst.identity.?.display_name);
     try testing.expectEqualStrings("alice", dst.identity.?.username.?);
     try testing.expectEqualStrings("en", dst.telegram_profile.?.language_code.?);
+}
+
+test "Message.dupe deep-copies observed_users and detaches them from the source arena" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const src_a = arena.allocator();
+
+    const src = Message{
+        .chat_id = try src_a.dupe(u8, "1"),
+        .user_id = try src_a.dupe(u8, "2"),
+        .observed_users = &.{
+            .{
+                .platform = .telegram,
+                .native_id = try src_a.dupe(u8, "99"),
+                .display_name = try src_a.dupe(u8, "Bob"),
+                .first_seen = 1000,
+                .last_seen = 1000,
+            },
+        },
+    };
+
+    const dst = try src.dupe(testing.allocator);
+    defer {
+        testing.allocator.free(dst.chat_id);
+        testing.allocator.free(dst.user_id);
+        testing.allocator.free(dst.observed_users[0].native_id);
+        testing.allocator.free(dst.observed_users[0].display_name);
+        testing.allocator.free(dst.observed_users);
+    }
+
+    arena.deinit();
+
+    try testing.expectEqual(@as(usize, 1), dst.observed_users.len);
+    try testing.expectEqualStrings("99", dst.observed_users[0].native_id);
+    try testing.expectEqualStrings("Bob", dst.observed_users[0].display_name);
+}
+
+test "Message.dupe passes through an empty observed_users without allocating" {
+    const src = Message{ .chat_id = "1", .user_id = "2" };
+    const dst = try src.dupe(testing.allocator);
+    defer {
+        testing.allocator.free(dst.chat_id);
+        testing.allocator.free(dst.user_id);
+    }
+    try testing.expectEqual(@as(usize, 0), dst.observed_users.len);
 }
