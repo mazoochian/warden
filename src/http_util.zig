@@ -1,6 +1,11 @@
 //! Shared one-shot GET/POST helpers over `std.http.Client.fetch`, used by
 //! the Telegram client and the LLM provider adapters alike so each of them
-//! doesn't hand-roll the same response-buffering boilerplate.
+//! doesn't hand-roll the same response-buffering boilerplate. The one
+//! exception is `postJsonSSE`, built on `std.http.Client`'s lower-level
+//! request/receiveHead/reader primitives instead of `fetch` — it streams
+//! the response line-by-line for Server-Sent-Events endpoints rather than
+//! buffering the whole body; see its own doc comment for how its retry/
+//! timeout story differs from everything else here.
 //!
 //! All helpers request `keep_alive = false` and additionally retry transient
 //! connection errors (see `isTransient`) up to two more times with a short
@@ -340,6 +345,156 @@ fn putJsonOnce(
     }, default_timeout_ns);
     try checkStatus("PUT", url, result.status, response_writer.writer.buffered());
     return response_writer.toOwnedSlice();
+}
+
+/// One line read from a Server-Sent-Events response body, handed to
+/// `postJsonSSE`'s caller as it arrives. `ptr`/`onLine` rather than a plain
+/// closure — same ptr+fn idiom used throughout this codebase (see
+/// `platform.Connector`) since Zig has no capturing closures.
+pub const SseLineSink = struct {
+    ptr: *anyopaque,
+    onLine: *const fn (ptr: *anyopaque, line: []const u8) anyerror!void,
+};
+
+const StreamShared = struct {
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+fn streamJsonSSEAndFlag(
+    client: *http.Client,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    extra_headers: []const http.Header,
+    payload: []const u8,
+    sink: SseLineSink,
+    shared: *StreamShared,
+    out: *anyerror!void,
+) void {
+    out.* = postJsonSSEOnce(client, allocator, url, extra_headers, payload, sink);
+    shared.done.store(true, .release);
+}
+
+/// Like `postJson`, but for a Server-Sent-Events endpoint (`"stream":true`
+/// set in `payload` by the caller) — invokes `sink.onLine` once per line
+/// read from the response body as it arrives, instead of buffering the
+/// whole response before returning. Each caller (the LLM provider adapters)
+/// owns interpreting the lines itself, since SSE payload shapes differ per
+/// API; this only handles the shared transport mechanics (connect, send,
+/// read-loop, timeout) — same `Io.concurrent` + done-flag + `Future.cancel`
+/// timeout pattern as `fetchWithTimeout`, just wrapping a read-loop instead
+/// of one blocking `client.fetch()` call, with the same cancellation-safety
+/// property: `cancel` blocks until the task has actually unwound, so it's
+/// safe for `sink` to keep pointing at the caller's stack/state.
+///
+/// Unlike every other helper in this file, this does NOT retry on a
+/// transient connection error once streaming has begun (any line already
+/// reached `sink`) — retrying from scratch after the caller has already
+/// acted on partial data (e.g. edited it into a chat message, or started
+/// accumulating a tool call's arguments) would silently corrupt whatever
+/// state it's built up so far. A failure after the first line is a hard
+/// error, same as any other request failure the caller (`toolcall.run` via
+/// the LLM provider adapters) already knows how to surface.
+pub fn postJsonSSE(
+    client: *http.Client,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    extra_headers: []const http.Header,
+    payload: []const u8,
+    timeout_ns: u64,
+    sink: SseLineSink,
+) !void {
+    const io = client.io;
+    var shared: StreamShared = .{};
+    var out: anyerror!void = undefined;
+
+    var future = try Io.concurrent(io, streamJsonSSEAndFlag, .{ client, allocator, url, extra_headers, payload, sink, &shared, &out });
+
+    var waited_ns: u64 = 0;
+    while (!shared.done.load(.acquire) and waited_ns < timeout_ns) {
+        const step = @min(poll_interval_ns, timeout_ns - waited_ns);
+        Io.sleep(io, .fromNanoseconds(@intCast(step)), .awake) catch break;
+        waited_ns += step;
+    }
+
+    if (shared.done.load(.acquire)) {
+        _ = future.await(io);
+        return out;
+    }
+    _ = future.cancel(io);
+    return error.RequestTimedOut;
+}
+
+fn postJsonSSEOnce(
+    client: *http.Client,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    extra_headers: []const http.Header,
+    payload: []const u8,
+    sink: SseLineSink,
+) !void {
+    const uri = try std.Uri.parse(url);
+
+    var req = try client.request(.POST, uri, .{
+        // Matches `fetch()`'s own POST-with-payload default (it overrides
+        // `RequestOptions`'s plain "follow 3 redirects" default to
+        // `.unhandled` whenever a payload is present) — re-sending a POST
+        // body after a redirect isn't something to do implicitly.
+        .redirect_behavior = .unhandled,
+        .extra_headers = extra_headers,
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .keep_alive = false,
+    });
+    defer req.deinit();
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+    var body = try req.sendBodyUnflushed(&.{});
+    try body.writer.writeAll(payload);
+    try body.end();
+    try req.connection.?.flush();
+
+    const redirect_buffer = try allocator.alloc(u8, 8 * 1024);
+    defer allocator.free(redirect_buffer);
+    var response = try req.receiveHead(redirect_buffer);
+
+    if (response.head.status.class() != .success) {
+        var err_buf: Io.Writer.Allocating = .init(allocator);
+        defer err_buf.deinit();
+        var small_transfer_buffer: [64]u8 = undefined;
+        const err_reader = response.reader(&small_transfer_buffer);
+        _ = err_reader.streamRemaining(&err_buf.writer) catch {};
+        const shown = err_buf.writer.buffered();
+        var url_buf: [512]u8 = undefined;
+        std.log.err("POST {s} -> {d}: {s}", .{
+            redactUrl(&url_buf, url),
+            @intFromEnum(response.head.status),
+            shown[0..@min(shown.len, max_logged_body)],
+        });
+        return error.HttpRequestFailed;
+    }
+
+    // Sized to comfortably hold one SSE line (a large streamed tool-call
+    // argument fragment, say) — `takeDelimiterExclusive` fails with
+    // `error.StreamTooLong` if a single line exceeds this.
+    var transfer_buffer: [32 * 1024]u8 = undefined;
+    var decompress: http.Decompress = undefined;
+    // Same conditional sizing `fetch()` itself uses — most LLM APIs don't
+    // compress SSE responses, so this is usually a zero-byte allocation.
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (decompress_buffer.len > 0) allocator.free(decompress_buffer);
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+
+    while (true) {
+        const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => |e| return e,
+        };
+        try sink.onLine(sink.ptr, std.mem.trimEnd(u8, line, "\r"));
+    }
 }
 
 fn checkStatus(method: []const u8, url: []const u8, status: http.Status, body: []const u8) !void {

@@ -79,11 +79,15 @@ pub const OpenAiCompatProvider = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: llm.Provider.VTable = .{ .chat = chatFn };
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn };
 
-    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
-        const self: *OpenAiCompatProvider = @ptrCast(@alignCast(ptr));
-
+    /// Shared request-body builder for both `chatFn` and `chatStreamFn` —
+    /// the only difference between the two is `"stream":true`. Duped into a
+    /// fresh allocation before returning rather than handing back
+    /// `payload_writer.buffered()` directly, since `payload_writer` goes
+    /// out of scope here (see `anthropic.zig`'s `buildPayload`, same
+    /// reasoning).
+    fn buildPayload(allocator: std.mem.Allocator, self: *const OpenAiCompatProvider, request: llm.ChatRequest, stream: bool) ![]const u8 {
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
         const w = &payload_writer.writer;
@@ -97,17 +101,31 @@ pub const OpenAiCompatProvider = struct {
             try w.writeAll(",\"tools\":");
             try writeTools(allocator, w, request.tools);
         }
+        if (stream) try w.writeAll(",\"stream\":true");
         try w.writeByte('}');
-        const payload = w.buffered();
+        return allocator.dupe(u8, w.buffered());
+    }
+
+    /// `auth_header_buf` is written into `headers_out[0]` (when an API key
+    /// is set) and must outlive it — kept as an out-param rather than a
+    /// return value so the caller controls that lifetime relationship
+    /// directly instead of this function returning a slice into its own
+    /// stack frame.
+    fn buildHeaders(self: *const OpenAiCompatProvider, auth_header_buf: []u8) ![]const http.Header {
+        if (self.api_key.len == 0) return &.{};
+        const value = try std.fmt.bufPrint(auth_header_buf, "Bearer {s}", .{self.api_key});
+        return &.{.{ .name = "Authorization", .value = value }};
+    }
+
+    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        const self: *OpenAiCompatProvider = @ptrCast(@alignCast(ptr));
+        const payload = try buildPayload(allocator, self, request, false);
 
         const url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{self.base_url});
         defer allocator.free(url);
 
         var auth_header_buf: [8 + 255]u8 = undefined;
-        const headers: []const http.Header = if (self.api_key.len > 0) blk: {
-            const value = try std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{self.api_key});
-            break :blk &.{.{ .name = "Authorization", .value = value }};
-        } else &.{};
+        const headers = try self.buildHeaders(&auth_header_buf);
 
         const body = try http_util.postJsonWithTimeout(&self.http_client, allocator, url, headers, payload, http_util.llm_timeout_ns);
         defer allocator.free(body);
@@ -177,6 +195,27 @@ pub const OpenAiCompatProvider = struct {
 
         return .{ .content = try blocks.toOwnedSlice(allocator), .stop_reason = stop_reason };
     }
+
+    fn chatStreamFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest, sink: llm.StreamSink) anyerror!llm.ChatResponse {
+        const self: *OpenAiCompatProvider = @ptrCast(@alignCast(ptr));
+        const payload = try buildPayload(allocator, self, request, true);
+
+        const url = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{self.base_url});
+        defer allocator.free(url);
+
+        var auth_header_buf: [8 + 255]u8 = undefined;
+        const headers = try self.buildHeaders(&auth_header_buf);
+
+        var state: StreamState = .{ .allocator = allocator, .stream_sink = sink, .show_thinking = self.show_thinking };
+        try http_util.postJsonSSE(&self.http_client, allocator, url, headers, payload, http_util.llm_timeout_ns, state.sink());
+
+        if (state.err) |err| {
+            std.log.err("openai-compatible streaming api error: {s}: {s}", .{ err.type, err.message });
+            return error.OpenAiCompatApiError;
+        }
+
+        return try state.finalize(allocator);
+    }
 };
 
 /// Removes every `<tag>...</tag>` span from `content` (used to strip
@@ -206,6 +245,176 @@ fn stripThinkingBlock(allocator: std.mem.Allocator, content: []const u8, comptim
     try out.appendSlice(allocator, rest);
     return out.toOwnedSlice(allocator);
 }
+
+fn jsonStr(obj: json.ObjectMap, key: []const u8) []const u8 {
+    const v = obj.get(key) orelse return "";
+    return if (v == .string) v.string else "";
+}
+
+/// Incrementally assembles a `llm.ChatResponse` from an OpenAI-compatible
+/// `chat.completion.chunk` SSE stream. Unlike Anthropic's stream (see
+/// `anthropic.zig`'s `StreamState` doc comment), tool-call deltas carry
+/// their own `index` and aren't guaranteed to arrive one-at-a-time, so
+/// in-progress tool calls are tracked in a small list keyed by that index
+/// rather than assuming only one is ever open.
+const StreamState = struct {
+    const ToolCallAccum = struct {
+        index: i64,
+        id: std.ArrayList(u8) = .empty,
+        name: std.ArrayList(u8) = .empty,
+        /// Fragments concatenate into a JSON string, parsed once complete
+        /// (see `finalize`) — same reasoning as the non-streaming path's
+        /// `tc.function.arguments`.
+        arguments: std.ArrayList(u8) = .empty,
+    };
+
+    allocator: std.mem.Allocator,
+    stream_sink: llm.StreamSink,
+    show_thinking: bool,
+    /// Raw `content` deltas concatenated as they arrive — reported to
+    /// `stream_sink` unconditionally (regardless of `show_thinking`) as
+    /// they grow, since safely stripping `<think>` tags out of a live,
+    /// still-growing stream isn't reliable (a tag can straddle two SSE
+    /// chunks) — see `finalize`, which is where the `show_thinking=false`
+    /// cleanup actually gets applied, same as the non-streaming path.
+    visible_text: std.ArrayList(u8) = .empty,
+    reasoning_text: std.ArrayList(u8) = .empty,
+    tool_calls: std.ArrayList(ToolCallAccum) = .empty,
+    saw_tool_calls_finish: bool = false,
+    stop_reason_str: []const u8 = "",
+    err: ?ApiError = null,
+
+    fn sink(self: *StreamState) http_util.SseLineSink {
+        return .{ .ptr = self, .onLine = onLine };
+    }
+
+    fn findOrCreateToolCall(self: *StreamState, index: i64) !*ToolCallAccum {
+        for (self.tool_calls.items) |*tc| {
+            if (tc.index == index) return tc;
+        }
+        try self.tool_calls.append(self.allocator, .{ .index = index });
+        return &self.tool_calls.items[self.tool_calls.items.len - 1];
+    }
+
+    fn onLine(ptr: *anyopaque, line: []const u8) anyerror!void {
+        const self: *StreamState = @ptrCast(@alignCast(ptr));
+        if (!std.mem.startsWith(u8, line, "data:")) return; // skip blank lines, comments
+        const data = std.mem.trim(u8, line["data:".len..], " ");
+        if (data.len == 0) return;
+        if (std.mem.eql(u8, data, "[DONE]")) return;
+
+        // `.alloc_always` so nothing in `parsed.value` aliases `data`,
+        // which aliases the SSE reader's transfer buffer — see
+        // `anthropic.zig`'s `StreamState.onLine` for the same note.
+        var parsed = json.parseFromSlice(json.Value, self.allocator, data, .{ .allocate = .alloc_always }) catch |err| {
+            std.log.warn("openai-compatible stream: unparseable SSE data line ({t}): {s}", .{ err, data[0..@min(data.len, 200)] });
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const obj = parsed.value.object;
+
+        if (obj.get("error")) |e| {
+            if (e == .object) {
+                self.err = .{
+                    .type = try self.allocator.dupe(u8, jsonStr(e.object, "type")),
+                    .message = try self.allocator.dupe(u8, jsonStr(e.object, "message")),
+                };
+            }
+            return;
+        }
+
+        const choices = obj.get("choices") orelse return;
+        if (choices != .array or choices.array.items.len == 0) return;
+        const choice = choices.array.items[0];
+        if (choice != .object) return;
+
+        if (choice.object.get("finish_reason")) |fr| {
+            if (fr == .string and fr.string.len > 0) {
+                self.stop_reason_str = try self.allocator.dupe(u8, fr.string);
+            }
+        }
+
+        const delta = choice.object.get("delta") orelse return;
+        if (delta != .object) return;
+
+        if (delta.object.get("content")) |c| {
+            if (c == .string and c.string.len > 0) {
+                try self.visible_text.appendSlice(self.allocator, c.string);
+                self.stream_sink.report(try self.allocator.dupe(u8, self.visible_text.items));
+            }
+        }
+        const reasoning = delta.object.get("reasoning_content") orelse delta.object.get("reasoning");
+        if (reasoning) |r| {
+            if (r == .string and r.string.len > 0) try self.reasoning_text.appendSlice(self.allocator, r.string);
+        }
+
+        if (delta.object.get("tool_calls")) |tcs| {
+            if (tcs == .array) {
+                for (tcs.array.items) |item| {
+                    if (item != .object) continue;
+                    self.saw_tool_calls_finish = true;
+                    const idx: i64 = if (item.object.get("index")) |iv| (if (iv == .integer) iv.integer else 0) else 0;
+                    const accum = try self.findOrCreateToolCall(idx);
+                    if (item.object.get("id")) |idv| {
+                        if (idv == .string and idv.string.len > 0) try accum.id.appendSlice(self.allocator, idv.string);
+                    }
+                    if (item.object.get("function")) |fnv| {
+                        if (fnv == .object) {
+                            if (fnv.object.get("name")) |nv| {
+                                if (nv == .string and nv.string.len > 0) try accum.name.appendSlice(self.allocator, nv.string);
+                            }
+                            if (fnv.object.get("arguments")) |av| {
+                                if (av == .string) try accum.arguments.appendSlice(self.allocator, av.string);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Assembles the final `llm.ChatResponse` once the stream has ended —
+    /// mirrors `chatFn`'s own block-building tail exactly (same
+    /// `show_thinking` branches, same empty-arguments-becomes-`{}`
+    /// handling), just reading from accumulated stream state instead of one
+    /// parsed `ChatCompletionResponse`.
+    fn finalize(self: *StreamState, allocator: std.mem.Allocator) !llm.ChatResponse {
+        var blocks: std.ArrayList(llm.ContentBlock) = .empty;
+
+        if (self.show_thinking) {
+            if (self.reasoning_text.items.len > 0) {
+                try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "\u{1F4AD} {s}\n\n", .{self.reasoning_text.items}) });
+            }
+            if (self.visible_text.items.len > 0) try blocks.append(allocator, .{ .text = self.visible_text.items });
+        } else if (self.visible_text.items.len > 0) {
+            var c = try stripThinkingBlock(allocator, self.visible_text.items, "think");
+            c = try stripThinkingBlock(allocator, c, "thinking");
+            c = std.mem.trim(u8, c, " \t\r\n");
+            if (c.len > 0) try blocks.append(allocator, .{ .text = c });
+        }
+
+        for (self.tool_calls.items) |tc| {
+            const args_src = if (tc.arguments.items.len == 0) "{}" else tc.arguments.items;
+            const args = json.parseFromSlice(json.Value, allocator, args_src, .{ .allocate = .alloc_always }) catch |err| {
+                std.log.err("tool call '{s}' has unparseable streamed arguments ({t}): {s}", .{
+                    tc.name.items, err, args_src[0..@min(args_src.len, 400)],
+                });
+                return err;
+            };
+            try blocks.append(allocator, .{ .tool_use = .{ .id = tc.id.items, .name = tc.name.items, .input = args.value } });
+        }
+
+        const stop_reason: llm.StopReason = if (self.saw_tool_calls_finish or std.mem.eql(u8, self.stop_reason_str, "tool_calls"))
+            .tool_use
+        else if (std.mem.eql(u8, self.stop_reason_str, "stop"))
+            .end_turn
+        else
+            .other;
+
+        return .{ .content = try blocks.toOwnedSlice(allocator), .stop_reason = stop_reason };
+    }
+};
 
 /// Unlike Anthropic (one bundled `tool_result` array per turn), OpenAI
 /// expects one standalone `{"role":"tool",...}` message per result — so a
@@ -401,4 +610,124 @@ test "stripThinkingBlock returns the input unchanged when the tag never appears"
     const input = "just a normal reply";
     const out = try stripThinkingBlock(testing.allocator, input, "think");
     try testing.expectEqualStrings(input, out);
+}
+
+// `StreamState.onLine` is fed canned SSE lines directly, same "deterministic
+// and offline" philosophy as the response-body tests above, at the
+// SSE-chunk granularity instead of one whole JSON body.
+
+const Recorder = struct {
+    reports: std.ArrayList([]const u8) = .empty,
+
+    fn sink(self: *Recorder) llm.StreamSink {
+        return .{ .ptr = self, .onText = onText };
+    }
+    fn onText(ptr: *anyopaque, text_so_far: []const u8) void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
+        self.reports.append(testing.allocator, text_so_far) catch {};
+    }
+};
+
+fn feedLines(state: *StreamState, lines: []const []const u8) !void {
+    const line_sink = state.sink();
+    for (lines) |line| try line_sink.onLine(line_sink.ptr, line);
+}
+
+test "StreamState assembles multi-chunk content deltas, reporting cumulative text each time, until [DONE]" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink(), .show_thinking = true };
+
+    try feedLines(&state, &.{
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\", world\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "data: [DONE]",
+    });
+
+    const response = try state.finalize(a);
+    try testing.expectEqual(@as(usize, 1), response.content.len);
+    try testing.expectEqualStrings("Hello, world", response.content[0].text);
+    try testing.expectEqual(llm.StopReason.end_turn, response.stop_reason);
+
+    try testing.expectEqual(@as(usize, 2), recorder.reports.items.len);
+    try testing.expectEqualStrings("Hello", recorder.reports.items[0]);
+    try testing.expectEqualStrings("Hello, world", recorder.reports.items[1]);
+}
+
+test "StreamState reassembles a tool call streamed across several argument fragments, keyed by index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink(), .show_thinking = true };
+
+    try feedLines(&state, &.{
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"\"}}]}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"locat\"}}]}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ion\\\":\\\"Tokyo\\\"}\"}}]}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+        "data: [DONE]",
+    });
+
+    const response = try state.finalize(a);
+    try testing.expectEqual(@as(usize, 1), response.content.len);
+    const tu = response.content[0].tool_use;
+    try testing.expectEqualStrings("call_1", tu.id);
+    try testing.expectEqualStrings("weather", tu.name);
+    try testing.expectEqualStrings("Tokyo", tu.input.object.get("location").?.string);
+    try testing.expectEqual(llm.StopReason.tool_use, response.stop_reason);
+    try testing.expectEqual(@as(usize, 0), recorder.reports.items.len);
+}
+
+test "StreamState streams raw content live but strips <think> tags from the finalized response when show_thinking is false" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink(), .show_thinking = false };
+
+    try feedLines(&state, &.{
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>pondering\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"...</think>the answer is 4\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+    });
+
+    // Live reporting is unconditional (see `StreamState.visible_text`'s doc
+    // comment) — the raw, untrimmed tag is visible mid-stream...
+    try testing.expectEqual(@as(usize, 2), recorder.reports.items.len);
+    try testing.expect(std.mem.indexOf(u8, recorder.reports.items[0], "<think>") != null);
+
+    // ...but the finalized response has it cleaned up, same as the
+    // non-streaming path.
+    const response = try state.finalize(a);
+    try testing.expectEqual(@as(usize, 1), response.content.len);
+    try testing.expectEqualStrings("the answer is 4", response.content[0].text);
+}
+
+test "StreamState captures a mid-stream error event" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink(), .show_thinking = true };
+
+    try feedLines(&state, &.{
+        "data: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}",
+    });
+
+    try testing.expect(state.err != null);
+    try testing.expectEqualStrings("invalid_request_error", state.err.?.type);
+    try testing.expectEqualStrings("bad request", state.err.?.message);
 }

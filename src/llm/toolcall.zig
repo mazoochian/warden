@@ -22,6 +22,13 @@ pub const Progress = struct {
         thinking,
         /// About to execute a tool the model asked for.
         tool_use: []const u8,
+        /// Cumulative visible answer text generated so far *this turn* (not
+        /// a delta) — reported repeatedly as a streaming provider produces
+        /// more of it; the last report for a given turn equals that turn's
+        /// full text. Resets to a fresh, independent accumulation on the
+        /// next turn (e.g. after a tool call), same as `tool_use` simply
+        /// replacing whatever status was shown before it.
+        text: []const u8,
     };
 
     pub fn report(self: Progress, event: Event) void {
@@ -50,14 +57,21 @@ pub fn run(
         .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = user_message }}),
     });
 
+    // Bridges the provider-layer `llm.StreamSink` into this loop's own
+    // `Progress` — kept as one instance reused across every turn since it's
+    // stateless (just forwards whatever `text_so_far` it's given); each
+    // turn's own accumulation lives in the provider's `chatStream` call,
+    // not here.
+    var stream_bridge = ProgressStreamBridge{ .progress = progress };
+
     var i: u32 = 0;
     while (i < max_iterations) : (i += 1) {
         progress.report(.thinking);
-        const response = try provider.chat(allocator, .{
+        const response = try provider.chatStream(allocator, .{
             .system = system,
             .messages = messages.items,
             .tools = llm_tools,
-        });
+        }, stream_bridge.sink());
 
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
@@ -94,15 +108,31 @@ pub fn run(
     try messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(llm.ContentBlock, &.{
         .{ .text = "You have reached the tool-call limit. Do not call any more tools — give your final answer now using what you already have, and say plainly what you couldn't complete." },
     }) });
-    const response = try provider.chat(allocator, .{
+    const response = try provider.chatStream(allocator, .{
         .system = system,
         .messages = messages.items,
         .tools = llm_tools,
-    });
+    }, stream_bridge.sink());
     const text = try llm.textOf(allocator, response.content);
     if (text.len > 0) return text;
     return error.ToolCallLoopExceeded;
 }
+
+/// Forwards `llm.StreamSink` reports into this loop's own `Progress` as
+/// `.text` events — kept separate from `llm.StreamSink` itself since this
+/// module (unlike `llm/provider.zig`) is allowed to depend on `Progress`.
+const ProgressStreamBridge = struct {
+    progress: Progress,
+
+    fn sink(self: *ProgressStreamBridge) llm.StreamSink {
+        return .{ .ptr = self, .onText = onText };
+    }
+
+    fn onText(ptr: *anyopaque, text_so_far: []const u8) void {
+        const self: *ProgressStreamBridge = @ptrCast(@alignCast(ptr));
+        self.progress.report(.{ .text = text_so_far });
+    }
+};
 
 /// Tool results can carry arbitrary bytes from external sources — a
 /// scraped page served in an unexpected encoding, a botched HTML-entity
