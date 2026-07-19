@@ -41,7 +41,11 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
     // Not a live chat reply anyone's watching mid-generation (no ticker/
     // Progress consumer is wired up here anyway — `.{}` above is a no-op
     // Progress), so streaming would have zero visible effect either way.
-    const summary = toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false) catch |err| blk: {
+    // show_thinking=false regardless of any chat's own preference — a wall
+    // of chain-of-thought has no place in a summary digest. max_tokens
+    // matches ChatRequest's own pre-existing default (unset before this
+    // became an explicit `toolcall.run` parameter).
+    const summary = toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false, false, 1024) catch |err| blk: {
         std.log.err("digest: llm summary failed: {t}", .{err});
         break :blk "";
     };

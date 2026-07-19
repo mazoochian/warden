@@ -5,6 +5,7 @@ const json = std.json;
 
 const types = @import("types.zig");
 const http_util = @import("../http_util.zig");
+const markdown_html = @import("markdown_html.zig");
 
 /// Thin wrapper around the Telegram Bot API. Uses long polling (`getUpdates`)
 /// rather than webhooks, since Warden runs local/dev without a public HTTPS
@@ -91,15 +92,14 @@ pub const Client = struct {
         allow_sending_without_reply: bool = true,
     };
 
-    fn sendMessageErr(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, reply_to_message_id: ?i64) !void {
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "https://api.telegram.org/bot{s}/sendMessage",
-            .{self.bot_token},
-        );
-        defer allocator.free(url);
-
-        const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
+    /// POSTs `sendMessage` once, either with `parse_mode=HTML` (converting
+    /// `text` first via `markdown_html.toHtml`) or as plain text — the
+    /// shared body every text-sending method's "try HTML, fall back to
+    /// plain on failure" retry (see e.g. `sendMessageErr` below) drives.
+    /// Caller owns the returned body.
+    fn postSendMessage(self: *Client, allocator: std.mem.Allocator, url: []const u8, chat_id: i64, text: []const u8, reply_parameters: ?ReplyParameters, html: bool) ![]u8 {
+        const send_text = if (html) markdown_html.toHtml(allocator, text) catch text else text;
+        const parse_mode: ?[]const u8 = if (html) "HTML" else null;
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
@@ -110,27 +110,17 @@ pub const Client = struct {
         // emit null optional fields as literal `null` rather than omitting
         // the key, which silently broke every unprompted message (a
         // reminder/alert/feed-watcher notification, anything not sent as a
-        // reply) until this was caught.
+        // reply) until this was caught. Same reasoning covers `parse_mode`.
         try json.Stringify.value(
-            .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters },
+            .{ .chat_id = chat_id, .text = send_text, .reply_parameters = reply_parameters, .parse_mode = parse_mode },
             .{ .emit_null_optional_fields = false },
             &payload_writer.writer,
         );
         const payload = payload_writer.writer.buffered();
-
-        const body = try http_util.postJson(&self.http_client, allocator, url, &.{}, payload);
-        defer allocator.free(body);
+        return http_util.postJson(&self.http_client, allocator, url, &.{}, payload);
     }
 
-    const SendMessageResponse = struct {
-        ok: bool,
-        result: ?struct { message_id: i64 } = null,
-        description: ?[]const u8 = null,
-    };
-
-    /// Like `sendMessage`, but returns the sent message's id (needed to
-    /// edit it later — see `editMessage`) instead of being fire-and-forget.
-    pub fn sendMessageReturningId(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, reply_to_message_id: ?i64) !i64 {
+    fn sendMessageErr(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, reply_to_message_id: ?i64) !void {
         const url = try std.fmt.allocPrint(
             allocator,
             "https://api.telegram.org/bot{s}/sendMessage",
@@ -140,20 +130,37 @@ pub const Client = struct {
 
         const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
 
-        var payload_writer: Io.Writer.Allocating = .init(allocator);
-        defer payload_writer.deinit();
-        // See `sendMessageErr`'s doc comment on why this needs
-        // `emit_null_optional_fields = false`.
-        try json.Stringify.value(
-            .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters },
-            .{ .emit_null_optional_fields = false },
-            &payload_writer.writer,
-        );
-        const payload = payload_writer.writer.buffered();
+        // Try HTML-formatted first; only retry as plain text when Telegram
+        // itself rejected the request (`error.HttpRequestFailed` — most
+        // plausibly an entity `markdown_html.toHtml`'s necessarily-
+        // incomplete grammar got wrong, occasionally a genuinely benign
+        // rejection like "message is not modified" that'll just fail the
+        // same way again either way). A transient network failure
+        // (timeout, connection reset) isn't a formatting problem — retrying
+        // would just repeat the same failure while silently discarding
+        // formatting that would have worked fine; propagate those as-is
+        // instead. Confirmed live: an editMessage that failed this way
+        // dropped an otherwise-valid expandable blockquote down to plain
+        // text for no reason before this distinction existed. See
+        // `markdown_html.zig`'s module doc comment.
+        if (self.postSendMessage(allocator, url, chat_id, text, reply_parameters, true)) |body| {
+            allocator.free(body);
+            return;
+        } else |err| {
+            if (err != error.HttpRequestFailed) return err;
+            std.log.warn("sendMessage: HTML send rejected for chat {d}, retrying as plain text", .{chat_id});
+        }
+        const body = try self.postSendMessage(allocator, url, chat_id, text, reply_parameters, false);
+        allocator.free(body);
+    }
 
-        const body = try http_util.postJson(&self.http_client, allocator, url, &.{}, payload);
-        defer allocator.free(body);
+    const SendMessageResponse = struct {
+        ok: bool,
+        result: ?struct { message_id: i64 } = null,
+        description: ?[]const u8 = null,
+    };
 
+    fn parseSendMessageResponse(allocator: std.mem.Allocator, body: []const u8) !i64 {
         var parsed = try json.parseFromSlice(
             SendMessageResponse,
             allocator,
@@ -167,6 +174,38 @@ pub const Client = struct {
             return error.TelegramApiError;
         };
         return result.message_id;
+    }
+
+    /// Like `sendMessage`, but returns the sent message's id (needed to
+    /// edit it later — see `editMessage`) instead of being fire-and-forget.
+    pub fn sendMessageReturningId(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, reply_to_message_id: ?i64) !i64 {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "https://api.telegram.org/bot{s}/sendMessage",
+            .{self.bot_token},
+        );
+        defer allocator.free(url);
+
+        const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
+
+        // Same HTML-then-plain-text fallback as `sendMessageErr` — only
+        // retry as plain on an actual Telegram rejection, not a transient
+        // network failure. Reaching `parseSendMessageResponse` at all means
+        // the HTTP call itself already succeeded (2xx), so any error it
+        // raises is cheap to retry regardless of cause.
+        if (self.postSendMessage(allocator, url, chat_id, text, reply_parameters, true)) |body| {
+            defer allocator.free(body);
+            if (parseSendMessageResponse(allocator, body)) |id| return id else |_| {
+                std.log.warn("sendMessageReturningId: HTML send rejected for chat {d}, retrying as plain text", .{chat_id});
+            }
+        } else |err| {
+            if (err != error.HttpRequestFailed) return err;
+            std.log.warn("sendMessageReturningId: HTML send rejected for chat {d}, retrying as plain text", .{chat_id});
+        }
+
+        const body = try self.postSendMessage(allocator, url, chat_id, text, reply_parameters, false);
+        defer allocator.free(body);
+        return parseSendMessageResponse(allocator, body);
     }
 
     /// One button on an inline keyboard, in this client's own local shape
@@ -258,8 +297,26 @@ pub const Client = struct {
     /// discards the response body, so that specific case can't be told
     /// apart from a real failure here; callers must avoid sending an
     /// identical edit in the first place (main.zig's ticker tracks the
-    /// last text it actually sent and skips a no-op edit).
+    /// last text it actually sent and skips a no-op edit). Same
+    /// HTML-then-plain-text fallback as `sendMessageErr` — the "not
+    /// modified" case above will still just fail after both attempts
+    /// (unrelated to formatting, nothing new to do about it here), same as
+    /// it already did before this fallback existed.
     pub fn editMessage(self: *Client, allocator: std.mem.Allocator, chat_id: i64, message_id: i64, text: []const u8) !void {
+        const html_text = markdown_html.toHtml(allocator, text) catch text;
+        const parse_mode: ?[]const u8 = "HTML";
+        if (self.callMethod(allocator, "editMessageText", .{ .chat_id = chat_id, .message_id = message_id, .text = html_text, .parse_mode = parse_mode })) |_| {
+            return;
+        } else |err| {
+            // Only an actual Telegram rejection is worth retrying as plain
+            // text — see `sendMessageErr`'s doc comment for why a
+            // transient network failure isn't. Includes the benign "not
+            // modified" case (also a 400 = `error.HttpRequestFailed`);
+            // that retry will just fail the same way again either way, no
+            // worse off than before this fallback existed.
+            if (err != error.HttpRequestFailed) return err;
+            std.log.warn("editMessage: HTML edit rejected for chat {d} message {d}, retrying as plain text", .{ chat_id, message_id });
+        }
         return self.callMethod(allocator, "editMessageText", .{ .chat_id = chat_id, .message_id = message_id, .text = text });
     }
 
