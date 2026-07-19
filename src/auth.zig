@@ -31,6 +31,7 @@ test "isOwner matches only the configured platform+id pair" {
         .whisper_url = null,
         .llm_owner_only = true,
         .llm_show_thinking = false,
+        .llm_streaming = false,
     };
     try testing.expect(isOwner(&config, .telegram, "101573604"));
     try testing.expect(!isOwner(&config, .telegram, "1"));

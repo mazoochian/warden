@@ -39,7 +39,12 @@ pub const Progress = struct {
 /// Drives one provider-agnostic conversation: sends `user_message`, and as
 /// long as the model keeps asking for tools, executes them against
 /// `tool_defs` and feeds the results back, until it produces a final text
-/// answer (or the iteration cap is hit).
+/// answer (or the iteration cap is hit). `stream` selects `chatStream`
+/// (progressively reports `.text` events as the model generates, see
+/// `ProgressStreamBridge`) vs. one blocking `chat` call per turn — see
+/// `config.zig`'s `llm_streaming` doc comment for why this is
+/// caller-controlled rather than always-on: the streaming SSE read path has
+/// a known production hang, confirmed live, not yet fixed.
 pub fn run(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -48,6 +53,7 @@ pub fn run(
     user_message: []const u8,
     tool_defs: []const registry.ToolDef,
     progress: Progress,
+    stream: bool,
 ) ![]const u8 {
     const llm_tools = try toLlmTools(allocator, tool_defs);
 
@@ -57,22 +63,28 @@ pub fn run(
         .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = user_message }}),
     });
 
-    // TEMPORARILY DISABLED: `provider.chatStream` (via `postJsonSSE`'s SSE
-    // read loop) is hanging in a genuine CPU-pegging spin in production —
-    // outlives even the 2-minute timeout, since `Future.cancel` itself
-    // blocks waiting for a loop that never reaches a cancellable point.
-    // Reverted to the known-good non-streaming `chat()` call to restore
-    // service while that's debugged; `ProgressStreamBridge`/`StreamSink`
-    // plumbing below is left in place, unused, to re-enable with a
-    // one-line change once the read loop is fixed.
+    // Bridges the provider-layer `llm.StreamSink` into this loop's own
+    // `Progress` — kept as one instance reused across every turn since it's
+    // stateless (just forwards whatever `text_so_far` it's given); each
+    // turn's own accumulation lives in the provider's `chatStream` call,
+    // not here. Only actually used when `stream` is true.
+    var stream_bridge = ProgressStreamBridge{ .progress = progress };
+
     var i: u32 = 0;
     while (i < max_iterations) : (i += 1) {
         progress.report(.thinking);
-        const response = try provider.chat(allocator, .{
-            .system = system,
-            .messages = messages.items,
-            .tools = llm_tools,
-        });
+        const response = if (stream)
+            try provider.chatStream(allocator, .{
+                .system = system,
+                .messages = messages.items,
+                .tools = llm_tools,
+            }, stream_bridge.sink())
+        else
+            try provider.chat(allocator, .{
+                .system = system,
+                .messages = messages.items,
+                .tools = llm_tools,
+            });
 
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
@@ -109,11 +121,18 @@ pub fn run(
     try messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(llm.ContentBlock, &.{
         .{ .text = "You have reached the tool-call limit. Do not call any more tools — give your final answer now using what you already have, and say plainly what you couldn't complete." },
     }) });
-    const response = try provider.chat(allocator, .{
-        .system = system,
-        .messages = messages.items,
-        .tools = llm_tools,
-    });
+    const response = if (stream)
+        try provider.chatStream(allocator, .{
+            .system = system,
+            .messages = messages.items,
+            .tools = llm_tools,
+        }, stream_bridge.sink())
+    else
+        try provider.chat(allocator, .{
+            .system = system,
+            .messages = messages.items,
+            .tools = llm_tools,
+        });
     const text = try llm.textOf(allocator, response.content);
     if (text.len > 0) return text;
     return error.ToolCallLoopExceeded;
@@ -243,9 +262,71 @@ test "run executes a tool call and threads its result back to the model" {
     var fake = FakeProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{});
+    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false);
     try testing.expectEqualStrings("The answer is 4.", result);
     try testing.expectEqual(@as(u32, 2), fake.call_count);
+}
+
+/// Implements `chatStream`, not just `chat` — used to confirm `run(...,
+/// true)` actually calls the streaming path (and reports `.text` progress
+/// events for the visible answer, not the tool-calling turn) rather than
+/// silently falling back to `chat`.
+const FakeStreamingProvider = struct {
+    call_count: u32 = 0,
+
+    fn provider(self: *FakeStreamingProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn };
+
+    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        _ = ptr;
+        _ = allocator;
+        _ = request;
+        return error.UnexpectedNonStreamingCall;
+    }
+
+    fn chatStreamFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest, sink: llm.StreamSink) anyerror!llm.ChatResponse {
+        _ = request;
+        const self: *FakeStreamingProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        sink.report("Hel");
+        sink.report("Hello");
+        return .{
+            .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = "Hello" }}),
+            .stop_reason = .end_turn,
+        };
+    }
+};
+
+test "run(..., true) uses chatStream, reporting .text progress events" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake = FakeStreamingProvider{};
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    var reports: std.ArrayList([]const u8) = .empty;
+    const Recorder = struct {
+        fn onEvent(ptr: *anyopaque, event: Progress.Event) void {
+            const list: *std.ArrayList([]const u8) = @ptrCast(@alignCast(ptr));
+            switch (event) {
+                .text => |t| list.append(std.testing.allocator, t) catch {},
+                else => {},
+            }
+        }
+    };
+    defer reports.deinit(testing.allocator);
+    const progress = Progress{ .ptr = &reports, .onEvent = Recorder.onEvent };
+
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, progress, true);
+    try testing.expectEqualStrings("Hello", result);
+    try testing.expectEqual(@as(u32, 1), fake.call_count);
+    try testing.expectEqual(@as(usize, 2), reports.items.len);
+    try testing.expectEqualStrings("Hel", reports.items[0]);
+    try testing.expectEqualStrings("Hello", reports.items[1]);
 }
 
 /// Requests the calculator on every turn until it sees the wrap-up nudge —
@@ -292,7 +373,7 @@ test "run salvages a final answer when the tool-call cap is hit" {
     var fake = InsatiableProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{});
+    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{}, false);
     try testing.expectEqualStrings("best effort answer", result);
     // max_iterations tool turns plus the final wrap-up call.
     try testing.expectEqual(@as(u32, 7), fake.call_count);
@@ -320,7 +401,7 @@ test "run returns the model's answer directly when it never calls a tool" {
     var fake = NoToolProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{});
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{}, false);
     try testing.expectEqualStrings("no tools needed", result);
 }
 

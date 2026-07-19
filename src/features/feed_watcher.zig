@@ -114,7 +114,9 @@ pub fn checkAndNotifyFeeds(connectors: []const iface.Connector, gpa: std.mem.All
         const prompt = std.fmt.allocPrint(a, "New items from {s}:\n{s}\nWrite the update now.", .{ fw.feed_url, titles_buf.writer.buffered() }) catch continue;
 
         const tool_ctx = registry.ToolContext{ .allocator = a, .io = io };
-        const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}) catch |err| blk: {
+        // Background job, no live chat message being edited — streaming
+        // would have zero visible effect (same reasoning as digest.zig).
+        const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}, false) catch |err| blk: {
             std.log.err("feed_watcher: llm summary failed for {s}: {t}", .{ fw.feed_url, err });
             break :blk "";
         };

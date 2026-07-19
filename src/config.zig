@@ -95,6 +95,14 @@ pub const Config = struct {
     /// `reasoning` field the OpenAI-compatible backend sends are filtered
     /// out before the reply is shown — see `llm/openai_compat.zig`.
     llm_show_thinking: bool,
+    /// Whether `toolcall.run` uses `Provider.chatStream` (progressively
+    /// edits the reply into the chat as the model generates it) instead of
+    /// one blocking `Provider.chat` call. Defaults to off: as of this
+    /// writing, the streaming SSE read path
+    /// (`http_util.postJsonSSE`/`postJsonSSEOnce`) has a known bug that can
+    /// spin a CPU core indefinitely, past even its own timeout — confirmed
+    /// live, not theoretical. Flip on to test a fix; leave off otherwise.
+    llm_streaming: bool,
     /// Null when Matrix isn't configured — `main.zig` only constructs a
     /// `MatrixConnector` (and adds it to the active connector list) when
     /// this is set.
@@ -187,6 +195,7 @@ pub const Config = struct {
 
         const llm_owner_only = parseBoolEnv(env, "WARDEN_LLM_OWNER_ONLY", default_llm_owner_only);
         const llm_show_thinking = parseBoolEnv(env, "WARDEN_LLM_SHOW_THINKING", default_llm_show_thinking);
+        const llm_streaming = parseBoolEnv(env, "WARDEN_LLM_STREAMING", default_llm_streaming);
 
         return .{
             .telegram_bot_token = telegram_bot_token,
@@ -204,6 +213,7 @@ pub const Config = struct {
             .whisper_url = whisper_url,
             .llm_owner_only = llm_owner_only,
             .llm_show_thinking = llm_show_thinking,
+            .llm_streaming = llm_streaming,
             .matrix = matrix,
         };
     }
@@ -266,6 +276,7 @@ pub const Config = struct {
     pub const default_digest_interval_seconds: i64 = 86_400;
     pub const default_llm_owner_only: bool = true;
     pub const default_llm_show_thinking: bool = false;
+    pub const default_llm_streaming: bool = false;
 
     /// Armin's numeric Telegram user id, as a string. Deliberately not
     /// username-based, since usernames can change.
