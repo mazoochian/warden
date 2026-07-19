@@ -1942,6 +1942,13 @@ const ticker_interval_ms: i64 = 1200;
 const TickerState = struct {
     io: Io,
     allocator: std.mem.Allocator,
+    /// This platform's hard cap on a single message's text (see
+    /// `effectiveMaxMessageLength`) — a streamed `.text` status is
+    /// truncated to this before being shown, since unlike the *final*
+    /// answer (routed to a file when too long via `sendTextOrFile`) the
+    /// growing interim preview has no such fallback and would otherwise
+    /// eventually 400 out of `editMessage` on a long answer.
+    max_len: usize,
     mutex: Io.Mutex = .init,
     /// null = show the generic thinking animation; set = show this until
     /// the model moves past the tool call that set it.
@@ -1968,7 +1975,48 @@ fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
             const text = std.fmt.allocPrint(state.allocator, "🔧 using {s}…", .{name}) catch return;
             state.setStatus(text);
         },
+        .text => |text_so_far| {
+            if (text_so_far.len == 0) return; // nothing to show yet, keep the thinking animation
+            state.setStatus(truncateUtf8(text_so_far, state.max_len));
+        },
     }
+}
+
+/// UTF-8-boundary-safe truncation to at most `max_len` bytes — backs off
+/// from `max_len` to the start of whatever multi-byte codepoint it would
+/// otherwise cut through, so a truncated interim streaming preview is never
+/// invalid UTF-8 (which `editMessage` would otherwise send to Telegram
+/// broken, the same class of problem `toolcall.zig`'s `sanitizeUtf8` guards
+/// tool results against). Returns `text` unchanged (no allocation) when
+/// it's already within budget.
+fn truncateUtf8(text: []const u8, max_len: usize) []const u8 {
+    if (text.len <= max_len) return text;
+    var end = max_len;
+    // `text[end]` is the first byte being cut off; back off while it's a
+    // UTF-8 continuation byte (`10xxxxxx`), i.e. while stopping here would
+    // split a multi-byte codepoint in half.
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    return text[0..end];
+}
+
+test "truncateUtf8 passes short text through unchanged" {
+    try std.testing.expectEqualStrings("hello", truncateUtf8("hello", 10));
+}
+
+test "truncateUtf8 backs off to a codepoint boundary instead of splitting one" {
+    // "café" = c,a,f,é where é is the 2-byte sequence 0xC3 0xA9. Cutting at
+    // byte 4 would land inside that sequence (after its leading byte).
+    const text = "caf\u{e9}"; // "café"
+    try std.testing.expectEqual(@as(usize, 5), text.len);
+    const truncated = truncateUtf8(text, 4);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(truncated));
+    try std.testing.expectEqualStrings("caf", truncated);
+}
+
+test "truncateUtf8 handles max_len landing exactly on a boundary" {
+    const text = "caf\u{e9}";
+    try std.testing.expectEqualStrings(text, truncateUtf8(text, 5));
+    try std.testing.expectEqualStrings("caf", truncateUtf8(text, 3));
 }
 
 /// Runs until canceled (see `replyWithAnswer`), editing `message_id` no
@@ -2044,7 +2092,7 @@ fn replyWithAnswer(
     };
     std.log.info("qa: placeholder for chat {s} = {?s}", .{ native_chat_id, placeholder_id });
 
-    var state = TickerState{ .io = io, .allocator = a };
+    var state = TickerState{ .io = io, .allocator = a, .max_len = max_message_len };
     var progress: toolcall.Progress = .{};
     var ticker_future: ?Io.Future(void) = null;
     if (placeholder_id) |pid| {
@@ -2209,6 +2257,7 @@ test {
     _ = @import("features/convert_flow.zig");
     _ = @import("tools/begin_conversion.zig");
     _ = @import("tools/find_chat_member.zig");
+    _ = @import("llm/provider.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
     _ = @import("tools/calculator.zig");

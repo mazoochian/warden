@@ -42,42 +42,26 @@ pub const AnthropicProvider = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: llm.Provider.VTable = .{ .chat = chatFn };
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn };
 
-    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
-        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+    const anthropic_url = "https://api.anthropic.com/v1/messages";
 
-        var payload_writer: Io.Writer.Allocating = .init(allocator);
-        defer payload_writer.deinit();
-        const w = &payload_writer.writer;
-
-        try w.writeAll("{\"model\":");
-        try json.Stringify.value(self.model, .{}, w);
-        try w.print(",\"max_tokens\":{d}", .{request.max_tokens});
-        // `system: null` is rejected by the API ("should be a valid
-        // string"), so the field is omitted entirely rather than sent as
-        // JSON null when there isn't one.
-        if (request.system) |system| {
-            try w.writeAll(",\"system\":");
-            try json.Stringify.value(system, .{}, w);
-        }
-        try w.writeAll(",\"messages\":");
-        try writeMessages(w, request.messages);
-        if (request.tools.len > 0) {
-            try w.writeAll(",\"tools\":");
-            try writeTools(allocator, w, request.tools);
-        }
-        try w.writeByte('}');
-        const payload = w.buffered();
-
-        const headers = [_]http.Header{
+    fn authHeaders(self: *const AnthropicProvider) [2]http.Header {
+        return .{
             .{ .name = "x-api-key", .value = self.api_key },
             .{ .name = "anthropic-version", .value = "2023-06-01" },
         };
+    }
+
+    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+        const payload = try buildPayload(allocator, self, request, false);
+        const headers = self.authHeaders();
+
         const body = try http_util.postJsonWithTimeout(
             &self.http_client,
             allocator,
-            "https://api.anthropic.com/v1/messages",
+            anthropic_url,
             &headers,
             payload,
             http_util.llm_timeout_ns,
@@ -103,15 +87,77 @@ pub const AnthropicProvider = struct {
 
         return .{
             .content = try parseContentBlocks(allocator, parsed.value.content),
-            .stop_reason = if (std.mem.eql(u8, parsed.value.stop_reason, "tool_use"))
-                .tool_use
-            else if (std.mem.eql(u8, parsed.value.stop_reason, "end_turn"))
-                .end_turn
-            else
-                .other,
+            .stop_reason = parseStopReason(parsed.value.stop_reason),
+        };
+    }
+
+    fn chatStreamFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest, sink: llm.StreamSink) anyerror!llm.ChatResponse {
+        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+        const payload = try buildPayload(allocator, self, request, true);
+        const headers = self.authHeaders();
+
+        var state: StreamState = .{ .allocator = allocator, .stream_sink = sink };
+        try http_util.postJsonSSE(
+            &self.http_client,
+            allocator,
+            anthropic_url,
+            &headers,
+            payload,
+            http_util.llm_timeout_ns,
+            state.sink(),
+        );
+
+        if (state.err) |err| {
+            std.log.err("anthropic streaming api error: {s}: {s}", .{ err.type, err.message });
+            return error.AnthropicApiError;
+        }
+
+        return .{
+            .content = try state.blocks.toOwnedSlice(allocator),
+            .stop_reason = state.stop_reason,
         };
     }
 };
+
+/// Shared request-body builder for both `chatFn` and `chatStreamFn` — the
+/// only difference between the two is `"stream":true`. Duped into a fresh
+/// allocation before returning (rather than handing back
+/// `payload_writer.buffered()` directly) since `payload_writer` is a local
+/// that goes out of scope here; the non-streaming call site used to build
+/// this inline specifically to keep the writer's buffer alive across the
+/// HTTP call within one function body — factoring it out means that trick
+/// no longer applies.
+fn buildPayload(allocator: std.mem.Allocator, self: *const AnthropicProvider, request: llm.ChatRequest, stream: bool) ![]const u8 {
+    var payload_writer: Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+    const w = &payload_writer.writer;
+
+    try w.writeAll("{\"model\":");
+    try json.Stringify.value(self.model, .{}, w);
+    try w.print(",\"max_tokens\":{d}", .{request.max_tokens});
+    // `system: null` is rejected by the API ("should be a valid string"),
+    // so the field is omitted entirely rather than sent as JSON null when
+    // there isn't one.
+    if (request.system) |system| {
+        try w.writeAll(",\"system\":");
+        try json.Stringify.value(system, .{}, w);
+    }
+    try w.writeAll(",\"messages\":");
+    try writeMessages(w, request.messages);
+    if (request.tools.len > 0) {
+        try w.writeAll(",\"tools\":");
+        try writeTools(allocator, w, request.tools);
+    }
+    if (stream) try w.writeAll(",\"stream\":true");
+    try w.writeByte('}');
+    return allocator.dupe(u8, w.buffered());
+}
+
+fn parseStopReason(raw: []const u8) llm.StopReason {
+    if (std.mem.eql(u8, raw, "tool_use")) return .tool_use;
+    if (std.mem.eql(u8, raw, "end_turn")) return .end_turn;
+    return .other;
+}
 
 fn writeMessages(w: *Io.Writer, messages: []const llm.ChatMessage) !void {
     try w.writeByte('[');
@@ -202,6 +248,147 @@ fn parseContentBlocks(allocator: std.mem.Allocator, value: json.Value) ![]const 
     return blocks.toOwnedSlice(allocator);
 }
 
+fn jsonStr(obj: json.ObjectMap, key: []const u8) []const u8 {
+    const v = obj.get(key) orelse return "";
+    return if (v == .string) v.string else "";
+}
+
+/// Incrementally assembles a `llm.ChatResponse` from Anthropic's streaming
+/// SSE events (https://docs.anthropic.com/en/api/messages-streaming),
+/// content-block by content-block. Anthropic's stream is a single ordered
+/// sequence — at most one content block is ever "open" at a time (a
+/// `content_block_stop` always precedes the next `content_block_start`) —
+/// so tracking just the *current* block's state (reset on each start,
+/// finalized on each stop) is enough; no need to key state by `index` the
+/// way `openai_compat.zig`'s parser has to (OpenAI-style tool_call deltas
+/// don't come with the same "one thing open at a time" guarantee).
+const StreamState = struct {
+    const CurrentBlock = union(enum) {
+        none,
+        text: std.ArrayList(u8),
+        tool_use: struct {
+            id: []const u8,
+            name: []const u8,
+            /// Raw JSON string accumulated from `input_json_delta`
+            /// fragments — parsed into a real `json.Value` only once the
+            /// block closes, matching how the non-streaming path parses
+            /// `input` whole (see `parseContentBlocks`).
+            json_buf: std.ArrayList(u8),
+        },
+    };
+
+    allocator: std.mem.Allocator,
+    stream_sink: llm.StreamSink,
+    blocks: std.ArrayList(llm.ContentBlock) = .empty,
+    /// Cumulative visible text across the *whole turn* so far (all closed
+    /// text blocks plus whatever's been streamed of the current one) —
+    /// reported to `stream_sink` on every delta. Separate from any single
+    /// content block's own text (see `CurrentBlock.text` below), which
+    /// only needs to span one block for `blocks` to come out correctly
+    /// ordered/split.
+    visible_text: std.ArrayList(u8) = .empty,
+    stop_reason: llm.StopReason = .other,
+    err: ?ApiError = null,
+    current: CurrentBlock = .none,
+
+    fn sink(self: *StreamState) http_util.SseLineSink {
+        return .{ .ptr = self, .onLine = onLine };
+    }
+
+    fn onLine(ptr: *anyopaque, line: []const u8) anyerror!void {
+        const self: *StreamState = @ptrCast(@alignCast(ptr));
+        if (!std.mem.startsWith(u8, line, "data:")) return; // skip event:/id:/blank/comment lines
+        const data = std.mem.trim(u8, line["data:".len..], " ");
+        if (data.len == 0) return;
+
+        // `.alloc_always` so nothing in `parsed.value` aliases `data`,
+        // which itself aliases the SSE reader's transfer buffer — about to
+        // be overwritten by the next line read, so anything from this
+        // parse that needs to outlive this one call must be copied out via
+        // `self.allocator` before returning (see the `dupe` calls below).
+        var parsed = json.parseFromSlice(json.Value, self.allocator, data, .{ .allocate = .alloc_always }) catch |err| {
+            std.log.warn("anthropic stream: unparseable SSE data line ({t}): {s}", .{ err, data[0..@min(data.len, 200)] });
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const obj = parsed.value.object;
+        const event_type = jsonStr(obj, "type");
+
+        if (std.mem.eql(u8, event_type, "error")) {
+            const e = obj.get("error") orelse return;
+            if (e != .object) return;
+            self.err = .{
+                .type = try self.allocator.dupe(u8, jsonStr(e.object, "type")),
+                .message = try self.allocator.dupe(u8, jsonStr(e.object, "message")),
+            };
+            return;
+        }
+
+        if (std.mem.eql(u8, event_type, "content_block_start")) {
+            const cb = obj.get("content_block") orelse return;
+            if (cb != .object) return;
+            if (std.mem.eql(u8, jsonStr(cb.object, "type"), "tool_use")) {
+                self.current = .{ .tool_use = .{
+                    .id = try self.allocator.dupe(u8, jsonStr(cb.object, "id")),
+                    .name = try self.allocator.dupe(u8, jsonStr(cb.object, "name")),
+                    .json_buf = .empty,
+                } };
+            } else {
+                self.current = .{ .text = .empty };
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, event_type, "content_block_delta")) {
+            const delta = obj.get("delta") orelse return;
+            if (delta != .object) return;
+            const delta_type = jsonStr(delta.object, "type");
+            if (std.mem.eql(u8, delta_type, "text_delta") and self.current == .text) {
+                const text = jsonStr(delta.object, "text");
+                if (text.len == 0) return;
+                try self.current.text.appendSlice(self.allocator, text);
+                try self.visible_text.appendSlice(self.allocator, text);
+                self.stream_sink.report(try self.allocator.dupe(u8, self.visible_text.items));
+            } else if (std.mem.eql(u8, delta_type, "input_json_delta") and self.current == .tool_use) {
+                const partial = jsonStr(delta.object, "partial_json");
+                try self.current.tool_use.json_buf.appendSlice(self.allocator, partial);
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, event_type, "content_block_stop")) {
+            switch (self.current) {
+                .none => {},
+                .text => |t| try self.blocks.append(self.allocator, .{ .text = t.items }),
+                .tool_use => |tu| {
+                    const src = if (tu.json_buf.items.len == 0) "{}" else tu.json_buf.items;
+                    var input_value: json.Value = .null;
+                    if (json.parseFromSlice(json.Value, self.allocator, src, .{ .allocate = .alloc_always })) |parsed_input| {
+                        input_value = parsed_input.value;
+                    } else |err| {
+                        std.log.warn("anthropic stream: unparseable tool_use input for '{s}' ({t}): {s}", .{ tu.name, err, src[0..@min(src.len, 200)] });
+                    }
+                    try self.blocks.append(self.allocator, .{ .tool_use = .{ .id = tu.id, .name = tu.name, .input = input_value } });
+                },
+            }
+            self.current = .none;
+            return;
+        }
+
+        if (std.mem.eql(u8, event_type, "message_delta")) {
+            const delta = obj.get("delta") orelse return;
+            if (delta != .object) return;
+            const raw = jsonStr(delta.object, "stop_reason");
+            if (raw.len > 0) self.stop_reason = parseStopReason(raw);
+            return;
+        }
+
+        // message_start/ping/message_stop and anything else carry nothing
+        // this loop needs.
+    }
+};
+
 const testing = std.testing;
 
 // These parse canned response bodies rather than hitting the real API:
@@ -273,4 +460,147 @@ test "writeContentBlocks/writeMessages/writeTools produce valid embedded JSON" {
     var parsed = try json.parseFromSlice(json.Value, testing.allocator, out.writer.buffered(), .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
+}
+
+// `StreamState.onLine` is fed canned SSE lines directly (one `sink.onLine`
+// call per line, matching what `postJsonSSE` would do) — deterministic and
+// offline, same philosophy as the response-body tests above, just at the
+// SSE-event granularity instead of one whole JSON body.
+
+const Recorder = struct {
+    reports: std.ArrayList([]const u8) = .empty,
+
+    fn sink(self: *Recorder) llm.StreamSink {
+        return .{ .ptr = self, .onText = onText };
+    }
+    fn onText(ptr: *anyopaque, text_so_far: []const u8) void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
+        self.reports.append(testing.allocator, text_so_far) catch {};
+    }
+};
+
+fn feedLines(state: *StreamState, lines: []const []const u8) !void {
+    const line_sink = state.sink();
+    for (lines) |line| try line_sink.onLine(line_sink.ptr, line);
+}
+
+test "StreamState assembles multi-chunk text_delta events into one text block, reporting cumulative text each time" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink() };
+
+    try feedLines(&state, &.{
+        "event: content_block_start",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\", world\"}}",
+        "",
+        "event: content_block_stop",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}",
+        "",
+        "event: message_delta",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}",
+        "",
+        "event: message_stop",
+        "data: {\"type\":\"message_stop\"}",
+    });
+
+    try testing.expectEqual(@as(usize, 1), state.blocks.items.len);
+    try testing.expectEqualStrings("Hello, world", state.blocks.items[0].text);
+    try testing.expectEqual(llm.StopReason.end_turn, state.stop_reason);
+
+    try testing.expectEqual(@as(usize, 2), recorder.reports.items.len);
+    try testing.expectEqualStrings("Hello", recorder.reports.items[0]);
+    try testing.expectEqualStrings("Hello, world", recorder.reports.items[1]);
+}
+
+test "StreamState reassembles a tool call streamed across several input_json_delta fragments, without reporting it to the sink" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink() };
+
+    try feedLines(&state, &.{
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"weather\",\"input\":{}}}",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"locat\"}}",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ion\\\":\\\"Tokyo\\\"}\"}}",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}",
+    });
+
+    try testing.expectEqual(@as(usize, 1), state.blocks.items.len);
+    const tu = state.blocks.items[0].tool_use;
+    try testing.expectEqualStrings("toolu_1", tu.id);
+    try testing.expectEqualStrings("weather", tu.name);
+    try testing.expectEqualStrings("Tokyo", tu.input.object.get("location").?.string);
+    try testing.expectEqual(llm.StopReason.tool_use, state.stop_reason);
+    try testing.expectEqual(@as(usize, 0), recorder.reports.items.len);
+}
+
+test "StreamState preserves text/tool_use interleaving order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink() };
+
+    try feedLines(&state, &.{
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me check.\"}}",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"weather\",\"input\":{}}}",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}",
+    });
+
+    try testing.expectEqual(@as(usize, 2), state.blocks.items.len);
+    try testing.expectEqualStrings("Let me check.", state.blocks.items[0].text);
+    try testing.expectEqualStrings("weather", state.blocks.items[1].tool_use.name);
+}
+
+test "StreamState captures a mid-stream error event" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink() };
+
+    try feedLines(&state, &.{
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+    });
+
+    try testing.expect(state.err != null);
+    try testing.expectEqualStrings("overloaded_error", state.err.?.type);
+    try testing.expectEqualStrings("Overloaded", state.err.?.message);
+}
+
+test "StreamState ignores non-data SSE lines and blank lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink() };
+
+    try feedLines(&state, &.{ "", "event: ping", "data: {\"type\":\"ping\"}", ": comment" });
+
+    try testing.expectEqual(@as(usize, 0), state.blocks.items.len);
+    try testing.expectEqual(@as(usize, 0), recorder.reports.items.len);
 }

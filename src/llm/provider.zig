@@ -60,6 +60,22 @@ pub const ChatResponse = struct {
     stop_reason: StopReason,
 };
 
+/// Reports progressively-generated answer text during a `Provider.chatStream`
+/// call. `text_so_far` is the *cumulative* visible text at each report (not
+/// a delta), so callers (see `toolcall.Progress`) can display it as-is
+/// without concatenating anything themselves. Same ptr+fn shape as
+/// `toolcall.Progress`, deliberately defined here rather than there: this
+/// module must not depend on `toolcall.zig` (the dependency runs the other
+/// way), but a provider adapter needs a sink type to report through.
+pub const StreamSink = struct {
+    ptr: *anyopaque = undefined,
+    onText: ?*const fn (ptr: *anyopaque, text_so_far: []const u8) void = null,
+
+    pub fn report(self: StreamSink, text_so_far: []const u8) void {
+        if (self.onText) |f| f(self.ptr, text_so_far);
+    }
+};
+
 /// Vtable-based LLM backend, same ptr+vtable idiom as `platform.Connector`.
 pub const Provider = struct {
     ptr: *anyopaque,
@@ -67,10 +83,30 @@ pub const Provider = struct {
 
     pub const VTable = struct {
         chat: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest) anyerror!ChatResponse,
+        /// Optional streaming variant: reports growing cumulative text via
+        /// `sink` as it arrives, but still returns the same full
+        /// `ChatResponse` at the end (tool_use blocks are assembled whole,
+        /// same as `chat` — only visible text streams). A provider that
+        /// doesn't implement this leaves the slot null; `chatStream`'s
+        /// wrapper below falls back to one blocking `chat()` call plus a
+        /// single final `sink.report()`, so every caller can call
+        /// `chatStream` unconditionally regardless of provider support —
+        /// same "optional slot, dumb fallback" convention as
+        /// `platform.Connector.sendPhoto`.
+        chatStream: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest, sink: StreamSink) anyerror!ChatResponse = null,
     };
 
     pub fn chat(self: Provider, allocator: std.mem.Allocator, request: ChatRequest) !ChatResponse {
         return self.vtable.chat(self.ptr, allocator, request);
+    }
+
+    pub fn chatStream(self: Provider, allocator: std.mem.Allocator, request: ChatRequest, sink: StreamSink) !ChatResponse {
+        const f = self.vtable.chatStream orelse {
+            const response = try self.chat(allocator, request);
+            sink.report(try textOf(allocator, response.content));
+            return response;
+        };
+        return f(self.ptr, allocator, request, sink);
     }
 };
 
@@ -86,4 +122,47 @@ pub fn textOf(allocator: std.mem.Allocator, content: []const ContentBlock) ![]co
         }
     }
     return buf.toOwnedSlice(allocator);
+}
+
+const testing = std.testing;
+
+test "Provider.chatStream falls back to chat() plus one final sink.report() when chatStream isn't implemented" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const NonStreamingProvider = struct {
+        fn provider(self: *@This()) Provider {
+            return .{ .ptr = self, .vtable = &vt };
+        }
+        const vt: Provider.VTable = .{ .chat = chatFn };
+        fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest) anyerror!ChatResponse {
+            _ = ptr;
+            _ = request;
+            return .{
+                .content = try allocator.dupe(ContentBlock, &.{.{ .text = "hello" }}),
+                .stop_reason = .end_turn,
+            };
+        }
+    };
+
+    const Recorder = struct {
+        reports: std.ArrayList([]const u8) = .empty,
+        fn sink(self: *@This()) StreamSink {
+            return .{ .ptr = self, .onText = onText };
+        }
+        fn onText(ptr: *anyopaque, text_so_far: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reports.append(std.testing.allocator, text_so_far) catch {};
+        }
+    };
+
+    var non_streaming = NonStreamingProvider{};
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+
+    const response = try non_streaming.provider().chatStream(a, .{ .messages = &.{} }, recorder.sink());
+    try testing.expectEqualStrings("hello", try textOf(a, response.content));
+    try testing.expectEqual(@as(usize, 1), recorder.reports.items.len);
+    try testing.expectEqualStrings("hello", recorder.reports.items[0]);
 }
