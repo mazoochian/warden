@@ -4,6 +4,7 @@ const Io = std.Io;
 const config_mod = @import("config.zig");
 const auth = @import("auth.zig");
 const iface = @import("platform/interface.zig");
+const Identity = @import("domain/identity.zig").Identity;
 const telegram_platform = @import("platform/telegram.zig");
 const matrix_platform = @import("platform/matrix.zig");
 const store_pool = @import("store/pool.zig");
@@ -53,6 +54,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/set_alert.zig").tool,
     @import("tools/begin_conversion.zig").tool,
     convert_file.tool,
+    @import("tools/find_chat_member.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
@@ -318,6 +320,7 @@ fn processMessageTask(
     if (msg.choice_picked == null) {
         recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, config.retention_messages);
     }
+    recordObservedUsers(pool, chat_id, msg.observed_users);
 
     // Downloaded eagerly (not lazily on first tool use) since it's cheap
     // relative to the LLM round trip this task is about to make anyway, and
@@ -352,6 +355,13 @@ fn processMessageTask(
         .chat_id = msg.chat_id,
         .user_id = msg.user_id,
     };
+    var member_directory_adapter: MemberDirectoryToolAdapter = .{
+        .pool = pool,
+        .connector = connector,
+        .chat_id = chat_id,
+        .native_chat_id = msg.chat_id,
+        .now = ts,
+    };
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
         .io = io,
@@ -364,6 +374,7 @@ fn processMessageTask(
         .reminders = reminder_adapter.sink(),
         .alerts = alert_adapter.sink(),
         .convert_flow = convert_flow_adapter.sink(),
+        .member_directory = member_directory_adapter.sink(),
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -503,6 +514,24 @@ fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, m
         return identity_id;
     }
     return identities.getOrCreateMinimal(pool, connector.platform(), msg.user_id, msg.username orelse msg.user_id, false, ts);
+}
+
+/// Registers every identity a message revealed *besides* its own sender
+/// (see `iface.Message.observed_users`'s doc comment) into this chat's
+/// roster, so `find_chat_member` can resolve them later even if they never
+/// send a message of their own. Uses `chat_members.ensureKnown`, not
+/// `touch` — being mentioned or replied to isn't the same as having spoken.
+/// Errors are logged, not propagated, same reasoning as `recordMessage`.
+fn recordObservedUsers(pool: *store_pool.PgPool, chat_id: i64, observed: []const Identity) void {
+    for (observed) |identity| {
+        const identity_id = identities.upsertIdentity(pool, identity) catch |err| {
+            std.log.err("failed to upsert observed identity {s} for chat {d}: {t}", .{ identity.native_id, chat_id, err });
+            continue;
+        };
+        chat_members.ensureKnown(pool, chat_id, identity_id) catch |err| {
+            std.log.err("failed to register observed member {s} for chat {d}: {t}", .{ identity.native_id, chat_id, err });
+        };
+    }
 }
 
 /// Logs one message and bumps the sender's chat-membership record, then
@@ -755,7 +784,20 @@ fn handleMessage(
         // Per-chat /persona override, falling back to the global default —
         // see `store/chat_settings.zig`'s `getSystemPromptOverride`.
         const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, resolved.text, replied_to, resolved.placeholder_id);
+        // Prefers the full `Identity` the connector built from the
+        // platform's own user object; falls back to the thinner
+        // `iface.Message` fields for a platform/message that didn't
+        // populate one (see `resolveSenderIdentity`'s same fallback).
+        const asker: qa.Asker = if (msg.identity) |identity| .{
+            .display_name = identity.display_name,
+            .username = identity.username,
+            .native_id = identity.native_id,
+        } else .{
+            .display_name = msg.username orelse msg.user_id,
+            .username = msg.username,
+            .native_id = msg.user_id,
+        };
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id);
     }
     return false;
 }
@@ -1579,6 +1621,52 @@ const ConvertFlowToolAdapter = struct {
     }
 };
 
+/// Wires the `find_chat_member` LLM tool (see `tools/find_chat_member.zig`)
+/// to the local roster — same per-message construction as the other tool
+/// adapters above. Before searching, best-effort refreshes this chat's admin
+/// list via the connector (Telegram's `getChatAdministrators` — see
+/// `iface.Connector.listChatAdmins`'s doc comment for why that's the only
+/// bulk membership call bots get) so admins who've never spoken still show
+/// up; a platform/failure that can't supply one just searches whatever's
+/// already known instead of failing the tool call.
+const MemberDirectoryToolAdapter = struct {
+    pool: *store_pool.PgPool,
+    connector: iface.Connector,
+    chat_id: i64,
+    native_chat_id: []const u8,
+    now: i64,
+
+    fn sink(self: *MemberDirectoryToolAdapter) tool_registry.MemberDirectorySink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.MemberDirectorySink.VTable = .{
+        .find = findFn,
+    };
+
+    fn findFn(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror![]tool_registry.MemberMatch {
+        const self: *MemberDirectoryToolAdapter = @ptrCast(@alignCast(ptr));
+
+        const admins = self.connector.listChatAdmins(allocator, self.native_chat_id) catch |err| blk: {
+            if (err != error.Unsupported) {
+                std.log.warn("find_chat_member: admin refresh failed for chat {s}: {t}", .{ self.native_chat_id, err });
+            }
+            break :blk &.{};
+        };
+        for (admins) |admin| {
+            const identity_id = identities.upsertIdentity(self.pool, admin) catch continue;
+            chat_members.ensureKnown(self.pool, self.chat_id, identity_id) catch {};
+        }
+
+        const matches = try chat_members.search(self.pool, allocator, self.chat_id, query, 5);
+        var out = try allocator.alloc(tool_registry.MemberMatch, matches.len);
+        for (matches, 0..) |m, i| {
+            out[i] = .{ .display_name = m.display_name, .username = m.username, .native_id = m.native_id };
+        }
+        return out;
+    }
+};
+
 /// Shared by `/alerts` and the `set_alert` LLM tool's `action=list`.
 fn formatPendingAlerts(a: std.mem.Allocator, pending: []const alert_store.PendingAlert) []const u8 {
     if (pending.len == 0) return "No alerts set. Set one with /alert <crypto|weather|aqi> <subject> <above|below> <threshold> (or just ask).";
@@ -1747,6 +1835,7 @@ fn replyWithAnswer(
     max_message_len: usize,
     native_chat_id: []const u8,
     reply_to: ?[]const u8,
+    asker: qa.Asker,
     question: []const u8,
     replied_to: ?[]const u8,
     existing_placeholder_id: ?[]const u8,
@@ -1780,7 +1869,7 @@ fn replyWithAnswer(
     }
 
     std.log.info("qa: calling the model for chat {s}", .{native_chat_id});
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, question, replied_to, progress);
+    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress);
 
     // Stop the ticker before touching the placeholder ourselves — it's the
     // sole owner of that Future until this point (see `Future.cancel`'s
@@ -1932,6 +2021,7 @@ test {
     _ = @import("features/transcribe.zig");
     _ = @import("features/convert_flow.zig");
     _ = @import("tools/begin_conversion.zig");
+    _ = @import("tools/find_chat_member.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
     _ = @import("tools/calculator.zig");

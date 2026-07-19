@@ -46,6 +46,18 @@ pub const default_system_prompt =
     \\fetch a promising result with fetch_url when the snippet isn't enough.
     \\Say plainly when you couldn't find an answer.
     \\
+    \\Identity: every message you receive is tagged with exactly who sent
+    \\it — their name, @handle if they have one, and platform id. This is
+    \\a group chat, not a conversation with one fixed person, so use that
+    \\tag to keep track of who's actually talking to you turn to turn;
+    \\don't assume the person asking now is the same one from earlier in
+    \\the history. When the sender refers to someone else in the chat by
+    \\name ("tell Courtney I said hi", "what's Alex's handle", "mention
+    \\Sam"), use find_chat_member to resolve that name to their real
+    \\@handle/id before answering — don't guess a username from the name
+    \\alone, and if it returns more than one plausible match, ask which one
+    \\they meant.
+    \\
     \\Tool restraint: only call a tool when the question actually needs its
     \\specific data (a real city's weather, an actual exchange rate, and so
     \\on). Don't reach for one out of habit or because it's in the list
@@ -57,12 +69,27 @@ pub const default_system_prompt =
 
 const history_window = 200;
 
+/// Identifies who's actually sending *this* turn's question — deliberately
+/// separate from the "who: text" tags in `recentFormatted`'s history, which
+/// only cover past messages and fall back to "unknown" for a sender with
+/// neither a username nor a display name. Without this, a group chat with
+/// several active participants gives the model no reliable way to tell them
+/// apart on the current turn (see main.zig's `resolveSenderIdentity`/
+/// `iface.Message.identity`, which is where these fields come from).
+pub const Asker = struct {
+    display_name: []const u8,
+    username: ?[]const u8 = null,
+    /// Platform-native user id (Telegram: decimal string).
+    native_id: []const u8,
+};
+
 /// Grounded free-form Q&A: pulls recent local chat history (not model
 /// memory) as context, then runs the tool-calling loop so the model can
 /// also reach for weather/currency/calculator/web_search/fetch_url as
 /// needed. `replied_to` carries the text of the (bot's) message the user
 /// replied to, so follow-ups keep their referent even if it has scrolled
-/// out of the history window.
+/// out of the history window. `asker` identifies who sent this specific
+/// question — see `Asker`'s doc comment.
 pub fn answer(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -72,23 +99,29 @@ pub fn answer(
     chat_id: i64,
     system_prompt: ?[]const u8,
     max_answer_len: usize,
+    asker: Asker,
     question: []const u8,
     replied_to: ?[]const u8,
     progress: toolcall.Progress,
 ) ![]const u8 {
     const history = try messages.recentFormatted(pool, allocator, chat_id, history_window);
 
+    const asker_line = if (asker.username) |u|
+        try std.fmt.allocPrint(allocator, "{s} (@{s}, platform id {s})", .{ asker.display_name, u, asker.native_id })
+    else
+        try std.fmt.allocPrint(allocator, "{s} (platform id {s})", .{ asker.display_name, asker.native_id });
+
     const user_content = if (replied_to) |earlier|
         try std.fmt.allocPrint(
             allocator,
-            "Recent chat history:\n{s}\n\nThe user is replying to this earlier message of yours:\n\"{s}\"\n\nTheir reply: {s}",
-            .{ history, earlier, question },
+            "Recent chat history:\n{s}\n\nThis message is from: {s}\n\nThe user is replying to this earlier message of yours:\n\"{s}\"\n\nTheir reply: {s}",
+            .{ history, asker_line, earlier, question },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "Recent chat history:\n{s}\n\nQuestion: {s}",
-            .{ history, question },
+            "Recent chat history:\n{s}\n\nThis message is from: {s}\n\nQuestion: {s}",
+            .{ history, asker_line, question },
         );
 
     // A hard file-fallback exists for whatever slips through (see

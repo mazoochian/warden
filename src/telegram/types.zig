@@ -72,6 +72,20 @@ pub const Video = struct {
     mime_type: ?[]const u8 = null,
 };
 
+/// One parsed span of `Message.text` — Warden only cares about
+/// `text_mention`, the one entity kind that carries a full `User` object
+/// (used when a client mentions someone by name without an `@username`,
+/// e.g. tapping a name out of the member list on a person with no handle).
+/// Plain `"mention"` entities (`@username`) carry no `user` and need no
+/// special parsing — the raw `@handle` is already in `text`.
+pub const MessageEntity = struct {
+    type: []const u8 = "",
+    offset: i64 = 0,
+    length: i64 = 0,
+    /// Set only when `type == "text_mention"`.
+    user: ?User = null,
+};
+
 pub const Message = struct {
     message_id: i64,
     from: ?User = null,
@@ -84,6 +98,10 @@ pub const Message = struct {
     /// into `iface.Message.text` so callers don't need to know which field
     /// a given message actually populated.
     caption: ?[]const u8 = null,
+    /// Parsed spans of `text` (mentions, links, bold, ...) — Warden only
+    /// reads `text_mention` entries out of this (see `MessageEntity`'s doc
+    /// comment) to learn about a chat member who has no `@username`.
+    entities: ?[]MessageEntity = null,
     reply_to_message: ?ReplyToMessage = null,
     /// Multiple resolutions when present; adapters pick the largest.
     photo: ?[]PhotoSize = null,
@@ -91,6 +109,12 @@ pub const Message = struct {
     voice: ?Voice = null,
     audio: ?Audio = null,
     video: ?Video = null,
+    /// Present on the service message Telegram sends when one or more users
+    /// join a group (including the bot itself, which callers should skip).
+    new_chat_members: ?[]User = null,
+    /// Present on the service message Telegram sends when a single user
+    /// leaves/is removed from a group.
+    left_chat_member: ?User = null,
 };
 
 /// Response shape of `getFile` — resolves a `file_id` to a downloadable path.
@@ -172,5 +196,15 @@ pub const ChatMember = struct {
 pub const ChatMemberResponse = struct {
     ok: bool,
     result: ?ChatMember = null,
+    description: ?[]const u8 = null,
+};
+
+/// Response shape of `getChatAdministrators` — every owner/administrator of
+/// a chat, the one Telegram Bot API call that surfaces more than a single
+/// member at a time (see `Client.getChatAdministrators`'s doc comment for
+/// why this is the closest thing to a member "roster" bots get).
+pub const ChatAdministratorsResponse = struct {
+    ok: bool,
+    result: []ChatMember = &.{},
     description: ?[]const u8 = null,
 };

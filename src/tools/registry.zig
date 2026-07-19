@@ -108,6 +108,35 @@ pub const ConvertFlowSink = struct {
     }
 };
 
+/// One match `find_chat_member` can hand back to the model — enough to
+/// resolve a name to a real handle/id (to @-mention someone, or just refer
+/// to them correctly) without exposing internal store row ids.
+pub const MemberMatch = struct {
+    display_name: []const u8,
+    username: ?[]const u8 = null,
+    /// Platform-native user id (Telegram: decimal string) — mirrors
+    /// `iface.Message.user_id`'s "never parsed to a native int in shared
+    /// code" reasoning.
+    native_id: []const u8,
+};
+
+/// Callback surface the `find_chat_member` tool uses to fuzzy-search this
+/// chat's known participants — same ptr+vtable shape as `ReminderSink`/
+/// `AlertSink`, for the same "registry.zig must never depend on the store
+/// layer" reason (see `ScraperConfig`'s doc comment).
+pub const MemberDirectorySink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        find: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8) anyerror![]MemberMatch,
+    };
+
+    pub fn find(self: MemberDirectorySink, allocator: std.mem.Allocator, query: []const u8) ![]MemberMatch {
+        return self.vtable.find(self.ptr, allocator, query);
+    }
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -134,6 +163,9 @@ pub const ToolContext = struct {
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `begin_file_conversion` tool.
     convert_flow: ?ConvertFlowSink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `find_chat_member` tool.
+    member_directory: ?MemberDirectorySink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the
