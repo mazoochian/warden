@@ -15,6 +15,14 @@ pub const Platform = enum {
 
 pub const AttachmentKind = enum { photo, document, voice, audio, video };
 
+/// One entry in the bot's advertised command menu (Telegram's `/`
+/// autocomplete) — see `Connector.VTable.setCommands`.
+pub const CommandSpec = struct {
+    /// Bare command name, no leading slash (e.g. "ping", not "/ping").
+    name: []const u8,
+    description: []const u8,
+};
+
 /// Metadata for an inbound file/media attachment — deliberately just enough
 /// to *locate* the bytes (via `Connector.downloadFile`), not the bytes
 /// themselves: not every message with an attachment needs it downloaded
@@ -282,6 +290,13 @@ pub const Connector = struct {
         /// have sent a message themselves. Optional: a platform without the
         /// concept just reports `error.Unsupported`.
         listChatAdmins: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8) anyerror![]Identity = null,
+        /// Publishes the bot's command menu (see `CommandSpec`'s doc
+        /// comment) so it shows up in the platform's own UI (Telegram's "/"
+        /// autocomplete) instead of only working for people who already
+        /// know the exact command text. Optional/best-effort: a platform
+        /// without the concept just reports `error.Unsupported`, and
+        /// `main.zig` logs rather than fails startup on any error here.
+        setCommands: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, commands: []const CommandSpec) anyerror!void = null,
     };
 
     pub fn platform(self: Connector) Platform {
@@ -405,6 +420,11 @@ pub const Connector = struct {
     pub fn listChatAdmins(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8) ![]Identity {
         const f = self.vtable.listChatAdmins orelse return error.Unsupported;
         return f(self.ptr, allocator, chat_id);
+    }
+
+    pub fn setCommands(self: Connector, allocator: std.mem.Allocator, commands: []const CommandSpec) !void {
+        const f = self.vtable.setCommands orelse return error.Unsupported;
+        return f(self.ptr, allocator, commands);
     }
 };
 

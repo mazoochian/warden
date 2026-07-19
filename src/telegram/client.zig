@@ -517,6 +517,25 @@ pub const Client = struct {
         return std.mem.eql(u8, member.status, "administrator") or std.mem.eql(u8, member.status, "creator");
     }
 
+    /// One entry in the bot's command menu, in this client's own local
+    /// shape — same "no dependency on the adapter layer" reasoning as
+    /// `Button`. `command` is Telegram's bare command name with no leading
+    /// slash (lowercase letters/digits/underscores, 1-32 chars).
+    pub const BotCommand = struct {
+        command: []const u8,
+        description: []const u8,
+    };
+
+    /// Publishes the bot-wide command menu Telegram clients show in the
+    /// "/" autocomplete / attachment-icon menu — without this call the bot
+    /// works identically, it's purely a discoverability aid. Global default
+    /// scope (every chat, every language); replaces whatever was set
+    /// before. Best-effort from the caller's point of view: `main.zig` logs
+    /// a failure here rather than treating it as fatal to startup.
+    pub fn setMyCommands(self: *Client, allocator: std.mem.Allocator, commands: []const BotCommand) !void {
+        return self.callMethod(allocator, "setMyCommands", .{ .commands = commands });
+    }
+
     /// Every owner/administrator of `chat_id`, full `User` objects included.
     /// This is the *only* Bot API call that hands back more than one
     /// member at a time — Telegram deliberately gives bots no way to

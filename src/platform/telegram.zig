@@ -220,6 +220,7 @@ pub const TelegramConnector = struct {
         .selfUsername = selfUsernameFn,
         .selfId = selfIdFn,
         .listChatAdmins = listChatAdminsFn,
+        .setCommands = setCommandsFn,
     };
 
     /// Telegram's documented hard cap on `sendMessage`'s `text` — see
@@ -491,6 +492,14 @@ pub const TelegramConnector = struct {
             try out.append(allocator, try identityFromUser(allocator, user, now));
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    fn setCommandsFn(ptr: *anyopaque, allocator: std.mem.Allocator, commands: []const iface.CommandSpec) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        const list = try allocator.alloc(raw.Client.BotCommand, commands.len);
+        defer allocator.free(list);
+        for (commands, 0..) |c, i| list[i] = .{ .command = c.name, .description = c.description };
+        return self.client.setMyCommands(allocator, list);
     }
 
     fn parseId(s: []const u8) !i64 {
