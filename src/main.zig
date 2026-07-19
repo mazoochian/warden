@@ -926,7 +926,7 @@ fn handleMessage(
             .username = msg.username,
             .native_id = msg.user_id,
         };
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id);
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, config.llm_streaming);
     }
     return false;
 }
@@ -2074,6 +2074,7 @@ fn replyWithAnswer(
     question: []const u8,
     replied_to: ?[]const u8,
     existing_placeholder_id: ?[]const u8,
+    stream: bool,
 ) void {
     // The placeholder + ticker only work when the platform supports
     // editing (Telegram does); anything that doesn't falls back to
@@ -2104,7 +2105,7 @@ fn replyWithAnswer(
     }
 
     std.log.info("qa: calling the model for chat {s}", .{native_chat_id});
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress);
+    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream);
 
     // Stop the ticker before touching the placeholder ourselves — it's the
     // sole owner of that Future until this point (see `Future.cancel`'s

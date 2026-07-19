@@ -38,7 +38,10 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
         .{history},
     );
 
-    const summary = toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}) catch |err| blk: {
+    // Not a live chat reply anyone's watching mid-generation (no ticker/
+    // Progress consumer is wired up here anyway — `.{}` above is a no-op
+    // Progress), so streaming would have zero visible effect either way.
+    const summary = toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false) catch |err| blk: {
         std.log.err("digest: llm summary failed: {t}", .{err});
         break :blk "";
     };

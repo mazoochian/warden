@@ -89,7 +89,9 @@ pub const Asker = struct {
 /// needed. `replied_to` carries the text of the (bot's) message the user
 /// replied to, so follow-ups keep their referent even if it has scrolled
 /// out of the history window. `asker` identifies who sent this specific
-/// question — see `Asker`'s doc comment.
+/// question — see `Asker`'s doc comment. `stream` is forwarded straight to
+/// `toolcall.run` — see `config.zig`'s `llm_streaming` doc comment for why
+/// this is caller-controlled instead of always on.
 pub fn answer(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -103,6 +105,7 @@ pub fn answer(
     question: []const u8,
     replied_to: ?[]const u8,
     progress: toolcall.Progress,
+    stream: bool,
 ) ![]const u8 {
     const history = try messages.recentFormatted(pool, allocator, chat_id, history_window);
 
@@ -134,5 +137,5 @@ pub fn answer(
         .{ system_prompt orelse default_system_prompt, max_answer_len },
     );
 
-    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress);
+    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream);
 }
