@@ -57,21 +57,22 @@ pub fn run(
         .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = user_message }}),
     });
 
-    // Bridges the provider-layer `llm.StreamSink` into this loop's own
-    // `Progress` — kept as one instance reused across every turn since it's
-    // stateless (just forwards whatever `text_so_far` it's given); each
-    // turn's own accumulation lives in the provider's `chatStream` call,
-    // not here.
-    var stream_bridge = ProgressStreamBridge{ .progress = progress };
-
+    // TEMPORARILY DISABLED: `provider.chatStream` (via `postJsonSSE`'s SSE
+    // read loop) is hanging in a genuine CPU-pegging spin in production —
+    // outlives even the 2-minute timeout, since `Future.cancel` itself
+    // blocks waiting for a loop that never reaches a cancellable point.
+    // Reverted to the known-good non-streaming `chat()` call to restore
+    // service while that's debugged; `ProgressStreamBridge`/`StreamSink`
+    // plumbing below is left in place, unused, to re-enable with a
+    // one-line change once the read loop is fixed.
     var i: u32 = 0;
     while (i < max_iterations) : (i += 1) {
         progress.report(.thinking);
-        const response = try provider.chatStream(allocator, .{
+        const response = try provider.chat(allocator, .{
             .system = system,
             .messages = messages.items,
             .tools = llm_tools,
-        }, stream_bridge.sink());
+        });
 
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
@@ -108,11 +109,11 @@ pub fn run(
     try messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(llm.ContentBlock, &.{
         .{ .text = "You have reached the tool-call limit. Do not call any more tools — give your final answer now using what you already have, and say plainly what you couldn't complete." },
     }) });
-    const response = try provider.chatStream(allocator, .{
+    const response = try provider.chat(allocator, .{
         .system = system,
         .messages = messages.items,
         .tools = llm_tools,
-    }, stream_bridge.sink());
+    });
     const text = try llm.textOf(allocator, response.content);
     if (text.len > 0) return text;
     return error.ToolCallLoopExceeded;
