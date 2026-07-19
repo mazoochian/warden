@@ -159,7 +159,16 @@ pub const OpenAiCompatProvider = struct {
             if (reasoning) |r| {
                 if (r.len > 0) try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "{s}{s}{s}\n\n", .{ llm.thinking_start, r, llm.thinking_end }) });
             }
-            if (choice.message.content) |c| {
+            // Some models (MiniMax-M3 among them) send chain-of-thought
+            // inline in `content` as literal <think>/<thinking> tags
+            // instead of (or as well as) the separate reasoning field above
+            // — rewrap those into the same thinking_start/thinking_end
+            // markers so they render as the same expandable blockquote
+            // instead of showing up as raw, unrendered tag text (see
+            // `wrapThinkingTags`).
+            if (choice.message.content) |c0| {
+                var c = try wrapThinkingTags(allocator, c0, "think");
+                c = try wrapThinkingTags(allocator, c, "thinking");
                 if (c.len > 0) try blocks.append(allocator, .{ .text = c });
             }
         } else {
@@ -240,6 +249,46 @@ fn stripThinkingBlock(allocator: std.mem.Allocator, content: []const u8, comptim
         if (std.mem.indexOf(u8, after_open, close_tag)) |end| {
             rest = after_open[end + close_tag.len ..];
         } else {
+            rest = "";
+            break;
+        }
+    }
+    try out.appendSlice(allocator, rest);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Converts inline `<tag>...</tag>` spans — a reasoning model's chain-of-
+/// thought embedded directly in `content` (MiniMax-M3 and similar do this,
+/// rather than/as well as the separate `reasoning`/`reasoning_content`
+/// field) — into `llm.thinking_start`/`thinking_end`-wrapped spans, so
+/// `telegram/markdown_html.zig` renders them as the same expandable
+/// blockquote as field-based reasoning gets, instead of the raw tag text
+/// showing up escaped and unrendered. The mirror image of
+/// `stripThinkingBlock`: content is *kept* (wrapped, not deleted) — this
+/// only runs when `show_thinking` is true, so the whole point is showing
+/// it, just legibly. An unterminated opening tag (mid-stream, before the
+/// closing tag has arrived yet) is left as literal text for this call —
+/// callers that re-run this on the whole growing buffer on every delta
+/// (see `StreamState.shownText`) resolve it naturally once the closing tag
+/// actually streams in.
+fn wrapThinkingTags(allocator: std.mem.Allocator, content: []const u8, comptime tag: []const u8) ![]const u8 {
+    const open_tag = "<" ++ tag ++ ">";
+    const close_tag = "</" ++ tag ++ ">";
+
+    if (std.mem.indexOf(u8, content, open_tag) == null) return content;
+
+    var out: std.ArrayList(u8) = .empty;
+    var rest = content;
+    while (std.mem.indexOf(u8, rest, open_tag)) |start| {
+        try out.appendSlice(allocator, rest[0..start]);
+        const after_open = rest[start + open_tag.len ..];
+        if (std.mem.indexOf(u8, after_open, close_tag)) |end| {
+            try out.appendSlice(allocator, llm.thinking_start);
+            try out.appendSlice(allocator, after_open[0..end]);
+            try out.appendSlice(allocator, llm.thinking_end);
+            rest = after_open[end + close_tag.len ..];
+        } else {
+            try out.appendSlice(allocator, rest[start..]);
             rest = "";
             break;
         }
@@ -382,20 +431,33 @@ const StreamState = struct {
     }
 
     /// The answer text as it should be *shown right now* — i.e. what
-    /// `finalize`'s `!show_thinking` branch computes from the complete
-    /// response, just recomputed from `visible_text` on every delta instead
-    /// of once at the end. While inside an unterminated `<think>`/
+    /// `finalize` computes from the complete response, just recomputed from
+    /// `visible_text` on every delta instead of once at the end.
+    ///
+    /// `show_thinking = false`: while inside an unterminated `<think>`/
     /// `<thinking>` block, `stripThinkingBlock` already drops everything
     /// from the open tag onward (see its own doc comment), so this
     /// naturally reports nothing new for the whole thinking phase — the
     /// live stream just pauses until `</think>` closes, then the real
-    /// answer appears and continues streaming normally. Re-scanning the
-    /// whole buffer each call is O(n) in the response length; for a
-    /// chat-sized answer over maybe a hundred deltas that's negligible,
-    /// and `stripThinkingBlock` itself is a no-op allocation whenever no
-    /// tag has appeared yet (the common non-reasoning-model case).
+    /// answer appears and continues streaming normally.
+    ///
+    /// `show_thinking = true`: `wrapThinkingTags` rewrites any inline
+    /// `<think>`/`<thinking>` tags (some models, MiniMax-M3 included, embed
+    /// chain-of-thought directly in `content` rather than a separate
+    /// field) into `llm.thinking_start`/`thinking_end` markers, so
+    /// `telegram/markdown_html.zig` renders them as an expandable
+    /// blockquote instead of raw, unrendered tag text.
+    ///
+    /// Re-scanning the whole buffer each call is O(n) in the response
+    /// length; for a chat-sized answer over maybe a hundred deltas that's
+    /// negligible, and both helpers are no-op allocations whenever no tag
+    /// has appeared yet (the common non-reasoning-model case).
     fn shownText(self: *StreamState) ![]const u8 {
-        if (self.show_thinking) return self.visible_text.items;
+        if (self.show_thinking) {
+            var c = try wrapThinkingTags(self.allocator, self.visible_text.items, "think");
+            c = try wrapThinkingTags(self.allocator, c, "thinking");
+            return c;
+        }
         var c = try stripThinkingBlock(self.allocator, self.visible_text.items, "think");
         c = try stripThinkingBlock(self.allocator, c, "thinking");
         return std.mem.trim(u8, c, " \t\r\n");
@@ -409,12 +471,10 @@ const StreamState = struct {
     fn finalize(self: *StreamState, allocator: std.mem.Allocator) !llm.ChatResponse {
         var blocks: std.ArrayList(llm.ContentBlock) = .empty;
 
-        if (self.show_thinking) {
-            if (self.reasoning_text.items.len > 0) {
-                try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "{s}{s}{s}\n\n", .{ llm.thinking_start, self.reasoning_text.items, llm.thinking_end }) });
-            }
-            if (self.visible_text.items.len > 0) try blocks.append(allocator, .{ .text = self.visible_text.items });
-        } else if (self.visible_text.items.len > 0) {
+        if (self.show_thinking and self.reasoning_text.items.len > 0) {
+            try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "{s}{s}{s}\n\n", .{ llm.thinking_start, self.reasoning_text.items, llm.thinking_end }) });
+        }
+        if (self.visible_text.items.len > 0) {
             const c = try self.shownText();
             if (c.len > 0) try blocks.append(allocator, .{ .text = c });
         }
@@ -637,6 +697,30 @@ test "stripThinkingBlock returns the input unchanged when the tag never appears"
     try testing.expectEqualStrings(input, out);
 }
 
+test "wrapThinkingTags rewraps a single <think> span, keeping its content" {
+    const out = try wrapThinkingTags(testing.allocator, "<think>pondering...</think>the answer is 4", "think");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(llm.thinking_start ++ "pondering..." ++ llm.thinking_end ++ "the answer is 4", out);
+}
+
+test "wrapThinkingTags rewraps multiple spans and leaves surrounding text alone" {
+    const out = try wrapThinkingTags(testing.allocator, "a<think>x</think>b<think>y</think>c", "think");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a" ++ llm.thinking_start ++ "x" ++ llm.thinking_end ++ "b" ++ llm.thinking_start ++ "y" ++ llm.thinking_end ++ "c", out);
+}
+
+test "wrapThinkingTags leaves an unterminated tag as literal text" {
+    const out = try wrapThinkingTags(testing.allocator, "before<think>never closes", "think");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("before<think>never closes", out);
+}
+
+test "wrapThinkingTags returns the input unchanged when the tag never appears" {
+    const input = "just a normal reply";
+    const out = try wrapThinkingTags(testing.allocator, input, "think");
+    try testing.expectEqualStrings(input, out);
+}
+
 // `StreamState.onLine` is fed canned SSE lines directly, same "deterministic
 // and offline" philosophy as the response-body tests above, at the
 // SSE-chunk granularity instead of one whole JSON body.
@@ -744,7 +828,7 @@ test "StreamState suppresses live reporting entirely during an unterminated <thi
     try testing.expectEqualStrings("the answer is 4", response.content[0].text);
 }
 
-test "StreamState still streams live normally when show_thinking is true, tags included" {
+test "StreamState rewraps inline <think> tags into thinking_start/thinking_end markers when show_thinking is true" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -758,9 +842,17 @@ test "StreamState still streams live normally when show_thinking is true, tags i
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"</think>4\"}}]}",
     });
 
+    // While the tag is still open, it's left as literal text for now (no
+    // matching close yet) — same "resolves once the closing tag streams
+    // in" story as the show_thinking=false suppression case, just visible
+    // instead of hidden meanwhile.
     try testing.expectEqual(@as(usize, 2), recorder.reports.items.len);
     try testing.expectEqualStrings("<think>pondering", recorder.reports.items[0]);
-    try testing.expectEqualStrings("<think>pondering</think>4", recorder.reports.items[1]);
+    try testing.expectEqualStrings(llm.thinking_start ++ "pondering" ++ llm.thinking_end ++ "4", recorder.reports.items[1]);
+
+    const response = try state.finalize(a);
+    try testing.expectEqual(@as(usize, 1), response.content.len);
+    try testing.expectEqualStrings(llm.thinking_start ++ "pondering" ++ llm.thinking_end ++ "4", response.content[0].text);
 }
 
 test "StreamState captures a mid-stream error event" {
