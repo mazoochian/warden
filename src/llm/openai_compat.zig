@@ -106,15 +106,19 @@ pub const OpenAiCompatProvider = struct {
         return allocator.dupe(u8, w.buffered());
     }
 
-    /// `auth_header_buf` is written into `headers_out[0]` (when an API key
-    /// is set) and must outlive it — kept as an out-param rather than a
-    /// return value so the caller controls that lifetime relationship
-    /// directly instead of this function returning a slice into its own
-    /// stack frame.
-    fn buildHeaders(self: *const OpenAiCompatProvider, auth_header_buf: []u8) ![]const http.Header {
+    /// Writes the "Bearer ..." value into `auth_header_buf` and the header
+    /// itself into `headers_buf[0]`, returning a slice into `headers_buf` —
+    /// both caller-owned buffers, so the returned slice's storage is the
+    /// *caller's* stack frame, not this function's (which would leave a
+    /// dangling slice into memory that's gone the instant this returns —
+    /// confirmed the hard way: an earlier version of this returned `&.{...}`
+    /// directly and segfaulted on the very first request, `extra_headers`
+    /// already garbage by the time `std.http.Client.request` read it).
+    fn buildHeaders(self: *const OpenAiCompatProvider, auth_header_buf: []u8, headers_buf: *[1]http.Header) ![]const http.Header {
         if (self.api_key.len == 0) return &.{};
         const value = try std.fmt.bufPrint(auth_header_buf, "Bearer {s}", .{self.api_key});
-        return &.{.{ .name = "Authorization", .value = value }};
+        headers_buf[0] = .{ .name = "Authorization", .value = value };
+        return headers_buf[0..1];
     }
 
     fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
@@ -125,7 +129,8 @@ pub const OpenAiCompatProvider = struct {
         defer allocator.free(url);
 
         var auth_header_buf: [8 + 255]u8 = undefined;
-        const headers = try self.buildHeaders(&auth_header_buf);
+        var headers_buf: [1]http.Header = undefined;
+        const headers = try self.buildHeaders(&auth_header_buf, &headers_buf);
 
         const body = try http_util.postJsonWithTimeout(&self.http_client, allocator, url, headers, payload, http_util.llm_timeout_ns);
         defer allocator.free(body);
@@ -204,7 +209,8 @@ pub const OpenAiCompatProvider = struct {
         defer allocator.free(url);
 
         var auth_header_buf: [8 + 255]u8 = undefined;
-        const headers = try self.buildHeaders(&auth_header_buf);
+        var headers_buf: [1]http.Header = undefined;
+        const headers = try self.buildHeaders(&auth_header_buf, &headers_buf);
 
         var state: StreamState = .{ .allocator = allocator, .stream_sink = sink, .show_thinking = self.show_thinking };
         try http_util.postJsonSSE(&self.http_client, allocator, url, headers, payload, http_util.llm_timeout_ns, state.sink());
