@@ -58,6 +58,117 @@ const base_tools = [_]tool_registry.ToolDef{
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
+/// Published via `Connector.setCommands` at startup so commands show up in
+/// the platform's own UI (Telegram's "/" autocomplete / attachment menu)
+/// instead of only working for people who already know the exact text to
+/// type — see `handleHelp`/`help_text` below for the fuller reference,
+/// including the owner-only `/token`/`/scraper` deliberately left out of
+/// this public menu (see their own dispatch-table gates in `handleMessage`).
+const public_commands = [_]iface.CommandSpec{
+    .{ .name = "help", .description = "Show available commands and how to talk to Warden." },
+    .{ .name = "ping", .description = "Check that Warden is responsive." },
+    .{ .name = "stats", .description = "Show message stats for this chat." },
+    .{ .name = "wordcloud", .description = "Generate a word cloud from recent chat activity." },
+    .{ .name = "digest", .description = "on | off | now -- enable, disable, or generate a recent-activity summary." },
+    .{ .name = "remind", .description = "<time> <message> -- set a reminder. Also: every <interval> ..., cancel <id>." },
+    .{ .name = "reminders", .description = "List your pending reminders in this chat." },
+    .{ .name = "alert", .description = "<crypto|weather|aqi> <subject> <above|below> <value> -- set an alert." },
+    .{ .name = "alerts", .description = "List pending alerts in this chat." },
+    .{ .name = "watch", .description = "<feed url> -- get notified when an RSS/Atom feed publishes." },
+    .{ .name = "unwatch", .description = "<feed url> -- stop watching a feed." },
+    .{ .name = "watches", .description = "List feeds this chat is watching." },
+    .{ .name = "convert", .description = "Convert an attached photo/document/voice/audio/video to another format." },
+    .{ .name = "magicword", .description = "<word> -- make Warden answer any message containing this word." },
+    .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
+    .{ .name = "mute", .description = "Reply to a user's message to mute them. Admins only." },
+    .{ .name = "unmute", .description = "Reply to a user's message to unmute them. Admins only." },
+    .{ .name = "pin", .description = "Reply to a message to pin it. Admins only." },
+    .{ .name = "unpin", .description = "Unpin the current pinned message. Admins only." },
+    .{ .name = "delete", .description = "Reply to a message to delete it. Admins only." },
+    .{ .name = "kick", .description = "Reply to a user's message to remove them. Admins only." },
+    .{ .name = "ban", .description = "Reply to a user's message to permanently ban them. Admins only." },
+    .{ .name = "confirm", .description = "Confirm a pending /kick or /ban. Admins only." },
+    .{ .name = "cancel", .description = "Cancel your pending file conversion, or a pending /kick or /ban." },
+};
+
+/// `/help`'s reply — kept as a single static string (matches `reply()`'s
+/// `comptime txt` parameter) rather than built from `public_commands`, since
+/// it also covers the owner-only commands deliberately left out of that
+/// public menu, group-chat-only commands, and the free-form LLM path, none
+/// of which fit `CommandSpec`'s flat name/description shape.
+const help_text =
+    \\I'm Warden. Talk to me directly by mentioning me (@username), replying
+    \\to one of my messages, or (in a group) saying a chat-specific magic
+    \\word if one's set — see /magicword. I'm not limited to chat commands:
+    \\ask me anything in plain language and I'll use whatever tool fits
+    \\(weather/air quality, currency/crypto prices, a calculator,
+    \\dictionaries, Hacker News, QR codes, diagrams, word clouds, web
+    \\search, fetching a URL) -- reminders, alerts, and file conversion
+    \\below all work as plain requests too, not just as slash commands.
+    \\
+    \\General
+    \\/ping -- check I'm responsive
+    \\/stats -- message stats for this chat
+    \\/wordcloud -- word cloud from recent activity
+    \\/digest on|off|now -- enable/disable/generate a recent-activity summary
+    \\
+    \\Reminders, alerts, feeds
+    \\/remind <time> <message> -- e.g. /remind 30m take the bread out, or
+    \\  /remind 14:30 stand-up. Also: /remind every <interval> <message> to
+    \\  repeat, /remind cancel <id>
+    \\/reminders -- list your pending reminders
+    \\/alert <crypto|weather|aqi> <subject> <above|below> <value> -- e.g.
+    \\  /alert crypto btc above 100000. Also: /alert cancel <id>
+    \\/alerts -- list pending alerts
+    \\/watch <feed url> / /unwatch <feed url> / /watches -- RSS/Atom feed
+    \\  notifications for this chat
+    \\
+    \\Files
+    \\/convert -- start a guided conversion (I'll ask you to send a file);
+    \\  or send a file with "/convert <format>" as its caption for one shot,
+    \\  e.g. /convert pdf
+    \\
+    \\Customization
+    \\/magicword <word> -- make me answer any message containing it, or
+    \\  /magicword off. Owner only to change, anyone can view.
+    \\/persona <text> -- set this chat's personality/system prompt, or
+    \\  /persona off to reset. Owner only to change, anyone can view.
+    \\
+    \\Group moderation (chat admins only, most by replying to a message)
+    \\/mute, /unmute, /pin, /unpin, /delete, /kick, /ban -- reply to the
+    \\  target message/user (unpin doesn't need a reply)
+    \\/confirm -- confirm a pending /kick or /ban
+    \\/cancel -- cancel your pending file conversion, or a pending
+    \\  /kick/ban if you're an admin
+    \\
+    \\Bot owner only
+    \\/token -- reply to a user's message to view/set their token count
+    \\/scraper -- configure the web-scraping backend
+;
+
+/// Appends a note about the `/command@botusername` qualified form (see
+/// `normalizeCommandMention`) using this connector's *actual* username when
+/// known, rather than baking a guessed example into the static `help_text`
+/// above — relevant mainly when two bot instances share one group chat.
+fn handleHelp(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
+    const username = connector.selfUsername() orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, help_text);
+        return;
+    };
+    const full = std.fmt.allocPrint(
+        a,
+        "{s}\n\nSharing this group with another bot? Qualify a command with my username, e.g. /ping@{s}, and I'll ignore commands qualified for a different bot.",
+        .{ help_text, username },
+    ) catch return reply(connector, a, msg.chat_id, msg.message_id, help_text);
+    connector.sendMessage(a, msg.chat_id, full, msg.message_id);
+}
+
+test "help_text leaves enough headroom under Telegram's 4096-byte message cap for handleHelp's dynamic suffix" {
+    // A Telegram username is at most 32 bytes, so 200 bytes of slack is
+    // generous for the "Sharing this group..." suffix `handleHelp` appends.
+    try std.testing.expect(help_text.len < 4096 - 200);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -140,6 +251,17 @@ pub fn main(init: std.process.Init) !void {
     };
 
     std.log.info("warden started, {d} connector(s), {d} owner(s) configured", .{ connectors.len, config.owners.len });
+
+    // Best-effort: a platform without the concept (or a transient API
+    // failure) just means commands don't autocomplete, not a startup
+    // failure — the commands themselves work regardless via `handleMessage`.
+    for (connectors) |connector| {
+        connector.setCommands(gpa, &public_commands) catch |err| {
+            if (err != error.Unsupported) {
+                std.log.warn("failed to publish command menu for {s}: {t}", .{ @tagName(connector.platform()), err });
+            }
+        };
+    }
 
     // Long-lived: every message spawns a task into this group (never
     // awaited/canceled during normal operation — see `Group`'s doc comment
@@ -675,8 +797,13 @@ fn handleMessage(
     // reply when addressed to the bot — the attachment alone is enough for
     // e.g. convert_file to have something to work with. Only bail when
     // there's neither text nor an attachment to react to.
-    const text = msg.text orelse "";
-    if (text.len == 0 and msg.attachment == null) return false;
+    const raw_text = msg.text orelse "";
+    if (raw_text.len == 0 and msg.attachment == null) return false;
+
+    // See `normalizeCommandMention`'s doc comment: makes `/ping@warden_bot`
+    // dispatch exactly like `/ping`, and drops a command explicitly
+    // addressed to a different bot instance sharing this chat.
+    const text = normalizeCommandMention(a, raw_text, connector.selfUsername()) orelse return false;
 
     // An attachment arriving while (chat, user) is mid-flow, waiting for a
     // file — claimed here, before the big dispatch chain and before
@@ -694,6 +821,8 @@ fn handleMessage(
 
     if (std.mem.eql(u8, text, "/ping")) {
         connector.sendMessage(a, msg.chat_id, "pong", msg.message_id);
+    } else if (std.mem.eql(u8, text, "/help") or std.mem.startsWith(u8, text, "/help ")) {
+        handleHelp(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/stats")) {
         replyWithStats(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/wordcloud")) {
@@ -800,6 +929,64 @@ fn handleMessage(
         replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id);
     }
     return false;
+}
+
+/// Strips a Telegram-style `@botusername` qualifier off the leading
+/// `/command` token, so `/ping` and `/ping@warden_bot` dispatch
+/// identically — the qualified form is how Telegram clients disambiguate
+/// which bot a command is for once two or more bots share a chat, and every
+/// bot in the chat receives the update regardless of which one it names.
+/// Returns the original `text` unchanged when there's no qualifier, the
+/// leading token isn't a command at all, or this connector doesn't know its
+/// own username yet; returns `null` when the qualifier explicitly names a
+/// *different* bot (this command isn't for us — the caller should bail out
+/// entirely rather than fall through to the "unrecognized command" path,
+/// so two Warden instances in one group don't both act on it); otherwise
+/// returns a freshly allocated copy of `text` with the qualifier removed,
+/// leaving any arguments after it intact. A `text` starting with a `/` but
+/// with no matching qualifier reaching `allocator` (out of memory) falls
+/// back to the original, unqualified-looking `text`, which simply won't
+/// match any known command below — a safe degrade, not a crash.
+fn normalizeCommandMention(allocator: std.mem.Allocator, text: []const u8, self_username: ?[]const u8) ?[]const u8 {
+    if (text.len == 0 or text[0] != '/') return text;
+    const cmd_end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
+    const at = std.mem.indexOfScalar(u8, text[0..cmd_end], '@') orelse return text;
+    const me = self_username orelse return text;
+    const target = text[at + 1 .. cmd_end];
+    if (!std.ascii.eqlIgnoreCase(target, me)) return null;
+    return std.mem.concat(allocator, u8, &.{ text[0..at], text[cmd_end..] }) catch text;
+}
+
+test "normalizeCommandMention strips a qualifier naming us, preserving trailing args" {
+    const a = std.testing.allocator;
+    const out = normalizeCommandMention(a, "/ping@warden_bot", "warden_bot").?;
+    defer a.free(out);
+    try std.testing.expectEqualStrings("/ping", out);
+
+    const out2 = normalizeCommandMention(a, "/token@warden_bot 123 add", "warden_bot").?;
+    defer a.free(out2);
+    try std.testing.expectEqualStrings("/token 123 add", out2);
+}
+
+test "normalizeCommandMention matches the qualifier case-insensitively" {
+    const a = std.testing.allocator;
+    const out = normalizeCommandMention(a, "/ping@Warden_Bot", "warden_bot").?;
+    defer a.free(out);
+    try std.testing.expectEqualStrings("/ping", out);
+}
+
+test "normalizeCommandMention returns null for a qualifier naming a different bot" {
+    try std.testing.expectEqual(@as(?[]const u8, null), normalizeCommandMention(std.testing.allocator, "/ping@someotherbot", "warden_bot"));
+}
+
+test "normalizeCommandMention passes non-commands and unqualified commands through unchanged" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqualStrings("", normalizeCommandMention(a, "", "warden_bot").?);
+    try std.testing.expectEqualStrings("hello there", normalizeCommandMention(a, "hello there", "warden_bot").?);
+    try std.testing.expectEqualStrings("/ping", normalizeCommandMention(a, "/ping", "warden_bot").?);
+    // No known self-username yet (e.g. before the first getMe resolves) —
+    // left as-is rather than guessed at.
+    try std.testing.expectEqualStrings("/ping@warden_bot", normalizeCommandMention(a, "/ping@warden_bot", null).?);
 }
 
 /// True for the protected one-shot `/convert <format>` caption path (a
