@@ -41,10 +41,10 @@ pub const Progress = struct {
 /// `tool_defs` and feeds the results back, until it produces a final text
 /// answer (or the iteration cap is hit). `stream` selects `chatStream`
 /// (progressively reports `.text` events as the model generates, see
-/// `ProgressStreamBridge`) vs. one blocking `chat` call per turn — see
-/// `config.zig`'s `llm_streaming` doc comment for why this is
-/// caller-controlled rather than always-on: the streaming SSE read path has
-/// a known production hang, confirmed live, not yet fixed.
+/// `ProgressStreamBridge`) vs. one blocking `chat` call per turn.
+/// `show_thinking`/`max_tokens` are forwarded straight into every
+/// `ChatRequest` — see `provider.zig`'s `ChatRequest.show_thinking` doc
+/// comment and `qa.zig`'s `answerMaxTokens` for how callers compute them.
 pub fn run(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -54,6 +54,8 @@ pub fn run(
     tool_defs: []const registry.ToolDef,
     progress: Progress,
     stream: bool,
+    show_thinking: bool,
+    max_tokens: u32,
 ) ![]const u8 {
     const llm_tools = try toLlmTools(allocator, tool_defs);
 
@@ -78,12 +80,16 @@ pub fn run(
                 .system = system,
                 .messages = messages.items,
                 .tools = llm_tools,
+                .show_thinking = show_thinking,
+                .max_tokens = max_tokens,
             }, stream_bridge.sink())
         else
             try provider.chat(allocator, .{
                 .system = system,
                 .messages = messages.items,
                 .tools = llm_tools,
+                .show_thinking = show_thinking,
+                .max_tokens = max_tokens,
             });
 
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
@@ -126,12 +132,16 @@ pub fn run(
             .system = system,
             .messages = messages.items,
             .tools = llm_tools,
+            .show_thinking = show_thinking,
+            .max_tokens = max_tokens,
         }, stream_bridge.sink())
     else
         try provider.chat(allocator, .{
             .system = system,
             .messages = messages.items,
             .tools = llm_tools,
+            .show_thinking = show_thinking,
+            .max_tokens = max_tokens,
         });
     const text = try llm.textOf(allocator, response.content);
     if (text.len > 0) return text;
@@ -262,7 +272,7 @@ test "run executes a tool call and threads its result back to the model" {
     var fake = FakeProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false);
+    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false, false, 1024);
     try testing.expectEqualStrings("The answer is 4.", result);
     try testing.expectEqual(@as(u32, 2), fake.call_count);
 }
@@ -321,7 +331,7 @@ test "run(..., true) uses chatStream, reporting .text progress events" {
     defer reports.deinit(testing.allocator);
     const progress = Progress{ .ptr = &reports, .onEvent = Recorder.onEvent };
 
-    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, progress, true);
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, progress, true, false, 1024);
     try testing.expectEqualStrings("Hello", result);
     try testing.expectEqual(@as(u32, 1), fake.call_count);
     try testing.expectEqual(@as(usize, 2), reports.items.len);
@@ -373,7 +383,7 @@ test "run salvages a final answer when the tool-call cap is hit" {
     var fake = InsatiableProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{}, false);
+    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{}, false, false, 1024);
     try testing.expectEqualStrings("best effort answer", result);
     // max_iterations tool turns plus the final wrap-up call.
     try testing.expectEqual(@as(u32, 7), fake.call_count);
@@ -401,7 +411,7 @@ test "run returns the model's answer directly when it never calls a tool" {
     var fake = NoToolProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{}, false);
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, 1024);
     try testing.expectEqualStrings("no tools needed", result);
 }
 

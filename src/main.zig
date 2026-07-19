@@ -80,6 +80,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "convert", .description = "Convert an attached photo/document/voice/audio/video to another format." },
     .{ .name = "magicword", .description = "<word> -- make Warden answer any message containing this word." },
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
+    .{ .name = "thinking", .description = "on|off|default -- show or hide the model's reasoning for this chat." },
     .{ .name = "mute", .description = "Reply to a user's message to mute them. Admins only." },
     .{ .name = "unmute", .description = "Reply to a user's message to unmute them. Admins only." },
     .{ .name = "pin", .description = "Reply to a message to pin it. Admins only." },
@@ -133,6 +134,9 @@ const help_text =
     \\  /magicword off. Owner only to change, anyone can view.
     \\/persona <text> -- set this chat's personality/system prompt, or
     \\  /persona off to reset. Owner only to change, anyone can view.
+    \\/thinking on|off|default -- show or hide the model's reasoning for
+    \\  this chat, overriding the bot-wide default. Owner only to change,
+    \\  anyone can view.
     \\
     \\Group moderation (chat admins only, most by replying to a message)
     \\/mute, /unmute, /pin, /unpin, /delete, /kick, /ban -- reply to the
@@ -245,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .openai_compat => |o| blk: {
             const p = try gpa.create(OpenAiCompatProvider);
-            p.* = OpenAiCompatProvider.init(gpa, io, o.base_url, o.api_key, o.model, config.llm_show_thinking);
+            p.* = OpenAiCompatProvider.init(gpa, io, o.base_url, o.api_key, o.model);
             break :blk p.provider();
         },
     };
@@ -872,6 +876,8 @@ fn handleMessage(
         handleMagicWord(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/persona") or std.mem.startsWith(u8, text, "/persona ")) {
         handlePersonaCommand(connector, a, config, pool, chat_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/thinking") or std.mem.startsWith(u8, text, "/thinking ")) {
+        handleThinkingCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/scraper") or std.mem.startsWith(u8, text, "/scraper ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleScraperCommand(connector, a, pool, msg, text);
@@ -913,6 +919,9 @@ fn handleMessage(
         // Per-chat /persona override, falling back to the global default —
         // see `store/chat_settings.zig`'s `getSystemPromptOverride`.
         const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
+        // Per-chat /thinking override, falling back to the global default —
+        // see `store/chat_settings.zig`'s `getShowThinkingOverride`.
+        const show_thinking = chat_settings.getShowThinkingOverride(pool, chat_id) orelse config.llm_show_thinking;
         // Prefers the full `Identity` the connector built from the
         // platform's own user object; falls back to the thinner
         // `iface.Message` fields for a platform/message that didn't
@@ -926,7 +935,7 @@ fn handleMessage(
             .username = msg.username,
             .native_id = msg.user_id,
         };
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, config.llm_streaming);
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, config.llm_streaming, show_thinking);
     }
     return false;
 }
@@ -1128,6 +1137,68 @@ fn handlePersonaCommand(
         return;
     };
     reply(connector, a, msg.chat_id, msg.message_id, "Persona updated for this chat.");
+}
+
+/// Per-chat override for whether a reasoning model's chain-of-thought is
+/// shown — same view-open-to-anyone/change-owner-only access model as
+/// `/persona` (a chat member flipping this is a smaller lever than a full
+/// persona rewrite, but still not something to leave open to anyone).
+fn handleThinkingCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/thinking".len..], " ");
+
+    if (arg.len == 0) {
+        const override = chat_settings.getShowThinkingOverride(pool, chat_id);
+        const effective = override orelse config.llm_show_thinking;
+        const reply_text = if (override) |_|
+            std.fmt.allocPrint(
+                a,
+                "Thinking is {s} for this chat (override). Change it with /thinking on, /thinking off, or /thinking default to follow the bot-wide setting.",
+                .{if (effective) "shown" else "hidden"},
+            ) catch return
+        else
+            std.fmt.allocPrint(
+                a,
+                "Thinking is {s} for this chat (bot-wide default). Override it with /thinking on or /thinking off.",
+                .{if (effective) "shown" else "hidden"},
+            ) catch return;
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can change this chat's thinking setting.");
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "on")) {
+        chat_settings.setShowThinkingOverride(pool, chat_id, true) catch |err| {
+            std.log.err("thinking: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Thinking will be shown for this chat.");
+    } else if (std.mem.eql(u8, arg, "off")) {
+        chat_settings.setShowThinkingOverride(pool, chat_id, false) catch |err| {
+            std.log.err("thinking: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Thinking will be hidden for this chat.");
+    } else if (std.mem.eql(u8, arg, "default")) {
+        chat_settings.setShowThinkingOverride(pool, chat_id, null) catch |err| {
+            std.log.err("thinking: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Thinking reset to the bot-wide default for this chat.");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /thinking [on|off|default]");
+    }
 }
 
 /// Owner-only, unlike /magicword: the whole command (including viewing) is
@@ -2075,6 +2146,7 @@ fn replyWithAnswer(
     replied_to: ?[]const u8,
     existing_placeholder_id: ?[]const u8,
     stream: bool,
+    show_thinking: bool,
 ) void {
     // The placeholder + ticker only work when the platform supports
     // editing (Telegram does); anything that doesn't falls back to
@@ -2105,7 +2177,7 @@ fn replyWithAnswer(
     }
 
     std.log.info("qa: calling the model for chat {s}", .{native_chat_id});
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream);
+    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking);
 
     // Stop the ticker before touching the placeholder ourselves — it's the
     // sole owner of that Future until this point (see `Future.cancel`'s
@@ -2244,6 +2316,7 @@ test {
     _ = @import("store/messages.zig");
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
+    _ = @import("features/qa.zig");
     _ = @import("features/reminder_format.zig");
     _ = @import("tools/remind.zig");
     _ = @import("features/convert.zig");
@@ -2279,6 +2352,7 @@ test {
     _ = @import("tools/hackernews.zig");
     _ = @import("platform/telegram.zig");
     _ = @import("telegram/client.zig");
+    _ = @import("telegram/markdown_html.zig");
     _ = @import("http_util.zig");
     _ = @import("features/scheduler.zig");
     _ = @import("features/digest.zig");

@@ -116,7 +116,9 @@ pub fn checkAndNotifyFeeds(connectors: []const iface.Connector, gpa: std.mem.All
         const tool_ctx = registry.ToolContext{ .allocator = a, .io = io };
         // Background job, no live chat message being edited — streaming
         // would have zero visible effect (same reasoning as digest.zig).
-        const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}, false) catch |err| blk: {
+        // show_thinking=false and max_tokens=1024 for the same reasons
+        // documented in digest.zig's own toolcall.run call.
+        const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}, false, false, 1024) catch |err| blk: {
             std.log.err("feed_watcher: llm summary failed for {s}: {t}", .{ fw.feed_url, err });
             break :blk "";
         };

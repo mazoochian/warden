@@ -40,6 +40,18 @@ pub const Tool = struct {
 
 pub const StopReason = enum { end_turn, tool_use, other };
 
+/// Wraps a span of answer text that represents a reasoning model's
+/// chain-of-thought (see `llm/openai_compat.zig`'s use in place of the old
+/// bare "💭 " prefix) — platform-neutral on purpose: what a *renderer* does
+/// with a wrapped span (Telegram: an expandable blockquote, see
+/// `telegram/markdown_html.zig`; a platform with no special treatment yet:
+/// nothing, or strip the markers and show it plain) is that renderer's own
+/// decision, not something an LLM provider adapter should know about.
+/// Control bytes, never legitimately present in real model output, so they
+/// can't collide with anything the model writes and need no escaping.
+pub const thinking_start = "\x02";
+pub const thinking_end = "\x03";
+
 pub const ChatRequest = struct {
     /// Top-level system prompt (Anthropic's shape); the OpenAI-compatible
     /// adapter folds this into a leading system-role message instead.
@@ -47,6 +59,15 @@ pub const ChatRequest = struct {
     messages: []const ChatMessage,
     tools: []const Tool = &.{},
     max_tokens: u32 = 1024,
+    /// Whether a reasoning model's chain-of-thought is passed through to
+    /// the caller. Per-request (not per-provider) since it's now a
+    /// per-chat-overridable setting (see `chat_settings.getShowThinkingOverride`)
+    /// and providers are long-lived singletons shared across every chat —
+    /// only `llm/openai_compat.zig` currently interprets this (filtering
+    /// `reasoning_content`/`reasoning` fields and inline `<think>` tags, see
+    /// its `stripThinkingBlock`); Anthropic ignores it, same as it already
+    /// ignores fields it has no equivalent concept for.
+    show_thinking: bool = false,
 };
 
 /// `content` (specifically any `ToolUse.input`) borrows from an internal

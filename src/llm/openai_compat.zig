@@ -57,17 +57,13 @@ pub const OpenAiCompatProvider = struct {
     /// local runtimes, which don't check one).
     api_key: []const u8,
     model: []const u8,
-    /// Whether a reasoning model's chain-of-thought is passed through to
-    /// the caller. See `filterThinking` for what gets stripped when false.
-    show_thinking: bool,
 
-    pub fn init(allocator: std.mem.Allocator, io: Io, base_url: []const u8, api_key: []const u8, model: []const u8, show_thinking: bool) OpenAiCompatProvider {
+    pub fn init(allocator: std.mem.Allocator, io: Io, base_url: []const u8, api_key: []const u8, model: []const u8) OpenAiCompatProvider {
         return .{
             .http_client = .{ .allocator = allocator, .io = io },
             .base_url = base_url,
             .api_key = api_key,
             .model = model,
-            .show_thinking = show_thinking,
         };
     }
 
@@ -159,9 +155,9 @@ pub const OpenAiCompatProvider = struct {
 
         var blocks: std.ArrayList(llm.ContentBlock) = .empty;
         const reasoning = choice.message.reasoning_content orelse choice.message.reasoning;
-        if (self.show_thinking) {
+        if (request.show_thinking) {
             if (reasoning) |r| {
-                if (r.len > 0) try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "\u{1F4AD} {s}\n\n", .{r}) });
+                if (r.len > 0) try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "{s}{s}{s}\n\n", .{ llm.thinking_start, r, llm.thinking_end }) });
             }
             if (choice.message.content) |c| {
                 if (c.len > 0) try blocks.append(allocator, .{ .text = c });
@@ -212,7 +208,7 @@ pub const OpenAiCompatProvider = struct {
         var headers_buf: [1]http.Header = undefined;
         const headers = try self.buildHeaders(&auth_header_buf, &headers_buf);
 
-        var state: StreamState = .{ .allocator = allocator, .stream_sink = sink, .show_thinking = self.show_thinking };
+        var state: StreamState = .{ .allocator = allocator, .stream_sink = sink, .show_thinking = request.show_thinking };
         try http_util.postJsonSSE(&self.http_client, allocator, url, headers, payload, http_util.llm_timeout_ns, state.sink());
 
         if (state.err) |err| {
@@ -277,12 +273,10 @@ const StreamState = struct {
     allocator: std.mem.Allocator,
     stream_sink: llm.StreamSink,
     show_thinking: bool,
-    /// Raw `content` deltas concatenated as they arrive — reported to
-    /// `stream_sink` unconditionally (regardless of `show_thinking`) as
-    /// they grow, since safely stripping `<think>` tags out of a live,
-    /// still-growing stream isn't reliable (a tag can straddle two SSE
-    /// chunks) — see `finalize`, which is where the `show_thinking=false`
-    /// cleanup actually gets applied, same as the non-streaming path.
+    /// Raw `content` deltas concatenated as they arrive, tags and all —
+    /// the source of truth `finalize` builds the real response from.
+    /// *Not* what's reported to `stream_sink` when `show_thinking` is
+    /// false — see `shownText`, called on every delta instead.
     visible_text: std.ArrayList(u8) = .empty,
     reasoning_text: std.ArrayList(u8) = .empty,
     tool_calls: std.ArrayList(ToolCallAccum) = .empty,
@@ -347,7 +341,14 @@ const StreamState = struct {
         if (delta.object.get("content")) |c| {
             if (c == .string and c.string.len > 0) {
                 try self.visible_text.appendSlice(self.allocator, c.string);
-                self.stream_sink.report(try self.allocator.dupe(u8, self.visible_text.items));
+                // Duped: `shownText()` can return `visible_text.items`
+                // itself (the `show_thinking = true` case), which keeps
+                // growing/reallocating on later deltas — the sink (and the
+                // ticker status it ends up in) needs its own immutable
+                // snapshot, not a live alias that could be freed out from
+                // under it.
+                const shown = try self.allocator.dupe(u8, try self.shownText());
+                if (shown.len > 0) self.stream_sink.report(shown);
             }
         }
         const reasoning = delta.object.get("reasoning_content") orelse delta.object.get("reasoning");
@@ -380,6 +381,26 @@ const StreamState = struct {
         }
     }
 
+    /// The answer text as it should be *shown right now* — i.e. what
+    /// `finalize`'s `!show_thinking` branch computes from the complete
+    /// response, just recomputed from `visible_text` on every delta instead
+    /// of once at the end. While inside an unterminated `<think>`/
+    /// `<thinking>` block, `stripThinkingBlock` already drops everything
+    /// from the open tag onward (see its own doc comment), so this
+    /// naturally reports nothing new for the whole thinking phase — the
+    /// live stream just pauses until `</think>` closes, then the real
+    /// answer appears and continues streaming normally. Re-scanning the
+    /// whole buffer each call is O(n) in the response length; for a
+    /// chat-sized answer over maybe a hundred deltas that's negligible,
+    /// and `stripThinkingBlock` itself is a no-op allocation whenever no
+    /// tag has appeared yet (the common non-reasoning-model case).
+    fn shownText(self: *StreamState) ![]const u8 {
+        if (self.show_thinking) return self.visible_text.items;
+        var c = try stripThinkingBlock(self.allocator, self.visible_text.items, "think");
+        c = try stripThinkingBlock(self.allocator, c, "thinking");
+        return std.mem.trim(u8, c, " \t\r\n");
+    }
+
     /// Assembles the final `llm.ChatResponse` once the stream has ended —
     /// mirrors `chatFn`'s own block-building tail exactly (same
     /// `show_thinking` branches, same empty-arguments-becomes-`{}`
@@ -390,13 +411,11 @@ const StreamState = struct {
 
         if (self.show_thinking) {
             if (self.reasoning_text.items.len > 0) {
-                try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "\u{1F4AD} {s}\n\n", .{self.reasoning_text.items}) });
+                try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "{s}{s}{s}\n\n", .{ llm.thinking_start, self.reasoning_text.items, llm.thinking_end }) });
             }
             if (self.visible_text.items.len > 0) try blocks.append(allocator, .{ .text = self.visible_text.items });
         } else if (self.visible_text.items.len > 0) {
-            var c = try stripThinkingBlock(allocator, self.visible_text.items, "think");
-            c = try stripThinkingBlock(allocator, c, "thinking");
-            c = std.mem.trim(u8, c, " \t\r\n");
+            const c = try self.shownText();
             if (c.len > 0) try blocks.append(allocator, .{ .text = c });
         }
 
@@ -693,7 +712,7 @@ test "StreamState reassembles a tool call streamed across several argument fragm
     try testing.expectEqual(@as(usize, 0), recorder.reports.items.len);
 }
 
-test "StreamState streams raw content live but strips <think> tags from the finalized response when show_thinking is false" {
+test "StreamState suppresses live reporting entirely during an unterminated <think> block when show_thinking is false" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -704,20 +723,44 @@ test "StreamState streams raw content live but strips <think> tags from the fina
 
     try feedLines(&state, &.{
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>pondering\"}}]}",
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"...</think>the answer is 4\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" some more\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"...</think>the\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" answer is 4\"}}]}",
         "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
     });
 
-    // Live reporting is unconditional (see `StreamState.visible_text`'s doc
-    // comment) — the raw, untrimmed tag is visible mid-stream...
+    // The two deltas that landed entirely inside the still-open <think>
+    // block report nothing at all (stripThinkingBlock drops everything
+    // from an unterminated open tag onward, so there's nothing new to
+    // show) -- no raw tag ever reaches the sink. The moment </think>
+    // closes, the real answer appears and keeps streaming normally.
     try testing.expectEqual(@as(usize, 2), recorder.reports.items.len);
-    try testing.expect(std.mem.indexOf(u8, recorder.reports.items[0], "<think>") != null);
+    try testing.expectEqualStrings("the", recorder.reports.items[0]);
+    try testing.expectEqualStrings("the answer is 4", recorder.reports.items[1]);
 
-    // ...but the finalized response has it cleaned up, same as the
-    // non-streaming path.
+    // The finalized response is the same clean text either way.
     const response = try state.finalize(a);
     try testing.expectEqual(@as(usize, 1), response.content.len);
     try testing.expectEqualStrings("the answer is 4", response.content[0].text);
+}
+
+test "StreamState still streams live normally when show_thinking is true, tags included" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink(), .show_thinking = true };
+
+    try feedLines(&state, &.{
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>pondering\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"</think>4\"}}]}",
+    });
+
+    try testing.expectEqual(@as(usize, 2), recorder.reports.items.len);
+    try testing.expectEqualStrings("<think>pondering", recorder.reports.items[0]);
+    try testing.expectEqualStrings("<think>pondering</think>4", recorder.reports.items[1]);
 }
 
 test "StreamState captures a mid-stream error event" {

@@ -118,6 +118,36 @@ pub fn setSystemPromptOverride(pool: *PgPool, chat_id: i64, prompt: ?[]const u8)
     _ = try stmt.step();
 }
 
+/// Returns the per-chat show-thinking override, or `null` if unset (the
+/// caller falls back to `config.llm_show_thinking`) — see the
+/// `0007_show_thinking.sql` migration comment.
+pub fn getShowThinkingOverride(pool: *PgPool, chat_id: i64) ?bool {
+    const db = pool.acquire() catch return null;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT show_thinking FROM chat_settings WHERE chat_id = $1;") catch return null;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return null;
+    if (!has_row or stmt.columnIsNull(0)) return null;
+    return stmt.columnBool(0);
+}
+
+/// `null` clears it (falls back to the global default again).
+pub fn setShowThinkingOverride(pool: *PgPool, chat_id: i64, value: ?bool) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, show_thinking) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET show_thinking = excluded.show_thinking;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    if (value) |v| stmt.bindBool(2, v) else stmt.bindNull(2);
+    _ = try stmt.step();
+}
+
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const chats = @import("chats.zig");
@@ -165,4 +195,24 @@ test "system_prompt override round trips and clears back to null" {
 
     try setSystemPromptOverride(&pool, chat_id, null);
     try testing.expectEqual(@as(?[]const u8, null), getSystemPromptOverride(&pool, testing.allocator, chat_id));
+}
+
+test "show_thinking override round trips through true, false, and clears back to null" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    try testing.expectEqual(@as(?bool, null), getShowThinkingOverride(&pool, chat_id));
+
+    try setShowThinkingOverride(&pool, chat_id, true);
+    try testing.expectEqual(@as(?bool, true), getShowThinkingOverride(&pool, chat_id));
+
+    try setShowThinkingOverride(&pool, chat_id, false);
+    try testing.expectEqual(@as(?bool, false), getShowThinkingOverride(&pool, chat_id));
+
+    try setShowThinkingOverride(&pool, chat_id, null);
+    try testing.expectEqual(@as(?bool, null), getShowThinkingOverride(&pool, chat_id));
 }

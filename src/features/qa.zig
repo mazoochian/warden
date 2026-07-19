@@ -69,6 +69,33 @@ pub const default_system_prompt =
 
 const history_window = 200;
 
+/// Reserved token budget for a reasoning model's `<think>...</think>` phase,
+/// on top of whatever the visible answer itself needs — a chain-of-thought
+/// can run to several thousand tokens for a non-trivial question, and none
+/// of it counts toward the platform's *character* limit (it's stripped or
+/// hidden before the user ever sees it, see `openai_compat.zig`'s
+/// `stripThinkingBlock`/`shownText`). Without this, `max_tokens` sized only
+/// off the visible answer's length risks the model exhausting its whole
+/// budget mid-thought and never producing (or truncating) the real answer.
+const thinking_token_reserve: u32 = 4000;
+
+/// Deliberately conservative (fewer characters per token than most
+/// real-world English text averages) so the *answer* portion of the budget
+/// is never the actual bottleneck for a less token-efficient script/
+/// language — overshooting here just means `max_tokens` is a bit more
+/// generous than strictly necessary, not that a real answer gets cut short.
+const min_chars_per_token: usize = 3;
+
+/// `max_tokens` for a request whose visible answer is capped at
+/// `max_answer_len` characters (the active platform's message-size limit,
+/// see `main.zig`'s `effectiveMaxMessageLength`) — covers both that answer
+/// and `thinking_token_reserve` worth of chain-of-thought ahead of it.
+fn answerMaxTokens(max_answer_len: usize) u32 {
+    const capped_chars = @min(max_answer_len, std.math.maxInt(u32) * min_chars_per_token);
+    const answer_tokens: u32 = @intCast(capped_chars / min_chars_per_token);
+    return thinking_token_reserve +| answer_tokens;
+}
+
 /// Identifies who's actually sending *this* turn's question — deliberately
 /// separate from the "who: text" tags in `recentFormatted`'s history, which
 /// only cover past messages and fall back to "unknown" for a sender with
@@ -89,9 +116,13 @@ pub const Asker = struct {
 /// needed. `replied_to` carries the text of the (bot's) message the user
 /// replied to, so follow-ups keep their referent even if it has scrolled
 /// out of the history window. `asker` identifies who sent this specific
-/// question — see `Asker`'s doc comment. `stream` is forwarded straight to
-/// `toolcall.run` — see `config.zig`'s `llm_streaming` doc comment for why
-/// this is caller-controlled instead of always on.
+/// question — see `Asker`'s doc comment. `stream`/`show_thinking` are
+/// forwarded straight to `toolcall.run`/`ChatRequest` — see
+/// `config.zig`'s `llm_streaming` doc comment and
+/// `store/chat_settings.zig`'s `getShowThinkingOverride` for why both are
+/// caller-controlled (a global default that can be overridden) rather than
+/// fixed. `max_tokens` is derived from `max_answer_len` — see
+/// `answerMaxTokens`.
 pub fn answer(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -106,6 +137,7 @@ pub fn answer(
     replied_to: ?[]const u8,
     progress: toolcall.Progress,
     stream: bool,
+    show_thinking: bool,
 ) ![]const u8 {
     const history = try messages.recentFormatted(pool, allocator, chat_id, history_window);
 
@@ -137,5 +169,12 @@ pub fn answer(
         .{ system_prompt orelse default_system_prompt, max_answer_len },
     );
 
-    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream);
+    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, answerMaxTokens(max_answer_len));
+}
+
+test "answerMaxTokens reserves a thinking budget on top of the answer's own character-derived budget" {
+    // Telegram's 4096-byte cap, at the conservative 3 chars/token estimate,
+    // is (4096/3)=1365 tokens, plus the fixed thinking reserve.
+    try std.testing.expectEqual(@as(u32, 4000 + 1365), answerMaxTokens(4096));
+    try std.testing.expectEqual(@as(u32, 4000 + 0), answerMaxTokens(0));
 }
