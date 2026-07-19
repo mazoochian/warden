@@ -487,13 +487,32 @@ fn postJsonSSEOnce(
     };
     defer if (decompress_buffer.len > 0) allocator.free(decompress_buffer);
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    return drainSseLines(reader, sink);
+}
 
+/// Reads `reader` line-by-line until end of stream, handing each one
+/// (delimiter stripped) to `sink.onLine`. Split out from `postJsonSSEOnce`
+/// so it's testable against an in-memory reader — no real socket needed —
+/// since this exact loop previously had a real, severe bug: using
+/// `takeDelimiterExclusive` instead of `takeDelimiterInclusive`.
+/// `takeDelimiterExclusive` does NOT consume the delimiter itself (see its
+/// own doc comment: advances "up to but not past" it), so every line's
+/// `\n` was left sitting unconsumed in the buffer — the next call re-found
+/// that same already-buffered byte and returned an empty match instantly,
+/// forever: a genuine zero-progress spin burning 100% CPU. Confirmed live
+/// against the real router: thousands of 0-byte "lines" per millisecond
+/// after the first real chunk, every time a blank SSE separator line
+/// (`data: {...}\n\n` — completely normal, standard SSE framing) was hit.
+/// `takeDelimiterInclusive` actually advances past the delimiter each call,
+/// so real progress is always made; the delimiter (and a preceding `\r`,
+/// if present) is trimmed off below instead of relied on to be absent.
+fn drainSseLines(reader: *Io.Reader, sink: SseLineSink) !void {
     while (true) {
-        const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
             error.EndOfStream => return,
             else => |e| return e,
         };
-        try sink.onLine(sink.ptr, std.mem.trimEnd(u8, line, "\r"));
+        try sink.onLine(sink.ptr, std.mem.trimEnd(u8, line, "\r\n"));
     }
 }
 
@@ -551,4 +570,86 @@ pub fn encodeQueryComponent(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+const testing = std.testing;
+
+const LineRecorder = struct {
+    lines: std.ArrayList([]const u8) = .empty,
+
+    fn sink(self: *LineRecorder) SseLineSink {
+        return .{ .ptr = self, .onLine = onLine };
+    }
+    fn onLine(ptr: *anyopaque, line: []const u8) anyerror!void {
+        const self: *LineRecorder = @ptrCast(@alignCast(ptr));
+        // Bounds a would-be regression: an infinite zero-progress loop
+        // (see `drainSseLines`'s doc comment) would blow way past any
+        // real SSE stream's line count long before a test runner's own
+        // timeout ever kicked in, so failing fast here turns "the test
+        // suite hangs" into a normal, readable assertion failure.
+        if (self.lines.items.len > 1000) return error.TooManyLines;
+        self.lines.append(std.testing.allocator, line) catch return error.OutOfMemory;
+    }
+};
+
+test "drainSseLines delivers blank SSE separator lines without looping (regression: takeDelimiterExclusive never consumed the delimiter)" {
+    var reader: Io.Reader = .fixed("data: {\"a\":1}\n\ndata: {\"b\":2}\n\n");
+    var recorder = LineRecorder{};
+    defer recorder.lines.deinit(testing.allocator);
+
+    try drainSseLines(&reader, recorder.sink());
+
+    try testing.expectEqual(@as(usize, 4), recorder.lines.items.len);
+    try testing.expectEqualStrings("data: {\"a\":1}", recorder.lines.items[0]);
+    try testing.expectEqualStrings("", recorder.lines.items[1]);
+    try testing.expectEqualStrings("data: {\"b\":2}", recorder.lines.items[2]);
+    try testing.expectEqualStrings("", recorder.lines.items[3]);
+}
+
+test "drainSseLines handles many consecutive blank lines without looping" {
+    // "data: x" + 3 blank lines + "data: y" + 1 trailing blank line = 6
+    // lines total ("data: x\n" + "\n\n\n" + "data: y\n" + "\n").
+    var reader: Io.Reader = .fixed("data: x\n\n\n\ndata: y\n\n");
+    var recorder = LineRecorder{};
+    defer recorder.lines.deinit(testing.allocator);
+
+    try drainSseLines(&reader, recorder.sink());
+
+    try testing.expectEqual(@as(usize, 6), recorder.lines.items.len);
+    try testing.expectEqualStrings("data: x", recorder.lines.items[0]);
+    try testing.expectEqualStrings("", recorder.lines.items[1]);
+    try testing.expectEqualStrings("", recorder.lines.items[2]);
+    try testing.expectEqualStrings("", recorder.lines.items[3]);
+    try testing.expectEqualStrings("data: y", recorder.lines.items[4]);
+    try testing.expectEqualStrings("", recorder.lines.items[5]);
+}
+
+test "drainSseLines strips a trailing \\r (CRLF line endings)" {
+    var reader: Io.Reader = .fixed("data: x\r\n\r\n");
+    var recorder = LineRecorder{};
+    defer recorder.lines.deinit(testing.allocator);
+
+    try drainSseLines(&reader, recorder.sink());
+
+    try testing.expectEqual(@as(usize, 2), recorder.lines.items.len);
+    try testing.expectEqualStrings("data: x", recorder.lines.items[0]);
+    try testing.expectEqualStrings("", recorder.lines.items[1]);
+}
+
+test "drainSseLines stops cleanly at end of stream, including an unterminated trailing line" {
+    var reader: Io.Reader = .fixed("data: x\n\ndata: partial-no-newline");
+    var recorder = LineRecorder{};
+    defer recorder.lines.deinit(testing.allocator);
+
+    try drainSseLines(&reader, recorder.sink());
+
+    // The final line has no trailing delimiter, so it's silently dropped
+    // (matches `takeDelimiterInclusive`'s documented EndOfStream
+    // behavior) rather than looped on or fabricated — real SSE streams
+    // always end on a clean blank line, so this only matters for a
+    // connection that dies mid-line, where there's nothing sensible to
+    // return anyway.
+    try testing.expectEqual(@as(usize, 2), recorder.lines.items.len);
+    try testing.expectEqualStrings("data: x", recorder.lines.items[0]);
+    try testing.expectEqualStrings("", recorder.lines.items[1]);
 }
