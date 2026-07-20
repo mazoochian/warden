@@ -16,6 +16,9 @@ pub fn build(b: *std.Build) void {
     // right there in /usr/lib.
     exe_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     exe_mod.linkSystemLibrary("pq", .{});
+    // libolm (Matrix E2E encryption, see src/matrix/olm.zig) — same
+    // reasoning/shape as the pq linkage above.
+    exe_mod.linkSystemLibrary("olm", .{});
 
     const exe = b.addExecutable(.{
         .name = "warden",

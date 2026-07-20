@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 data/
+prosody/data/
 .env
 node_modules/
 bfg.jar

@@ -9,7 +9,7 @@ ARG ZIG_VERSION=0.16.0
 # The retry loop and curl --retry exist because builds run on networks with
 # transient DNS/connection failures; downloading to a file (rather than
 # piping into tar) keeps a mid-stream retry from corrupting the extraction.
-RUN for i in 1 2 3 4 5; do apk add --no-cache curl xz postgresql-dev && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+RUN for i in 1 2 3 4 5; do apk add --no-cache curl xz postgresql-dev olm-dev && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && curl -fSL --retry 5 --retry-delay 2 --retry-all-errors -o /tmp/zig.tar.xz \
        "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
     && tar -xJf /tmp/zig.tar.xz -C /opt \
@@ -48,10 +48,12 @@ RUN cd wordcloud && npm ci --omit=dev
 # itself), imagemagick (image format/resize), and ffmpeg (audio/video).
 # pdf *output* reuses the chromium already installed here (pandoc -> html,
 # then chromium --headless --print-to-pdf) rather than pulling in a whole
-# separate LaTeX toolchain just for that one direction.
+# separate LaTeX toolchain just for that one direction. `olm` is the runtime
+# half of Matrix E2E encryption's libolm binding (see src/matrix/olm.zig) —
+# `olm-dev` above is the build-time headers/import-lib half.
 # ---------------------------------------------------------------------------
 FROM node:22-alpine
-RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq pandoc poppler-utils imagemagick ffmpeg && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq olm pandoc poppler-utils imagemagick ffmpeg && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && test -x /usr/bin/chromium-browser
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
     PUPPETEER_SKIP_DOWNLOAD=true

@@ -7,6 +7,7 @@ const iface = @import("platform/interface.zig");
 const Identity = @import("domain/identity.zig").Identity;
 const telegram_platform = @import("platform/telegram.zig");
 const matrix_platform = @import("platform/matrix.zig");
+const xmpp_platform = @import("platform/xmpp.zig");
 const store_pool = @import("store/pool.zig");
 const migrate = @import("store/migrate.zig");
 const chats = @import("store/chats.zig");
@@ -208,12 +209,23 @@ pub fn main(init: std.process.Init) !void {
         null;
     defer if (matrix_adapter) |*m| m.deinit();
 
-    var connectors_buf: [2]iface.Connector = undefined;
+    // Same "only join the list when configured" shape as Matrix above.
+    var xmpp_adapter: ?xmpp_platform.XmppConnector = if (config.xmpp) |xc|
+        xmpp_platform.XmppConnector.init(gpa, io, xc.host, xc.port, xc.domain, xc.jid_user, xc.password, xc.muc_rooms)
+    else
+        null;
+    defer if (xmpp_adapter) |*x| x.deinit();
+
+    var connectors_buf: [3]iface.Connector = undefined;
     var connectors_len: usize = 0;
     connectors_buf[connectors_len] = telegram_adapter.connector();
     connectors_len += 1;
     if (matrix_adapter) |*m| {
         connectors_buf[connectors_len] = m.connector();
+        connectors_len += 1;
+    }
+    if (xmpp_adapter) |*x| {
+        connectors_buf[connectors_len] = x.connector();
         connectors_len += 1;
     }
     const connectors: []const iface.Connector = connectors_buf[0..connectors_len];
@@ -225,6 +237,19 @@ pub fn main(init: std.process.Init) !void {
         const db = try pool.acquire();
         defer pool.release(db);
         try migrate.migrate(db, gpa);
+    }
+
+    // Device key creation/upload plus ongoing encrypt/decrypt for Matrix
+    // E2E encryption (see src/matrix/olm.zig, src/matrix/crypto.zig,
+    // ROADMAP.md's Phase 2b) — only active when `WARDEN_MATRIX_PICKLE_KEY`
+    // is set; a failure here is logged, not fatal, since plaintext-room
+    // Matrix functionality doesn't depend on it.
+    if (matrix_adapter) |*m| {
+        if (config.matrix_pickle_key) |pickle_key| {
+            m.enableCrypto(gpa, io, &pool, pickle_key) catch |err| {
+                std.log.err("matrix e2ee: device key setup failed: {t}", .{err});
+            };
+        }
     }
 
     var pending_confirmations = group_admin.PendingConfirmations.init(gpa, io, config.confirm_timeout_seconds);
@@ -267,95 +292,154 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    // Long-lived: every message spawns a task into this group (never
-    // awaited/canceled during normal operation — see `Group`'s doc comment
-    // on why that's fine for a repeatedly-added-to, long-lived group). This
-    // is what keeps one slow chat (a stuck LLM call, a slow tool) from
-    // blocking polling or any other chat: the loop below only ever does the
-    // fast, sequential parts (poll, group by nothing — spawn per message,
-    // check digests) and never blocks on `handleMessage` itself.
+    // Long-lived: every per-message task, and now every connector's own
+    // poll loop below, is spawned into this one group (never awaited/
+    // canceled during normal operation — see `Group`'s doc comment on why
+    // that's fine for a repeatedly-added-to, long-lived group).
     var worker_group: Io.Group = .init;
 
+    // One persistent poll loop per connector, running concurrently —
+    // previously a single loop polled every connector in turn, so one
+    // connector's slow or failing poll (a ~25s long-poll timeout, or
+    // XMPP's connection retries) delayed every other connector's turn by
+    // however long it took. Each connector already owns its own
+    // independent state (`since`/`offset` tokens, sockets), so there was
+    // never a data-race reason for the round-robin — it was simply how the
+    // loop looked before Matrix/XMPP joined Telegram as second and third
+    // connectors, and never got revisited.
+    //
+    // Real OS threads (`std.Thread.spawn`), deliberately NOT
+    // `worker_group.async`: `Io.Threaded`'s async/group pool is bounded
+    // (`cpu_count - 1` slots — see its `async_limit`), and once that pool
+    // is exhausted, a further `.async()` call doesn't queue, it runs the
+    // function *synchronously inline on the calling thread* instead.
+    // These loops never return, so spawning them into that same bounded
+    // pool would permanently occupy slots meant for short-lived concurrent
+    // work — confirmed live: doing that once caused the "thinking"
+    // ticker's edits and the LLM call itself to silently start blocking
+    // instead of running concurrently, hanging real requests. Raw threads
+    // sidestep the pool entirely; `io` itself is safe to call from any
+    // thread; `.detach()` since these run forever and are never joined,
+    // matching how nothing here ever joins `worker_group`'s tasks either.
+    for (connectors) |connector| {
+        const thread = std.Thread.spawn(.{}, connectorPollLoop, .{
+            connector,
+            &config,
+            &pool,
+            llm_provider,
+            active_tools,
+            &pending_confirmations,
+            &digest_scheduler,
+            &pending_conversions,
+            io,
+            gpa,
+            max_message_len,
+            &worker_group,
+        }) catch |err| {
+            std.log.err("failed to start poll loop thread for {t}: {t}", .{ connector.platform(), err });
+            continue;
+        };
+        thread.detach();
+    }
+
+    // Due-digest/reminder/alert/feed checks used to piggyback on the old
+    // round-robin loop's natural ~30s-ish cadence; now that connectors
+    // poll independently (no shared "lap" to hang off of), this is its own
+    // explicit ~30s ticker instead — same granularity as before.
     while (true) {
-        for (connectors) |connector| {
-            var poll_arena = std.heap.ArenaAllocator.init(gpa);
-            defer poll_arena.deinit();
-            const poll_a = poll_arena.allocator();
-
-            const polled_messages = connector.poll(poll_a) catch |err| {
-                switch (err) {
-                    // A long poll whose connection died or never came up is
-                    // operationally an empty poll: updates queue server-side
-                    // until the next successful getUpdates, so nothing is
-                    // lost. Flaky networks kill idle connections at the ~30s
-                    // long-poll mark and drop TLS handshakes during rough
-                    // patches routinely — warn, don't alarm.
-                    error.HttpConnectionClosing,
-                    error.TlsInitializationFailed,
-                    => std.log.warn("poll connection dropped (will re-poll): {t}", .{err}),
-                    else => std.log.err("poll failed: {t}", .{err}),
-                }
-                // A failed poll returns immediately instead of blocking for
-                // the ~30s long-poll window, so during an outage this loop
-                // would otherwise spin against a dead network. Cool off
-                // before the next attempt.
-                Io.sleep(io, .fromSeconds(5), .awake) catch {};
-                continue;
-            };
-
-            for (polled_messages) |msg| {
-                const ts = Io.Timestamp.now(io, .real).toSeconds();
-
-                // Each task owns an arena for its whole lifetime, created
-                // here (not shared with `poll_arena`, which this cycle
-                // frees as soon as every message in it has been spawned
-                // off) and freed by the task itself when it's done. `msg`
-                // is duped into it right away, before `poll_arena` can be
-                // freed out from under a task that hasn't started yet.
-                const task_arena = gpa.create(std.heap.ArenaAllocator) catch |err| {
-                    std.log.err("failed to allocate task arena: {t}", .{err});
-                    continue;
-                };
-                task_arena.* = std.heap.ArenaAllocator.init(gpa);
-                const duped_msg = msg.dupe(task_arena.allocator()) catch |err| {
-                    std.log.err("failed to dupe message for chat {s}: {t}", .{ msg.chat_id, err });
-                    task_arena.deinit();
-                    gpa.destroy(task_arena);
-                    continue;
-                };
-
-                worker_group.async(io, processMessageTask, .{
-                    connector,
-                    &config,
-                    &pool,
-                    llm_provider,
-                    active_tools,
-                    &pending_confirmations,
-                    &digest_scheduler,
-                    &pending_conversions,
-                    io,
-                    gpa,
-                    ts,
-                    max_message_len,
-                    task_arena,
-                    duped_msg,
-                });
-            }
-        }
-
-        // Piggybacks on the poll loop's natural ~30s cadence (Telegram's
-        // long-poll timeout) rather than a separate timer/thread — fine
-        // granularity for a daily-ish interval. Runs once per lap over every
-        // connector (not once per connector) since a due digest/reminder
-        // needs to be matched to whichever connector actually owns its
-        // chat's platform, not delivered through whichever connector
-        // happened to be polling most recently.
         const now = Io.Timestamp.now(io, .real).toSeconds();
         checkAndSendDueDigests(connectors, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
         checkAndSendDueReminders(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
         pending_conversions.sweepExpired(gpa, now);
+        Io.sleep(io, .fromSeconds(30), .awake) catch {};
+    }
+}
+
+/// One connector's own poll-forever loop (see the call site's doc comment
+/// on why this replaced a single round-robin loop over every connector).
+/// Never returns under normal operation, same as `main`'s own top-level
+/// loop it runs alongside.
+fn connectorPollLoop(
+    connector: iface.Connector,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    llm_provider: llm.Provider,
+    tools: []const tool_registry.ToolDef,
+    pending: *group_admin.PendingConfirmations,
+    digest_scheduler: *scheduler.DigestScheduler,
+    pending_conversions: *convert_flow.PendingConversions,
+    io: Io,
+    gpa: std.mem.Allocator,
+    max_message_len: usize,
+    worker_group: *Io.Group,
+) void {
+    while (true) {
+        var poll_arena = std.heap.ArenaAllocator.init(gpa);
+        defer poll_arena.deinit();
+        const poll_a = poll_arena.allocator();
+
+        const polled_messages = connector.poll(poll_a) catch |err| {
+            switch (err) {
+                // A long poll whose connection died or never came up is
+                // operationally an empty poll: updates queue server-side
+                // until the next successful getUpdates, so nothing is
+                // lost. Flaky networks kill idle connections at the ~30s
+                // long-poll mark and drop TLS handshakes during rough
+                // patches routinely — warn, don't alarm.
+                error.HttpConnectionClosing,
+                error.TlsInitializationFailed,
+                => std.log.warn("poll connection dropped (will re-poll): {t}", .{err}),
+                else => std.log.err("poll failed: {t}", .{err}),
+            }
+            // A failed poll returns immediately instead of blocking for
+            // the ~30s long-poll window, so during an outage this loop
+            // would otherwise spin against a dead network. Cool off before
+            // the next attempt — this connector's own cooldown, no longer
+            // one that stalls every other connector's turn too.
+            Io.sleep(io, .fromSeconds(5), .awake) catch {};
+            continue;
+        };
+
+        for (polled_messages) |msg| {
+            const ts = Io.Timestamp.now(io, .real).toSeconds();
+
+            // Each task owns an arena for its whole lifetime, created here
+            // (not shared with `poll_arena`, which this cycle frees as
+            // soon as every message in it has been spawned off) and freed
+            // by the task itself when it's done. `msg` is duped into it
+            // right away, before `poll_arena` can be freed out from under
+            // a task that hasn't started yet.
+            const task_arena = gpa.create(std.heap.ArenaAllocator) catch |err| {
+                std.log.err("failed to allocate task arena: {t}", .{err});
+                continue;
+            };
+            task_arena.* = std.heap.ArenaAllocator.init(gpa);
+            const duped_msg = msg.dupe(task_arena.allocator()) catch |err| {
+                std.log.err("failed to dupe message for chat {s}: {t}", .{ msg.chat_id, err });
+                task_arena.deinit();
+                gpa.destroy(task_arena);
+                continue;
+            };
+
+            worker_group.async(io, processMessageTask, .{
+                connector,
+                config,
+                pool,
+                llm_provider,
+                tools,
+                pending,
+                digest_scheduler,
+                pending_conversions,
+                io,
+                gpa,
+                ts,
+                max_message_len,
+                task_arena,
+                duped_msg,
+            });
+        }
     }
 }
 
@@ -635,6 +719,16 @@ fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, m
         if (msg.telegram_profile) |profile| {
             identities.upsertTelegramProfile(pool, identity_id, profile) catch |err| {
                 std.log.err("failed to upsert telegram profile for identity {d}: {t}", .{ identity_id, err });
+            };
+        }
+        if (msg.matrix_profile) |profile| {
+            identities.upsertMatrixProfile(pool, identity_id, profile) catch |err| {
+                std.log.err("failed to upsert matrix profile for identity {d}: {t}", .{ identity_id, err });
+            };
+        }
+        if (msg.xmpp_profile) |profile| {
+            identities.upsertXmppProfile(pool, identity_id, profile) catch |err| {
+                std.log.err("failed to upsert xmpp profile for identity {d}: {t}", .{ identity_id, err });
             };
         }
         return identity_id;
@@ -956,14 +1050,33 @@ fn handleMessage(
 /// with no matching qualifier reaching `allocator` (out of memory) falls
 /// back to the original, unqualified-looking `text`, which simply won't
 /// match any known command below — a safe degrade, not a crash.
+/// Matrix (and most other chat clients) intercept a leading `/` as their
+/// own client-side slash command before it ever reaches the bot — `/ping`
+/// typed in Element never arrives as message text. `!` is accepted as an
+/// equivalent command indicator everywhere (not just Matrix) for exactly
+/// this reason: `!ping` dispatches identically to `/ping`, rewritten to a
+/// leading `/` up front so every check below (and the rest of
+/// `handleMessage`'s dispatch chain) only ever has to know about one
+/// prefix.
 fn normalizeCommandMention(allocator: std.mem.Allocator, text: []const u8, self_username: ?[]const u8) ?[]const u8 {
-    if (text.len == 0 or text[0] != '/') return text;
-    const cmd_end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
-    const at = std.mem.indexOfScalar(u8, text[0..cmd_end], '@') orelse return text;
-    const me = self_username orelse return text;
-    const target = text[at + 1 .. cmd_end];
-    if (!std.ascii.eqlIgnoreCase(target, me)) return null;
-    return std.mem.concat(allocator, u8, &.{ text[0..at], text[cmd_end..] }) catch text;
+    const bang_rewritten = text.len > 0 and text[0] == '!';
+    const slash_text: []const u8 = if (bang_rewritten)
+        std.mem.concat(allocator, u8, &.{ "/", text[1..] }) catch text
+    else
+        text;
+
+    if (slash_text.len == 0 or slash_text[0] != '/') return slash_text;
+    const cmd_end = std.mem.indexOfScalar(u8, slash_text, ' ') orelse slash_text.len;
+    const at = std.mem.indexOfScalar(u8, slash_text[0..cmd_end], '@') orelse return slash_text;
+    const me = self_username orelse return slash_text;
+    const target = slash_text[at + 1 .. cmd_end];
+    if (!std.ascii.eqlIgnoreCase(target, me)) {
+        if (bang_rewritten) allocator.free(slash_text);
+        return null;
+    }
+    const stripped = std.mem.concat(allocator, u8, &.{ slash_text[0..at], slash_text[cmd_end..] }) catch slash_text;
+    if (bang_rewritten and stripped.ptr != slash_text.ptr) allocator.free(slash_text);
+    return stripped;
 }
 
 test "normalizeCommandMention strips a qualifier naming us, preserving trailing args" {
@@ -996,6 +1109,22 @@ test "normalizeCommandMention passes non-commands and unqualified commands throu
     // No known self-username yet (e.g. before the first getMe resolves) —
     // left as-is rather than guessed at.
     try std.testing.expectEqualStrings("/ping@warden_bot", normalizeCommandMention(a, "/ping@warden_bot", null).?);
+}
+
+test "normalizeCommandMention treats a leading '!' the same as '/'" {
+    const a = std.testing.allocator;
+    const out = normalizeCommandMention(a, "!ping", "warden_bot").?;
+    defer a.free(out);
+    try std.testing.expectEqualStrings("/ping", out);
+
+    const out2 = normalizeCommandMention(a, "!remind 1m ping me", "warden_bot").?;
+    defer a.free(out2);
+    try std.testing.expectEqualStrings("/remind 1m ping me", out2);
+
+    // Mention-qualifier stripping still works after the '!' rewrite.
+    const out3 = normalizeCommandMention(a, "!ping@warden_bot", "warden_bot").?;
+    defer a.free(out3);
+    try std.testing.expectEqualStrings("/ping", out3);
 }
 
 /// True for the protected one-shot `/convert <format>` caption path (a
@@ -2362,7 +2491,17 @@ test {
     _ = @import("domain/identity.zig");
     _ = @import("domain/telegram_profile.zig");
     _ = @import("platform/matrix.zig");
+    _ = @import("matrix/types.zig");
+    _ = @import("domain/matrix_profile.zig");
+    _ = @import("matrix/olm.zig");
+    _ = @import("matrix/verification.zig");
+    _ = @import("matrix/crypto.zig");
+    _ = @import("store/crypto.zig");
     _ = @import("platform/xmpp.zig");
+    _ = @import("xmpp/xml.zig");
+    _ = @import("xmpp/types.zig");
+    _ = @import("xmpp/client.zig");
+    _ = @import("domain/xmpp_profile.zig");
 }
 
 /// ASCII whitespace/punctuation counts as a boundary; bytes >= 0x80 do NOT,

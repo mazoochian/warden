@@ -6,16 +6,19 @@ this is a personal project built in spare time, so scope stays deliberately
 small per phase.
 
 Status as of writing: **Phase 1 is committed** (reminders and
-file-conversion landed in `fc3658d`), **Phase 2's core (unencrypted Matrix)
-is implemented** but not yet live-tested against a real homeserver (no
-credentials available this session; see Phase 2's note — Matrix E2E
-encryption was split out into its own Phase 2b rather than bundled in),
-**Phase 3 (reminder recurrence + absolute time) is committed**, **Phase 4
-(price/metric alerts) is committed**, **Phase 5 (RSS/news watcher) is
-committed**, **Phase 6 (per-chat persona) is committed**, and **Phase 7
-(voice transcription; TTS deliberately not included, see its note) is
-committed**. `zig build test` green (145/145). Phase 2b (Matrix E2E
-encryption) is the only originally-planned item left unstarted.
+file-conversion landed in `fc3658d`), **Phase 2 (Matrix, plaintext rooms)
+is committed and live-verified** against a real homeserver, **Phase 2b
+(Matrix E2E encryption via libolm) is live-verified end-to-end as of
+2026-07-20** after finding and fixing two real send-side bugs an earlier
+"live-verified" pass had missed (see its note — the previous claim was
+inaccurate: the encrypt path silently produced undecryptable-by-Element
+messages the whole time), **Phase 3 (reminder recurrence +
+absolute time) is committed**, **Phase 4 (price/metric alerts) is
+committed**, **Phase 5 (RSS/news watcher) is committed**, **Phase 6
+(per-chat persona) is committed**, and **Phase 7 (voice transcription; TTS
+deliberately not included, see its note) is committed**. Also shipped
+outside the phase sequence: a real XMPP connector (self-hosted-only,
+SASL PLAIN, no OMEMO — see its own note below). `zig build test` green.
 
 **Unplanned, shipped outside the phase sequence** (direct user request):
 interactive choice prompts — Telegram inline-keyboard buttons, and Matrix
@@ -64,7 +67,7 @@ making one explicit scoping call, not writing new code.
   a real Telegram chat (`/remind 1m ping me`, convert a sent photo).
 
 ## Phase 2 — Real Matrix connector, parity with Telegram (plaintext rooms)
-*Effort: L. Dependencies: Phase 1. Status: implemented, not live-verified.*
+*Effort: L. Dependencies: Phase 1. Status: done, live-verified.*
 
 The biggest lift on this list, and worth doing early: every scheduled feature
 after this point (alerts, RSS watching) currently carries a latent
@@ -109,19 +112,88 @@ Done:
   auto-engagement) since telling a real 1:1 room apart needs an extra
   `m.direct` lookup not implemented yet; mute has no expiry.
 
-Not done / next step: **live-test against a real homeserver** — this
-session had no Matrix credentials to verify the login/sync/send/moderation
-round trip against, so treat it as best-effort-correct-per-spec rather than
-proven. Get a homeserver + access token (matrix.org account or self-hosted
-Synapse/Dendrite), then run through: DM the bot, get invited/auto-joined to
-a room, send/receive text, send a photo/document both directions, `/mute`
-+`/unmute`, `/kick`/`/ban`, `/pin`/`/unpin`, `/delete`, and the live-editing
-reply flow.
+Live-verified against a real homeserver (matrix.mazoochian.ir): DM the bot,
+auto-join on invite, send/receive text, mention detection (both MSC3952
+`m.mentions` and the plain-text fallback), the live-editing "thinking..."
+reply flow. `!` was added as a second command prefix alongside `/`, since
+Element intercepts a leading `/` as its own client command before it ever
+reaches the bot. Photo/document both-directions, `/mute`+`/unmute`,
+`/kick`/`/ban`, `/pin`/`/unpin`, `/delete`, and the `/convert` choice-prompt
+flow are still unexercised against the real homeserver — implemented per
+spec, not yet individually confirmed live.
 
 ## Phase 2b — Matrix end-to-end encryption via libolm
 *Effort: L (new — split out of Phase 2). Dependencies: Phase 2's live
 verification, ideally, so encrypted-room bugs aren't confused with
-plaintext-room bugs.*
+plaintext-room bugs. Status: done, live-verified both directions as of
+2026-07-20.*
+
+**2026-07-20 postmortem** — the earlier "done, live-verified" claim above
+was wrong: encrypt-path bugs meant every message the bot sent into an
+encrypted room was undecryptable by Element, silently, the entire time.
+Two separate root causes, both "the plaintext payload was missing a field
+the Matrix spec requires, and libolm/Megolm happily encrypt garbage
+without complaining":
+
+1. `shareWithNewDevices`'s `m.room_key` to-device payload was missing
+   `sender`/`sender_device`/`keys`/`recipient`/`recipient_keys` — required
+   by spec, and matrix-js-sdk's `OlmDecryption.decryptEvent` checks
+   `recipient`/`recipient_keys.ed25519` *before* ever looking at the
+   `m.room_key` content, throwing `OLM_BAD_RECIPIENT` otherwise. To-device
+   decryption failures are only logged internally by Element, never
+   surfaced in its UI — so `sendToDevice` returning `200 OK` gave no hint
+   anything was wrong on either side.
+2. `platform/matrix.zig`'s `sendEvent` omitted `room_id` from the
+   plaintext it Megolm-encrypts. Megolm requires it as an anti-replay
+   check (a session key can't be reused to forge a message into a
+   different room) — once (1) was fixed, this surfaced as "the room id of
+   the room key doesn't match the room id of the decrypted event:
+   expected `<room>`, got None."
+3. Smaller, found in the same pass: edits/replies/reactions
+   (`m.relates_to`) were rendering as brand-new messages instead of
+   collapsing into the original — matrix-js-sdk's `isRelation`/
+   `getRelation` read `m.relates_to` from the event's *clear* (wire) top
+   level, never from the decrypted content, so a relation kept only
+   inside the encrypted payload is invisible to the client. Fixed by
+   duplicating `m.relates_to` into the unencrypted `m.room.encrypted`
+   envelope alongside `algorithm`/`ciphertext`/etc.
+
+Also found: the bot's Matrix account (`@ameli`) has legacy cross-signing
+keys server-side from an earlier real-Element-login session, predating
+this bot's own hand-rolled crypto (which has no cross-signing
+implementation at all). This shows up as an "unverified device" shield in
+clients that surface it — cosmetic, not a decrypt-blocker; see
+`README.md`'s Encryption section. No fix planned — building real
+interactive (SAS/emoji) device verification for a headless bot is a
+much bigger feature than this warrants, and the account's cross-signing
+identity was reset once (2026-07-20) as basic hygiene regardless.
+
+Hardening added in the same pass, beyond the two root-cause fixes:
+- Answers `m.room_key_request` (e.g. from a client that ran
+  `/discardsession`) with `m.forwarded_room_key`, scoped to only this
+  account's own other devices — a self-healing fallback for to-device
+  delivery being best-effort, not guaranteed (see `matrix/crypto.zig`'s
+  `State.handleRoomKeyRequest`).
+- One-time-key replenishment (`/sync`'s `device_one_time_keys_count`
+  drives `State.topUpOneTimeKeysIfNeeded`) — previously the initial batch
+  of 20, generated once at first startup, was never topped up.
+- Fallback-key generation/upload, so OTK exhaustion doesn't hard-fail
+  every future session establishment.
+- Megolm outbound session rotation (time-based, 7 days) — previously a
+  room's session lived for the whole process lifetime once created.
+- Receive-side envelope validation (`sender`/`recipient`/
+  `recipient_keys.ed25519`) mirroring matrix-js-sdk's own checks — closes
+  the gap where the bot's own decrypt path was more lenient than a real
+  client's, which is part of why its test suite didn't catch bug (1)
+  above.
+
+Deferred, not done: multi-Olm-session-per-sender fallback (still one
+session per sender identity key, a known simplification — see
+`store/crypto.zig`), and HTTP-request-shape test coverage for
+`matrix/client.zig` (currently zero tests on `queryKeys`/
+`claimOneTimeKey`/`sendToDevice`/etc. — the bugs above were all in
+payload *construction*, not HTTP mechanics, so this stayed lower priority
+this pass).
 
 - Bind `libolm` via Zig's C interop (`link_libc` + `linkSystemLibrary`, same
   shape as `build.zig`'s existing `pq` linkage) rather than a from-scratch
