@@ -139,6 +139,38 @@ pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Messa
     reply(connector, a, msg.chat_id, msg.message_id, "Unmuted {s}.", .{target.label});
 }
 
+/// Grants real platform admin/moderator standing — unlike every other
+/// command in this file, gated owner-only rather than open to any
+/// existing chat admin (see `main.zig`'s dispatch: it checks
+/// `auth.isOwner` directly here instead of `isAuthorizedForGroupAdmin`).
+/// Deliberately immediate, no `/confirm` step — the owner is already
+/// fully trusted for everything else, and a confirm step mainly guards
+/// against a *different* admin acting rashly, which doesn't apply once
+/// this is owner-only.
+pub fn promote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
+    const target = replyTarget(msg) orelse {
+        connector.sendMessage(a, msg.chat_id, "Reply to the message of the person you want to promote.", msg.message_id);
+        return;
+    };
+    connector.promoteUser(a, msg.chat_id, target.user_id) catch |err| {
+        reportFailure(connector, a, msg.chat_id, msg.message_id, "promote", err);
+        return;
+    };
+    reply(connector, a, msg.chat_id, msg.message_id, "Promoted {s} to admin.", .{target.label});
+}
+
+pub fn demote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
+    const target = replyTarget(msg) orelse {
+        connector.sendMessage(a, msg.chat_id, "Reply to the message of the person you want to demote.", msg.message_id);
+        return;
+    };
+    connector.demoteUser(a, msg.chat_id, target.user_id) catch |err| {
+        reportFailure(connector, a, msg.chat_id, msg.message_id, "demote", err);
+        return;
+    };
+    reply(connector, a, msg.chat_id, msg.message_id, "Demoted {s}.", .{target.label});
+}
+
 pub fn pin(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
     const message_id = msg.reply_to_message_id orelse {
         connector.sendMessage(a, msg.chat_id, "Reply to the message you want to pin.", msg.message_id);

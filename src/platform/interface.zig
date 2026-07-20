@@ -274,6 +274,17 @@ pub const Connector = struct {
         kickUser: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void = null,
         /// Permanent removal — stays banned until explicitly unbanned.
         banUser: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void = null,
+        /// Grants `user_id` real, platform-level admin/moderator standing
+        /// in `chat_id` — not a warden-internal flag. Telegram:
+        /// `promoteChatMember` with a moderate permission set (no
+        /// `can_promote_members`, so a promoted admin can't themselves
+        /// mint further admins through the bot). Matrix: room power level
+        /// bumped to moderator. Optional: a platform without a granular
+        /// admin concept (e.g. XMPP MUC, per this project's current
+        /// scope) reports `error.Unsupported`.
+        promoteUser: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void = null,
+        /// Reverses `promoteUser` — back to an ordinary member.
+        demoteUser: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void = null,
         pinMessage: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void = null,
         /// `message_id` null unpins whatever's currently pinned.
         unpinMessage: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: ?[]const u8) anyerror!void = null,
@@ -396,6 +407,16 @@ pub const Connector = struct {
 
     pub fn banUser(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) !void {
         const f = self.vtable.banUser orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id, user_id);
+    }
+
+    pub fn promoteUser(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) !void {
+        const f = self.vtable.promoteUser orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id, user_id);
+    }
+
+    pub fn demoteUser(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) !void {
+        const f = self.vtable.demoteUser orelse return error.Unsupported;
         return f(self.ptr, allocator, chat_id, user_id);
     }
 

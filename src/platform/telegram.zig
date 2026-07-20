@@ -213,6 +213,8 @@ pub const TelegramConnector = struct {
         .unmuteUser = unmuteUserFn,
         .kickUser = kickUserFn,
         .banUser = banUserFn,
+        .promoteUser = promoteUserFn,
+        .demoteUser = demoteUserFn,
         .pinMessage = pinMessageFn,
         .unpinMessage = unpinMessageFn,
         .deleteMessage = deleteMessageFn,
@@ -452,6 +454,16 @@ pub const TelegramConnector = struct {
     fn banUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         return self.client.banChatMember(allocator, try parseId(chat_id), try parseId(user_id));
+    }
+
+    fn promoteUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.client.promoteChatMember(allocator, try parseId(chat_id), try parseId(user_id));
+    }
+
+    fn demoteUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.client.demoteChatMember(allocator, try parseId(chat_id), try parseId(user_id));
     }
 
     fn pinMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void {
