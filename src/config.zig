@@ -35,6 +35,23 @@ pub const MatrixConfig = struct {
     access_token: []const u8,
 };
 
+/// XMPP connector config — `host`/`port` is the raw TCP target (may differ
+/// from `domain`, e.g. a compose service name like "prosody" vs. a JID's
+/// "localhost" domain part). Authenticates via SASL PLAIN, the only
+/// mechanism `xmpp/client.zig` implements (see its doc comment: self-
+/// hosted/trusted-server deployments only, not a public/federated server).
+pub const XmppConfig = struct {
+    host: []const u8,
+    port: u16,
+    domain: []const u8,
+    jid_user: []const u8,
+    password: []const u8,
+    /// Bare room JIDs to auto-join on connect — MUC has no Telegram/
+    /// Matrix-equivalent "just works once added to a group" step, so this
+    /// is how the operator opts a room in.
+    muc_rooms: []const []const u8,
+};
+
 pub const LlmConfig = union(LlmProviderKind) {
     anthropic: AnthropicConfig,
     openai_compat: OpenAiCompatConfig,
@@ -107,6 +124,19 @@ pub const Config = struct {
     /// `MatrixConnector` (and adds it to the active connector list) when
     /// this is set.
     matrix: ?MatrixConfig = null,
+    /// The local secret libolm's account/session pickles (see
+    /// `src/matrix/olm.zig`) are encrypted under before being persisted —
+    /// deliberately sourced from config, not stored in the database
+    /// alongside the pickles themselves, so a DB-only compromise doesn't
+    /// also hand over the key material needed to decrypt them. Null means
+    /// Matrix E2E encryption stays inert (device keys never get created/
+    /// uploaded) even if `matrix` is otherwise configured — same
+    /// half-configured-stays-disabled reasoning as the connector configs.
+    matrix_pickle_key: ?[]const u8 = null,
+    /// Null when XMPP isn't configured — `main.zig` only constructs an
+    /// `XmppConnector` (and adds it to the active connector list) when
+    /// this is set.
+    xmpp: ?XmppConfig = null,
 
     pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile } || std.mem.Allocator.Error;
 
@@ -120,8 +150,10 @@ pub const Config = struct {
         const telegram_owner_id = env.get("WARDEN_TELEGRAM_OWNER_ID") orelse default_telegram_owner_id;
 
         const matrix = loadMatrixConfig(env);
+        const matrix_pickle_key = nonEmpty(env.get("WARDEN_MATRIX_PICKLE_KEY"));
+        const xmpp = try loadXmppConfig(arena, env);
 
-        var owners_buf: [2]OwnerEntry = undefined;
+        var owners_buf: [3]OwnerEntry = undefined;
         var owners_len: usize = 0;
         owners_buf[owners_len] = .{ .platform = .telegram, .owner_id = telegram_owner_id };
         owners_len += 1;
@@ -131,6 +163,14 @@ pub const Config = struct {
                 owners_len += 1;
             } else {
                 std.log.warn("WARDEN_MATRIX_HOMESERVER_URL/WARDEN_MATRIX_ACCESS_TOKEN are set but WARDEN_MATRIX_OWNER_ID isn't — owner-gated Q&A will reject the Matrix owner until it's set", .{});
+            }
+        }
+        if (xmpp != null) {
+            if (env.get("WARDEN_XMPP_OWNER_ID")) |xmpp_owner_id| {
+                owners_buf[owners_len] = .{ .platform = .xmpp, .owner_id = xmpp_owner_id };
+                owners_len += 1;
+            } else {
+                std.log.warn("WARDEN_XMPP_JID/WARDEN_XMPP_PASSWORD are set but WARDEN_XMPP_OWNER_ID isn't — owner-gated Q&A will reject the XMPP owner until it's set", .{});
             }
         }
         const owners = try arena.dupe(OwnerEntry, owners_buf[0..owners_len]);
@@ -215,6 +255,8 @@ pub const Config = struct {
             .llm_show_thinking = llm_show_thinking,
             .llm_streaming = llm_streaming,
             .matrix = matrix,
+            .matrix_pickle_key = matrix_pickle_key,
+            .xmpp = xmpp,
         };
     }
 
@@ -228,13 +270,27 @@ pub const Config = struct {
         return default;
     }
 
+    /// Treats an empty string the same as an absent env var — a value left
+    /// as `export VAR=""` (e.g. a placeholder for a human to fill in by
+    /// hand) should disable the feature it configures, not activate it
+    /// with garbage.
+    fn nonEmpty(raw: ?[]const u8) ?[]const u8 {
+        const v = raw orelse return null;
+        return if (v.len == 0) null else v;
+    }
+
     /// `null` when neither var is set. When only one of the pair is set,
     /// logs an error and also returns `null` — a half-configured Matrix
     /// connector (e.g. a homeserver URL with no token) would otherwise fail
     /// obscurely on its first API call instead of just not starting.
     fn loadMatrixConfig(env: *const std.process.Environ.Map) ?MatrixConfig {
-        const homeserver_url = env.get("WARDEN_MATRIX_HOMESERVER_URL");
-        const access_token = env.get("WARDEN_MATRIX_ACCESS_TOKEN");
+        // An env var set to an empty string (e.g. a placeholder left for a
+        // human to fill in by hand) counts as unset, same as
+        // `WARDEN_SEARXNG_URL`/`WARDEN_WHISPER_URL` — otherwise Matrix would
+        // try to activate with blank credentials and spam connection errors
+        // until real values land.
+        const homeserver_url = nonEmpty(env.get("WARDEN_MATRIX_HOMESERVER_URL"));
+        const access_token = nonEmpty(env.get("WARDEN_MATRIX_ACCESS_TOKEN"));
         if (homeserver_url == null and access_token == null) return null;
         const hs = homeserver_url orelse {
             std.log.err("WARDEN_MATRIX_ACCESS_TOKEN is set but WARDEN_MATRIX_HOMESERVER_URL isn't — Matrix stays disabled", .{});
@@ -245,6 +301,63 @@ pub const Config = struct {
             return null;
         };
         return .{ .homeserver_url = std.mem.trimEnd(u8, hs, "/"), .access_token = token };
+    }
+
+    /// `null` when neither `WARDEN_XMPP_JID` nor `WARDEN_XMPP_PASSWORD` is
+    /// set; logs and also returns `null` when only one is (same half-
+    /// configured-stays-disabled reasoning as `loadMatrixConfig`), or when
+    /// `WARDEN_XMPP_JID` isn't shaped like `user@domain`.
+    fn loadXmppConfig(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !?XmppConfig {
+        const jid = nonEmpty(env.get("WARDEN_XMPP_JID"));
+        const password = nonEmpty(env.get("WARDEN_XMPP_PASSWORD"));
+        if (jid == null and password == null) return null;
+        const full_jid = jid orelse {
+            std.log.err("WARDEN_XMPP_PASSWORD is set but WARDEN_XMPP_JID isn't — XMPP stays disabled", .{});
+            return null;
+        };
+        const pw = password orelse {
+            std.log.err("WARDEN_XMPP_JID is set but WARDEN_XMPP_PASSWORD isn't — XMPP stays disabled", .{});
+            return null;
+        };
+
+        const at = std.mem.indexOfScalar(u8, full_jid, '@') orelse {
+            std.log.err("WARDEN_XMPP_JID '{s}' isn't shaped like user@domain — XMPP stays disabled", .{full_jid});
+            return null;
+        };
+        const jid_user = full_jid[0..at];
+        const domain = full_jid[at + 1 ..];
+
+        // Defaults to dialing `domain` directly on the standard client port
+        // — override with `WARDEN_XMPP_SERVER` when the socket target
+        // differs from the JID's domain (e.g. a compose service name).
+        var host: []const u8 = domain;
+        var port: u16 = default_xmpp_port;
+        if (env.get("WARDEN_XMPP_SERVER")) |server| {
+            if (std.mem.indexOfScalar(u8, server, ':')) |colon| {
+                host = server[0..colon];
+                port = std.fmt.parseInt(u16, server[colon + 1 ..], 10) catch default_xmpp_port;
+            } else {
+                host = server;
+            }
+        }
+
+        var muc_rooms: std.ArrayList([]const u8) = .empty;
+        if (env.get("WARDEN_XMPP_MUC_ROOMS")) |rooms_raw| {
+            var it = std.mem.splitScalar(u8, rooms_raw, ',');
+            while (it.next()) |room| {
+                const trimmed = std.mem.trim(u8, room, " \t");
+                if (trimmed.len > 0) try muc_rooms.append(arena, trimmed);
+            }
+        }
+
+        return .{
+            .host = host,
+            .port = port,
+            .domain = domain,
+            .jid_user = jid_user,
+            .password = pw,
+            .muc_rooms = try muc_rooms.toOwnedSlice(arena),
+        };
     }
 
     fn loadLlmConfig(env: *const std.process.Environ.Map) LoadError!LlmConfig {
@@ -277,6 +390,7 @@ pub const Config = struct {
     pub const default_llm_owner_only: bool = true;
     pub const default_llm_show_thinking: bool = false;
     pub const default_llm_streaming: bool = false;
+    pub const default_xmpp_port: u16 = 5222;
 
     /// Armin's numeric Telegram user id, as a string. Deliberately not
     /// username-based, since usernames can change.

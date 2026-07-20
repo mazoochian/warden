@@ -112,3 +112,29 @@ services:
     # --host 0.0.0.0 so it's reachable from the warden container over the
     # compose network by service name (http://whisper-server:8091).
     command: ["whisper-server --model /models/ggml-base.bin --host 0.0.0.0 --port 8091"]
+
+  # Self-hosted XMPP server for developing/testing the XMPP connector (see
+  # README's "XMPP" section) — same opt-in-sidecar shape as llama-server/
+  # whisper-server above: not started by a plain `docker compose up -d`,
+  # only when named explicitly (e.g. `docker compose up -d prosody warden
+  # searxng`). Test-only config (see prosody/config/prosody.cfg.lua):
+  # self-signed TLS, SASL PLAIN via internal_plain storage. Port 5222 is
+  # published to the host (not just the compose network) so a real XMPP
+  # client (Gajim/Dino) and the manual openssl/SASL sanity check can reach
+  # it during development from outside the compose network too.
+  prosody:
+    # `:latest` resolves to 0.11.9 (2019) as of this writing, whose bundled
+    # LuaSec/OpenSSL couldn't complete a TLS 1.3 handshake with Zig 0.16's
+    # `std.crypto.tls.Client` (its ClientHello offers a hybrid ML-KEM768
+    # post-quantum key share by default, with no Options field to disable
+    # it — confirmed via `TlsUnexpectedMessage` failing consistently against
+    # 0.11.9 while a plain Python `ssl` client succeeded against the same
+    # server). `:trunk` resolved this — a real server-version compatibility
+    # gap, not a bug in the connector.
+    image: prosody/prosody:trunk
+    restart: unless-stopped
+    volumes:
+      - ./prosody/config:/etc/prosody
+      - ./prosody/data:/var/lib/prosody
+    ports:
+      - "5222:5222"

@@ -3,6 +3,8 @@ const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 const Identity = @import("../domain/identity.zig").Identity;
 const TelegramProfile = @import("../domain/telegram_profile.zig").TelegramProfile;
+const MatrixProfile = @import("../domain/matrix_profile.zig").MatrixProfile;
+const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
 
 /// Upserts the platform-neutral ancestor identity row (see `Identity`'s doc
 /// comment) and returns its internal `identities.id` — the FK every other
@@ -75,6 +77,44 @@ pub fn upsertTelegramUser(pool: *PgPool, profile: TelegramProfile) !i64 {
     const identity_id = try upsertIdentity(pool, profile.identity);
     try upsertTelegramProfile(pool, identity_id, profile);
     return identity_id;
+}
+
+/// Upserts a Matrix-specific profile extension for an already-upserted
+/// identity (see `MatrixProfile`'s doc comment).
+pub fn upsertMatrixProfile(pool: *PgPool, identity_id: i64, profile: MatrixProfile) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO matrix_profiles (identity_id, homeserver, avatar_url)
+        \\VALUES ($1, $2, $3)
+        \\ON CONFLICT (identity_id) DO UPDATE SET
+        \\  homeserver = excluded.homeserver,
+        \\  avatar_url = excluded.avatar_url;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    stmt.bindText(2, profile.homeserver);
+    if (profile.avatar_url) |s| stmt.bindText(3, s) else stmt.bindNull(3);
+    _ = try stmt.step();
+}
+
+/// Upserts an XMPP-specific profile extension for an already-upserted
+/// identity (see `XmppProfile`'s doc comment).
+pub fn upsertXmppProfile(pool: *PgPool, identity_id: i64, profile: XmppProfile) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO xmpp_profiles (identity_id, jid_resource)
+        \\VALUES ($1, $2)
+        \\ON CONFLICT (identity_id) DO UPDATE SET
+        \\  jid_resource = excluded.jid_resource;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    if (profile.jid_resource) |s| stmt.bindText(2, s) else stmt.bindNull(2);
+    _ = try stmt.step();
 }
 
 const Platform = @import("../platform/interface.zig").Platform;
@@ -170,6 +210,72 @@ test "upsertTelegramUser writes both identities and telegram_profiles rows" {
     try testing.expectEqualStrings("Alice", stmt.columnText(0));
     try testing.expect(stmt.columnBool(1));
     try testing.expectEqualStrings("en", stmt.columnText(2));
+}
+
+test "upsertMatrixProfile writes a matrix_profiles row keyed by identity_id" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const identity_id = try upsertIdentity(&pool, .{
+        .platform = .matrix,
+        .native_id = "@alice:example.org",
+        .display_name = "Alice",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+    try upsertMatrixProfile(&pool, identity_id, .{
+        .identity = .{
+            .platform = .matrix,
+            .native_id = "@alice:example.org",
+            .display_name = "Alice",
+            .first_seen = 1000,
+            .last_seen = 1000,
+        },
+        .homeserver = "https://example.org",
+        .avatar_url = "mxc://example.org/abc",
+    });
+
+    var stmt = try db.prepare("SELECT homeserver, avatar_url FROM matrix_profiles WHERE identity_id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    try testing.expect(try stmt.step());
+    try testing.expectEqualStrings("https://example.org", stmt.columnText(0));
+    try testing.expectEqualStrings("mxc://example.org/abc", stmt.columnText(1));
+}
+
+test "upsertXmppProfile writes an xmpp_profiles row keyed by identity_id" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const identity_id = try upsertIdentity(&pool, .{
+        .platform = .xmpp,
+        .native_id = "alice@example.org",
+        .display_name = "alice",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+    try upsertXmppProfile(&pool, identity_id, .{
+        .identity = .{
+            .platform = .xmpp,
+            .native_id = "alice@example.org",
+            .display_name = "alice",
+            .first_seen = 1000,
+            .last_seen = 1000,
+        },
+        .jid_resource = "phone",
+    });
+
+    var stmt = try db.prepare("SELECT jid_resource FROM xmpp_profiles WHERE identity_id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    try testing.expect(try stmt.step());
+    try testing.expectEqualStrings("phone", stmt.columnText(0));
 }
 
 test "getOrCreateMinimal creates a placeholder once, then resolves without overwriting" {

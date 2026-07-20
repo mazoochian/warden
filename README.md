@@ -113,14 +113,19 @@ curl -XPOST https://matrix.org/_matrix/client/v3/login -d '{
 The bot auto-joins any room it's invited to — there's no separate "add to
 group" step.
 
-**Encryption**: only plaintext (non-end-to-end-encrypted) rooms are
-supported. Matrix's E2E encryption (Olm/Megolm) is a real cryptographic
-protocol stack — key exchange, per-device sessions, group ratcheting — and
-hand-rolling that from scratch would be a serious way to get subtly-wrong
-crypto; support for it is tracked in `ROADMAP.md` as its own future phase,
-built on the audited `libolm` library rather than a reimplementation.
-Inviting the bot into an encrypted room won't error, but it won't be able to
-read or send anything meaningful there either.
+**Encryption**: end-to-end encrypted rooms (Olm/Megolm, via the audited
+`libolm` library — no reimplemented crypto) are supported when
+`WARDEN_MATRIX_PICKLE_KEY` is set; unset, the bot only sends/receives
+plaintext, and inviting it into an encrypted room won't error but it won't
+be able to read or send anything meaningful there either. Known gap:
+**no device verification / cross-signing** — the bot's device will show
+up as "not verified by its owner" in clients that surface that, since
+there's no interactive (SAS/emoji) verification flow implemented. This
+doesn't block sending or receiving; it's a trust-indicator warning only.
+The bot proactively shares room keys on send and also answers
+`m.room_key_request` (e.g. from a client that ran `/discardsession`) as a
+self-healing fallback, since to-device delivery is best-effort, not
+guaranteed.
 
 Two smaller simplifications versus Telegram, both worth knowing about:
 - Every Matrix room is treated as a "group" for the purposes of the
@@ -134,9 +139,58 @@ Two smaller simplifications versus Telegram, both worth knowing about:
   after an hour on Telegram, but on Matrix it lasts until explicitly
   `/unmute`d.
 
+# XMPP
+Warden can also connect to an XMPP server (self-hosted Prosody/ejabberd),
+alongside Telegram and Matrix. Q&A, group management (for MUC rooms), and
+every other connector-agnostic feature work the same way; see the env vars
+above to set it up.
+
+Authenticate with a JID + password (`WARDEN_XMPP_JID`/`WARDEN_XMPP_PASSWORD`)
+— the account needs to already exist on the server (e.g.
+`prosodyctl adduser bot@yourserver`). `WARDEN_XMPP_SERVER` is only needed if
+the socket you dial differs from the JID's own domain (e.g. a Docker Compose
+service name).
+
+This connector is an MVP, built and tested in one evening against a
+self-hosted Prosody instance — several things a more mature XMPP client
+would have are deliberately out of scope for now:
+- **SASL PLAIN only, no SCRAM.** This makes the connector suitable for a
+  self-hosted server you control and trust, but unsuitable against a public/
+  federated server, which will almost always refuse PLAIN. TLS is still
+  required (STARTTLS) so the password isn't sent in the clear, but there's
+  no certificate-authority verification of the server's certificate either
+  (`.no_verification` — see `xmpp/client.zig`), so this is not a hardened
+  setup for use over an untrusted network.
+- **No end-to-end encryption (OMEMO).** Same reasoning/precedent as Matrix's
+  Olm/Megolm: a real cryptographic protocol worth doing properly or not at
+  all, not attempted here.
+- **No file transfer.** XMPP's mechanisms for this (XEP-0363 HTTP Upload,
+  Jingle) are a separate system from a `<message>`'s `<body>`, unlike
+  Matrix's `m.image`/`m.file` msgtypes — not implemented tonight.
+- **Group chat (MUC, XEP-0045) has no admin features.** The bot can join
+  rooms (via `WARDEN_XMPP_MUC_ROOMS`) and send/receive `groupchat` messages,
+  but there's no kick/ban/affiliation support — every moderation vtable slot
+  reports "unsupported" for XMPP, same as the pre-built-out Matrix/XMPP
+  stubs used to before either connector was real.
+- **No roster UI.** Any incoming presence-subscription request is
+  auto-accepted (mirrors Matrix's auto-join-on-invite) — there's no way to
+  see or manage a roster from within the bot.
+- **No mention detection in group chat.** Unlike Telegram/Matrix, an XMPP
+  MUC message doesn't get scanned for an @mention of the bot yet — it'll
+  only respond to the configured magic word in a room.
+
+For local development, `compose.yaml` includes an opt-in `prosody` service
+(same not-started-by-a-plain-`up`-shape as `llama-server`/`whisper-server`)
+— bring it up with `docker compose up -d prosody warden searxng`, then
+create a test account (`docker compose exec prosody prosodyctl adduser
+bot@localhost`) before pointing `WARDEN_XMPP_JID`/`WARDEN_XMPP_PASSWORD` at
+it. See `prosody/config/prosody.cfg.lua`'s comments for why this config is
+test-only (self-signed TLS, `internal_plain` auth storage).
+
 Supported Messaging Platforms:
 - Telegram
 - Matrix (plaintext rooms only — see "Matrix" below)
+- XMPP (MVP — see "XMPP" below)
 - WhatsApp (comming soon)
 
 Supported AI Providers:
@@ -162,6 +216,16 @@ export WARDEN_TELEGRAM_OWNER_ID=<your_numeric_telegram_user_id>
 # export WARDEN_MATRIX_HOMESERVER_URL=https://matrix.org
 # export WARDEN_MATRIX_ACCESS_TOKEN=<access token>
 # export WARDEN_MATRIX_OWNER_ID=@you:matrix.org
+
+# XMPP (optional — see "XMPP" below; unset means XMPP stays disabled):
+# export WARDEN_XMPP_JID=bot@yourserver.example
+# export WARDEN_XMPP_PASSWORD=<password>
+# export WARDEN_XMPP_OWNER_ID=you@yourserver.example
+# Only needed if the socket target differs from the JID's domain (e.g. a
+# Docker Compose service name) — defaults to "<domain>:5222" otherwise:
+# export WARDEN_XMPP_SERVER=prosody:5222
+# Comma-separated bare room JIDs to auto-join on connect (optional):
+# export WARDEN_XMPP_MUC_ROOMS=room1@conference.yourserver.example,room2@conference.yourserver.example
 
 # LLM provider — anthropic (default) or openai_compat:
 export WARDEN_LLM_PROVIDER=anthropic

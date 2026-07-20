@@ -1,6 +1,8 @@
 const std = @import("std");
 const Identity = @import("../domain/identity.zig").Identity;
 const TelegramProfile = @import("../domain/telegram_profile.zig").TelegramProfile;
+const MatrixProfile = @import("../domain/matrix_profile.zig").MatrixProfile;
+const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
 
 /// Chat platforms Warden can be wired up to. Only `.telegram` has an
 /// implementation right now; the others exist so config/auth code can
@@ -136,6 +138,14 @@ pub const Message = struct {
     /// the shared fields; this just carries what Telegram's `User` object
     /// has beyond them, for persisting into `telegram_profiles`.
     telegram_profile: ?TelegramProfile = null,
+    /// Matrix-specific extension of `identity` (homeserver, avatar_url) —
+    /// populated only by the Matrix connector, null for every other
+    /// platform. Same reasoning as `telegram_profile` above.
+    matrix_profile: ?MatrixProfile = null,
+    /// XMPP-specific extension of `identity` (jid_resource) — populated
+    /// only by the XMPP connector, null for every other platform. Same
+    /// reasoning as `telegram_profile`/`matrix_profile` above.
+    xmpp_profile: ?XmppProfile = null,
     /// Set when this message carries a photo/document/voice/audio/video —
     /// see `Attachment`'s doc comment on why only metadata lives here.
     attachment: ?Attachment = null,
@@ -177,6 +187,8 @@ pub const Message = struct {
             .mentions_me = self.mentions_me,
             .identity = if (self.identity) |id| try id.dupe(allocator) else null,
             .telegram_profile = if (self.telegram_profile) |p| try p.dupe(allocator) else null,
+            .matrix_profile = if (self.matrix_profile) |p| try p.dupe(allocator) else null,
+            .xmpp_profile = if (self.xmpp_profile) |p| try p.dupe(allocator) else null,
             .attachment = if (self.attachment) |att| try att.dupe(allocator) else null,
             .choice_picked = if (self.choice_picked) |cp| .{
                 .prompt_message_id = try allocator.dupe(u8, cp.prompt_message_id),

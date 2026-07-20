@@ -24,6 +24,14 @@ pub const Client = struct {
     /// atomically since moderation/reply calls can run concurrently across
     /// per-message tasks (see `PgPool`'s doc comment for why that's normal
     /// in this codebase).
+    ///
+    /// Seeded from wall-clock time in `init`, not left at 0: Synapse
+    /// remembers recently-used txn ids per access token across different
+    /// endpoints (e.g. `sendToDevice` vs `send/m.room.encrypted`) and
+    /// rejects a reused id with `M_INVALID_PARAM` even across process
+    /// restarts. A dev container that restarts often would otherwise
+    /// reissue low ids like `warden3` that collide with the same id from
+    /// a previous run — confirmed live 2026-07-20.
     txn_counter: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, io: Io, homeserver_url: []const u8, access_token: []const u8) Client {
@@ -33,6 +41,7 @@ pub const Client = struct {
             .http_client = .{ .allocator = allocator, .io = io },
             .homeserver_url = homeserver_url,
             .access_token = access_token,
+            .txn_counter = .init(@intCast(Io.Timestamp.now(io, .real).toNanoseconds())),
         };
     }
 
@@ -70,6 +79,20 @@ pub const Client = struct {
         return json.parseFromSlice(types.WhoamiResponse, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
     }
 
+    /// Uploads this device's signed identity/one-time keys (see
+    /// `matrix/crypto.zig`'s `deviceKeysJson`/`signedOneTimeKeysJson`/
+    /// `uploadKeysPayload` for how `payload` is built) — returns the raw
+    /// response body (just `{"one_time_key_counts": {...}}`) rather than a
+    /// typed struct, since nothing needs to act on it yet beyond logging.
+    pub fn uploadKeys(self: *Client, allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/keys/upload", .{self.homeserver_url});
+        defer allocator.free(url);
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        return http_util.postJson(&self.http_client, allocator, url, &.{auth}, payload);
+    }
+
     /// Long-polls for new events since `since` (null on the very first call
     /// — see `MatrixConnector.pollFn`'s doc comment on why that first
     /// response's events are discarded rather than processed). 25s not 30s,
@@ -104,41 +127,45 @@ pub const Client = struct {
         defer allocator.free(body);
     }
 
-    const MessagePayload = struct {
+    pub const MessagePayload = struct {
         msgtype: []const u8 = "m.text",
         body: []const u8,
         @"m.relates_to": ?types.RelatesTo = null,
     };
 
-    fn replyRelation(reply_to_event_id: ?[]const u8) ?types.RelatesTo {
+    pub fn replyRelation(reply_to_event_id: ?[]const u8) ?types.RelatesTo {
         const id = reply_to_event_id orelse return null;
         return .{ .@"m.in_reply_to" = .{ .event_id = id } };
     }
 
-    /// Fire-and-forget send, matching `telegram/client.zig`'s `sendMessage`
-    /// — logs failures rather than propagating, since a failed reply
-    /// shouldn't crash the poll loop.
-    pub fn sendMessage(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, text: []const u8, reply_to_event_id: ?[]const u8) void {
-        _ = self.sendMessageReturningId(allocator, room_id, text, reply_to_event_id) catch |err| {
-            std.log.err("matrix sendMessage failed: {t}", .{err});
-        };
-    }
+    pub const EditPayload = struct {
+        msgtype: []const u8 = "m.text",
+        body: []const u8,
+        @"m.new_content": types.NewContent,
+        @"m.relates_to": types.RelatesTo,
+    };
 
-    /// Like `sendMessage`, but returns the sent event id (needed to later
-    /// `editMessage` it — the "thinking" placeholder / progressive-answer
-    /// flow, same as Telegram's).
-    pub fn sendMessageReturningId(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, text: []const u8, reply_to_event_id: ?[]const u8) ![]const u8 {
+    pub const ReactionPayload = struct {
+        @"m.relates_to": types.RelatesTo,
+    };
+
+    /// `PUT .../rooms/{roomId}/send/{eventType}/{txn}` with an
+    /// already-JSON-stringified `payload` — the one generic primitive every
+    /// room-timeline send goes through, whether that's a plaintext
+    /// `m.room.message`/`m.reaction` or (see `platform/matrix.zig`'s
+    /// `MatrixConnector.sendEvent`) an `m.room.encrypted` event wrapping one
+    /// of those. Kept generic rather than one method per event type so the
+    /// encryption decision has a single place to plug into, instead of
+    /// needing its own copy inside every `sendX` method.
+    pub fn putRoomEvent(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_type: []const u8, payload: []const u8) ![]const u8 {
         const encoded_room = try encodeSegment(allocator, room_id);
         defer allocator.free(encoded_room);
+        const encoded_type = try encodeSegment(allocator, event_type);
+        defer allocator.free(encoded_type);
         const txn = try self.nextTxnId(allocator);
         defer allocator.free(txn);
-        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/send/m.room.message/{s}", .{ self.homeserver_url, encoded_room, txn });
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/send/{s}/{s}", .{ self.homeserver_url, encoded_room, encoded_type, txn });
         defer allocator.free(url);
-
-        var payload_writer: Io.Writer.Allocating = .init(allocator);
-        defer payload_writer.deinit();
-        try json.Stringify.value(MessagePayload{ .body = text, .@"m.relates_to" = replyRelation(reply_to_event_id) }, .{}, &payload_writer.writer);
-        const payload = payload_writer.writer.buffered();
 
         const auth = try self.authHeader(allocator);
         defer allocator.free(auth.value);
@@ -148,76 +175,6 @@ pub const Client = struct {
         var parsed = try json.parseFromSlice(types.SendEventResponse, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
         defer parsed.deinit();
         return allocator.dupe(u8, parsed.value.event_id);
-    }
-
-    const EditPayload = struct {
-        msgtype: []const u8 = "m.text",
-        body: []const u8,
-        @"m.new_content": types.NewContent,
-        @"m.relates_to": types.RelatesTo,
-    };
-
-    /// Replaces a previously-sent message's displayed text via `m.replace`
-    /// (MSC2676) — same "thinking" placeholder / progressive-answer role as
-    /// `telegram/client.zig`'s `editMessage`. Unlike Telegram, Matrix has no
-    /// "not modified" rejection for an edit identical to the current
-    /// content, so callers don't need Telegram's dedupe workaround here.
-    pub fn editMessage(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_id: []const u8, text: []const u8) !void {
-        const encoded_room = try encodeSegment(allocator, room_id);
-        defer allocator.free(encoded_room);
-        const txn = try self.nextTxnId(allocator);
-        defer allocator.free(txn);
-        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/send/m.room.message/{s}", .{ self.homeserver_url, encoded_room, txn });
-        defer allocator.free(url);
-
-        // `body` is a plain-text fallback for clients that don't understand
-        // `m.replace` — conventionally prefixed with "* " per MSC2676.
-        const fallback_body = try std.fmt.allocPrint(allocator, "* {s}", .{text});
-        defer allocator.free(fallback_body);
-
-        var payload_writer: Io.Writer.Allocating = .init(allocator);
-        defer payload_writer.deinit();
-        try json.Stringify.value(EditPayload{
-            .body = fallback_body,
-            .@"m.new_content" = .{ .msgtype = "m.text", .body = text },
-            .@"m.relates_to" = .{ .rel_type = "m.replace", .event_id = event_id },
-        }, .{}, &payload_writer.writer);
-        const payload = payload_writer.writer.buffered();
-
-        const auth = try self.authHeader(allocator);
-        defer allocator.free(auth.value);
-        const body = try http_util.putJson(&self.http_client, allocator, url, &.{auth}, payload);
-        defer allocator.free(body);
-    }
-
-    const ReactionPayload = struct {
-        @"m.relates_to": types.RelatesTo,
-    };
-
-    /// Reacts to `event_id` with `key` (an emoji) — used to self-seed
-    /// tappable "pills" on the bot's own choice-prompt message (see
-    /// `MatrixConnector.sendChoicePromptFn`), and by users tapping one to
-    /// pick a choice (read back via `pollFn`'s `m.reaction` handling).
-    /// Fire-and-forget like `sendMessage`.
-    pub fn sendReaction(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_id: []const u8, key: []const u8) !void {
-        const encoded_room = try encodeSegment(allocator, room_id);
-        defer allocator.free(encoded_room);
-        const txn = try self.nextTxnId(allocator);
-        defer allocator.free(txn);
-        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/send/m.reaction/{s}", .{ self.homeserver_url, encoded_room, txn });
-        defer allocator.free(url);
-
-        var payload_writer: Io.Writer.Allocating = .init(allocator);
-        defer payload_writer.deinit();
-        try json.Stringify.value(ReactionPayload{
-            .@"m.relates_to" = .{ .rel_type = "m.annotation", .event_id = event_id, .key = key },
-        }, .{}, &payload_writer.writer);
-        const payload = payload_writer.writer.buffered();
-
-        const auth = try self.authHeader(allocator);
-        defer allocator.free(auth.value);
-        const body = try http_util.putJson(&self.http_client, allocator, url, &.{auth}, payload);
-        defer allocator.free(body);
     }
 
     /// Uploads bytes and returns their `mxc://` content URI — the two-step
@@ -334,6 +291,178 @@ pub const Client = struct {
         defer allocator.free(body);
 
         return json.parseFromSlice(types.RoomEvent, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    }
+
+    /// True if `room_id` has an `m.room.encryption` state event — 404 (no
+    /// such state event) means the room is plaintext, matching how
+    /// `getPinnedEvents` treats a 404 as "nothing there" rather than an
+    /// error. Checked once per send by `platform/matrix.zig`'s
+    /// `MatrixConnector.sendEvent` to decide whether to Megolm-wrap the
+    /// outgoing content.
+    pub fn isRoomEncrypted(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) !bool {
+        const encoded_room = try encodeSegment(allocator, room_id);
+        defer allocator.free(encoded_room);
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/state/m.room.encryption", .{ self.homeserver_url, encoded_room });
+        defer allocator.free(url);
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        const body = http_util.getWithHeaders(&self.http_client, allocator, url, &.{auth}) catch |err| {
+            if (err == error.HttpRequestFailed) return false;
+            return err;
+        };
+        allocator.free(body);
+        return true;
+    }
+
+    /// Currently-joined member user ids for `room_id` — needed to know
+    /// whose devices a freshly-created (or expanding) outbound Megolm
+    /// session's key must be shared with. A dedicated GET rather than
+    /// reading `m.room.member` state off `/sync`: warden doesn't track full
+    /// room membership locally, and this is only called on a send into an
+    /// encrypted room, not on every poll cycle.
+    pub fn joinedMembers(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) ![]const []const u8 {
+        const encoded_room = try encodeSegment(allocator, room_id);
+        defer allocator.free(encoded_room);
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/joined_members", .{ self.homeserver_url, encoded_room });
+        defer allocator.free(url);
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        const body = try http_util.getWithHeaders(&self.http_client, allocator, url, &.{auth});
+        defer allocator.free(body);
+
+        var parsed = try json.parseFromSlice(json.Value, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer parsed.deinit();
+        const joined = parsed.value.object.get("joined") orelse return &.{};
+        if (joined != .object) return &.{};
+
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = joined.object.iterator();
+        while (it.next()) |entry| try out.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// `POST /keys/query` for every device of each of `user_ids` — returned
+    /// as a raw `json.Value` (shape:
+    /// `{"device_keys":{"@user:server":{"DEVICEID":{"keys":{"curve25519:DEVICEID":"..."},...}}}}`)
+    /// rather than a typed struct: `matrix/crypto.zig`'s
+    /// `State.shareWithNewDevices` is the only caller, and it only ever
+    /// walks this one shape once per send — not worth a dedicated type for
+    /// a single call site, same reasoning as `getPowerLevels`.
+    pub fn queryKeys(self: *Client, allocator: std.mem.Allocator, user_ids: []const []const u8) !json.Parsed(json.Value) {
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/keys/query", .{self.homeserver_url});
+        defer allocator.free(url);
+
+        var device_keys: json.Value = .{ .object = .empty };
+        for (user_ids) |uid| try device_keys.object.put(allocator, uid, .{ .array = .init(allocator) });
+        var body_obj: json.Value = .{ .object = .empty };
+        try body_obj.object.put(allocator, "device_keys", device_keys);
+
+        var payload_writer: Io.Writer.Allocating = .init(allocator);
+        defer payload_writer.deinit();
+        try json.Stringify.value(body_obj, .{}, &payload_writer.writer);
+        const payload = payload_writer.writer.buffered();
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        const body = try http_util.postJson(&self.http_client, allocator, url, &.{auth}, payload);
+        defer allocator.free(body);
+
+        return json.parseFromSlice(json.Value, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    }
+
+    /// `POST /keys/claim` for one `signed_curve25519` one-time key from
+    /// `device_id`, returning the claimed key's base64 value — needed to
+    /// `olm.Session.createOutbound` a fresh per-device Olm session before a
+    /// room key can be shared with a device warden has never talked to
+    /// before. The claimed key's own signature isn't verified here (no
+    /// device-verification UI exists at all yet — trust-on-first-use,
+    /// same simplification scope already accepted for the rest of tonight's
+    /// E2EE work).
+    pub fn claimOneTimeKey(self: *Client, allocator: std.mem.Allocator, user_id: []const u8, device_id: []const u8) ![]const u8 {
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/keys/claim", .{self.homeserver_url});
+        defer allocator.free(url);
+
+        var device_obj: json.Value = .{ .object = .empty };
+        try device_obj.object.put(allocator, device_id, .{ .string = "signed_curve25519" });
+        var user_obj: json.Value = .{ .object = .empty };
+        try user_obj.object.put(allocator, user_id, device_obj);
+        var body_obj: json.Value = .{ .object = .empty };
+        try body_obj.object.put(allocator, "one_time_keys", user_obj);
+
+        var payload_writer: Io.Writer.Allocating = .init(allocator);
+        defer payload_writer.deinit();
+        try json.Stringify.value(body_obj, .{}, &payload_writer.writer);
+        const payload = payload_writer.writer.buffered();
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        const body = try http_util.postJson(&self.http_client, allocator, url, &.{auth}, payload);
+        defer allocator.free(body);
+
+        var parsed = try json.parseFromSlice(json.Value, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+        defer parsed.deinit();
+
+        const otks = parsed.value.object.get("one_time_keys") orelse return error.NoOneTimeKeyAvailable;
+        if (otks != .object) return error.NoOneTimeKeyAvailable;
+        const per_user = otks.object.get(user_id) orelse return error.NoOneTimeKeyAvailable;
+        if (per_user != .object) return error.NoOneTimeKeyAvailable;
+        const per_device = per_user.object.get(device_id) orelse return error.NoOneTimeKeyAvailable;
+        if (per_device != .object or per_device.object.count() == 0) return error.NoOneTimeKeyAvailable;
+
+        // Exactly one `signed_curve25519:<key id>` entry per requested
+        // device — take whichever the server handed back.
+        var it = per_device.object.iterator();
+        const entry = it.next().?;
+        if (entry.value_ptr.* != .object) return error.NoOneTimeKeyAvailable;
+        const key_val = entry.value_ptr.object.get("key") orelse return error.NoOneTimeKeyAvailable;
+        if (key_val != .string) return error.NoOneTimeKeyAvailable;
+        return allocator.dupe(u8, key_val.string);
+    }
+
+    /// `PUT /sendToDevice/{eventType}/{txn}` addressed to a single
+    /// `(user_id, device_id)` — used to Olm-encrypt and deliver an
+    /// `m.room_key` to exactly the device that needs it. Matrix's
+    /// `/sendToDevice` supports batching many recipients into one call, but
+    /// warden's key-sharing loop (`matrix/crypto.zig`'s
+    /// `State.shareWithNewDevices`) already needs a separate Olm-encrypt
+    /// step per device anyway, so there's no batching win being left behind
+    /// by sending one at a time here.
+    pub fn sendToDevice(self: *Client, allocator: std.mem.Allocator, event_type: []const u8, user_id: []const u8, device_id: []const u8, content: json.Value) !void {
+        const encoded_type = try encodeSegment(allocator, event_type);
+        defer allocator.free(encoded_type);
+        const txn = try self.nextTxnId(allocator);
+        defer allocator.free(txn);
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/sendToDevice/{s}/{s}", .{ self.homeserver_url, encoded_type, txn });
+        defer allocator.free(url);
+
+        // Each `.deinit()` only frees this function's own wrapper map
+        // storage, not `content` itself — that's the caller's, freed
+        // separately (e.g. `crypto.zig`'s `sendVerificationEvent` owns
+        // `content` via its own `parsed.deinit()`). Found live via a test
+        // that — for the first time — actually exercised a real (if
+        // failing) call through this function: previously nothing ever
+        // freed these on *any* path, success included.
+        var device_obj: json.Value = .{ .object = .empty };
+        defer device_obj.object.deinit(allocator);
+        try device_obj.object.put(allocator, device_id, content);
+        var user_obj: json.Value = .{ .object = .empty };
+        defer user_obj.object.deinit(allocator);
+        try user_obj.object.put(allocator, user_id, device_obj);
+        var body_obj: json.Value = .{ .object = .empty };
+        defer body_obj.object.deinit(allocator);
+        try body_obj.object.put(allocator, "messages", user_obj);
+
+        var payload_writer: Io.Writer.Allocating = .init(allocator);
+        defer payload_writer.deinit();
+        try json.Stringify.value(body_obj, .{}, &payload_writer.writer);
+        const payload = payload_writer.writer.buffered();
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        const body = try http_util.putJson(&self.http_client, allocator, url, &.{auth}, payload);
+        defer allocator.free(body);
     }
 
     fn callAction(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, action: []const u8, user_id: []const u8, reason: ?[]const u8) !void {
