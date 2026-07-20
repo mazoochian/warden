@@ -528,6 +528,50 @@ pub const Client = struct {
         });
     }
 
+    /// A moderate permission set — deliberately omits `can_promote_members`
+    /// so a bot-promoted admin can't themselves mint further admins
+    /// through the bot (`/promote` is owner-gated; a promoted admin
+    /// bypassing that gate for anyone else would defeat the point).
+    /// Everything else here matches what a group owner would typically
+    /// hand a trusted moderator.
+    pub fn promoteChatMember(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64) !void {
+        return self.callMethod(allocator, "promoteChatMember", .{
+            .chat_id = chat_id,
+            .user_id = user_id,
+            .can_manage_chat = true,
+            .can_delete_messages = true,
+            .can_restrict_members = true,
+            .can_pin_messages = true,
+            .can_invite_users = true,
+            .can_change_info = false,
+            .can_promote_members = false,
+            .can_manage_video_chats = false,
+            .can_post_messages = false,
+            .can_edit_messages = false,
+            .is_anonymous = false,
+        });
+    }
+
+    /// `promoteChatMember` with every permission false is Telegram's own
+    /// idiom for demoting an admin back to an ordinary member.
+    pub fn demoteChatMember(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64) !void {
+        return self.callMethod(allocator, "promoteChatMember", .{
+            .chat_id = chat_id,
+            .user_id = user_id,
+            .can_manage_chat = false,
+            .can_delete_messages = false,
+            .can_restrict_members = false,
+            .can_pin_messages = false,
+            .can_invite_users = false,
+            .can_change_info = false,
+            .can_promote_members = false,
+            .can_manage_video_chats = false,
+            .can_post_messages = false,
+            .can_edit_messages = false,
+            .is_anonymous = false,
+        });
+    }
+
     pub fn pinChatMessage(self: *Client, allocator: std.mem.Allocator, chat_id: i64, message_id: i64) !void {
         return self.callMethod(allocator, "pinChatMessage", .{ .chat_id = chat_id, .message_id = message_id });
     }

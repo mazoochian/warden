@@ -20,6 +20,7 @@ const migrations = [_]Migration{
     .{ .version = 6, .name = "0006_persona", .sql = @embedFile("migrations/0006_persona.sql") },
     .{ .version = 7, .name = "0007_show_thinking", .sql = @embedFile("migrations/0007_show_thinking.sql") },
     .{ .version = 8, .name = "0008_matrix_crypto", .sql = @embedFile("migrations/0008_matrix_crypto.sql") },
+    .{ .version = 9, .name = "0009_feed_watches_seen_guids", .sql = @embedFile("migrations/0009_feed_watches_seen_guids.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each

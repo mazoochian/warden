@@ -566,6 +566,23 @@ pub const Client = struct {
         return self.setUserPowerLevel(allocator, room_id, user_id, ordinary_power_level);
     }
 
+    /// Matrix's power-level equivalent of Telegram's `promoteChatMember` —
+    /// bumps `user_id` to the room's moderator threshold. Unlike
+    /// Telegram's granular permission bits, Matrix power levels are a
+    /// single scalar gating every privileged action at or below it, so
+    /// there's no equivalent of withholding "can_promote_members"
+    /// specifically — a promoted moderator here *can* set other users'
+    /// power levels up to their own. `/promote` staying owner-gated (see
+    /// `group_admin.zig`) is what actually prevents runaway
+    /// self-promotion chains, not anything at this layer.
+    pub fn promoteUser(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, user_id: []const u8) !void {
+        return self.setUserPowerLevel(allocator, room_id, user_id, moderator_power_level);
+    }
+
+    pub fn demoteUser(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, user_id: []const u8) !void {
+        return self.setUserPowerLevel(allocator, room_id, user_id, ordinary_power_level);
+    }
+
     /// True if `user_id`'s power level in `room_id` meets or exceeds the
     /// moderator threshold — the live source of truth `group_admin.zig`
     /// gates moderation commands on, same role as `telegram/client.zig`'s

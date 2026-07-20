@@ -78,6 +78,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "watch", .description = "<feed url> -- get notified when an RSS/Atom feed publishes." },
     .{ .name = "unwatch", .description = "<feed url> -- stop watching a feed." },
     .{ .name = "watches", .description = "List feeds this chat is watching." },
+    .{ .name = "watchcheck", .description = "<feed url> -- force an immediate check of a watch, for testing." },
     .{ .name = "convert", .description = "Convert an attached photo/document/voice/audio/video to another format." },
     .{ .name = "magicword", .description = "<word> -- make Warden answer any message containing this word." },
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
@@ -89,6 +90,8 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "delete", .description = "Reply to a message to delete it. Admins only." },
     .{ .name = "kick", .description = "Reply to a user's message to remove them. Admins only." },
     .{ .name = "ban", .description = "Reply to a user's message to permanently ban them. Admins only." },
+    .{ .name = "promote", .description = "Reply to a user's message to grant them admin. Bot owner only." },
+    .{ .name = "demote", .description = "Reply to a user's message to revoke their admin. Bot owner only." },
     .{ .name = "confirm", .description = "Confirm a pending /kick or /ban. Admins only." },
     .{ .name = "cancel", .description = "Cancel your pending file conversion, or a pending /kick or /ban." },
 };
@@ -123,7 +126,8 @@ const help_text =
     \\  /alert crypto btc above 100000. Also: /alert cancel <id>
     \\/alerts -- list pending alerts
     \\/watch <feed url> / /unwatch <feed url> / /watches -- RSS/Atom feed
-    \\  notifications for this chat
+    \\  notifications for this chat. /watchcheck <feed url> forces an
+    \\  immediate check, for testing
     \\
     \\Files
     \\/convert -- start a guided conversion (I'll ask you to send a file);
@@ -142,6 +146,8 @@ const help_text =
     \\Group moderation (chat admins only, most by replying to a message)
     \\/mute, /unmute, /pin, /unpin, /delete, /kick, /ban -- reply to the
     \\  target message/user (unpin doesn't need a reply)
+    \\/promote, /demote -- reply to a user's message to grant/revoke real
+    \\  admin rights. Bot owner only, not open to other chat admins
     \\/confirm -- confirm a pending /kick or /ban
     \\/cancel -- cancel your pending file conversion, or a pending
     \\  /kick/ban if you're an admin
@@ -942,6 +948,17 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/delete")) {
         if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.deleteMessage(connector, a, msg);
+    } else if (std.mem.eql(u8, text, "/promote")) {
+        // Owner-only, not `isAuthorizedForGroupAdmin` — granting real
+        // admin rights is more consequential than mute/kick/pin, and
+        // Telegram's own admin flag doesn't tell us whether a given admin
+        // actually has permission to add further admins themselves (see
+        // `group_admin.promote`'s doc comment).
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        group_admin.promote(connector, a, msg);
+    } else if (std.mem.eql(u8, text, "/demote")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        group_admin.demote(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/kick")) {
         if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
         group_admin.requestConfirmation(connector, a, pool, chat_id, now, msg, .kick);
@@ -997,6 +1014,8 @@ fn handleMessage(
         handleUnwatchCommand(connector, a, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/watches")) {
         handleWatchesList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
+    } else if (std.mem.eql(u8, text, "/watchcheck") or std.mem.startsWith(u8, text, "/watchcheck ")) {
+        handleWatchCheckCommand(connector, a, pool, io, llm_provider, chat_id, msg, text, now);
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
@@ -1835,6 +1854,60 @@ fn handleWatchesList(
     buf.writer.print("Watched feeds:\n", .{}) catch {};
     for (pending) |fw| buf.writer.print("  #{d} {s}\n", .{ fw.id, fw.feed_url }) catch {};
     connector.sendMessage(a, native_chat_id, buf.writer.buffered(), reply_to);
+}
+
+/// Forces an immediate check of one watch already set up in this chat,
+/// bypassing its `check_interval_seconds` wait — for testing/debugging a
+/// watch that doesn't seem to be firing, without needing DB or log access.
+/// Runs the exact same fetch/parse/dedupe/notify pipeline
+/// `checkAndNotifyFeeds`'s scheduled loop uses (`feed_watcher.checkNow`,
+/// sharing `checkOne` with it) — if there genuinely are new items, this
+/// posts the real notification, same as an automatic check would. Either
+/// way, replies with a summary of what happened, since "0 new items" and
+/// "the feed didn't parse as RSS/Atom at all" would otherwise look
+/// identical from outside (see `feed_watcher.zig`'s `CheckOutcome` doc
+/// comment — this is the tool for telling those apart without grepping
+/// logs).
+fn handleWatchCheckCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    io: Io,
+    llm_provider: llm.Provider,
+    chat_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+    now: i64,
+) void {
+    const feed_url = std.mem.trim(u8, text["/watchcheck".len..], " ");
+    if (feed_url.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /watchcheck <feed url>");
+        return;
+    }
+    // A single-element connector list is enough here (unlike the scheduled
+    // batch loop, which needs every connector since it's checking watches
+    // across every chat/platform at once): this command always runs from
+    // within the exact chat the watch belongs to, so `fw.platform` can
+    // only ever match `connector`'s own platform.
+    const outcome = feed_watcher.checkNow(&.{connector}, a, io, pool, llm_provider, chat_id, feed_url, now) catch |err| {
+        std.log.err("watchcheck: failed for {s} in chat {d}: {t}", .{ feed_url, chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't run that check, try again.");
+        return;
+    };
+    const result = outcome orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Not watching that feed in this chat — add it first with /watch <feed url>.");
+        return;
+    };
+    const summary = switch (result) {
+        .baseline_recorded => |n| std.fmt.allocPrint(a, "Checked — this was the first-ever check, so it just recorded {d} item(s) as the baseline (nothing announced, same as when /watch first adds a feed).", .{n}) catch "Checked — recorded the baseline.",
+        .no_new_items => "Checked — fetched and parsed fine, no new items since the last check.",
+        .notified => |n| std.fmt.allocPrint(a, "Checked — found {d} new item(s) and posted the notification.", .{n}) catch "Checked — found new items and posted the notification.",
+        .unrecognized_feed_shape => "Checked — the fetch succeeded, but the response doesn't look like RSS or Atom (no <item>/<entry> tags found). The URL might be wrong, or serving something other than a real feed.",
+        .fetch_failed => |err| std.fmt.allocPrint(a, "Fetch failed: {t}", .{err}) catch "Fetch failed.",
+        .parse_failed => |err| std.fmt.allocPrint(a, "Parse failed: {t}", .{err}) catch "Parse failed.",
+        .no_connector_for_platform => "No active connector for this chat's platform right now.",
+    };
+    connector.sendMessage(a, msg.chat_id, summary, msg.message_id);
 }
 
 /// Direct entry point to `convert_file` (see `tools/convert_file.zig`) for

@@ -178,6 +178,8 @@ pub const MatrixConnector = struct {
         .unmuteUser = unmuteUserFn,
         .kickUser = kickUserFn,
         .banUser = banUserFn,
+        .promoteUser = promoteUserFn,
+        .demoteUser = demoteUserFn,
         .pinMessage = pinMessageFn,
         .unpinMessage = unpinMessageFn,
         .deleteMessage = deleteMessageFn,
@@ -681,6 +683,16 @@ pub const MatrixConnector = struct {
     fn banUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
         const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
         return self.client.banUser(allocator, chat_id, user_id);
+    }
+
+    fn promoteUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
+        const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
+        return self.client.promoteUser(allocator, chat_id, user_id);
+    }
+
+    fn demoteUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
+        const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
+        return self.client.demoteUser(allocator, chat_id, user_id);
     }
 
     fn pinMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void {
