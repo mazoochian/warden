@@ -138,8 +138,18 @@ fn checkOne(connectors: []const iface.Connector, gpa: std.mem.Allocator, io: Io,
     defer arena.deinit();
     const a = arena.allocator();
 
-    const body = fetchFeed(a, io, fw.feed_url) catch |err| return .{ .fetch_failed = err };
-    const items = feed_parse.parseFeedItems(a, body) catch |err| return .{ .parse_failed = err };
+    const body = fetchFeed(a, io, fw.feed_url) catch |err| {
+        feed_watches.bumpLastChecked(pool, fw.id, now) catch |e| {
+            std.log.err("feed_watcher: failed to mark {d} checked after fetch failure: {t}", .{ fw.id, e });
+        };
+        return .{ .fetch_failed = err };
+    };
+    const items = feed_parse.parseFeedItems(a, body) catch |err| {
+        feed_watches.bumpLastChecked(pool, fw.id, now) catch |e| {
+            std.log.err("feed_watcher: failed to mark {d} checked after parse failure: {t}", .{ fw.id, e });
+        };
+        return .{ .parse_failed = err };
+    };
     if (items.len == 0) {
         // Not necessarily an error (a feed can genuinely be empty, or this
         // fetch just didn't look like RSS/Atom at all — parseFeedItems

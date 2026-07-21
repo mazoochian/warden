@@ -1796,6 +1796,16 @@ fn handleWatchCommand(
         reply(connector, a, msg.chat_id, msg.message_id, "Usage: /watch <feed url>");
         return;
     }
+    if (!std.mem.startsWith(u8, feed_url, "http://") and !std.mem.startsWith(u8, feed_url, "https://")) {
+        // Found live 2026-07-21: typo'd input meant for `/unwatch` (e.g.
+        // "/watch cancel 1") got stored verbatim as a feed_url and
+        // fetch-failed on every poll tick forever — see
+        // feed_watches.bumpLastChecked's doc comment for the other half of
+        // this fix. Reject obviously-not-a-URL input before it ever reaches
+        // the DB instead of relying on the watcher loop to survive garbage.
+        reply(connector, a, msg.chat_id, msg.message_id, "That doesn't look like a feed URL. Usage: /watch <feed url> (to stop watching, use /unwatch <feed url>)");
+        return;
+    }
     const created = feed_watches.create(pool, chat_id, identity_id, feed_url) catch |err| {
         std.log.err("watch: failed to add feed {s} for chat {d}: {t}", .{ feed_url, chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't add that watch, try again.");
