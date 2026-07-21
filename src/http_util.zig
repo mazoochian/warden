@@ -28,12 +28,26 @@
 //! a resolver that hangs instead of erroring) would otherwise freeze the
 //! entire bot indefinitely — confirmed in production: a DNS hiccup left a
 //! `getUpdates` connection sitting open for minutes with no timeout to cut
-//! it off. `fetchWithTimeout` runs the fetch on an `Io.concurrent` task and
-//! polls a completion flag from the caller; on timeout it calls
-//! `Future.cancel`, which genuinely interrupts the stuck operation (unlike
-//! abandoning a raw thread, which would leak the socket) and blocks until
-//! the task has actually unwound, so it's safe for the response writer to
-//! live on the caller's stack.
+//! it off.
+//!
+//! `fetchWithTimeout` runs the fetch on a real `std.Thread` and polls a
+//! completion flag from the caller; on timeout it **detaches and abandons**
+//! that thread rather than trying to cancel it. An earlier version used
+//! `Io.concurrent` + `Future.cancel` instead, on the theory that `cancel`
+//! "genuinely interrupts the stuck operation" — that's true only for calls
+//! that pass through an `Io`-native cancellation point. `std.http.Client`
+//! doesn't: `ConnectTcpOptions.timeout` is declared but never read anywhere
+//! in `std/http/Client.zig`, and `Client.fetch` has no way to bound a
+//! socket read at all. Confirmed live 2026-07-21: a remote peer that
+//! accepted the connection and then went silent (no data, no close) left
+//! `cancel()` blocked *waiting for a task to unwind that never would*,
+//! which froze the entire bot for 5+ minutes at 0% CPU with no error ever
+//! logged — worse than not having a timeout at all, since it looked like a
+//! deadline was enforced when it wasn't. Detaching trades that unbounded
+//! wait for a small, bounded leak (the request's cloned inputs plus
+//! whatever the orphaned thread manages to buffer) on the rare occasions a
+//! peer actually stalls like this — see `FetchShared`'s doc comment for how
+//! the leak is kept safe rather than a use-after-free.
 
 const std = @import("std");
 const Io = std.Io;
@@ -76,44 +90,131 @@ pub const llm_timeout_ns: u64 = 2 * std.time.ns_per_min;
 /// request.
 const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
+/// Deep-copies the parts of a `FetchOptions` that are borrowed from the
+/// caller (a URL built with `std.fmt.allocPrint` into an arena, a JSON
+/// payload, per-request headers) into memory this module owns outright,
+/// plus a private response buffer instead of writing into the caller's own
+/// `response_writer`. Needed because `fetchWithTimeout` may detach the
+/// thread running the actual request and return to the caller — which can
+/// then free its arena/stack frame — while that thread keeps running. Every
+/// byte the thread touches from this point on must be reachable only
+/// through `FetchShared`, never through the original `FetchOptions`, or an
+/// abandoned request becomes a use-after-free instead of a plain memory
+/// leak. On the normal (non-timeout) path this is freed right away by
+/// `freeShared`; on timeout it's deliberately never freed (see module doc).
 const FetchShared = struct {
     done: std.atomic.Value(bool) = .init(false),
+    result: http.Client.FetchError!http.Client.FetchResult = undefined,
+    body: Io.Writer.Allocating,
+    url: []const u8,
+    payload: ?[]const u8,
+    extra_headers: []const http.Header,
 };
 
-fn fetchAndFlag(
-    client: *http.Client,
-    options: http.Client.FetchOptions,
-    shared: *FetchShared,
-    out: *(http.Client.FetchError!http.Client.FetchResult),
-) void {
-    out.* = client.fetch(options);
+fn dupeHeaders(allocator: std.mem.Allocator, headers: []const http.Header) ![]http.Header {
+    const out = try allocator.alloc(http.Header, headers.len);
+    for (headers, 0..) |h, i| {
+        out[i] = .{
+            .name = try allocator.dupe(u8, h.name),
+            .value = try allocator.dupe(u8, h.value),
+        };
+    }
+    return out;
+}
+
+fn freeHeaders(allocator: std.mem.Allocator, headers: []const http.Header) void {
+    for (headers) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    }
+    allocator.free(headers);
+}
+
+fn freeShared(allocator: std.mem.Allocator, shared: *FetchShared) void {
+    shared.body.deinit();
+    allocator.free(shared.url);
+    if (shared.payload) |p| allocator.free(p);
+    freeHeaders(allocator, shared.extra_headers);
+    allocator.destroy(shared);
+}
+
+fn fetchAndFlag(client: *http.Client, base_options: http.Client.FetchOptions, shared: *FetchShared) void {
+    var opts = base_options;
+    opts.location = .{ .url = shared.url };
+    opts.payload = shared.payload;
+    opts.extra_headers = shared.extra_headers;
+    opts.response_writer = &shared.body.writer;
+    shared.result = client.fetch(opts);
     shared.done.store(true, .release);
 }
 
-/// Runs `client.fetch(options)` with a hard wall-clock deadline of
-/// `timeout_ns` (see module doc for why this exists at all). Returns
-/// `error.RequestTimedOut` if it doesn't finish in time.
-fn fetchWithTimeout(client: *http.Client, options: http.Client.FetchOptions, timeout_ns: u64) !http.Client.FetchResult {
-    const io = client.io;
-    var shared: FetchShared = .{};
-    var out: http.Client.FetchError!http.Client.FetchResult = undefined;
+/// Builds the heap-owned `FetchShared` for one request. Split out from
+/// `fetchWithTimeout` so its `errdefer`s stay scoped to just the cloning
+/// itself: an `errdefer` guards everything from its declaration to the end
+/// of the *enclosing function*, so if these lived inline in
+/// `fetchWithTimeout` they'd still be armed all the way through
+/// `try shared.result` far below — double-freeing `shared`'s contents
+/// alongside the later, correct `defer freeShared(...)` on any request
+/// that legitimately fails (a very ordinary outcome, not a bug on its own)
+/// instead of only on a real setup-time allocation failure. Confirmed live
+/// by this file's own test suite: two matrix crypto tests whose HTTP send
+/// fails as expected crashed with a general-protection fault inside a
+/// second, spurious `freeHeaders` call.
+fn buildFetchShared(gpa: std.mem.Allocator, options: http.Client.FetchOptions) !*FetchShared {
+    const url = switch (options.location) {
+        .url => |u| u,
+        .uri => unreachable,
+    };
 
-    var future = try Io.concurrent(io, fetchAndFlag, .{ client, options, &shared, &out });
+    const shared = try gpa.create(FetchShared);
+    errdefer gpa.destroy(shared);
+    const url_copy = try gpa.dupe(u8, url);
+    errdefer gpa.free(url_copy);
+    const payload_copy = if (options.payload) |p| try gpa.dupe(u8, p) else null;
+    errdefer if (payload_copy) |p| gpa.free(p);
+    const headers_copy = try dupeHeaders(gpa, options.extra_headers);
+    errdefer freeHeaders(gpa, headers_copy);
+    shared.* = .{ .body = .init(gpa), .url = url_copy, .payload = payload_copy, .extra_headers = headers_copy };
+    return shared;
+}
+
+/// Also its own function for the same reason as `buildFetchShared`: an
+/// `errdefer` here needs to free `shared` only if spawning genuinely
+/// fails, without staying armed into `fetchWithTimeout`'s later, normal
+/// `defer freeShared(...)` on the request-completed-but-failed path.
+fn spawnFetch(client: *http.Client, options: http.Client.FetchOptions, shared: *FetchShared) !std.Thread {
+    errdefer freeShared(client.allocator, shared);
+    return std.Thread.spawn(.{}, fetchAndFlag, .{ client, options, shared });
+}
+
+/// Runs `client.fetch(options)` with a hard wall-clock deadline of
+/// `timeout_ns` (see module doc for why this exists, and why it detaches
+/// rather than cancels). Returns `error.RequestTimedOut` if it doesn't
+/// finish in time. `options.location` must be `.url` — the only variant
+/// this module ever builds.
+fn fetchWithTimeout(client: *http.Client, options: http.Client.FetchOptions, timeout_ns: u64) !http.Client.FetchResult {
+    const gpa = client.allocator;
+    const shared = try buildFetchShared(gpa, options);
+    const thread = try spawnFetch(client, options, shared);
 
     var waited_ns: u64 = 0;
     while (!shared.done.load(.acquire) and waited_ns < timeout_ns) {
         const step = @min(poll_interval_ns, timeout_ns - waited_ns);
-        Io.sleep(io, .fromNanoseconds(@intCast(step)), .awake) catch break;
+        Io.sleep(client.io, .fromNanoseconds(@intCast(step)), .awake) catch break;
         waited_ns += step;
     }
 
     if (shared.done.load(.acquire)) {
-        _ = future.await(io);
-        return out;
+        thread.join();
+        defer freeShared(gpa, shared);
+        const result = try shared.result;
+        if (options.response_writer) |w| try w.writeAll(shared.body.writer.buffered());
+        return result;
     }
-    // Blocks until the task actually unwinds (see module doc) — safe for
-    // `options.response_writer` to keep pointing at the caller's stack.
-    _ = future.cancel(io);
+
+    // Deliberately not joined or freed — see module doc and `FetchShared`'s
+    // doc comment for why this is a bounded leak, not a use-after-free.
+    thread.detach();
     return error.RequestTimedOut;
 }
 
@@ -356,22 +457,80 @@ pub const SseLineSink = struct {
     onLine: *const fn (ptr: *anyopaque, line: []const u8) anyerror!void,
 };
 
-const StreamShared = struct {
-    done: std.atomic.Value(bool) = .init(false),
+/// Wraps a caller's `SseLineSink` so it can be silenced after the fact:
+/// once `abandoned` is set, `onLine` becomes a no-op instead of touching
+/// `inner.ptr` — needed because `postJsonSSE` may detach the thread that
+/// calls it and return to a caller who then frees whatever `inner.ptr`
+/// pointed at. `abandoned` is set right before detaching, so every
+/// subsequent call becomes safe; the one call that might already be
+/// in-flight at that exact instant is the only window this can't close —
+/// same inherent limit as any non-preemptive cancellation, see this file's
+/// module doc for why a real (blocking, wait-for-unwind) cancel isn't safe
+/// to rely on here either.
+const SinkGuard = struct {
+    inner: SseLineSink,
+    abandoned: std.atomic.Value(bool) = .init(false),
+
+    fn sink(self: *SinkGuard) SseLineSink {
+        return .{ .ptr = self, .onLine = onLine };
+    }
+    fn onLine(ptr: *anyopaque, line: []const u8) anyerror!void {
+        const self: *SinkGuard = @ptrCast(@alignCast(ptr));
+        if (self.abandoned.load(.acquire)) return;
+        return self.inner.onLine(self.inner.ptr, line);
+    }
 };
 
-fn streamJsonSSEAndFlag(
-    client: *http.Client,
-    allocator: std.mem.Allocator,
+/// See `FetchShared`'s doc comment for the general reasoning — same idea
+/// for the streaming path. `url`/`payload`/`extra_headers` are owned
+/// copies rather than the caller's own memory. Internal buffers
+/// (`postJsonSSEOnce`'s redirect/decompress buffers) are allocated from
+/// `client.allocator` rather than the caller-supplied allocator once this
+/// runs on its own thread, since that allocator may be an arena the caller
+/// frees the moment `postJsonSSE` returns `error.RequestTimedOut`.
+const StreamShared = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    result: anyerror!void = undefined,
     url: []const u8,
-    extra_headers: []const http.Header,
     payload: []const u8,
-    sink: SseLineSink,
-    shared: *StreamShared,
-    out: *anyerror!void,
-) void {
-    out.* = postJsonSSEOnce(client, allocator, url, extra_headers, payload, sink);
+    extra_headers: []const http.Header,
+    sink_guard: SinkGuard,
+};
+
+fn freeStreamShared(allocator: std.mem.Allocator, shared: *StreamShared) void {
+    allocator.free(shared.url);
+    allocator.free(shared.payload);
+    freeHeaders(allocator, shared.extra_headers);
+    allocator.destroy(shared);
+}
+
+fn streamJsonSSEAndFlag(client: *http.Client, gpa: std.mem.Allocator, shared: *StreamShared) void {
+    shared.result = postJsonSSEOnce(client, gpa, shared.url, shared.extra_headers, shared.payload, shared.sink_guard.sink());
     shared.done.store(true, .release);
+}
+
+/// Split out for the same reason as `fetchWithTimeout`'s
+/// `buildFetchShared`/`spawnFetch` — see those doc comments. An `errdefer`
+/// declared inline in `postJsonSSE` would still be armed by the time
+/// `shared.result` (an ordinary request failure, not a bug) propagates out
+/// near the bottom of that function, double-freeing alongside the later
+/// `defer freeStreamShared(...)`.
+fn buildStreamShared(gpa: std.mem.Allocator, url: []const u8, extra_headers: []const http.Header, payload: []const u8, sink: SseLineSink) !*StreamShared {
+    const shared = try gpa.create(StreamShared);
+    errdefer gpa.destroy(shared);
+    const url_copy = try gpa.dupe(u8, url);
+    errdefer gpa.free(url_copy);
+    const payload_copy = try gpa.dupe(u8, payload);
+    errdefer gpa.free(payload_copy);
+    const headers_copy = try dupeHeaders(gpa, extra_headers);
+    errdefer freeHeaders(gpa, headers_copy);
+    shared.* = .{ .url = url_copy, .payload = payload_copy, .extra_headers = headers_copy, .sink_guard = .{ .inner = sink } };
+    return shared;
+}
+
+fn spawnStream(client: *http.Client, gpa: std.mem.Allocator, shared: *StreamShared) !std.Thread {
+    errdefer freeStreamShared(gpa, shared);
+    return std.Thread.spawn(.{}, streamJsonSSEAndFlag, .{ client, gpa, shared });
 }
 
 /// Like `postJson`, but for a Server-Sent-Events endpoint (`"stream":true`
@@ -380,11 +539,10 @@ fn streamJsonSSEAndFlag(
 /// whole response before returning. Each caller (the LLM provider adapters)
 /// owns interpreting the lines itself, since SSE payload shapes differ per
 /// API; this only handles the shared transport mechanics (connect, send,
-/// read-loop, timeout) — same `Io.concurrent` + done-flag + `Future.cancel`
-/// timeout pattern as `fetchWithTimeout`, just wrapping a read-loop instead
-/// of one blocking `client.fetch()` call, with the same cancellation-safety
-/// property: `cancel` blocks until the task has actually unwound, so it's
-/// safe for `sink` to keep pointing at the caller's stack/state.
+/// read-loop, timeout) — same detach-on-timeout pattern as
+/// `fetchWithTimeout`, just wrapping a read-loop instead of one blocking
+/// `client.fetch()` call. See this file's module doc for why detaching
+/// (not a blocking `Future.cancel`) is the safe choice here.
 ///
 /// Unlike every other helper in this file, this does NOT retry on a
 /// transient connection error once streaming has begun (any line already
@@ -394,6 +552,10 @@ fn streamJsonSSEAndFlag(
 /// state it's built up so far. A failure after the first line is a hard
 /// error, same as any other request failure the caller (`toolcall.run` via
 /// the LLM provider adapters) already knows how to surface.
+///
+/// `allocator` is accepted for API-compatibility with existing callers but
+/// deliberately unused — see `StreamShared`'s doc comment for why the
+/// implementation only ever uses `client.allocator` now.
 pub fn postJsonSSE(
     client: *http.Client,
     allocator: std.mem.Allocator,
@@ -403,24 +565,26 @@ pub fn postJsonSSE(
     timeout_ns: u64,
     sink: SseLineSink,
 ) !void {
-    const io = client.io;
-    var shared: StreamShared = .{};
-    var out: anyerror!void = undefined;
-
-    var future = try Io.concurrent(io, streamJsonSSEAndFlag, .{ client, allocator, url, extra_headers, payload, sink, &shared, &out });
+    _ = allocator;
+    const gpa = client.allocator;
+    const shared = try buildStreamShared(gpa, url, extra_headers, payload, sink);
+    const thread = try spawnStream(client, gpa, shared);
 
     var waited_ns: u64 = 0;
     while (!shared.done.load(.acquire) and waited_ns < timeout_ns) {
         const step = @min(poll_interval_ns, timeout_ns - waited_ns);
-        Io.sleep(io, .fromNanoseconds(@intCast(step)), .awake) catch break;
+        Io.sleep(client.io, .fromNanoseconds(@intCast(step)), .awake) catch break;
         waited_ns += step;
     }
 
     if (shared.done.load(.acquire)) {
-        _ = future.await(io);
-        return out;
+        thread.join();
+        defer freeStreamShared(gpa, shared);
+        return shared.result;
     }
-    _ = future.cancel(io);
+
+    shared.sink_guard.abandoned.store(true, .release);
+    thread.detach();
     return error.RequestTimedOut;
 }
 
@@ -488,6 +652,57 @@ fn postJsonSSEOnce(
     defer if (decompress_buffer.len > 0) allocator.free(decompress_buffer);
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     return drainSseLines(reader, sink);
+}
+
+test "getWithTimeout returns RequestTimedOut instead of hanging forever when a peer accepts the connection but never responds (regression: production hang 2026-07-21)" {
+    const io = testing.io;
+
+    var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    // Accepts the connection and then goes silent forever: no read, no
+    // write, no close. This is exactly what the real remote peer did in
+    // production — not a connection error (which already retries/fails
+    // fast), but a peer that looks alive and simply never answers. That's
+    // the one failure mode `std.http.Client` has no way to bound on its
+    // own (see this file's module doc), and the one the old
+    // `Io.concurrent` + `Future.cancel` implementation couldn't actually
+    // escape either, since cancellation only fires at `Io`-native
+    // cancelation points that a stuck raw socket read never reaches.
+    const Acceptor = struct {
+        fn run(srv: *Io.net.Server, accept_io: Io) void {
+            var conn = srv.accept(accept_io) catch return;
+            defer conn.socket.close(accept_io);
+            Io.sleep(accept_io, .fromSeconds(30), .awake) catch {};
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Acceptor.run, .{ &server, io });
+    defer thread.detach();
+
+    // Deliberately not `testing.allocator` and no `client.deinit()` below:
+    // this test's whole point is that the fetch thread gets abandoned
+    // still holding a live connection out of `client`'s pool, which is
+    // exactly the state `deinit()` asserts never happens
+    // (`connection_pool.used.first == null`) and which `testing.allocator`
+    // would report as a leak. Both are correct, expected consequences of
+    // this one deliberate, bounded leak — see this file's module doc — not
+    // bugs to paper over.
+    var client: http.Client = .{ .allocator = std.heap.page_allocator, .io = io };
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const started = Io.Timestamp.now(io, .real);
+    const result = getWithTimeout(&client, testing.allocator, url, 300 * std.time.ns_per_ms);
+    const elapsed_ns = Io.Timestamp.now(io, .real).toNanoseconds() - started.toNanoseconds();
+
+    try testing.expectError(error.RequestTimedOut, result);
+    // Generous upper bound — this asserts "didn't hang indefinitely," not
+    // exact timing. Failing here means the timeout mechanism regressed
+    // back to blocking on the stuck peer instead of detaching from it.
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }
 
 /// Reads `reader` line-by-line until end of stream, handing each one
