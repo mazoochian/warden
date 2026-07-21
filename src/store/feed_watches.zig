@@ -164,6 +164,28 @@ pub fn markChecked(pool: *PgPool, allocator: std.mem.Allocator, id: i64, now: i6
     _ = try stmt.step();
 }
 
+/// Bumps `last_checked_at` only, leaving `seen_guids_json` untouched
+/// (including left `NULL` if the watch was never successfully baselined).
+/// For a fetch/parse failure — `markChecked` can't be reused here since it
+/// unconditionally overwrites `seen_guids_json`, which would either wipe an
+/// existing dedup baseline or (worse) turn a `NULL` baseline into an empty
+/// one, making the next successful check treat every current item as "new"
+/// instead of recording a proper baseline. Without this, `dueForCheck`'s
+/// `last_checked_at IS NULL OR ...` picks a failing watch again on every
+/// ~30s poll tick forever — found live 2026-07-21: three watches with
+/// garbage `feed_url`s (typo'd `/watch` input meant as `/unwatch`) fetch-failed
+/// continuously for 16+ hours, one retry storm per poll tick.
+pub fn bumpLastChecked(pool: *PgPool, id: i64, now: i64) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("UPDATE feed_watches SET last_checked_at = to_timestamp($2) WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, id);
+    stmt.bindInt64(2, now);
+    _ = try stmt.step();
+}
+
 fn parseSeenGuidsJson(allocator: std.mem.Allocator, json_text: []const u8) ![]const []const u8 {
     var parsed = try std.json.parseFromSlice([]const []const u8, allocator, json_text, .{ .allocate = .alloc_always });
     defer parsed.deinit();

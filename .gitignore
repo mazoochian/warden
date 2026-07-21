@@ -3,6 +3,7 @@ zig-out/
 data/
 prosody/data/
 .env
+prod.env
 node_modules/
 bfg.jar
 compose.override.yaml
