@@ -71,6 +71,24 @@ pub const Config = struct {
     postgres_dsn: []const u8,
     /// Size of the Postgres connection pool (see `store/pool.zig`).
     postgres_pool_size: usize,
+    /// How long `PgPool.acquire` waits for a free connection before giving
+    /// up with `error.PoolExhausted` instead of blocking forever — see
+    /// `store/pool.zig`'s doc comment for why an unbounded wait here used to
+    /// be able to wedge every platform's message handling permanently.
+    postgres_acquire_timeout_seconds: i64,
+    /// Server-side `statement_timeout` set on every pooled connection right
+    /// after connecting (see `store/db.zig`'s `Db.open`) — bounds a single
+    /// wedged query so it can't hold a pool slot forever even once
+    /// connected, complementing `postgres_acquire_timeout_seconds` above.
+    postgres_statement_timeout_seconds: i64,
+    /// Worker threads per platform connector that actually run
+    /// `processMessageTask` (see `main.zig`'s `WorkerPool` usage). Defaults
+    /// to whatever gives real parallelism regardless of how few cores the
+    /// host has — see `default_workers_per_platform`'s doc comment for why
+    /// this can no longer be left to Zig's own (unconfigurable, CPU-count-
+    /// derived, and silently-degrading-to-zero-on-a-1-vCPU-host) `Io.Group`
+    /// pool.
+    workers_per_platform: usize,
     /// Per-chat message retention: keep only the most recent N messages.
     retention_messages: i64,
     llm: LlmConfig,
@@ -182,6 +200,21 @@ pub const Config = struct {
         else
             default_postgres_pool_size;
 
+        const postgres_acquire_timeout_seconds: i64 = if (env.get("WARDEN_POSTGRES_ACQUIRE_TIMEOUT_SECONDS")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_postgres_acquire_timeout_seconds
+        else
+            default_postgres_acquire_timeout_seconds;
+
+        const postgres_statement_timeout_seconds: i64 = if (env.get("WARDEN_POSTGRES_STATEMENT_TIMEOUT_SECONDS")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_postgres_statement_timeout_seconds
+        else
+            default_postgres_statement_timeout_seconds;
+
+        const workers_per_platform: usize = if (env.get("WARDEN_WORKERS_PER_PLATFORM")) |raw|
+            std.fmt.parseInt(usize, raw, 10) catch defaultWorkersPerPlatform()
+        else
+            defaultWorkersPerPlatform();
+
         const retention_messages: i64 = if (env.get("WARDEN_RETENTION_MESSAGES")) |raw|
             std.fmt.parseInt(i64, raw, 10) catch default_retention_messages
         else
@@ -242,6 +275,9 @@ pub const Config = struct {
             .owners = owners,
             .postgres_dsn = postgres_dsn,
             .postgres_pool_size = postgres_pool_size,
+            .postgres_acquire_timeout_seconds = postgres_acquire_timeout_seconds,
+            .postgres_statement_timeout_seconds = postgres_statement_timeout_seconds,
+            .workers_per_platform = workers_per_platform,
             .retention_messages = retention_messages,
             .llm = llm,
             .confirm_timeout_seconds = confirm_timeout_seconds,
@@ -384,6 +420,25 @@ pub const Config = struct {
 
     pub const default_retention_messages: i64 = 20_000;
     pub const default_postgres_pool_size: usize = 10;
+    pub const default_postgres_acquire_timeout_seconds: i64 = 30;
+    pub const default_postgres_statement_timeout_seconds: i64 = 30;
+
+    /// Floor of 2 regardless of detected core count: on a 1-vCPU host,
+    /// Zig's own implicit `Io.Threaded` async pool sizes itself to
+    /// `cpu_count - 1` (`0` slots here — confirmed live on the production
+    /// VPS), which silently defeats per-message concurrency entirely
+    /// (`Io.Group.async` falls back to running inline on the caller instead
+    /// of queuing once its bounded pool is exhausted). `WorkerPool` is a
+    /// warden-owned pool of real `std.Thread`s instead, so it isn't subject
+    /// to that limit — but a "1 worker" default would still let a single
+    /// stuck message wedge the whole platform forever, exactly the bug this
+    /// replaces, so 2 is the true minimum useful value even on the smallest
+    /// possible host. Scales up automatically on beefier hardware; override
+    /// with `WARDEN_WORKERS_PER_PLATFORM` to tune either direction.
+    fn defaultWorkersPerPlatform() usize {
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        return @max(2, cpu_count);
+    }
     pub const default_confirm_timeout_seconds: i64 = 60;
     pub const default_convert_timeout_seconds: i64 = 300;
     pub const default_digest_interval_seconds: i64 = 86_400;

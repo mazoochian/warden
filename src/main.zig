@@ -36,6 +36,7 @@ const wordcloud = @import("features/wordcloud.zig");
 const digest = @import("features/digest.zig");
 const scheduler = @import("features/scheduler.zig");
 const convert_file = @import("tools/convert_file.zig");
+const worker_pool = @import("worker_pool.zig");
 
 const base_tools = [_]tool_registry.ToolDef{
     @import("tools/calculator.zig").tool,
@@ -184,6 +185,16 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
+    // Docker's `HEALTHCHECK` (see `Dockerfile`) spawns this same binary as a
+    // brand-new process on a timer rather than reaching into the running
+    // one — there was previously no liveness signal at all, so a fully
+    // wedged-but-still-running process (see `PgPool`'s and `WorkerPool`'s
+    // doc comments for how that happened in production) looked identical to
+    // a healthy one from `docker ps`'s point of view. Checked before
+    // anything else (config load included) so a healthcheck probe never
+    // waits on, or fails because of, the bot's own startup dependencies.
+    if (wantsHealthcheck(init.minimal.args)) runHealthcheck(gpa, io, init.environ_map);
+
     const config = config_mod.Config.load(init.environ_map, init.arena.allocator(), io) catch |err| {
         std.log.err("config error: {t} (did you set WARDEN_TELEGRAM_BOT_TOKEN and WARDEN_POSTGRES_DSN?)", .{err});
         return err;
@@ -237,7 +248,14 @@ pub fn main(init: std.process.Init) !void {
     const connectors: []const iface.Connector = connectors_buf[0..connectors_len];
     const max_message_len = effectiveMaxMessageLength(connectors);
 
-    var pool = try store_pool.PgPool.init(gpa, io, config.postgres_dsn, config.postgres_pool_size);
+    var pool = try store_pool.PgPool.init(
+        gpa,
+        io,
+        config.postgres_dsn,
+        config.postgres_pool_size,
+        @intCast(config.postgres_acquire_timeout_seconds * std.time.ns_per_s),
+        config.postgres_statement_timeout_seconds,
+    );
     defer pool.deinit();
     {
         const db = try pool.acquire();
@@ -298,11 +316,17 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    // Long-lived: every per-message task, and now every connector's own
-    // poll loop below, is spawned into this one group (never awaited/
-    // canceled during normal operation — see `Group`'s doc comment on why
-    // that's fine for a repeatedly-added-to, long-lived group).
-    var worker_group: Io.Group = .init;
+    // One timestamp per connector (last successful `poll()` return) plus
+    // one for `main`'s own scheduler loop below — the only cross-process
+    // liveness signal that exists (see `runHealthcheck`/`selfWatchdogLoop`).
+    // Sized/allocated before any poll loop starts so every connector has a
+    // slot regardless of whether its own startup below succeeds; a
+    // connector that never starts simply never stamps its slot, which
+    // correctly reads as permanently unhealthy rather than "absent."
+    var heartbeat = Heartbeat.init(gpa, connectors) catch |err| {
+        std.log.err("failed to allocate heartbeat state: {t}", .{err});
+        return err;
+    };
 
     // One persistent poll loop per connector, running concurrently —
     // previously a single loop polled every connector in turn, so one
@@ -315,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
     // connectors, and never got revisited.
     //
     // Real OS threads (`std.Thread.spawn`), deliberately NOT
-    // `worker_group.async`: `Io.Threaded`'s async/group pool is bounded
+    // `Io.Group.async`: `Io.Threaded`'s async/group pool is bounded
     // (`cpu_count - 1` slots — see its `async_limit`), and once that pool
     // is exhausted, a further `.async()` call doesn't queue, it runs the
     // function *synchronously inline on the calling thread* instead.
@@ -326,8 +350,26 @@ pub fn main(init: std.process.Init) !void {
     // instead of running concurrently, hanging real requests. Raw threads
     // sidestep the pool entirely; `io` itself is safe to call from any
     // thread; `.detach()` since these run forever and are never joined,
-    // matching how nothing here ever joins `worker_group`'s tasks either.
-    for (connectors) |connector| {
+    // matching how nothing here ever joins a `WorkerPool`'s tasks either.
+    //
+    // Each connector also gets its own `MessageWorkerPool` — real
+    // `std.Thread`s sized off `config.workers_per_platform` (floor of 2
+    // regardless of detected cores) — replacing the old single, process-
+    // wide `Io.Group` that funneled every platform's messages through
+    // Zig's own implicit, unconfigurable `Io.Threaded` async pool (bounded
+    // to `cpu_count - 1` slots — `0` on the production VPS's single vCPU,
+    // which silently defeated per-message concurrency entirely; see
+    // `worker_pool.zig`'s module doc for the full story). Isolated per
+    // platform so a Telegram backlog can never starve Matrix/XMPP
+    // processing or vice versa, same isolation principle as the dedicated
+    // poll thread itself. A pool that fails to start (thread-spawn
+    // failure — the process is already in a bad way) skips that
+    // connector's poll loop too rather than aborting every platform.
+    for (connectors, 0..) |connector, i| {
+        const msg_pool = MessageWorkerPool.init(gpa, io, config.workers_per_platform, MessageTask.run) catch |err| {
+            std.log.err("failed to start worker pool for {t}: {t}", .{ connector.platform(), err });
+            continue;
+        };
         const thread = std.Thread.spawn(.{}, connectorPollLoop, .{
             connector,
             &config,
@@ -340,12 +382,29 @@ pub fn main(init: std.process.Init) !void {
             io,
             gpa,
             max_message_len,
-            &worker_group,
+            msg_pool,
+            &heartbeat,
+            i,
         }) catch |err| {
             std.log.err("failed to start poll loop thread for {t}: {t}", .{ connector.platform(), err });
             continue;
         };
         thread.detach();
+    }
+
+    // Guarantees recovery even if nothing external is watching the
+    // `Dockerfile` HEALTHCHECK's result — Docker does not restart a
+    // container merely because it reports unhealthy, only
+    // `restart: unless-stopped` (already set in `compose.yaml`) reacting to
+    // the *process* actually exiting does that. Generous stale threshold
+    // (well above any legitimate poll/scheduler cadence) so this never
+    // fires on a merely slow, still-alive bot. A failure to even start this
+    // thread is logged, not fatal — the bot still runs, just without the
+    // extra self-healing safety net.
+    if (std.Thread.spawn(.{}, selfWatchdogLoop, .{ io, &heartbeat })) |thread| {
+        thread.detach();
+    } else |err| {
+        std.log.warn("failed to start self-watchdog thread: {t}", .{err});
     }
 
     // Due-digest/reminder/alert/feed checks used to piggyback on the old
@@ -359,7 +418,162 @@ pub fn main(init: std.process.Init) !void {
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
         pending_conversions.sweepExpired(gpa, now);
+        heartbeat.stampScheduler(now);
+        heartbeat.writeToFile(io, gpa, config.tmp_dir);
         Io.sleep(io, .fromSeconds(30), .awake) catch {};
+    }
+}
+
+/// Filename (under `Config.tmp_dir`) `Heartbeat.writeToFile` writes to and
+/// `runHealthcheck` reads back — the only cross-process liveness signal
+/// that exists, since Docker's `HEALTHCHECK` (see `Dockerfile`) spawns a
+/// brand-new instance of this same binary rather than reaching into the
+/// running one.
+const heartbeat_filename = "heartbeat";
+
+/// How stale a heartbeat line can get before `--healthcheck` reports
+/// unhealthy — a generous multiple of the ~30s scheduler cadence that
+/// writes it, so a merely slow (not stuck) tick never trips this.
+const healthcheck_stale_seconds: i64 = 120;
+
+/// How stale before the in-process watchdog gives up waiting for an
+/// external monitor and self-exits instead (see `selfWatchdogLoop`) — much
+/// more generous than `healthcheck_stale_seconds` since this is the last
+/// resort, not the first signal.
+const watchdog_stale_seconds: i64 = 300;
+
+/// One timestamp per connector (index-aligned with `main`'s `connectors`
+/// slice) plus one for the top-level scheduler loop — see `main`'s call
+/// sites for where each gets stamped. `std.atomic.Value` since connector
+/// poll threads, the scheduler loop, and the self-watchdog thread all touch
+/// this concurrently with no other synchronization.
+const Heartbeat = struct {
+    connector_platforms: []const iface.Platform,
+    connector_last_ok: []std.atomic.Value(i64),
+    scheduler_last_tick: std.atomic.Value(i64) = .init(0),
+
+    fn init(gpa: std.mem.Allocator, connectors: []const iface.Connector) !Heartbeat {
+        const last_ok = try gpa.alloc(std.atomic.Value(i64), connectors.len);
+        for (last_ok) |*slot| slot.* = .init(0);
+        const platforms = try gpa.alloc(iface.Platform, connectors.len);
+        for (connectors, platforms) |c, *p| p.* = c.platform();
+        return .{ .connector_platforms = platforms, .connector_last_ok = last_ok };
+    }
+
+    fn stampConnector(self: *Heartbeat, idx: usize, now: i64) void {
+        self.connector_last_ok[idx].store(now, .release);
+    }
+
+    fn stampScheduler(self: *Heartbeat, now: i64) void {
+        self.scheduler_last_tick.store(now, .release);
+    }
+
+    /// `true` if every tracked timestamp is within `stale_seconds` of `now`
+    /// — shared logic between `runHealthcheck` (reading a written file, a
+    /// separate process) and `selfWatchdogLoop` (reading this same live
+    /// struct in-process).
+    fn allFreshInMemory(self: *const Heartbeat, now: i64, stale_seconds: i64) bool {
+        if (now - self.scheduler_last_tick.load(.acquire) > stale_seconds) return false;
+        for (self.connector_last_ok) |*slot| {
+            if (now - slot.load(.acquire) > stale_seconds) return false;
+        }
+        return true;
+    }
+
+    /// Serializes every timestamp to `<tmp_dir>/heartbeat` as plain
+    /// `name=unix_timestamp` lines — read back by `runHealthcheck` in a
+    /// separate process invocation. Best-effort: a write failure (disk
+    /// full, permissions) shouldn't crash the bot, just skip this cycle's
+    /// external health visibility — the in-process `selfWatchdogLoop` still
+    /// covers actual recovery regardless of whether this file is ever
+    /// read.
+    fn writeToFile(self: *const Heartbeat, io: Io, gpa: std.mem.Allocator, tmp_dir: []const u8) void {
+        Io.Dir.cwd().createDirPath(io, tmp_dir) catch |err| {
+            std.log.warn("heartbeat: couldn't create tmp_dir '{s}': {t}", .{ tmp_dir, err });
+            return;
+        };
+        const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ tmp_dir, heartbeat_filename }) catch return;
+        defer gpa.free(path);
+
+        var buf: Io.Writer.Allocating = .init(gpa);
+        defer buf.deinit();
+        buf.writer.print("scheduler={d}\n", .{self.scheduler_last_tick.load(.acquire)}) catch return;
+        for (self.connector_platforms, self.connector_last_ok) |platform, *slot| {
+            buf.writer.print("{t}={d}\n", .{ platform, slot.load(.acquire) }) catch return;
+        }
+
+        var file = Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
+            std.log.warn("heartbeat: couldn't write '{s}': {t}", .{ path, err });
+            return;
+        };
+        defer file.close(io);
+        var file_writer = file.writer(io, &.{});
+        file_writer.interface.writeAll(buf.writer.buffered()) catch |err| {
+            std.log.warn("heartbeat: couldn't write '{s}': {t}", .{ path, err });
+            return;
+        };
+        file_writer.interface.flush() catch {};
+    }
+};
+
+/// `true` if any argument (skipping argv[0]) is exactly `--healthcheck` —
+/// the flag `Dockerfile`'s `HEALTHCHECK` passes to probe liveness (see
+/// `runHealthcheck`).
+fn wantsHealthcheck(args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.skip(); // argv[0]
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--healthcheck")) return true;
+    }
+    return false;
+}
+
+/// Reads `<WARDEN_TMP_DIR>/heartbeat` (same env var `Config.load` uses,
+/// read directly here since a healthcheck probe shouldn't have to satisfy
+/// every other config requirement, e.g. a bot token, just to check
+/// liveness) and exits `0` if every recorded timestamp is fresh, `1`
+/// otherwise — including when the file is missing/unreadable (a normal
+/// state during the container's `--start-period` grace window, which
+/// Docker itself already accounts for on its side). Never returns.
+fn runHealthcheck(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map) noreturn {
+    const tmp_dir = env.get("WARDEN_TMP_DIR") orelse "data/tmp";
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ tmp_dir, heartbeat_filename }) catch std.process.exit(1);
+    defer gpa.free(path);
+
+    const contents = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch {
+        std.process.exit(1);
+    };
+    defer gpa.free(contents);
+
+    const now = Io.Timestamp.now(io, .real).toSeconds();
+    var healthy = true;
+    var seen_any = false;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const ts = std.fmt.parseInt(i64, line[eq + 1 ..], 10) catch continue;
+        seen_any = true;
+        if (now - ts > healthcheck_stale_seconds) healthy = false;
+    }
+    std.process.exit(if (healthy and seen_any) 0 else 1);
+}
+
+/// Reads the same in-process `Heartbeat` the poll loops/scheduler stamp
+/// directly (no file round-trip needed here, unlike `runHealthcheck`) and
+/// self-exits if anything has gone stale past `watchdog_stale_seconds` —
+/// guarantees actual recovery via `compose.yaml`'s `restart: unless-stopped`
+/// even if nothing external is watching the `Dockerfile` HEALTHCHECK's
+/// result (Docker itself does not restart a container merely because it
+/// reports unhealthy). Never returns under normal operation.
+fn selfWatchdogLoop(io: Io, heartbeat: *Heartbeat) void {
+    while (true) {
+        Io.sleep(io, .fromSeconds(60), .awake) catch return;
+        const now = Io.Timestamp.now(io, .real).toSeconds();
+        if (!heartbeat.allFreshInMemory(now, watchdog_stale_seconds)) {
+            std.log.err("self-watchdog: a connector or the scheduler has gone stale for over {d}s — exiting so the container restarts", .{watchdog_stale_seconds});
+            std.process.exit(1);
+        }
     }
 }
 
@@ -379,7 +593,9 @@ fn connectorPollLoop(
     io: Io,
     gpa: std.mem.Allocator,
     max_message_len: usize,
-    worker_group: *Io.Group,
+    msg_pool: *MessageWorkerPool,
+    heartbeat: *Heartbeat,
+    connector_idx: usize,
 ) void {
     while (true) {
         var poll_arena = std.heap.ArenaAllocator.init(gpa);
@@ -408,15 +624,21 @@ fn connectorPollLoop(
             continue;
         };
 
+        // Stamped on every successful cycle, whether or not it returned any
+        // messages — an empty-but-successful poll already proves this
+        // connector isn't wedged, which is all `runHealthcheck`/
+        // `selfWatchdogLoop` need to know.
+        heartbeat.stampConnector(connector_idx, Io.Timestamp.now(io, .real).toSeconds());
+
         for (polled_messages) |msg| {
             const ts = Io.Timestamp.now(io, .real).toSeconds();
 
             // Each task owns an arena for its whole lifetime, created here
             // (not shared with `poll_arena`, which this cycle frees as
-            // soon as every message in it has been spawned off) and freed
-            // by the task itself when it's done. `msg` is duped into it
-            // right away, before `poll_arena` can be freed out from under
-            // a task that hasn't started yet.
+            // soon as every message in it has been queued) and freed by the
+            // task itself when it's done. `msg` is duped into it right
+            // away, before `poll_arena` can be freed out from under a task
+            // that hasn't started yet.
             const task_arena = gpa.create(std.heap.ArenaAllocator) catch |err| {
                 std.log.err("failed to allocate task arena: {t}", .{err});
                 continue;
@@ -429,22 +651,37 @@ fn connectorPollLoop(
                 continue;
             };
 
-            worker_group.async(io, processMessageTask, .{
-                connector,
-                config,
-                pool,
-                llm_provider,
-                tools,
-                pending,
-                digest_scheduler,
-                pending_conversions,
-                io,
-                gpa,
-                ts,
-                max_message_len,
-                task_arena,
-                duped_msg,
-            });
+            // Enqueued onto this connector's own `MessageWorkerPool` instead
+            // of spawned via `Io.Group.async` — `push` never blocks on
+            // processing, so this loop always gets straight back to
+            // `connector.poll()` regardless of how backed up the queue is,
+            // and a stuck message only ever occupies one of N worker
+            // threads instead of this poll loop's own thread (see
+            // `worker_pool.zig`'s module doc).
+            msg_pool.push(.{
+                .connector = connector,
+                .config = config,
+                .pool = pool,
+                .llm_provider = llm_provider,
+                .tools = tools,
+                .pending = pending,
+                .digest_scheduler = digest_scheduler,
+                .pending_conversions = pending_conversions,
+                .io = io,
+                .gpa = gpa,
+                .ts = ts,
+                .max_message_len = max_message_len,
+                .task_arena = task_arena,
+                .msg = duped_msg,
+            }) catch |err| {
+                // Queueing itself failed (OOM growing the queue's backing
+                // array) — `processMessageTask` never got a chance to free
+                // `task_arena`, so this is the one place that has to do it
+                // instead of leaking it.
+                std.log.err("failed to queue message for chat {s}: {t}", .{ msg.chat_id, err });
+                task_arena.deinit();
+                gpa.destroy(task_arena);
+            };
         }
     }
 }
@@ -492,10 +729,56 @@ fn sendTextOrFile(connector: iface.Connector, a: std.mem.Allocator, chat_id: []c
     connector.sendDocument(a, chat_id, text, filename, "That was too long for a single message — attached as a file.");
 }
 
-/// Body of one spawned per-message task (see `worker_group` above). Owns
-/// `task_arena` end-to-end: created by the caller right before spawning
-/// (so `duped_msg` has somewhere stable to live), destroyed here once this
-/// message is fully handled.
+/// One connector's own per-message `WorkerPool` (see `connectorPollLoop`'s
+/// call site doc comment for why each connector gets its own instead of
+/// sharing one process-wide pool).
+const MessageWorkerPool = worker_pool.WorkerPool(MessageTask);
+
+/// Bundles every argument `processMessageTask` needs into one plain-data
+/// value so it can travel through `MessageWorkerPool`'s queue (see
+/// `worker_pool.zig`'s doc comment on `Item`) — the pool's worker threads
+/// call `MessageTask.run` directly instead of the old
+/// `worker_group.async(io, processMessageTask, .{...})` call.
+const MessageTask = struct {
+    connector: iface.Connector,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    llm_provider: llm.Provider,
+    tools: []const tool_registry.ToolDef,
+    pending: *group_admin.PendingConfirmations,
+    digest_scheduler: *scheduler.DigestScheduler,
+    pending_conversions: *convert_flow.PendingConversions,
+    io: Io,
+    gpa: std.mem.Allocator,
+    ts: i64,
+    max_message_len: usize,
+    task_arena: *std.heap.ArenaAllocator,
+    msg: iface.Message,
+
+    fn run(self: MessageTask) void {
+        processMessageTask(
+            self.connector,
+            self.config,
+            self.pool,
+            self.llm_provider,
+            self.tools,
+            self.pending,
+            self.digest_scheduler,
+            self.pending_conversions,
+            self.io,
+            self.gpa,
+            self.ts,
+            self.max_message_len,
+            self.task_arena,
+            self.msg,
+        );
+    }
+};
+
+/// Body of one queued per-message task (see `MessageWorkerPool`/
+/// `MessageTask` above). Owns `task_arena` end-to-end: created by the
+/// caller right before queueing (so `duped_msg` has somewhere stable to
+/// live), destroyed here once this message is fully handled.
 fn processMessageTask(
     connector: iface.Connector,
     config: *const config_mod.Config,
@@ -2585,6 +2868,8 @@ test {
     _ = @import("xmpp/types.zig");
     _ = @import("xmpp/client.zig");
     _ = @import("domain/xmpp_profile.zig");
+    _ = @import("worker_pool.zig");
+    _ = @import("store/db.zig");
 }
 
 /// ASCII whitespace/punctuation counts as a boundary; bytes >= 0x80 do NOT,

@@ -10,7 +10,7 @@ const migrate = @import("migrate.zig").migrate;
 /// share one real database and rely on `truncateAll` for isolation.
 pub fn openTestDb(allocator: std.mem.Allocator) !?Db {
     const dsn_z = std.c.getenv("WARDEN_TEST_POSTGRES_DSN") orelse return null;
-    var db = try Db.open(allocator, std.mem.span(dsn_z));
+    var db = try Db.open(allocator, std.mem.span(dsn_z), 30);
     try migrate(&db, allocator);
     try truncateAll(&db);
     return db;

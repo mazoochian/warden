@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const data_dir = env.get("WARDEN_DATA_DIR") orelse "data/chats";
 
-    var pool = try store_pool.PgPool.init(gpa, io, postgres_dsn, 4);
+    var pool = try store_pool.PgPool.init(gpa, io, postgres_dsn, 4, 30 * std.time.ns_per_s, 30);
     defer pool.deinit();
     {
         const db = try pool.acquire();

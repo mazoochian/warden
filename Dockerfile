@@ -71,4 +71,20 @@ COPY docker-entrypoint.sh ./docker-entrypoint.sh
 # rendering), not persistent state.
 RUN chmod +x ./docker-entrypoint.sh && mkdir -p /app/data
 
+# Previously nonexistent: `docker ps`/`docker inspect` had no way to tell a
+# fully wedged-but-still-running process (confirmed in production, see
+# `main.zig`'s `Heartbeat`/`PgPool`/`WorkerPool` doc comments) from a healthy
+# one — the container just always read "up." `--healthcheck` is a mode of
+# this same binary (not a separate script/curl dependency, which isn't
+# installed in this image) that reads the heartbeat file the running
+# instance maintains and exits non-zero if anything's gone stale. Docker
+# itself does not restart a container merely because it's unhealthy — the
+# in-process self-watchdog (`selfWatchdogLoop`) plus `compose.yaml`'s
+# `restart: unless-stopped` handle actual recovery; this exists for
+# visibility (`docker ps` finally shows the true state) and as a second,
+# independent signal alongside the watchdog. `start-period` gives the bot
+# room to connect/migrate on a cold start before the first real check counts.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/app/warden", "--healthcheck"]
+
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
