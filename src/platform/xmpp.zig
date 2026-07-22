@@ -149,20 +149,44 @@ pub const XmppConnector = struct {
         return false;
     }
 
-    const ReadShared = struct { done: std.atomic.Value(bool) = .init(false) };
+    const ReadShared = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        result: anyerror!xml.ParsedElement = undefined,
+    };
 
-    fn readElementAndFlag(client: *raw.Client, allocator: std.mem.Allocator, shared: *ReadShared, out: *(anyerror!xml.ParsedElement)) void {
-        out.* = client.readElement(allocator);
+    fn readElementAndFlag(client: *raw.Client, allocator: std.mem.Allocator, shared: *ReadShared) void {
+        shared.result = client.readElement(allocator);
         shared.done.store(true, .release);
     }
 
-    /// Blocks up to `poll_timeout_ns` for one stanza, via `Io.concurrent` +
-    /// `Future.cancel` — same pattern as `http_util.zig`'s
-    /// `fetchWithTimeout`, needed here because the underlying socket read
-    /// has no built-in deadline and `main.zig`'s poll loop is single-
-    /// threaded (see this file's module doc comment). Empty slice (not an
-    /// error) on timeout, matching the vtable's documented "poll cycle
-    /// times out" contract.
+    /// Blocks up to `poll_timeout_ns` for one stanza, on a real detachable
+    /// `std.Thread` rather than `Io.concurrent` + `Future.cancel` — mirrors
+    /// `http_util.zig`'s `fetchWithTimeout` fix (see its module doc for the
+    /// full story): the underlying socket read (`Client.readElement` /
+    /// `fillMore`) is a plain blocking call with no `Io`-native
+    /// cancellation point, so `cancel()` could never actually interrupt it —
+    /// confirmed by the exact same failure mode `8dcbcd8` fixed for HTTP,
+    /// just not yet applied here: a black-holed connection left `cancel()`
+    /// blocked waiting forever for a task to unwind that never would,
+    /// freezing this connector's poll loop (and, per `main.zig`'s
+    /// `WorkerPool`/`Heartbeat` doc comments, everything downstream of it)
+    /// permanently.
+    ///
+    /// `readElement`'s allocations go through `self.allocator` (long-lived,
+    /// owned by this connector) rather than the caller's per-poll-cycle
+    /// arena — required so an abandoned thread that eventually does finish
+    /// writing into `shared` never touches memory the caller may have
+    /// already freed (same reasoning as `http_util.zig`'s `FetchShared`).
+    ///
+    /// On timeout this detaches and abandons the thread — a small, bounded
+    /// leak (the read's eventual result, if it ever arrives) — and, unlike
+    /// a one-shot HTTP request, also gives up this connector's `Client`
+    /// entirely (`self.client = null`, never `client.close()`'d: that would
+    /// free/close state the abandoned thread might still be touching,
+    /// trading a leak for a use-after-free). `Client.readElement` isn't
+    /// safe for two threads to call concurrently, so once one read might
+    /// still be in flight in the background, the only safe way to poll
+    /// again is a brand-new connection instead of reusing this one.
     fn pollFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]iface.Message {
         const self: *XmppConnector = @ptrCast(@alignCast(ptr));
 
@@ -172,9 +196,12 @@ pub const XmppConnector = struct {
         };
         const client = self.client.?;
 
-        var shared: ReadShared = .{};
-        var out: anyerror!xml.ParsedElement = undefined;
-        var future = try Io.concurrent(self.io, readElementAndFlag, .{ client, allocator, &shared, &out });
+        const shared = try self.allocator.create(ReadShared);
+        shared.* = .{};
+        const thread = std.Thread.spawn(.{}, readElementAndFlag, .{ client, self.allocator, shared }) catch |err| {
+            self.allocator.destroy(shared);
+            return err;
+        };
 
         var waited_ns: u64 = 0;
         while (!shared.done.load(.acquire) and waited_ns < poll_timeout_ns) {
@@ -184,12 +211,16 @@ pub const XmppConnector = struct {
         }
 
         if (!shared.done.load(.acquire)) {
-            _ = future.cancel(self.io);
+            // Deliberately not joined, not freed, and `client` deliberately
+            // not closed — see this function's doc comment.
+            thread.detach();
+            self.client = null;
             return &.{};
         }
-        _ = future.await(self.io);
+        thread.join();
+        defer self.allocator.destroy(shared);
 
-        var parsed = out catch |err| {
+        var parsed = shared.result catch |err| {
             std.log.warn("xmpp: connection lost ({t}), will reconnect next cycle", .{err});
             client.close();
             self.client = null;

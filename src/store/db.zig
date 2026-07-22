@@ -16,14 +16,55 @@ pub const Db = struct {
     /// `Stmt` gets its own arena off this, freed on `finalize()`.
     allocator: std.mem.Allocator,
 
-    pub fn open(allocator: std.mem.Allocator, dsn: [:0]const u8) !Db {
-        const conn = c.PQconnectdb(dsn.ptr) orelse return error.PgConnectFailed;
+    /// `statement_timeout_seconds` bounds every query run on this connection
+    /// server-side (via a session `SET` right after connecting) — without
+    /// it, a single wedged query (lock contention, a network stall between
+    /// warden and Postgres) blocks the calling thread forever with no
+    /// recourse: these are plain blocking `libpq` C calls, entirely outside
+    /// `Io`, so there's no cancellation or timeout wrapper possible from the
+    /// caller's side the way `http_util.zig` manages for HTTP. Confirmed
+    /// live (2026-07-22) as the likely cause of a production hang where a
+    /// message-handling task never returned, never logged an error, and
+    /// permanently froze its platform's poll loop (see `PgPool`'s doc
+    /// comment for the full chain). A `connect_timeout` is applied the same
+    /// way, so even the initial TCP handshake can't hang indefinitely
+    /// either.
+    pub fn open(allocator: std.mem.Allocator, dsn: [:0]const u8, statement_timeout_seconds: i64) !Db {
+        const dsn_with_timeout = try appendConnectTimeout(allocator, dsn);
+        defer allocator.free(dsn_with_timeout);
+
+        const conn = c.PQconnectdb(dsn_with_timeout.ptr) orelse return error.PgConnectFailed;
         if (c.PQstatus(conn) != c.CONNECTION_OK) {
             std.log.err("PQconnectdb failed: {s}", .{std.mem.span(c.PQerrorMessage(conn))});
             c.PQfinish(conn);
             return error.PgConnectFailed;
         }
-        return .{ .conn = conn, .allocator = allocator };
+        var db: Db = .{ .conn = conn, .allocator = allocator };
+
+        const timeout_sql = std.fmt.allocPrintSentinel(allocator, "SET statement_timeout = {d}", .{statement_timeout_seconds * std.time.ms_per_s}, 0) catch {
+            // Allocation failure setting a safety timeout shouldn't fail the
+            // whole connection — the connection itself is already good.
+            return db;
+        };
+        defer allocator.free(timeout_sql);
+        db.exec(timeout_sql) catch |err| {
+            std.log.warn("pg: failed to set statement_timeout: {t}", .{err});
+        };
+        return db;
+    }
+
+    /// `libpq` accepts `connect_timeout` (seconds) as a DSN keyword; a
+    /// keyword/value DSN can just have it appended as another
+    /// space-separated pair, and a URI-style DSN (`postgresql://...`)
+    /// accepts it as a query parameter — both forms are handled by the
+    /// same `key=value` append since libpq's URI parser treats trailing
+    /// query parameters as connection options identically to the
+    /// keyword/value form. 10s is generous for even a slow LAN/VPN hop
+    /// while still bounding what used to be an unbounded TCP connect.
+    fn appendConnectTimeout(allocator: std.mem.Allocator, dsn: [:0]const u8) ![:0]u8 {
+        const is_uri = std.mem.startsWith(u8, dsn, "postgresql://") or std.mem.startsWith(u8, dsn, "postgres://");
+        const sep: u8 = if (is_uri) (if (std.mem.indexOfScalar(u8, dsn, '?') != null) '&' else '?') else ' ';
+        return std.fmt.allocPrintSentinel(allocator, "{s}{c}connect_timeout=10", .{ dsn, sep }, 0);
     }
 
     pub fn close(self: *Db) void {
@@ -162,3 +203,23 @@ pub const Stmt = struct {
         self.arena.deinit();
     }
 };
+
+const testing = std.testing;
+
+test "appendConnectTimeout appends a query param to a URI-style DSN" {
+    const out = try Db.appendConnectTimeout(testing.allocator, "postgresql://warden:pw@postgres/warden");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("postgresql://warden:pw@postgres/warden?connect_timeout=10", out);
+}
+
+test "appendConnectTimeout uses '&' when the URI-style DSN already has query params" {
+    const out = try Db.appendConnectTimeout(testing.allocator, "postgresql://postgres/warden?sslmode=disable");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("postgresql://postgres/warden?sslmode=disable&connect_timeout=10", out);
+}
+
+test "appendConnectTimeout uses a space-separated keyword for a non-URI DSN" {
+    const out = try Db.appendConnectTimeout(testing.allocator, "host=postgres dbname=warden");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("host=postgres dbname=warden connect_timeout=10", out);
+}
