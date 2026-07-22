@@ -33,11 +33,15 @@ pub const PgPool = struct {
     free_idx: std.ArrayList(usize),
     mutex: Io.Mutex = .init,
     acquire_timeout_ns: u64,
+    /// Kept for the pool's lifetime (not just during `init`) so a poisoned
+    /// slot can be reopened later — see `reopenPoisoned`.
+    dsn: [:0]const u8,
+    statement_timeout_seconds: i64,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, dsn: []const u8, size: usize, acquire_timeout_ns: u64, statement_timeout_seconds: i64) !PgPool {
         std.debug.assert(size > 0);
         const dsn_z = try allocator.dupeZ(u8, dsn);
-        defer allocator.free(dsn_z);
+        errdefer allocator.free(dsn_z);
 
         const conns = try allocator.alloc(Db, size);
         errdefer allocator.free(conns);
@@ -45,7 +49,7 @@ pub const PgPool = struct {
         var opened: usize = 0;
         errdefer for (conns[0..opened]) |*conn| conn.close();
         for (conns) |*conn| {
-            conn.* = try Db.open(allocator, dsn_z, statement_timeout_seconds);
+            conn.* = try Db.open(allocator, io, dsn_z, statement_timeout_seconds);
             opened += 1;
         }
 
@@ -60,13 +64,23 @@ pub const PgPool = struct {
             .conns = conns,
             .free_idx = free_idx,
             .acquire_timeout_ns = acquire_timeout_ns,
+            .dsn = dsn_z,
+            .statement_timeout_seconds = statement_timeout_seconds,
         };
     }
 
     pub fn deinit(self: *PgPool) void {
-        for (self.conns) |*conn| conn.close();
+        // A poisoned slot's `conn` may still be touched by an abandoned
+        // `runWithDeadline` thread at any point in the future (see
+        // `Db.poisoned`) — closing it here would race that thread, so it's
+        // left leaked, same trade-off `http_util.zig` accepts for a
+        // detached-on-timeout HTTP request.
+        for (self.conns) |*conn| {
+            if (!conn.poisoned) conn.close();
+        }
         self.allocator.free(self.conns);
         self.free_idx.deinit(self.allocator);
+        self.allocator.free(self.dsn);
     }
 
     /// Waits up to `acquire_timeout_ns` for a free connection, polling every
@@ -92,6 +106,30 @@ pub const PgPool = struct {
 
     pub fn release(self: *PgPool, db: *Db) void {
         const idx = (@intFromPtr(db) - @intFromPtr(self.conns.ptr)) / @sizeOf(Db);
+        if (db.poisoned) {
+            self.reopenPoisoned(idx);
+            return;
+        }
+        self.mutex.lockUncancelable(self.io);
+        self.free_idx.appendAssumeCapacity(idx);
+        self.mutex.unlock(self.io);
+    }
+
+    /// A query on this slot blew its deadline (see `Db.runWithDeadline`) —
+    /// the old connection is left exactly as-is (leaked; an abandoned
+    /// thread may still be touching it) and a fresh one takes its place so
+    /// the pool's usable capacity doesn't shrink permanently every time a
+    /// connection dies. If the reopen itself fails (Postgres genuinely
+    /// unreachable right now), the slot is simply not returned to the free
+    /// list — capacity degrades by one instead of looping or panicking; a
+    /// pool that runs out entirely surfaces as an ordinary, loggable
+    /// `error.PoolExhausted` from `acquire` rather than another silent hang.
+    fn reopenPoisoned(self: *PgPool, idx: usize) void {
+        const fresh = Db.open(self.allocator, self.io, self.dsn, self.statement_timeout_seconds) catch |err| {
+            std.log.err("pg: failed to reopen poisoned connection: {t}", .{err});
+            return;
+        };
+        self.conns[idx] = fresh;
         self.mutex.lockUncancelable(self.io);
         self.free_idx.appendAssumeCapacity(idx);
         self.mutex.unlock(self.io);
@@ -112,6 +150,8 @@ pub const PgPool = struct {
             .conns = @as([*]Db, @ptrCast(db))[0..1],
             .free_idx = free_idx,
             .acquire_timeout_ns = 30 * std.time.ns_per_s,
+            .dsn = "",
+            .statement_timeout_seconds = 30,
         };
     }
 
@@ -148,13 +188,15 @@ test "acquire returns error.PoolExhausted instead of hanging forever when nothin
     // production hang this replaces: `acquire` used to block on an
     // `Io.Semaphore` with no way out at all when every connection was
     // checked out and never returned.
-    var conns = [_]Db{.{ .conn = undefined, .allocator = testing.allocator }};
+    var conns = [_]Db{.{ .conn = undefined, .allocator = testing.allocator, .io = io, .query_timeout_ns = 30 * std.time.ns_per_s }};
     var pool: PgPool = .{
         .allocator = testing.allocator,
         .io = io,
         .conns = &conns,
         .free_idx = .empty, // nothing available to acquire
         .acquire_timeout_ns = 200 * std.time.ns_per_ms,
+        .dsn = "",
+        .statement_timeout_seconds = 30,
     };
 
     const started = Io.Timestamp.now(io, .real);
