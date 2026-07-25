@@ -1,6 +1,22 @@
 const std = @import("std");
 const Io = std.Io;
 
+const logging = @import("log.zig");
+const log = logging.scoped("main");
+
+/// `log_level` is left permissive (`.debug`) so `std.log`'s own comptime
+/// filter never intercepts a message before it reaches `logging.stdLogFn` —
+/// filtering by `WARDEN_LOG_LEVEL` happens once, at runtime, inside
+/// `log.zig` itself (see its module doc for why: `std.options.log_level` is
+/// a comptime value, so it can't respond to an env var on its own). This
+/// also means every pre-existing `std.log.err`/`.warn`/`.info`/`.debug` call
+/// site elsewhere in the codebase (not yet migrated to `log.zig`'s own
+/// `scoped()`) still renders through the same tabular formatter.
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = logging.stdLogFn,
+};
+
 const config_mod = @import("config.zig");
 const auth = @import("auth.zig");
 const iface = @import("platform/interface.zig");
@@ -185,6 +201,11 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
+    // As early as possible — before the healthcheck branch, before config
+    // load — so every log line from here on (including config-load
+    // failures) has a real timestamp and respects `WARDEN_LOG_LEVEL`.
+    logging.init(io, init.environ_map);
+
     // Docker's `HEALTHCHECK` (see `Dockerfile`) spawns this same binary as a
     // brand-new process on a timer rather than reaching into the running
     // one — there was previously no liveness signal at all, so a fully
@@ -196,9 +217,9 @@ pub fn main(init: std.process.Init) !void {
     if (wantsHealthcheck(init.minimal.args)) runHealthcheck(gpa, io, init.environ_map);
 
     const config = config_mod.Config.load(init.environ_map, init.arena.allocator(), io) catch |err| {
-        std.log.err("config error: {t} (did you set WARDEN_TELEGRAM_BOT_TOKEN and WARDEN_POSTGRES_DSN?)", .{err});
-        return err;
+        log.fatal("config error: {t} (did you set WARDEN_TELEGRAM_BOT_TOKEN and WARDEN_POSTGRES_DSN?)", .{err});
     };
+    log.notice("log level = {s} (set WARDEN_LOG_LEVEL to change)", .{@tagName(logging.currentLevel())});
 
     // web_search only joins the tool list when an instance is configured,
     // so the model never sees a tool that's guaranteed to fail.
@@ -209,7 +230,7 @@ pub fn main(init: std.process.Init) !void {
         tools_buf[tools_len] = web_search_tool;
         tools_len += 1;
     } else {
-        std.log.info("web search disabled (set WARDEN_SEARXNG_URL to enable)", .{});
+        log.info("web search disabled (set WARDEN_SEARXNG_URL to enable)", .{});
     }
     const active_tools = tools_buf[0..tools_len];
 
@@ -248,19 +269,24 @@ pub fn main(init: std.process.Init) !void {
     const connectors: []const iface.Connector = connectors_buf[0..connectors_len];
     const max_message_len = effectiveMaxMessageLength(connectors);
 
-    var pool = try store_pool.PgPool.init(
+    var pool = store_pool.PgPool.init(
         gpa,
         io,
         config.postgres_dsn,
         config.postgres_pool_size,
         @intCast(config.postgres_acquire_timeout_seconds * std.time.ns_per_s),
         config.postgres_statement_timeout_seconds,
-    );
+    ) catch |err| {
+        log.fatal("postgres: pool init failed (size={d}): {t}", .{ config.postgres_pool_size, err });
+    };
     defer pool.deinit();
+    log.info("postgres: pool ready, {d} connection(s)", .{config.postgres_pool_size});
     {
         const db = try pool.acquire();
         defer pool.release(db);
-        try migrate.migrate(db, gpa);
+        migrate.migrate(db, gpa) catch |err| {
+            log.fatal("postgres: schema migration failed: {t}", .{err});
+        };
     }
 
     // Device key creation/upload plus ongoing encrypt/decrypt for Matrix
@@ -271,7 +297,7 @@ pub fn main(init: std.process.Init) !void {
     if (matrix_adapter) |*m| {
         if (config.matrix_pickle_key) |pickle_key| {
             m.enableCrypto(gpa, io, &pool, pickle_key) catch |err| {
-                std.log.err("matrix e2ee: device key setup failed: {t}", .{err});
+                log.err("matrix e2ee: device key setup failed: {t}", .{err});
             };
         }
     }
@@ -303,7 +329,7 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    std.log.info("warden started, {d} connector(s), {d} owner(s) configured", .{ connectors.len, config.owners.len });
+    log.info("warden started, {d} connector(s), {d} owner(s) configured", .{ connectors.len, config.owners.len });
 
     // Best-effort: a platform without the concept (or a transient API
     // failure) just means commands don't autocomplete, not a startup
@@ -311,7 +337,7 @@ pub fn main(init: std.process.Init) !void {
     for (connectors) |connector| {
         connector.setCommands(gpa, &public_commands) catch |err| {
             if (err != error.Unsupported) {
-                std.log.warn("failed to publish command menu for {s}: {t}", .{ @tagName(connector.platform()), err });
+                log.warn("failed to publish command menu for {s}: {t}", .{ @tagName(connector.platform()), err });
             }
         };
     }
@@ -324,8 +350,7 @@ pub fn main(init: std.process.Init) !void {
     // connector that never starts simply never stamps its slot, which
     // correctly reads as permanently unhealthy rather than "absent."
     var heartbeat = Heartbeat.init(gpa, connectors) catch |err| {
-        std.log.err("failed to allocate heartbeat state: {t}", .{err});
-        return err;
+        log.fatal("failed to allocate heartbeat state: {t}", .{err});
     };
 
     // One persistent poll loop per connector, running concurrently —
@@ -367,9 +392,10 @@ pub fn main(init: std.process.Init) !void {
     // connector's poll loop too rather than aborting every platform.
     for (connectors, 0..) |connector, i| {
         const msg_pool = MessageWorkerPool.init(gpa, io, config.workers_per_platform, MessageTask.run) catch |err| {
-            std.log.err("failed to start worker pool for {t}: {t}", .{ connector.platform(), err });
+            log.err("failed to start worker pool for {t}: {t}", .{ connector.platform(), err });
             continue;
         };
+        log.info("{t}: worker pool started, {d} worker(s)", .{ connector.platform(), config.workers_per_platform });
         const thread = std.Thread.spawn(.{}, connectorPollLoop, .{
             connector,
             &config,
@@ -386,10 +412,11 @@ pub fn main(init: std.process.Init) !void {
             &heartbeat,
             i,
         }) catch |err| {
-            std.log.err("failed to start poll loop thread for {t}: {t}", .{ connector.platform(), err });
+            log.err("failed to start poll loop thread for {t}: {t}", .{ connector.platform(), err });
             continue;
         };
         thread.detach();
+        log.notice("{t}: poll loop started", .{connector.platform()});
     }
 
     // Guarantees recovery even if nothing external is watching the
@@ -404,15 +431,17 @@ pub fn main(init: std.process.Init) !void {
     if (std.Thread.spawn(.{}, selfWatchdogLoop, .{ io, &heartbeat })) |thread| {
         thread.detach();
     } else |err| {
-        std.log.warn("failed to start self-watchdog thread: {t}", .{err});
+        log.warn("failed to start self-watchdog thread: {t}", .{err});
     }
 
     // Due-digest/reminder/alert/feed checks used to piggyback on the old
     // round-robin loop's natural ~30s-ish cadence; now that connectors
     // poll independently (no shared "lap" to hang off of), this is its own
     // explicit ~30s ticker instead — same granularity as before.
+    const scheduler_log = logging.scoped("scheduler");
     while (true) {
-        const now = Io.Timestamp.now(io, .real).toSeconds();
+        const tick_started = Io.Timestamp.now(io, .real);
+        const now = tick_started.toSeconds();
         checkAndSendDueDigests(connectors, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
         checkAndSendDueReminders(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
@@ -420,6 +449,17 @@ pub fn main(init: std.process.Init) !void {
         pending_conversions.sweepExpired(gpa, now);
         heartbeat.stampScheduler(now);
         heartbeat.writeToFile(io, gpa, config.tmp_dir);
+        const tick_ms = @divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - tick_started.toNanoseconds(), std.time.ns_per_ms);
+        // A tick well past its own ~30s cadence is a real signal something
+        // downstream (a query, an HTTP call inside one of the due-item
+        // checks above) is running slow — WARN instead of DEBUG so it's
+        // visible even at the default log level, not just when actively
+        // digging with WARDEN_LOG_LEVEL=debug.
+        if (tick_ms > 10_000) {
+            scheduler_log.warn("tick took {d}ms (longer than expected)", .{tick_ms});
+        } else {
+            scheduler_log.debug("tick completed in {d}ms", .{tick_ms});
+        }
         Io.sleep(io, .fromSeconds(30), .awake) catch {};
     }
 }
@@ -489,7 +529,7 @@ const Heartbeat = struct {
     /// read.
     fn writeToFile(self: *const Heartbeat, io: Io, gpa: std.mem.Allocator, tmp_dir: []const u8) void {
         Io.Dir.cwd().createDirPath(io, tmp_dir) catch |err| {
-            std.log.warn("heartbeat: couldn't create tmp_dir '{s}': {t}", .{ tmp_dir, err });
+            log.warn("heartbeat: couldn't create tmp_dir '{s}': {t}", .{ tmp_dir, err });
             return;
         };
         const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ tmp_dir, heartbeat_filename }) catch return;
@@ -503,13 +543,13 @@ const Heartbeat = struct {
         }
 
         var file = Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
-            std.log.warn("heartbeat: couldn't write '{s}': {t}", .{ path, err });
+            log.warn("heartbeat: couldn't write '{s}': {t}", .{ path, err });
             return;
         };
         defer file.close(io);
         var file_writer = file.writer(io, &.{});
         file_writer.interface.writeAll(buf.writer.buffered()) catch |err| {
-            std.log.warn("heartbeat: couldn't write '{s}': {t}", .{ path, err });
+            log.warn("heartbeat: couldn't write '{s}': {t}", .{ path, err });
             return;
         };
         file_writer.interface.flush() catch {};
@@ -571,8 +611,7 @@ fn selfWatchdogLoop(io: Io, heartbeat: *Heartbeat) void {
         Io.sleep(io, .fromSeconds(60), .awake) catch return;
         const now = Io.Timestamp.now(io, .real).toSeconds();
         if (!heartbeat.allFreshInMemory(now, watchdog_stale_seconds)) {
-            std.log.err("self-watchdog: a connector or the scheduler has gone stale for over {d}s — exiting so the container restarts", .{watchdog_stale_seconds});
-            std.process.exit(1);
+            log.fatal("self-watchdog: a connector or the scheduler has gone stale for over {d}s — exiting so the container restarts", .{watchdog_stale_seconds});
         }
     }
 }
@@ -612,8 +651,8 @@ fn connectorPollLoop(
                 // patches routinely — warn, don't alarm.
                 error.HttpConnectionClosing,
                 error.TlsInitializationFailed,
-                => std.log.warn("poll connection dropped (will re-poll): {t}", .{err}),
-                else => std.log.err("poll failed: {t}", .{err}),
+                => log.warn("poll connection dropped (will re-poll): {t}", .{err}),
+                else => log.err("poll failed: {t}", .{err}),
             }
             // A failed poll returns immediately instead of blocking for
             // the ~30s long-poll window, so during an outage this loop
@@ -629,6 +668,9 @@ fn connectorPollLoop(
         // connector isn't wedged, which is all `runHealthcheck`/
         // `selfWatchdogLoop` need to know.
         heartbeat.stampConnector(connector_idx, Io.Timestamp.now(io, .real).toSeconds());
+        if (polled_messages.len > 0) {
+            log.debug("{t}: poll returned {d} message(s)", .{ connector.platform(), polled_messages.len });
+        }
 
         for (polled_messages) |msg| {
             const ts = Io.Timestamp.now(io, .real).toSeconds();
@@ -640,12 +682,12 @@ fn connectorPollLoop(
             // away, before `poll_arena` can be freed out from under a task
             // that hasn't started yet.
             const task_arena = gpa.create(std.heap.ArenaAllocator) catch |err| {
-                std.log.err("failed to allocate task arena: {t}", .{err});
+                log.err("failed to allocate task arena: {t}", .{err});
                 continue;
             };
             task_arena.* = std.heap.ArenaAllocator.init(gpa);
             const duped_msg = msg.dupe(task_arena.allocator()) catch |err| {
-                std.log.err("failed to dupe message for chat {s}: {t}", .{ msg.chat_id, err });
+                log.err("failed to dupe message for chat {s}: {t}", .{ msg.chat_id, err });
                 task_arena.deinit();
                 gpa.destroy(task_arena);
                 continue;
@@ -678,7 +720,7 @@ fn connectorPollLoop(
                 // array) — `processMessageTask` never got a chance to free
                 // `task_arena`, so this is the one place that has to do it
                 // instead of leaking it.
-                std.log.err("failed to queue message for chat {s}: {t}", .{ msg.chat_id, err });
+                log.err("failed to queue message for chat {s}: {t}", .{ msg.chat_id, err });
                 task_arena.deinit();
                 gpa.destroy(task_arena);
             };
@@ -799,10 +841,27 @@ fn processMessageTask(
         task_arena.deinit();
         gpa.destroy(task_arena);
     }
+    // Declared after the arena-cleanup defer above so it runs *before* that
+    // one (defers unwind in reverse declaration order) — `msg.chat_id`
+    // below lives in `task_arena`, so the arena must still be alive when
+    // this reads it. This is the single most useful log line for diagnosing
+    // "the bot died, what was it doing at the time": a task that starts but
+    // never logs its completion is exactly the one that was in flight when
+    // the process went away.
+    const task_started = Io.Timestamp.now(io, .real);
+    log.debug("{t}: processing message from chat {s}, user {s}", .{ connector.platform(), msg.chat_id, msg.user_id });
+    defer {
+        const elapsed_ms = @divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - task_started.toNanoseconds(), std.time.ns_per_ms);
+        if (elapsed_ms > 15_000) {
+            log.warn("{t}: message from chat {s} took {d}ms to process (longer than expected)", .{ connector.platform(), msg.chat_id, elapsed_ms });
+        } else {
+            log.debug("{t}: message from chat {s} processed in {d}ms", .{ connector.platform(), msg.chat_id, elapsed_ms });
+        }
+    }
     const a = task_arena.allocator();
 
     const chat_id = chats.upsertChat(pool, connector.platform(), msg.chat_id, msg.chat_type, msg.chat_title) catch |err| {
-        std.log.err("failed to upsert chat {s}: {t}", .{ msg.chat_id, err });
+        log.err("failed to upsert chat {s}: {t}", .{ msg.chat_id, err });
         return;
     };
 
@@ -813,7 +872,7 @@ fn processMessageTask(
     // so it doesn't show up as a stray empty-text row in /wordcloud or the
     // LLM's history window.
     const identity_id = resolveSenderIdentity(pool, connector, msg, ts) catch |err| {
-        std.log.err("failed to resolve identity for user {s}: {t}", .{ msg.user_id, err });
+        log.err("failed to resolve identity for user {s}: {t}", .{ msg.user_id, err });
         return;
     };
     if (msg.choice_picked == null) {
@@ -892,13 +951,13 @@ fn processMessageTask(
 /// since document/video attachments can run tens of MB.
 fn downloadAttachment(connector: iface.Connector, io: Io, allocator: std.mem.Allocator, tmp_dir: []const u8, att: iface.Attachment) ?[]const u8 {
     const bytes = connector.downloadFile(allocator, att.file_id) catch |err| {
-        std.log.warn("attachment: download failed for file_id {s}: {t}", .{ att.file_id, err });
+        log.warn("attachment: download failed for file_id {s}: {t}", .{ att.file_id, err });
         return null;
     };
     defer allocator.free(bytes);
 
     Io.Dir.cwd().createDirPath(io, tmp_dir) catch |err| {
-        std.log.warn("attachment: failed to create tmp dir {s}: {t}", .{ tmp_dir, err });
+        log.warn("attachment: failed to create tmp dir {s}: {t}", .{ tmp_dir, err });
         return null;
     };
 
@@ -906,17 +965,17 @@ fn downloadAttachment(connector: iface.Connector, io: Io, allocator: std.mem.All
     const path = std.fmt.allocPrint(allocator, "{s}/attach_{d}{s}", .{ tmp_dir, ts, extensionFor(att) }) catch return null;
 
     var file = Io.Dir.cwd().createFile(io, path, .{}) catch |err| {
-        std.log.warn("attachment: failed to create {s}: {t}", .{ path, err });
+        log.warn("attachment: failed to create {s}: {t}", .{ path, err });
         return null;
     };
     defer file.close(io);
     var file_writer = file.writer(io, &.{});
     file_writer.interface.writeAll(bytes) catch |err| {
-        std.log.warn("attachment: failed to write {s}: {t}", .{ path, err });
+        log.warn("attachment: failed to write {s}: {t}", .{ path, err });
         return null;
     };
     file_writer.interface.flush() catch |err| {
-        std.log.warn("attachment: failed to flush {s}: {t}", .{ path, err });
+        log.warn("attachment: failed to flush {s}: {t}", .{ path, err });
         return null;
     };
 
@@ -980,13 +1039,13 @@ fn resolveQuestion(connector: iface.Connector, a: std.mem.Allocator, io: Io, con
         if (config.whisper_url) |whisper_url| {
             if (tool_ctx.attachment_path) |path| {
                 const placeholder_id = connector.sendMessageReturningId(a, msg.chat_id, "🎙️ Transcribing your voice message…", msg.message_id) catch |err| blk: {
-                    std.log.warn("transcribe: couldn't send a placeholder for chat {s}: {t}", .{ msg.chat_id, err });
+                    log.warn("transcribe: couldn't send a placeholder for chat {s}: {t}", .{ msg.chat_id, err });
                     break :blk null;
                 };
                 if (transcribe.transcribe(a, io, whisper_url, config.tmp_dir, path)) |transcript| {
                     if (transcript.len > 0) return .{ .text = transcript, .placeholder_id = placeholder_id };
                 } else |err| {
-                    std.log.warn("transcribe: failed for chat {s}: {t}", .{ msg.chat_id, err });
+                    log.warn("transcribe: failed for chat {s}: {t}", .{ msg.chat_id, err });
                 }
                 return .{ .text = attachmentPlaceholder(a, att) catch text, .placeholder_id = placeholder_id };
             }
@@ -1007,17 +1066,17 @@ fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, m
         const identity_id = try identities.upsertIdentity(pool, identity);
         if (msg.telegram_profile) |profile| {
             identities.upsertTelegramProfile(pool, identity_id, profile) catch |err| {
-                std.log.err("failed to upsert telegram profile for identity {d}: {t}", .{ identity_id, err });
+                log.err("failed to upsert telegram profile for identity {d}: {t}", .{ identity_id, err });
             };
         }
         if (msg.matrix_profile) |profile| {
             identities.upsertMatrixProfile(pool, identity_id, profile) catch |err| {
-                std.log.err("failed to upsert matrix profile for identity {d}: {t}", .{ identity_id, err });
+                log.err("failed to upsert matrix profile for identity {d}: {t}", .{ identity_id, err });
             };
         }
         if (msg.xmpp_profile) |profile| {
             identities.upsertXmppProfile(pool, identity_id, profile) catch |err| {
-                std.log.err("failed to upsert xmpp profile for identity {d}: {t}", .{ identity_id, err });
+                log.err("failed to upsert xmpp profile for identity {d}: {t}", .{ identity_id, err });
             };
         }
         return identity_id;
@@ -1034,11 +1093,11 @@ fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, m
 fn recordObservedUsers(pool: *store_pool.PgPool, chat_id: i64, observed: []const Identity) void {
     for (observed) |identity| {
         const identity_id = identities.upsertIdentity(pool, identity) catch |err| {
-            std.log.err("failed to upsert observed identity {s} for chat {d}: {t}", .{ identity.native_id, chat_id, err });
+            log.err("failed to upsert observed identity {s} for chat {d}: {t}", .{ identity.native_id, chat_id, err });
             continue;
         };
         chat_members.ensureKnown(pool, chat_id, identity_id) catch |err| {
-            std.log.err("failed to register observed member {s} for chat {d}: {t}", .{ identity.native_id, chat_id, err });
+            log.err("failed to register observed member {s} for chat {d}: {t}", .{ identity.native_id, chat_id, err });
         };
     }
 }
@@ -1049,14 +1108,14 @@ fn recordObservedUsers(pool: *store_pool.PgPool, chat_id: i64, observed: []const
 /// the poll loop.
 fn recordMessage(pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, message_id: ?[]const u8, text: ?[]const u8, ts: i64, retention: i64) void {
     messages.insert(pool, chat_id, identity_id, message_id, text, ts) catch |err| {
-        std.log.err("failed to insert message for chat {d}: {t}", .{ chat_id, err });
+        log.err("failed to insert message for chat {d}: {t}", .{ chat_id, err });
         return;
     };
     chat_members.touch(pool, chat_id, identity_id, ts) catch |err| {
-        std.log.err("failed to touch chat_members for chat {d}: {t}", .{ chat_id, err });
+        log.err("failed to touch chat_members for chat {d}: {t}", .{ chat_id, err });
     };
     messages.pruneKeepLast(pool, chat_id, retention) catch |err| {
-        std.log.err("prune failed for chat {d}: {t}", .{ chat_id, err });
+        log.err("prune failed for chat {d}: {t}", .{ chat_id, err });
     };
 }
 
@@ -1065,7 +1124,7 @@ fn recordMessage(pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, messa
 /// a restart keep firing rather than silently going quiet.
 fn loadDigestScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, digest_scheduler: *scheduler.DigestScheduler) void {
     const refs = chats.listAll(pool, gpa) catch |err| {
-        std.log.err("digest: failed to scan existing chats: {t}", .{err});
+        log.err("digest: failed to scan existing chats: {t}", .{err});
         return;
     };
     defer {
@@ -1076,7 +1135,7 @@ fn loadDigestScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, 
     for (refs) |ref| {
         if (chat_settings.getDigestEnabled(pool, ref.id)) {
             digest_scheduler.enable(ref.platform, ref.native_chat_id) catch |err| {
-                std.log.err("digest: failed to restore schedule for chat {s}: {t}", .{ ref.native_chat_id, err });
+                log.err("digest: failed to restore schedule for chat {s}: {t}", .{ ref.native_chat_id, err });
             };
         }
     }
@@ -1099,7 +1158,7 @@ fn checkAndSendDueDigests(
     now: i64,
 ) void {
     const enabled_chats = digest_scheduler.snapshotEnabledChatIds(gpa) catch |err| {
-        std.log.err("digest: failed to snapshot enabled chats: {t}", .{err});
+        log.err("digest: failed to snapshot enabled chats: {t}", .{err});
         return;
     };
     defer {
@@ -1110,7 +1169,7 @@ fn checkAndSendDueDigests(
     for (enabled_chats) |key| {
         const native_chat_id = key.native_chat_id;
         const connector = findConnector(connectors, key.platform) orelse {
-            std.log.warn("digest: no active connector for platform {s}, skipping chat {s}", .{ @tagName(key.platform), native_chat_id });
+            log.warn("digest: no active connector for platform {s}, skipping chat {s}", .{ @tagName(key.platform), native_chat_id });
             continue;
         };
 
@@ -1122,7 +1181,7 @@ fn checkAndSendDueDigests(
         // a scheduled check, and `upsertChat` preserves whatever's already
         // stored for those columns when passed null (see its doc comment).
         const chat_id = chats.upsertChat(pool, connector.platform(), native_chat_id, null, null) catch |err| {
-            std.log.err("digest: failed to resolve chat {s}: {t}", .{ native_chat_id, err });
+            log.err("digest: failed to resolve chat {s}: {t}", .{ native_chat_id, err });
             continue;
         };
 
@@ -1139,12 +1198,12 @@ fn checkAndSendDueDigests(
             .scraper = bot_config.loadScraperConfig(pool, a),
         };
         const digest_text = digest.generate(llm_provider, a, tool_ctx, pool, chat_id) catch |err| {
-            std.log.err("digest: generate failed for chat {s}: {t}", .{ native_chat_id, err });
+            log.err("digest: generate failed for chat {s}: {t}", .{ native_chat_id, err });
             continue;
         };
         sendTextOrFile(connector, a, native_chat_id, digest_text, null, max_message_len, "digest.txt");
         chat_settings.setLastDigestTs(pool, chat_id, now) catch |err| {
-            std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
+            log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
         };
     }
 }
@@ -1451,7 +1510,7 @@ fn isOneShotConvertCaption(text: []const u8) bool {
 fn isAuthorizedForGroupAdmin(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, msg: iface.Message) bool {
     if (auth.isOwner(config, connector.platform(), msg.user_id)) return true;
     return connector.isGroupAdmin(a, msg.chat_id, msg.user_id) catch |err| {
-        std.log.warn("group_admin: admin check failed for user {s} in chat {s}: {t}", .{ msg.user_id, msg.chat_id, err });
+        log.warn("group_admin: admin check failed for user {s} in chat {s}: {t}", .{ msg.user_id, msg.chat_id, err });
         return false;
     };
 }
@@ -1497,7 +1556,7 @@ fn handleMagicWord(
 
     if (std.mem.eql(u8, arg, "off")) {
         chat_settings.setMagicWord(pool, chat_id, null) catch |err| {
-            std.log.err("magicword: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
+            log.err("magicword: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
         reply(connector, a, msg.chat_id, msg.message_id, "Magic word disabled — I'll still answer mentions and replies.");
@@ -1510,7 +1569,7 @@ fn handleMagicWord(
     }
 
     chat_settings.setMagicWord(pool, chat_id, arg) catch |err| {
-        std.log.err("magicword: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+        log.err("magicword: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
         return;
     };
     const confirmation = std.fmt.allocPrint(a, "Magic word set to \"{s}\" — I'll answer any message that contains it.", .{arg}) catch return;
@@ -1551,7 +1610,7 @@ fn handlePersonaCommand(
 
     if (std.mem.eql(u8, arg, "off")) {
         chat_settings.setSystemPromptOverride(pool, chat_id, null) catch |err| {
-            std.log.err("persona: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
+            log.err("persona: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
         reply(connector, a, msg.chat_id, msg.message_id, "Persona reset to the default.");
@@ -1564,7 +1623,7 @@ fn handlePersonaCommand(
     }
 
     chat_settings.setSystemPromptOverride(pool, chat_id, arg) catch |err| {
-        std.log.err("persona: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+        log.err("persona: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
         return;
     };
     reply(connector, a, msg.chat_id, msg.message_id, "Persona updated for this chat.");
@@ -1611,19 +1670,19 @@ fn handleThinkingCommand(
 
     if (std.mem.eql(u8, arg, "on")) {
         chat_settings.setShowThinkingOverride(pool, chat_id, true) catch |err| {
-            std.log.err("thinking: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+            log.err("thinking: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
         reply(connector, a, msg.chat_id, msg.message_id, "Thinking will be shown for this chat.");
     } else if (std.mem.eql(u8, arg, "off")) {
         chat_settings.setShowThinkingOverride(pool, chat_id, false) catch |err| {
-            std.log.err("thinking: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+            log.err("thinking: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
         reply(connector, a, msg.chat_id, msg.message_id, "Thinking will be hidden for this chat.");
     } else if (std.mem.eql(u8, arg, "default")) {
         chat_settings.setShowThinkingOverride(pool, chat_id, null) catch |err| {
-            std.log.err("thinking: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
+            log.err("thinking: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
         reply(connector, a, msg.chat_id, msg.message_id, "Thinking reset to the bot-wide default for this chat.");
@@ -1670,7 +1729,7 @@ fn handleScraperCommand(
                 return;
             }
             bot_config.setScraperMode(pool, .remote) catch |err| {
-                std.log.err("scraper: failed to set mode for global settings: {t}", .{err});
+                log.err("scraper: failed to set mode for global settings: {t}", .{err});
                 reply(connector, a, msg.chat_id, msg.message_id, "Couldn't update the scraper mode, try again.");
                 return;
             };
@@ -1678,7 +1737,7 @@ fn handleScraperCommand(
             connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
         } else if (std.mem.eql(u8, rest, "local")) {
             bot_config.setScraperMode(pool, .local) catch |err| {
-                std.log.err("scraper: failed to set mode for global settings: {t}", .{err});
+                log.err("scraper: failed to set mode for global settings: {t}", .{err});
                 reply(connector, a, msg.chat_id, msg.message_id, "Couldn't update the scraper mode, try again.");
                 return;
             };
@@ -1692,7 +1751,7 @@ fn handleScraperCommand(
             return;
         }
         bot_config.setScraperRemoteUrl(pool, rest) catch |err| {
-            std.log.err("scraper: failed to set remote url: {t}", .{err});
+            log.err("scraper: failed to set remote url: {t}", .{err});
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that endpoint, try again.");
             return;
         };
@@ -1700,14 +1759,14 @@ fn handleScraperCommand(
     } else if (std.mem.eql(u8, sub, "apikey")) {
         if (rest.len == 0 or std.mem.eql(u8, rest, "off")) {
             bot_config.setScraperRemoteApiKey(pool, null) catch |err| {
-                std.log.err("scraper: failed to clear remote api key: {t}", .{err});
+                log.err("scraper: failed to clear remote api key: {t}", .{err});
                 reply(connector, a, msg.chat_id, msg.message_id, "Couldn't clear the API key, try again.");
                 return;
             };
             reply(connector, a, msg.chat_id, msg.message_id, "Remote scraper API key cleared.");
         } else {
             bot_config.setScraperRemoteApiKey(pool, rest) catch |err| {
-                std.log.err("scraper: failed to set remote api key: {t}", .{err});
+                log.err("scraper: failed to set remote api key: {t}", .{err});
                 reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save the API key, try again.");
                 return;
             };
@@ -1733,14 +1792,14 @@ fn handleToken(
     };
     const arg = std.mem.trim(u8, text["/token".len..], " ");
     const target_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), target.user_id, target.label, false, now) catch |err| {
-        std.log.err("token: failed to resolve identity for user {s}: {t}", .{ target.user_id, err });
+        log.err("token: failed to resolve identity for user {s}: {t}", .{ target.user_id, err });
         return;
     };
     // If there is no argument, get the current token count and reply with it.
     if (arg.len == 0) {
         const count = chat_members.getTokens(pool, chat_id, target_identity_id, 0);
         const message = std.fmt.allocPrint(a, "Current token count: {}", .{count}) catch |err| {
-            std.debug.print("Failed to allocate message string: {}\n", .{err});
+            log.err("token: failed to allocate message string: {t}", .{err});
             return; // Exit the function early since we couldn't format the message
         };
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
@@ -1749,13 +1808,13 @@ fn handleToken(
     // Else just set the token count to the parsed value and reply with a confirmation.
     else {
         const count = std.fmt.parseInt(i64, arg, 10) catch 0;
-        std.log.info("Detected the count to be {}", .{count});
+        log.debug("token: parsed count {d}", .{count});
         chat_members.setTokens(pool, chat_id, target_identity_id, count) catch |err| {
-            std.log.err("Failed to set tokens on the databse: {}\n", .{err});
+            log.err("token: failed to set tokens: {t}", .{err});
             return;
         };
         const message = std.fmt.allocPrint(a, "token count updated to {}", .{count}) catch |err| {
-            std.log.err("Failed to allocate message string: {}\n", .{err});
+            log.err("token: failed to allocate message string: {t}", .{err});
             return; // Exit the function early since we couldn't format the message
         };
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
@@ -1780,12 +1839,12 @@ fn handleDigestCommand(
 
     if (std.mem.eql(u8, arg, "on")) {
         digest_scheduler.enable(connector.platform(), native_chat_id) catch |err| {
-            std.log.err("digest: failed to enable for chat {s}: {t}", .{ native_chat_id, err });
+            log.err("digest: failed to enable for chat {s}: {t}", .{ native_chat_id, err });
             connector.sendMessage(a, native_chat_id, "Couldn't enable digests, try again.", reply_to);
             return;
         };
         chat_settings.setDigestEnabled(pool, chat_id, true) catch |err| {
-            std.log.err("digest: failed to persist enabled flag for chat {s}: {t}", .{ native_chat_id, err });
+            log.err("digest: failed to persist enabled flag for chat {s}: {t}", .{ native_chat_id, err });
         };
         const hours = @divTrunc(digest_scheduler.interval_seconds, 3600);
         const msg_text = std.fmt.allocPrint(a, "Digest enabled — I'll post one roughly every {d}h.", .{hours}) catch return;
@@ -1793,18 +1852,18 @@ fn handleDigestCommand(
     } else if (std.mem.eql(u8, arg, "off")) {
         digest_scheduler.disable(a, connector.platform(), native_chat_id);
         chat_settings.setDigestEnabled(pool, chat_id, false) catch |err| {
-            std.log.err("digest: failed to persist disabled flag for chat {s}: {t}", .{ native_chat_id, err });
+            log.err("digest: failed to persist disabled flag for chat {s}: {t}", .{ native_chat_id, err });
         };
         connector.sendMessage(a, native_chat_id, "Digest disabled.", reply_to);
     } else if (std.mem.eql(u8, arg, "now")) {
         const digest_text = digest.generate(llm_provider, a, tool_ctx, pool, chat_id) catch |err| {
-            std.log.err("digest: generate failed for chat {s}: {t}", .{ native_chat_id, err });
+            log.err("digest: generate failed for chat {s}: {t}", .{ native_chat_id, err });
             connector.sendMessage(a, native_chat_id, "Couldn't generate a digest just now.", reply_to);
             return;
         };
         sendTextOrFile(connector, a, native_chat_id, digest_text, reply_to, max_message_len, "digest.txt");
         chat_settings.setLastDigestTs(pool, chat_id, now) catch |err| {
-            std.log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
+            log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
         };
     } else {
         const enabled = digest_scheduler.isEnabled(a, connector.platform(), native_chat_id);
@@ -1862,7 +1921,7 @@ fn handleRemindCommand(
             return;
         };
         const rem = (reminders.get(pool, a, id) catch |err| {
-            std.log.err("remind: lookup failed for id {d}: {t}", .{ id, err });
+            log.err("remind: lookup failed for id {d}: {t}", .{ id, err });
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that reminder, try again.");
             return;
         }) orelse {
@@ -1878,7 +1937,7 @@ fn handleRemindCommand(
             return;
         }
         reminders.cancel(pool, id) catch |err| {
-            std.log.err("remind: cancel failed for id {d}: {t}", .{ id, err });
+            log.err("remind: cancel failed for id {d}: {t}", .{ id, err });
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't cancel that reminder, try again.");
             return;
         };
@@ -1918,7 +1977,7 @@ fn handleRemindCommand(
         };
 
     const id = reminders.create(pool, chat_id, identity_id, message, due_at, recur_interval) catch |err| {
-        std.log.err("remind: failed to create reminder for chat {d}: {t}", .{ chat_id, err });
+        log.err("remind: failed to create reminder for chat {d}: {t}", .{ chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that reminder, try again.");
         return;
     };
@@ -1942,7 +2001,7 @@ fn handleRemindersList(
     reply_to: ?[]const u8,
 ) void {
     const pending = reminders.listPending(pool, a, chat_id) catch |err| {
-        std.log.err("reminders: list failed for chat {d}: {t}", .{ chat_id, err });
+        log.err("reminders: list failed for chat {d}: {t}", .{ chat_id, err });
         connector.sendMessage(a, native_chat_id, "Couldn't load reminders, try again.", reply_to);
         return;
     };
@@ -1981,7 +2040,7 @@ fn handleAlertCommand(
             return;
         };
         const al = (alert_store.get(pool, a, id) catch |err| {
-            std.log.err("alert: lookup failed for id {d}: {t}", .{ id, err });
+            log.err("alert: lookup failed for id {d}: {t}", .{ id, err });
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that alert, try again.");
             return;
         }) orelse {
@@ -1997,7 +2056,7 @@ fn handleAlertCommand(
             return;
         }
         alert_store.cancel(pool, id) catch |err| {
-            std.log.err("alert: cancel failed for id {d}: {t}", .{ id, err });
+            log.err("alert: cancel failed for id {d}: {t}", .{ id, err });
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't cancel that alert, try again.");
             return;
         };
@@ -2036,7 +2095,7 @@ fn handleAlertCommand(
 
     const currency: ?[]const u8 = if (kind == .crypto) "usd" else null;
     const id = alert_store.create(pool, chat_id, identity_id, kind, subject, currency, condition, threshold) catch |err| {
-        std.log.err("alert: failed to create alert for chat {d}: {t}", .{ chat_id, err });
+        log.err("alert: failed to create alert for chat {d}: {t}", .{ chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that alert, try again.");
         return;
     };
@@ -2054,7 +2113,7 @@ fn handleAlertsList(
     reply_to: ?[]const u8,
 ) void {
     const pending = alert_store.listPending(pool, a, chat_id) catch |err| {
-        std.log.err("alerts: list failed for chat {d}: {t}", .{ chat_id, err });
+        log.err("alerts: list failed for chat {d}: {t}", .{ chat_id, err });
         connector.sendMessage(a, native_chat_id, "Couldn't load alerts, try again.", reply_to);
         return;
     };
@@ -2090,7 +2149,7 @@ fn handleWatchCommand(
         return;
     }
     const created = feed_watches.create(pool, chat_id, identity_id, feed_url) catch |err| {
-        std.log.err("watch: failed to add feed {s} for chat {d}: {t}", .{ feed_url, chat_id, err });
+        log.err("watch: failed to add feed {s} for chat {d}: {t}", .{ feed_url, chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't add that watch, try again.");
         return;
     };
@@ -2115,7 +2174,7 @@ fn handleUnwatchCommand(
         return;
     }
     const removed = feed_watches.remove(pool, chat_id, feed_url) catch |err| {
-        std.log.err("unwatch: failed to remove feed {s} for chat {d}: {t}", .{ feed_url, chat_id, err });
+        log.err("unwatch: failed to remove feed {s} for chat {d}: {t}", .{ feed_url, chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't remove that watch, try again.");
         return;
     };
@@ -2135,7 +2194,7 @@ fn handleWatchesList(
     reply_to: ?[]const u8,
 ) void {
     const pending = feed_watches.listPending(pool, a, chat_id) catch |err| {
-        std.log.err("watches: list failed for chat {d}: {t}", .{ chat_id, err });
+        log.err("watches: list failed for chat {d}: {t}", .{ chat_id, err });
         connector.sendMessage(a, native_chat_id, "Couldn't load watches, try again.", reply_to);
         return;
     };
@@ -2183,7 +2242,7 @@ fn handleWatchCheckCommand(
     // within the exact chat the watch belongs to, so `fw.platform` can
     // only ever match `connector`'s own platform.
     const outcome = feed_watcher.checkNow(&.{connector}, a, io, pool, llm_provider, chat_id, feed_url, now) catch |err| {
-        std.log.err("watchcheck: failed for {s} in chat {d}: {t}", .{ feed_url, chat_id, err });
+        log.err("watchcheck: failed for {s} in chat {d}: {t}", .{ feed_url, chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't run that check, try again.");
         return;
     };
@@ -2224,13 +2283,13 @@ fn handleConvertCommand(
     }
 
     const placeholder_id = connector.sendMessageReturningId(a, msg.chat_id, "🔄 Converting your file…", msg.message_id) catch |err| blk: {
-        std.log.warn("convert: couldn't send a placeholder for chat {s}: {t}", .{ msg.chat_id, err });
+        log.warn("convert: couldn't send a placeholder for chat {s}: {t}", .{ msg.chat_id, err });
         break :blk null;
     };
 
     const input_json = std.json.Stringify.valueAlloc(a, .{ .target_format = arg }, .{}) catch return;
     const result = convert_file.tool.execute(tool_ctx, input_json) catch |err| {
-        std.log.err("convert: /convert command failed: {t}", .{err});
+        log.err("convert: /convert command failed: {t}", .{err});
         convert_flow.finalizePlaceholder(connector, a, msg.chat_id, placeholder_id, msg.message_id, "Something went wrong converting that file, try again.");
         return;
     };
@@ -2402,7 +2461,7 @@ const MemberDirectoryToolAdapter = struct {
 
         const admins = self.connector.listChatAdmins(allocator, self.native_chat_id) catch |err| blk: {
             if (err != error.Unsupported) {
-                std.log.warn("find_chat_member: admin refresh failed for chat {s}: {t}", .{ self.native_chat_id, err });
+                log.warn("find_chat_member: admin refresh failed for chat {s}: {t}", .{ self.native_chat_id, err });
             }
             break :blk &.{};
         };
@@ -2446,7 +2505,7 @@ fn checkAndSendDueReminders(
     now: i64,
 ) void {
     const due = reminders.dueUndelivered(pool, gpa, now) catch |err| {
-        std.log.err("remind: failed to query due reminders: {t}", .{err});
+        log.err("remind: failed to query due reminders: {t}", .{err});
         return;
     };
     defer {
@@ -2459,7 +2518,7 @@ fn checkAndSendDueReminders(
 
     for (due) |r| {
         const connector = findConnector(connectors, r.platform) orelse {
-            std.log.warn("remind: no active connector for platform {s}, leaving reminder {d} pending", .{ @tagName(r.platform), r.id });
+            log.warn("remind: no active connector for platform {s}, leaving reminder {d} pending", .{ @tagName(r.platform), r.id });
             continue;
         };
 
@@ -2473,11 +2532,11 @@ fn checkAndSendDueReminders(
         if (r.recur_interval_seconds) |interval| {
             const next_due = reminder_format.nextOccurrence(r.due_at, interval, now);
             reminders.reschedule(pool, r.id, next_due) catch |err| {
-                std.log.err("remind: failed to reschedule recurring reminder {d}: {t}", .{ r.id, err });
+                log.err("remind: failed to reschedule recurring reminder {d}: {t}", .{ r.id, err });
             };
         } else {
             reminders.markDelivered(pool, r.id, now) catch |err| {
-                std.log.err("remind: failed to mark reminder {d} delivered: {t}", .{ r.id, err });
+                log.err("remind: failed to mark reminder {d} delivered: {t}", .{ r.id, err });
             };
         }
     }
@@ -2614,7 +2673,7 @@ fn tickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []con
 
         if (!std.mem.eql(u8, text, last_sent)) {
             connector.editMessage(std.heap.page_allocator, chat_id, message_id, text) catch |err| {
-                std.log.warn("ticker: edit failed for chat {s}: {t}", .{ chat_id, err });
+                log.warn("ticker: edit failed for chat {s}: {t}", .{ chat_id, err });
             };
             last_sent = text;
         }
@@ -2651,14 +2710,14 @@ fn replyWithAnswer(
     // sending a second message right after it.
     const placeholder_id = if (existing_placeholder_id) |pid| blk: {
         connector.editMessage(a, native_chat_id, pid, thinking_text) catch |err| {
-            std.log.warn("qa: couldn't morph the transcription placeholder for chat {s}: {t}", .{ native_chat_id, err });
+            log.warn("qa: couldn't morph the transcription placeholder for chat {s}: {t}", .{ native_chat_id, err });
         };
         break :blk pid;
     } else connector.sendMessageReturningId(a, native_chat_id, thinking_text, reply_to) catch |err| blk: {
-        std.log.warn("qa: couldn't send a placeholder for chat {s}, falling back to a plain reply: {t}", .{ native_chat_id, err });
+        log.warn("qa: couldn't send a placeholder for chat {s}, falling back to a plain reply: {t}", .{ native_chat_id, err });
         break :blk null;
     };
-    std.log.info("qa: placeholder for chat {s} = {?s}", .{ native_chat_id, placeholder_id });
+    log.info("qa: placeholder for chat {s} = {?s}", .{ native_chat_id, placeholder_id });
 
     var state = TickerState{ .io = io, .allocator = a, .max_len = max_message_len };
     var progress: toolcall.Progress = .{};
@@ -2666,12 +2725,12 @@ fn replyWithAnswer(
     if (placeholder_id) |pid| {
         progress = .{ .ptr = &state, .onEvent = onProgressEvent };
         ticker_future = Io.concurrent(io, tickerLoop, .{ connector, native_chat_id, pid, &state }) catch |err| blk: {
-            std.log.warn("qa: couldn't start the thinking animation for chat {s}: {t}", .{ native_chat_id, err });
+            log.warn("qa: couldn't start the thinking animation for chat {s}: {t}", .{ native_chat_id, err });
             break :blk null;
         };
     }
 
-    std.log.info("qa: calling the model for chat {s}", .{native_chat_id});
+    log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking);
 
     // Stop the ticker before touching the placeholder ourselves — it's the
@@ -2679,16 +2738,16 @@ fn replyWithAnswer(
     // "not threadsafe" note), and cancel() blocks until it has actually
     // stopped, so there's no risk of it clobbering the final edit below.
     if (ticker_future) |*f| _ = f.cancel(io);
-    std.log.info("qa: model call for chat {s} returned", .{native_chat_id});
+    log.info("qa: model call for chat {s} returned", .{native_chat_id});
 
     const raw_answer = raw_answer_or_err catch |err| {
-        std.log.err("qa: failed to answer in chat {s}: {t}", .{ native_chat_id, err });
+        log.err("qa: failed to answer in chat {s}: {t}", .{ native_chat_id, err });
         const error_text = "Sorry, I couldn't reach the model just now.";
         if (placeholder_id) |pid| {
             if (connector.editMessage(a, native_chat_id, pid, error_text)) |_| {
-                std.log.info("qa: error message edited into placeholder for chat {s}", .{native_chat_id});
+                log.info("qa: error message edited into placeholder for chat {s}", .{native_chat_id});
             } else |edit_err| {
-                std.log.warn("qa: editing error message into placeholder failed for chat {s}: {t}, sending a new message instead", .{ native_chat_id, edit_err });
+                log.warn("qa: editing error message into placeholder failed for chat {s}: {t}, sending a new message instead", .{ native_chat_id, edit_err });
                 connector.sendMessage(a, native_chat_id, error_text, reply_to);
             }
         } else {
@@ -2702,16 +2761,16 @@ fn replyWithAnswer(
     // empty text with a 400, so don't try to send it — and don't leave the
     // placeholder stuck showing "thinking" forever either.
     const answer = std.mem.trim(u8, raw_answer, " \t\r\n");
-    std.log.info("qa: answer for chat {s} is {d} bytes (raw {d})", .{ native_chat_id, answer.len, raw_answer.len });
+    log.info("qa: answer for chat {s} is {d} bytes (raw {d})", .{ native_chat_id, answer.len, raw_answer.len });
     if (answer.len == 0) {
-        std.log.info("qa: empty answer for chat {s}, deleting placeholder", .{native_chat_id});
+        log.info("qa: empty answer for chat {s}, deleting placeholder", .{native_chat_id});
         if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |err| {
             // Previously swallowed silently — if this fails (network
             // hiccup, message already gone), the placeholder is stuck
             // showing "thinking" forever with zero trace of why. At least
             // log it; there's no good fallback text to edit in instead
             // since there was never a real answer to show.
-            std.log.warn("qa: failed to delete empty-answer placeholder for chat {s}: {t}", .{ native_chat_id, err });
+            log.warn("qa: failed to delete empty-answer placeholder for chat {s}: {t}", .{ native_chat_id, err });
         };
         return;
     }
@@ -2720,16 +2779,16 @@ fn replyWithAnswer(
         // Too long for this platform's limit — editing the placeholder
         // in-place with it would just fail the same way sending it fresh
         // would, so drop the placeholder and attach it as a file instead.
-        std.log.info("qa: answer for chat {s} exceeds max_message_len ({d} > {d}), sending as a file", .{ native_chat_id, answer.len, max_message_len });
+        log.info("qa: answer for chat {s} exceeds max_message_len ({d} > {d}), sending as a file", .{ native_chat_id, answer.len, max_message_len });
         if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |err| {
-            std.log.warn("qa: failed to delete placeholder before file fallback for chat {s}: {t}", .{ native_chat_id, err });
+            log.warn("qa: failed to delete placeholder before file fallback for chat {s}: {t}", .{ native_chat_id, err });
         };
         sendTextOrFile(connector, a, native_chat_id, answer, reply_to, max_message_len, "answer.txt");
     } else if (placeholder_id) |pid| {
         if (connector.editMessage(a, native_chat_id, pid, answer)) |_| {
-            std.log.info("qa: final answer edited into placeholder for chat {s}", .{native_chat_id});
+            log.info("qa: final answer edited into placeholder for chat {s}", .{native_chat_id});
         } else |err| {
-            std.log.warn("qa: final edit failed for chat {s}, sending a new message instead: {t}", .{ native_chat_id, err });
+            log.warn("qa: final edit failed for chat {s}, sending a new message instead: {t}", .{ native_chat_id, err });
             connector.sendMessage(a, native_chat_id, answer, reply_to);
         }
     } else {
@@ -2742,7 +2801,7 @@ fn replyWithAnswer(
     // hardcoded `user_id = "warden"` placeholder.
     const bot_username = connector.selfUsername() orelse "warden";
     const bot_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), connector.selfId() orelse "warden", bot_username, true, now) catch |err| {
-        std.log.err("qa: failed to resolve bot identity for chat {s}: {t}", .{ native_chat_id, err });
+        log.err("qa: failed to resolve bot identity for chat {s}: {t}", .{ native_chat_id, err });
         return;
     };
     recordMessage(pool, chat_id, bot_identity_id, null, answer, now, retention_messages);
@@ -2759,7 +2818,7 @@ fn replyWithWordcloud(
     reply_to: ?[]const u8,
 ) void {
     const words = wordcloud.topWords(a, pool, chat_id, 60) catch |err| {
-        std.log.err("wordcloud: tokenize failed for chat {s}: {t}", .{ native_chat_id, err });
+        log.err("wordcloud: tokenize failed for chat {s}: {t}", .{ native_chat_id, err });
         return;
     };
     if (words.len == 0) {
@@ -2767,7 +2826,7 @@ fn replyWithWordcloud(
         return;
     }
     const png = wordcloud.render(a, io, tmp_dir, words) catch |err| {
-        std.log.err("wordcloud: render failed for chat {s}: {t}", .{ native_chat_id, err });
+        log.err("wordcloud: render failed for chat {s}: {t}", .{ native_chat_id, err });
         connector.sendMessage(a, native_chat_id, "Couldn't render the word cloud (is Node installed?).", reply_to);
         return;
     };
@@ -2776,7 +2835,7 @@ fn replyWithWordcloud(
 
 fn replyWithStats(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, native_chat_id: []const u8, reply_to: ?[]const u8) void {
     const s = stats.compute(pool, a, chat_id, 5) catch |err| {
-        std.log.err("stats: query failed for chat {s}: {t}", .{ native_chat_id, err });
+        log.err("stats: query failed for chat {s}: {t}", .{ native_chat_id, err });
         return;
     };
 

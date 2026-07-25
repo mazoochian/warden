@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const log = @import("../log.zig").scoped("postgres");
 
 pub const c = @cImport({
     @cInclude("libpq-fe.h");
@@ -80,7 +81,7 @@ pub const Db = struct {
 
         const conn = c.PQconnectdb(dsn_with_options.ptr) orelse return error.PgConnectFailed;
         if (c.PQstatus(conn) != c.CONNECTION_OK) {
-            std.log.err("PQconnectdb failed: {s}", .{std.mem.span(c.PQerrorMessage(conn))});
+            log.err("PQconnectdb failed: {s}", .{std.mem.span(c.PQerrorMessage(conn))});
             c.PQfinish(conn);
             return error.PgConnectFailed;
         }
@@ -98,7 +99,7 @@ pub const Db = struct {
         };
         defer allocator.free(timeout_sql);
         db.exec(timeout_sql) catch |err| {
-            std.log.warn("pg: failed to set statement_timeout: {t}", .{err});
+            log.warn("pg: failed to set statement_timeout: {t}", .{err});
             // If setting the timeout is itself what blew the deadline,
             // `conn` is now poisoned before it was ever handed to a caller
             // — fail the open outright rather than returning a `Db` that
@@ -160,7 +161,7 @@ fn execBlocking(conn: *c.PGconn, sql: [:0]const u8) !void {
     defer c.PQclear(res);
     const status = c.PQresultStatus(res);
     if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
-        std.log.err("pg exec failed ({s}): {s}", .{ sql, std.mem.span(c.PQerrorMessage(conn)) });
+        log.err("pg exec failed ({s}): {s}", .{ sql, std.mem.span(c.PQerrorMessage(conn)) });
         return error.PgExecFailed;
     }
 }
@@ -170,7 +171,7 @@ fn execParamsBlocking(conn: *c.PGconn, sql: [:0]const u8, count: usize, ptrs: [m
     const res = c.PQexecParams(conn, sql.ptr, @intCast(count), null, @ptrCast(&mutable_ptrs), null, null, 0) orelse return error.PgExecFailed;
     const status = c.PQresultStatus(res);
     if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
-        std.log.err("pg exec failed ({s}): {s}", .{ sql, std.mem.span(c.PQerrorMessage(conn)) });
+        log.err("pg exec failed ({s}): {s}", .{ sql, std.mem.span(c.PQerrorMessage(conn)) });
         c.PQclear(res);
         return error.PgExecFailed;
     }
@@ -219,6 +220,7 @@ fn runWithDeadline(comptime T: type, db: *Db, comptime func: anytype, args: anyt
 
     // Deliberately not joined, closed, or reused from here on — see this
     // function's doc comment and `Db.poisoned`.
+    log.warn("query blew its {d}ms deadline, detaching and poisoning the connection", .{@divTrunc(db.query_timeout_ns, std.time.ns_per_ms)});
     thread.detach();
     db.poisoned = true;
     return error.QueryTimedOut;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Db = @import("db.zig").Db;
+const log = @import("../log.zig").scoped("postgres");
 
 /// How often `acquire` re-checks the free list while waiting for a
 /// connection — same idiom/value as `http_util.zig`'s `fetchWithTimeout`
@@ -49,8 +50,12 @@ pub const PgPool = struct {
         var opened: usize = 0;
         errdefer for (conns[0..opened]) |*conn| conn.close();
         for (conns) |*conn| {
-            conn.* = try Db.open(allocator, io, dsn_z, statement_timeout_seconds);
+            conn.* = Db.open(allocator, io, dsn_z, statement_timeout_seconds) catch |err| {
+                log.err("failed to open connection {d}/{d}: {t}", .{ opened + 1, size, err });
+                return err;
+            };
             opened += 1;
+            log.debug("opened connection {d}/{d}", .{ opened, size });
         }
 
         var free_idx: std.ArrayList(usize) = .empty;
@@ -89,8 +94,20 @@ pub const PgPool = struct {
     pub fn acquire(self: *PgPool) !*Db {
         var waited_ns: u64 = 0;
         while (true) {
-            if (try self.tryAcquire()) |db| return db;
-            if (waited_ns >= self.acquire_timeout_ns) return error.PoolExhausted;
+            if (try self.tryAcquire()) |db| {
+                // Only logged once actual waiting happened (not on the
+                // common instant-acquire path) — this is the leading
+                // indicator that the pool is under real pressure, well
+                // before it actually exhausts.
+                if (waited_ns > 0) {
+                    log.debug("acquired after waiting {d}ms", .{@divTrunc(waited_ns, std.time.ns_per_ms)});
+                }
+                return db;
+            }
+            if (waited_ns >= self.acquire_timeout_ns) {
+                log.warn("pool exhausted, gave up after {d}ms", .{@divTrunc(waited_ns, std.time.ns_per_ms)});
+                return error.PoolExhausted;
+            }
             const step = @min(poll_interval_ns, self.acquire_timeout_ns - waited_ns);
             Io.sleep(self.io, .fromNanoseconds(@intCast(step)), .awake) catch return error.PoolExhausted;
             waited_ns += step;
@@ -125,14 +142,16 @@ pub const PgPool = struct {
     /// pool that runs out entirely surfaces as an ordinary, loggable
     /// `error.PoolExhausted` from `acquire` rather than another silent hang.
     fn reopenPoisoned(self: *PgPool, idx: usize) void {
+        log.warn("connection slot {d} poisoned (query blew its deadline), reopening", .{idx});
         const fresh = Db.open(self.allocator, self.io, self.dsn, self.statement_timeout_seconds) catch |err| {
-            std.log.err("pg: failed to reopen poisoned connection: {t}", .{err});
+            log.err("failed to reopen poisoned connection (slot {d} stays out of the pool): {t}", .{ idx, err });
             return;
         };
         self.conns[idx] = fresh;
         self.mutex.lockUncancelable(self.io);
         self.free_idx.appendAssumeCapacity(idx);
         self.mutex.unlock(self.io);
+        log.notice("connection slot {d} reopened and back in the pool", .{idx});
     }
 
     /// Test-only: wraps a single already-open connection the caller still

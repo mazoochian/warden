@@ -6,6 +6,7 @@ const raw = @import("../telegram/client.zig");
 const types = @import("../telegram/types.zig");
 const Identity = @import("../domain/identity.zig").Identity;
 const TelegramProfile = @import("../domain/telegram_profile.zig").TelegramProfile;
+const log = @import("../log.zig").scoped("telegram");
 
 /// Telegram implementation of `platform.Connector`, backed by long polling.
 pub const TelegramConnector = struct {
@@ -32,7 +33,7 @@ pub const TelegramConnector = struct {
     fn ensureSelfInfo(self: *TelegramConnector, allocator: std.mem.Allocator) void {
         if (self.self_id != null) return;
         var me = self.client.getMe(allocator) catch |err| {
-            std.log.warn("telegram getMe failed (mention detection degraded until it succeeds): {t}", .{err});
+            log.warn("getMe failed (mention detection degraded until it succeeds): {t}", .{err});
             return;
         };
         defer me.deinit();
@@ -42,6 +43,7 @@ pub const TelegramConnector = struct {
         if (user.username) |u| {
             self.self_username = self.client.allocator.dupe(u8, u) catch null;
         }
+        log.notice("resolved self identity: id={d} username={?s}", .{ user.id, self.self_username });
     }
 
     /// Builds just the ancestor `Identity` from a Bot API `User` — the
@@ -262,7 +264,7 @@ pub const TelegramConnector = struct {
         defer updates.deinit();
 
         if (!updates.value.ok) {
-            std.log.err("telegram getUpdates not-ok: {?s}", .{updates.value.description});
+            log.err("telegram getUpdates not-ok: {?s}", .{updates.value.description});
             return &.{};
         }
 
@@ -493,7 +495,7 @@ pub const TelegramConnector = struct {
         defer parsed.deinit();
 
         if (!parsed.value.ok) {
-            std.log.err("telegram getChatAdministrators not-ok: {?s}", .{parsed.value.description});
+            log.err("telegram getChatAdministrators not-ok: {?s}", .{parsed.value.description});
             return error.TelegramApiError;
         }
 
@@ -520,7 +522,7 @@ pub const TelegramConnector = struct {
 
     fn parseChatId(chat_id: []const u8) ?i64 {
         return parseId(chat_id) catch {
-            std.log.err("telegram: invalid chat_id '{s}'", .{chat_id});
+            log.err("telegram: invalid chat_id '{s}'", .{chat_id});
             return null;
         };
     }

@@ -269,6 +269,15 @@ export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
 # export WARDEN_DIGEST_INTERVAL_SECONDS=86400
 # export WARDEN_CONFIRM_TIMEOUT_SECONDS=60
 # export WARDEN_CONVERT_TIMEOUT_SECONDS=300
+
+# Logging: debug | info | notice | warn | error | fatal (default: info).
+# Controls src/log.zig's runtime verbosity — every log line renders as
+# fixed-width columns (timestamp, level, scope, message) to stderr, which
+# `docker logs`/journald both capture. "debug" adds per-message and
+# per-HTTP/Postgres-call timing, useful when actively chasing a hang;
+# leave it at "info" (or "notice") for normal operation, since debug is
+# fairly verbose under real traffic.
+# export WARDEN_LOG_LEVEL=info
 ```
 
 ## Migrating from an older SQLite-based install

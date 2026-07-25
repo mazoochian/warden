@@ -1,0 +1,48 @@
+[Unit]
+# Wraps the existing docker-compose.yaml stack (warden + searxng + the
+# VPS-local postgres override) so systemd — not just Docker's own
+# `restart: unless-stopped` — supervises it. Two things this buys over the
+# container-only setup:
+#   1. Boot-time start: containers with `restart: unless-stopped` only come
+#      back if the Docker daemon itself was already running when they
+#      stopped; they don't get (re)created from scratch after a host
+#      reboot unless something starts them. `WantedBy=multi-user.target`
+#      below does that.
+#   2. `journalctl -u warden` instead of `docker logs`/`docker compose
+#      logs`: `ExecStart` runs in the foreground (no `-d`), so its stdout/
+#      stderr — which is every container's log output, prefixed by
+#      service name — lands directly in the journal via systemd's default
+#      `StandardOutput=journal`.
+# This does NOT replace compose.yaml's own `restart: unless-stopped` on
+# each service — that still recovers a single crashed *container* fast,
+# without waiting on this unit at all. This unit is the outer layer: if
+# the `docker compose up` process itself dies (lost its connection to a
+# restarted Docker daemon, was OOM-killed, etc.), `Restart=always` below
+# brings the whole stack back.
+Description=Warden bot (docker compose: warden, searxng, postgres)
+Documentation=https://github.com/mother-of-all-self-hosting
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/armin/warden
+# --no-color: compose colorizes each service's log-line prefix when it
+# thinks it's attached to a terminal; journald isn't one, but this forces
+# it off defensively so journal entries never carry stray ANSI escapes.
+# --remove-orphans: drops containers for services removed from
+# compose.yaml over time instead of leaving them running unmanaged.
+# Explicit service names (warden searxng postgres), not a bare `up`: this
+# repo also defines optional sidecar services (llama-server, whisper-
+# server, prosody) meant to be opt-in only — see compose.yaml's own
+# comments on why a bare `docker compose up` would try to start those too.
+ExecStart=/usr/bin/docker compose up --no-color --remove-orphans warden searxng postgres
+ExecStop=/usr/bin/docker compose stop warden searxng postgres
+Restart=always
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

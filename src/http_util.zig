@@ -52,6 +52,7 @@
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
+const log = @import("log.zig").scoped("http");
 
 /// How much of a failed response's body makes it into the log.
 const max_logged_body = 400;
@@ -214,8 +215,24 @@ fn fetchWithTimeout(client: *http.Client, options: http.Client.FetchOptions, tim
 
     // Deliberately not joined or freed — see module doc and `FetchShared`'s
     // doc comment for why this is a bounded leak, not a use-after-free.
+    var url_buf: [512]u8 = undefined;
+    log.warn("request timed out after {d}ms, detaching the stalled connection: {s} {s}", .{
+        @divTrunc(timeout_ns, std.time.ns_per_ms),
+        @tagName(options.method orelse .GET),
+        redactUrl(&url_buf, urlOf(options)),
+    });
     thread.detach();
     return error.RequestTimedOut;
+}
+
+/// Best-effort URL extraction for a log line — `options.location` is always
+/// `.url` in practice (see this function's doc comment above), but this
+/// stays defensive rather than asserting, since it only feeds a log message.
+fn urlOf(options: http.Client.FetchOptions) []const u8 {
+    return switch (options.location) {
+        .url => |u| u,
+        .uri => "(uri)",
+    };
 }
 
 /// Total attempts per request; the delay before each retry grows so a brief
@@ -271,6 +288,8 @@ pub fn getWithHeadersTimeout(client: *http.Client, allocator: std.mem.Allocator,
     while (true) : (attempt += 1) {
         return getOnce(client, allocator, url, extra_headers, timeout_ns) catch |err| {
             if (attempt + 1 >= max_attempts or !isTransient(err)) return err;
+            var url_buf: [512]u8 = undefined;
+            log.warn("GET {s} failed ({t}), retrying (attempt {d}/{d})", .{ redactUrl(&url_buf, url), err, attempt + 2, max_attempts });
             try backoff(client, attempt);
             continue;
         };
@@ -328,6 +347,8 @@ fn postJsonTimed(
     while (true) : (attempt += 1) {
         return postJsonOnce(client, allocator, url, extra_headers, payload, timeout_ns) catch |err| {
             if (attempt + 1 >= max_attempts or !isTransient(err)) return err;
+            var url_buf: [512]u8 = undefined;
+            log.warn("POST {s} failed ({t}), retrying (attempt {d}/{d})", .{ redactUrl(&url_buf, url), err, attempt + 2, max_attempts });
             try backoff(client, attempt);
             continue;
         };
@@ -628,7 +649,7 @@ fn postJsonSSEOnce(
         _ = err_reader.streamRemaining(&err_buf.writer) catch {};
         const shown = err_buf.writer.buffered();
         var url_buf: [512]u8 = undefined;
-        std.log.err("POST {s} -> {d}: {s}", .{
+        log.err("POST {s} -> {d}: {s}", .{
             redactUrl(&url_buf, url),
             @intFromEnum(response.head.status),
             shown[0..@min(shown.len, max_logged_body)],
@@ -735,7 +756,7 @@ fn checkStatus(method: []const u8, url: []const u8, status: http.Status, body: [
     if (status.class() == .success) return;
     var url_buf: [512]u8 = undefined;
     const shown = body[0..@min(body.len, max_logged_body)];
-    std.log.err("{s} {s} -> {d}: {s}", .{ method, redactUrl(&url_buf, url), @intFromEnum(status), shown });
+    log.err("{s} {s} -> {d}: {s}", .{ method, redactUrl(&url_buf, url), @intFromEnum(status), shown });
     return error.HttpRequestFailed;
 }
 

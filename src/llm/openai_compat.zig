@@ -5,6 +5,7 @@ const json = std.json;
 
 const llm = @import("provider.zig");
 const http_util = @import("../http_util.zig");
+const log = @import("../log.zig").scoped("llm");
 
 const ToolCallFunction = struct {
     name: []const u8 = "",
@@ -128,8 +129,11 @@ pub const OpenAiCompatProvider = struct {
         var headers_buf: [1]http.Header = undefined;
         const headers = try self.buildHeaders(&auth_header_buf, &headers_buf);
 
+        const started = Io.Timestamp.now(self.http_client.io, .real);
+        log.debug("chat: calling {s} ({d} message(s))", .{ self.model, request.messages.len });
         const body = try http_util.postJsonWithTimeout(&self.http_client, allocator, url, headers, payload, http_util.llm_timeout_ns);
         defer allocator.free(body);
+        log.debug("chat: {s} returned in {d}ms", .{ self.model, elapsedMs(self.http_client.io, started) });
 
         // Deliberately never `.deinit()`'d — see the note on
         // `llm.ChatResponse`; content (and each tool call's parsed
@@ -142,12 +146,12 @@ pub const OpenAiCompatProvider = struct {
             body,
             .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
         ) catch |err| {
-            std.log.err("openai-compatible response unparseable ({t}): {s}", .{ err, body[0..@min(body.len, 400)] });
+            log.err("response unparseable ({t}): {s}", .{ err, body[0..@min(body.len, 400)] });
             return err;
         };
 
         if (parsed.value.@"error") |err| {
-            std.log.err("openai-compatible api error: {s}: {s}", .{ err.type, err.message });
+            log.err("api error: {s}: {s}", .{ err.type, err.message });
             return error.OpenAiCompatApiError;
         }
         if (parsed.value.choices.len == 0) return error.OpenAiCompatEmptyResponse;
@@ -188,7 +192,7 @@ pub const OpenAiCompatProvider = struct {
             // the entire answer on a JSON parse of "".
             const args_src = if (tc.function.arguments.len == 0) "{}" else tc.function.arguments;
             const args = json.parseFromSlice(json.Value, allocator, args_src, .{}) catch |err| {
-                std.log.err("tool call '{s}' has unparseable arguments ({t}): {s}", .{
+                log.err("tool call '{s}' has unparseable arguments ({t}): {s}", .{
                     tc.function.name, err, args_src[0..@min(args_src.len, 400)],
                 });
                 return err;
@@ -218,16 +222,23 @@ pub const OpenAiCompatProvider = struct {
         const headers = try self.buildHeaders(&auth_header_buf, &headers_buf);
 
         var state: StreamState = .{ .allocator = allocator, .stream_sink = sink, .show_thinking = request.show_thinking };
+        const started = Io.Timestamp.now(self.http_client.io, .real);
+        log.debug("chat (stream): calling {s} ({d} message(s))", .{ self.model, request.messages.len });
         try http_util.postJsonSSE(&self.http_client, allocator, url, headers, payload, http_util.llm_timeout_ns, state.sink());
+        log.debug("chat (stream): {s} finished in {d}ms", .{ self.model, elapsedMs(self.http_client.io, started) });
 
         if (state.err) |err| {
-            std.log.err("openai-compatible streaming api error: {s}: {s}", .{ err.type, err.message });
+            log.err("streaming api error: {s}: {s}", .{ err.type, err.message });
             return error.OpenAiCompatApiError;
         }
 
         return try state.finalize(allocator);
     }
 };
+
+fn elapsedMs(io: Io, started: Io.Timestamp) i64 {
+    return @intCast(@divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - started.toNanoseconds(), std.time.ns_per_ms));
+}
 
 /// Removes every `<tag>...</tag>` span from `content` (used to strip
 /// `<think>`/`<thinking>` chain-of-thought some reasoning models inline
@@ -356,7 +367,7 @@ const StreamState = struct {
         // which aliases the SSE reader's transfer buffer — see
         // `anthropic.zig`'s `StreamState.onLine` for the same note.
         var parsed = json.parseFromSlice(json.Value, self.allocator, data, .{ .allocate = .alloc_always }) catch |err| {
-            std.log.warn("openai-compatible stream: unparseable SSE data line ({t}): {s}", .{ err, data[0..@min(data.len, 200)] });
+            log.warn("stream: unparseable SSE data line ({t}): {s}", .{ err, data[0..@min(data.len, 200)] });
             return;
         };
         defer parsed.deinit();
@@ -482,7 +493,7 @@ const StreamState = struct {
         for (self.tool_calls.items) |tc| {
             const args_src = if (tc.arguments.items.len == 0) "{}" else tc.arguments.items;
             const args = json.parseFromSlice(json.Value, allocator, args_src, .{ .allocate = .alloc_always }) catch |err| {
-                std.log.err("tool call '{s}' has unparseable streamed arguments ({t}): {s}", .{
+                log.err("tool call '{s}' has unparseable streamed arguments ({t}): {s}", .{
                     tc.name.items, err, args_src[0..@min(args_src.len, 400)],
                 });
                 return err;

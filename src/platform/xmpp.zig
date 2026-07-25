@@ -7,6 +7,7 @@ const xml = @import("../xmpp/xml.zig");
 const types = @import("../xmpp/types.zig");
 const Identity = @import("../domain/identity.zig").Identity;
 const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
+const log = @import("../log.zig").scoped("xmpp");
 
 /// How long a single `pollFn` cycle waits for a stanza before returning an
 /// empty slice — bounds the blocking socket read so the round-robin poll
@@ -16,6 +17,16 @@ const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
 /// XMPP's read has no server-side "nothing happened yet" signal the way
 /// long-poll does — it just blocks until bytes arrive.
 const poll_timeout_ns: u64 = 8 * std.time.ns_per_s;
+
+/// Cooldown after a failed `ensureConnected` before `pollFn` returns —
+/// discovered live while adding logging (2026-07-25): a failed connect
+/// returns an empty slice, not an error, so `main.zig`'s outer
+/// `connectorPollLoop` sees an ordinary successful-but-empty poll and loops
+/// straight back into `poll()` with zero delay. Without this, an
+/// unreachable/misconfigured XMPP server turns into a genuine busy-retry
+/// loop — hundreds of connect attempts and log lines per second, burning a
+/// full core for nothing, on every host this connector is enabled on.
+const reconnect_cooldown_ns: u64 = 5 * std.time.ns_per_s;
 const poll_check_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
 /// XMPP implementation of `platform.Connector` — MVP scope (1:1 chat +
@@ -134,14 +145,14 @@ pub const XmppConnector = struct {
 
         for (self.muc_rooms) |room| {
             client.joinMuc(allocator, room, self.resource) catch |err| {
-                std.log.warn("xmpp: failed to join MUC room {s}: {t}", .{ room, err });
+                log.warn("failed to join MUC room {s}: {t}", .{ room, err });
                 continue;
             };
             const dup = self.allocator.dupe(u8, room) catch continue;
             self.joined_rooms.append(self.allocator, dup) catch self.allocator.free(dup);
         }
 
-        std.log.info("xmpp: connected as {s}", .{self.bound_jid.?});
+        log.notice("connected as {s}", .{self.bound_jid.?});
     }
 
     fn isJoinedRoom(self: *XmppConnector, chat_id: []const u8) bool {
@@ -191,7 +202,8 @@ pub const XmppConnector = struct {
         const self: *XmppConnector = @ptrCast(@alignCast(ptr));
 
         self.ensureConnected(allocator) catch |err| {
-            std.log.warn("xmpp: connect failed, will retry next cycle: {t}", .{err});
+            log.warn("connect failed, retrying in {d}s: {t}", .{ @divTrunc(reconnect_cooldown_ns, std.time.ns_per_s), err });
+            Io.sleep(self.io, .fromNanoseconds(@intCast(reconnect_cooldown_ns)), .awake) catch {};
             return &.{};
         };
         const client = self.client.?;
@@ -221,7 +233,7 @@ pub const XmppConnector = struct {
         defer self.allocator.destroy(shared);
 
         var parsed = shared.result catch |err| {
-            std.log.warn("xmpp: connection lost ({t}), will reconnect next cycle", .{err});
+            log.warn("connection lost ({t}), will reconnect next cycle", .{err});
             client.close();
             self.client = null;
             return &.{};
@@ -230,13 +242,13 @@ pub const XmppConnector = struct {
 
         if (std.mem.eql(u8, parsed.element.name, "presence")) {
             self.handlePresence(allocator, parsed.element) catch |err| {
-                std.log.warn("xmpp: failed to handle presence: {t}", .{err});
+                log.warn("failed to handle presence: {t}", .{err});
             };
             return &.{};
         }
 
         return self.messagesFromElement(allocator, parsed.element) catch |err| {
-            std.log.warn("xmpp: failed to map an inbound message: {t}", .{err});
+            log.warn("failed to map an inbound message: {t}", .{err});
             return &.{};
         };
     }
@@ -310,12 +322,12 @@ pub const XmppConnector = struct {
         _ = reply_to_message_id; // No reply-threading concept this connector uses yet.
         const self: *XmppConnector = @ptrCast(@alignCast(ptr));
         const client = self.client orelse {
-            std.log.warn("xmpp: dropped message to {s}, not connected: {s}", .{ chat_id, text });
+            log.warn("dropped message to {s}, not connected: {s}", .{ chat_id, text });
             return;
         };
         const kind = if (self.isJoinedRoom(chat_id)) "groupchat" else "chat";
         client.sendMessage(allocator, chat_id, kind, text) catch |err| {
-            std.log.warn("xmpp: failed to send message to {s}: {t}", .{ chat_id, err });
+            log.warn("failed to send message to {s}: {t}", .{ chat_id, err });
         };
     }
 };

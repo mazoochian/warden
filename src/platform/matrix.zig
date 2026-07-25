@@ -9,6 +9,7 @@ const matrix_crypto = @import("../matrix/crypto.zig");
 const store_pool = @import("../store/pool.zig");
 const Identity = @import("../domain/identity.zig").Identity;
 const MatrixProfile = @import("../domain/matrix_profile.zig").MatrixProfile;
+const log = @import("../log.zig").scoped("matrix");
 
 /// Matrix implementation of `platform.Connector`, backed by `/sync`
 /// long-polling — same shape as `telegram.zig`'s `TelegramConnector`, just
@@ -86,12 +87,13 @@ pub const MatrixConnector = struct {
     fn ensureSelfInfo(self: *MatrixConnector, allocator: std.mem.Allocator) void {
         if (self.self_user_id != null) return;
         var who = self.client.whoami(allocator) catch |err| {
-            std.log.warn("matrix whoami failed (mention detection degraded until it succeeds): {t}", .{err});
+            log.warn("whoami failed (mention detection degraded until it succeeds): {t}", .{err});
             return;
         };
         defer who.deinit();
         if (who.value.user_id.len == 0) return;
         self.self_user_id = self.client.allocator.dupe(u8, who.value.user_id) catch null;
+        log.notice("resolved self identity: {?s}", .{self.self_user_id});
     }
 
     /// Content-based mention check, preferred over a plain-text scan: modern
@@ -223,7 +225,7 @@ pub const MatrixConnector = struct {
         var invite_it = synced.value.rooms.invite.map.iterator();
         while (invite_it.next()) |entry| {
             self.client.joinRoom(allocator, entry.key_ptr.*) catch |err| {
-                std.log.warn("matrix: failed to auto-join invited room {s}: {t}", .{ entry.key_ptr.*, err });
+                log.warn("matrix: failed to auto-join invited room {s}: {t}", .{ entry.key_ptr.*, err });
             };
         }
 
@@ -236,56 +238,56 @@ pub const MatrixConnector = struct {
             for (synced.value.to_device.events) |ev| {
                 if (std.mem.eql(u8, ev.type, "m.room.encrypted")) {
                     var parsed = json.parseFromValue(types.OlmEncryptedContent, allocator, ev.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse to-device m.room.encrypted content from {s}: {t}", .{ ev.sender, err });
+                        log.warn("matrix: failed to parse to-device m.room.encrypted content from {s}: {t}", .{ ev.sender, err });
                         continue;
                     };
                     defer parsed.deinit();
                     crypto.handleToDeviceEvent(ev.sender, parsed.value);
                 } else if (std.mem.eql(u8, ev.type, "m.room_key_request")) {
                     var parsed = json.parseFromValue(types.RoomKeyRequestContent, allocator, ev.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.room_key_request from {s}: {t}", .{ ev.sender, err });
+                        log.warn("matrix: failed to parse m.room_key_request from {s}: {t}", .{ ev.sender, err });
                         continue;
                     };
                     defer parsed.deinit();
                     crypto.handleRoomKeyRequest(ev.sender, parsed.value);
                 } else if (std.mem.eql(u8, ev.type, "m.key.verification.request")) {
                     var parsed = json.parseFromValue(types.VerificationRequestContent, allocator, ev.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.key.verification.request from {s}: {t}", .{ ev.sender, err });
+                        log.warn("matrix: failed to parse m.key.verification.request from {s}: {t}", .{ ev.sender, err });
                         continue;
                     };
                     defer parsed.deinit();
                     crypto.handleVerificationRequest(ev.sender, parsed.value);
                 } else if (std.mem.eql(u8, ev.type, "m.key.verification.accept")) {
                     var parsed = json.parseFromValue(types.VerificationAcceptContent, allocator, ev.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.key.verification.accept from {s}: {t}", .{ ev.sender, err });
+                        log.warn("matrix: failed to parse m.key.verification.accept from {s}: {t}", .{ ev.sender, err });
                         continue;
                     };
                     defer parsed.deinit();
                     crypto.handleVerificationAccept(ev.sender, parsed.value);
                 } else if (std.mem.eql(u8, ev.type, "m.key.verification.key")) {
                     var parsed = json.parseFromValue(types.VerificationKeyContent, allocator, ev.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.key.verification.key from {s}: {t}", .{ ev.sender, err });
+                        log.warn("matrix: failed to parse m.key.verification.key from {s}: {t}", .{ ev.sender, err });
                         continue;
                     };
                     defer parsed.deinit();
                     crypto.handleVerificationKey(ev.sender, parsed.value);
                 } else if (std.mem.eql(u8, ev.type, "m.key.verification.mac")) {
                     var parsed = json.parseFromValue(types.VerificationMacContent, allocator, ev.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.key.verification.mac from {s}: {t}", .{ ev.sender, err });
+                        log.warn("matrix: failed to parse m.key.verification.mac from {s}: {t}", .{ ev.sender, err });
                         continue;
                     };
                     defer parsed.deinit();
                     crypto.handleVerificationMac(ev.sender, parsed.value);
                 } else if (std.mem.eql(u8, ev.type, "m.key.verification.done")) {
                     var parsed = json.parseFromValue(types.VerificationDoneContent, allocator, ev.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.key.verification.done from {s}: {t}", .{ ev.sender, err });
+                        log.warn("matrix: failed to parse m.key.verification.done from {s}: {t}", .{ ev.sender, err });
                         continue;
                     };
                     defer parsed.deinit();
                     crypto.handleVerificationDone(ev.sender, parsed.value);
                 } else if (std.mem.eql(u8, ev.type, "m.key.verification.cancel")) {
                     var parsed = json.parseFromValue(types.VerificationCancelContent, allocator, ev.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.key.verification.cancel from {s}: {t}", .{ ev.sender, err });
+                        log.warn("matrix: failed to parse m.key.verification.cancel from {s}: {t}", .{ ev.sender, err });
                         continue;
                     };
                     defer parsed.deinit();
@@ -295,7 +297,7 @@ pub const MatrixConnector = struct {
 
             if (synced.value.device_one_time_keys_count.map.get("signed_curve25519")) |count| {
                 crypto.topUpOneTimeKeysIfNeeded(allocator, count) catch |err| {
-                    std.log.warn("matrix e2ee: failed to top up one-time keys: {t}", .{err});
+                    log.warn("matrix e2ee: failed to top up one-time keys: {t}", .{err});
                 };
             }
         }
@@ -348,7 +350,7 @@ pub const MatrixConnector = struct {
                 if (std.mem.eql(u8, event.type, "m.room.message")) {
                     if (self.self_user_id) |me| if (std.mem.eql(u8, event.sender, me)) continue;
                     var parsed = json.parseFromValue(types.MessageContent, allocator, event.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.room.message content for {s}: {t}", .{ event.event_id, err });
+                        log.warn("matrix: failed to parse m.room.message content for {s}: {t}", .{ event.event_id, err });
                         continue;
                     };
                     defer parsed.deinit();
@@ -361,12 +363,12 @@ pub const MatrixConnector = struct {
                     if (self.self_user_id) |me| if (std.mem.eql(u8, event.sender, me)) continue;
                     const crypto = if (self.crypto) |*c| c else continue; // no pickle key configured — can't read this
                     var enc_parsed = json.parseFromValue(types.MegolmEncryptedContent, allocator, event.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| {
-                        std.log.warn("matrix: failed to parse m.room.encrypted content for {s}: {t}", .{ event.event_id, err });
+                        log.warn("matrix: failed to parse m.room.encrypted content for {s}: {t}", .{ event.event_id, err });
                         continue;
                     };
                     defer enc_parsed.deinit();
                     var decrypted = (crypto.decryptRoomEvent(allocator, room_id, enc_parsed.value) catch |err| {
-                        std.log.warn("matrix: failed to decrypt event {s} in {s}: {t}", .{ event.event_id, room_id, err });
+                        log.warn("matrix: failed to decrypt event {s} in {s}: {t}", .{ event.event_id, room_id, err });
                         continue;
                     }) orelse continue; // no room key on file yet — can't read this one
                     defer decrypted.deinit();
@@ -414,7 +416,7 @@ pub const MatrixConnector = struct {
                     } else |_| {}
                     if (self.self_user_id) |me| reply_to_is_me = std.mem.eql(u8, reply_ev.value.sender, me);
                 } else |err| {
-                    std.log.warn("matrix: failed to resolve reply target {s}: {t}", .{ in_reply_to.event_id, err });
+                    log.warn("matrix: failed to resolve reply target {s}: {t}", .{ in_reply_to.event_id, err });
                 }
             }
         }
@@ -509,7 +511,7 @@ pub const MatrixConnector = struct {
         if (cached) return true;
 
         const encrypted = self.client.isRoomEncrypted(allocator, room_id) catch |err| {
-            std.log.warn("matrix: failed to check encryption state of {s}, sending this one plaintext (will re-check next send): {t}", .{ room_id, err });
+            log.warn("matrix: failed to check encryption state of {s}, sending this one plaintext (will re-check next send): {t}", .{ room_id, err });
             return false;
         };
         if (encrypted) {
@@ -551,7 +553,7 @@ pub const MatrixConnector = struct {
         defer allocator.free(inner_event);
 
         const enc = crypto.encryptForRoom(allocator, room_id, inner_event) catch |err| {
-            std.log.err("matrix e2ee: failed to encrypt outgoing {s} for {s}, sending plaintext (recipients likely won't see it): {t}", .{ event_type, room_id, err });
+            log.err("matrix e2ee: failed to encrypt outgoing {s} for {s}, sending plaintext (recipients likely won't see it): {t}", .{ event_type, room_id, err });
             return self.client.putRoomEvent(allocator, room_id, event_type, content_json);
         };
         defer allocator.free(enc.ciphertext);
@@ -578,7 +580,7 @@ pub const MatrixConnector = struct {
 
     fn sendMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to_message_id: ?[]const u8) void {
         const id = sendMessageReturningIdFn(ptr, allocator, chat_id, text, reply_to_message_id) catch |err| {
-            std.log.err("matrix sendMessage failed: {t}", .{err});
+            log.err("matrix sendMessage failed: {t}", .{err});
             return;
         };
         allocator.free(id);
@@ -636,12 +638,12 @@ pub const MatrixConnector = struct {
             const reaction_payload = buildJson(allocator, raw.Client.ReactionPayload{
                 .@"m.relates_to" = .{ .rel_type = "m.annotation", .event_id = event_id, .key = c.emoji },
             }) catch |err| {
-                std.log.warn("matrix: failed to build reaction payload for {s} on {s}: {t}", .{ c.emoji, event_id, err });
+                log.warn("matrix: failed to build reaction payload for {s} on {s}: {t}", .{ c.emoji, event_id, err });
                 continue;
             };
             defer allocator.free(reaction_payload);
             const reaction_id = self.sendEvent(allocator, chat_id, "m.reaction", reaction_payload) catch |err| {
-                std.log.warn("matrix: failed to seed reaction {s} on {s}: {t}", .{ c.emoji, event_id, err });
+                log.warn("matrix: failed to seed reaction {s} on {s}: {t}", .{ c.emoji, event_id, err });
                 continue;
             };
             allocator.free(reaction_id);

@@ -5,6 +5,7 @@ const json = std.json;
 
 const llm = @import("provider.zig");
 const http_util = @import("../http_util.zig");
+const log = @import("../log.zig").scoped("llm");
 
 const ApiError = struct {
     type: []const u8 = "",
@@ -58,6 +59,8 @@ pub const AnthropicProvider = struct {
         const payload = try buildPayload(allocator, self, request, false);
         const headers = self.authHeaders();
 
+        const started = Io.Timestamp.now(self.http_client.io, .real);
+        log.debug("chat: calling {s} ({d} message(s))", .{ self.model, request.messages.len });
         const body = try http_util.postJsonWithTimeout(
             &self.http_client,
             allocator,
@@ -67,6 +70,7 @@ pub const AnthropicProvider = struct {
             http_util.llm_timeout_ns,
         );
         defer allocator.free(body);
+        log.debug("chat: {s} returned in {d}ms", .{ self.model, elapsedMs(self.http_client.io, started) });
 
         // Deliberately never `.deinit()`'d: `ToolUse.input` below borrows
         // from this parse's arena, and callers are expected to run
@@ -81,7 +85,7 @@ pub const AnthropicProvider = struct {
         );
 
         if (parsed.value.@"error") |err| {
-            std.log.err("anthropic api error: {s}: {s}", .{ err.type, err.message });
+            log.err("anthropic api error: {s}: {s}", .{ err.type, err.message });
             return error.AnthropicApiError;
         }
 
@@ -97,6 +101,8 @@ pub const AnthropicProvider = struct {
         const headers = self.authHeaders();
 
         var state: StreamState = .{ .allocator = allocator, .stream_sink = sink };
+        const started = Io.Timestamp.now(self.http_client.io, .real);
+        log.debug("chat (stream): calling {s} ({d} message(s))", .{ self.model, request.messages.len });
         try http_util.postJsonSSE(
             &self.http_client,
             allocator,
@@ -106,9 +112,10 @@ pub const AnthropicProvider = struct {
             http_util.llm_timeout_ns,
             state.sink(),
         );
+        log.debug("chat (stream): {s} finished in {d}ms", .{ self.model, elapsedMs(self.http_client.io, started) });
 
         if (state.err) |err| {
-            std.log.err("anthropic streaming api error: {s}: {s}", .{ err.type, err.message });
+            log.err("anthropic streaming api error: {s}: {s}", .{ err.type, err.message });
             return error.AnthropicApiError;
         }
 
@@ -118,6 +125,10 @@ pub const AnthropicProvider = struct {
         };
     }
 };
+
+fn elapsedMs(io: Io, started: Io.Timestamp) i64 {
+    return @intCast(@divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - started.toNanoseconds(), std.time.ns_per_ms));
+}
 
 /// Shared request-body builder for both `chatFn` and `chatStreamFn` — the
 /// only difference between the two is `"stream":true`. Duped into a fresh
@@ -307,7 +318,7 @@ const StreamState = struct {
         // parse that needs to outlive this one call must be copied out via
         // `self.allocator` before returning (see the `dupe` calls below).
         var parsed = json.parseFromSlice(json.Value, self.allocator, data, .{ .allocate = .alloc_always }) catch |err| {
-            std.log.warn("anthropic stream: unparseable SSE data line ({t}): {s}", .{ err, data[0..@min(data.len, 200)] });
+            log.warn("stream: unparseable SSE data line ({t}): {s}", .{ err, data[0..@min(data.len, 200)] });
             return;
         };
         defer parsed.deinit();
@@ -367,7 +378,7 @@ const StreamState = struct {
                     if (json.parseFromSlice(json.Value, self.allocator, src, .{ .allocate = .alloc_always })) |parsed_input| {
                         input_value = parsed_input.value;
                     } else |err| {
-                        std.log.warn("anthropic stream: unparseable tool_use input for '{s}' ({t}): {s}", .{ tu.name, err, src[0..@min(src.len, 200)] });
+                        log.warn("stream: unparseable tool_use input for '{s}' ({t}): {s}", .{ tu.name, err, src[0..@min(src.len, 200)] });
                     }
                     try self.blocks.append(self.allocator, .{ .tool_use = .{ .id = tu.id, .name = tu.name, .input = input_value } });
                 },
