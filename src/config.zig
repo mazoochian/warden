@@ -178,8 +178,39 @@ pub const Config = struct {
     /// `XmppConnector` (and adds it to the active connector list) when
     /// this is set.
     xmpp: ?XmppConfig = null,
+    /// Null (the default) means the warden-ui HTTP+WebSocket API
+    /// (`src/api/`) stays entirely off — same half-configured-stays-
+    /// disabled convention as `matrix`/`xmpp` above, and a deliberate
+    /// choice while this is still under active development: an
+    /// in-progress API surface shouldn't be reachable at all on a
+    /// production deployment just because the binary happens to support
+    /// it now. Set to enable it (see `api_session_secret` below, which is
+    /// required once this is set).
+    api_port: ?u16 = null,
+    /// Worker threads servicing API requests — same `WorkerPool` shape as
+    /// `workers_per_platform`, so a slow/stuck API request can't wedge the
+    /// bot's own message processing (or vice versa).
+    api_workers: usize = default_api_workers,
+    /// HMAC-SHA256 signing key for session cookies (`src/api/auth.zig`) —
+    /// required (load fails) if `api_port` is set, since an API server
+    /// with no way to sign sessions can't authenticate anyone safely.
+    /// Never has a default — an auto-generated or hardcoded fallback here
+    /// would silently invalidate every session on every restart (auto-
+    /// generated) or be a shared, guessable secret across every
+    /// deployment of this codebase (hardcoded), either of which is worse
+    /// than failing loudly at startup.
+    api_session_secret: ?[]const u8 = null,
+    /// DANGER: lets anyone hit `POST /api/v1/auth/dev-login` and become
+    /// any identity by id, no real login required — exists purely so
+    /// Phase 0 could prove the whole session/account/RBAC chain end to
+    /// end before any real login provider (Telegram widget/Google/OIDC)
+    /// was wired up. Must be confirmed OFF (unset) before this is ever
+    /// reachable from anywhere but a contributor's own machine — this
+    /// flag existing at all is a tracked TODO to remove once Phase 1's
+    /// real logins land, not a permanent feature. Defaults to false.
+    api_dev_login: bool = false,
 
-    pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile } || std.mem.Allocator.Error;
+    pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile, ApiEnabledWithoutSessionSecret } || std.mem.Allocator.Error;
 
     /// `env` is expected to be `init.environ_map` from `std.process.Init`.
     /// `arena` should be long-lived (e.g. `init.arena.allocator()`) since
@@ -307,6 +338,24 @@ pub const Config = struct {
             default_llm_history_messages;
         const skip_trivial_messages = parseBoolEnv(env, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", default_skip_trivial_messages);
 
+        const api_port: ?u16 = if (env.get("WARDEN_API_PORT")) |raw|
+            std.fmt.parseInt(u16, raw, 10) catch null
+        else
+            null;
+        const api_workers: usize = if (env.get("WARDEN_API_WORKERS")) |raw|
+            std.fmt.parseInt(usize, raw, 10) catch default_api_workers
+        else
+            default_api_workers;
+        const api_session_secret = nonEmpty(env.get("WARDEN_API_SESSION_SECRET"));
+        if (api_port != null and api_session_secret == null) {
+            std.log.err("WARDEN_API_PORT is set but WARDEN_API_SESSION_SECRET isn't — refusing to start an API server with no way to sign sessions", .{});
+            return error.ApiEnabledWithoutSessionSecret;
+        }
+        const api_dev_login = parseBoolEnv(env, "WARDEN_API_DEV_LOGIN", false);
+        if (api_dev_login) {
+            std.log.warn("WARDEN_API_DEV_LOGIN is set — /api/v1/auth/dev-login lets anyone become any identity by id with no real login. NEVER set this outside a contributor's own machine.", .{});
+        }
+
         return .{
             .telegram_bot_token = telegram_bot_token,
             .owners = owners,
@@ -334,6 +383,10 @@ pub const Config = struct {
             .matrix = matrix,
             .matrix_pickle_key = matrix_pickle_key,
             .xmpp = xmpp,
+            .api_port = api_port,
+            .api_workers = api_workers,
+            .api_session_secret = api_session_secret,
+            .api_dev_login = api_dev_login,
         };
     }
 
@@ -483,6 +536,12 @@ pub const Config = struct {
     pub const default_confirm_timeout_seconds: i64 = 60;
     pub const default_convert_timeout_seconds: i64 = 300;
     pub const default_menu_timeout_seconds: i64 = 180;
+    /// Deliberately small and fixed (not CPU-scaled like
+    /// `defaultWorkersPerPlatform`) — the API is new/low-traffic by
+    /// design for now (see `api_port`'s doc comment), not yet a surface
+    /// that needs to scale with the host's core count the way per-
+    /// platform message workers do.
+    pub const default_api_workers: usize = 4;
     pub const default_digest_interval_seconds: i64 = 86_400;
     pub const default_llm_owner_only: bool = true;
     pub const default_llm_show_thinking: bool = false;

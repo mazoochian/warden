@@ -25,6 +25,7 @@ const telegram_platform = @import("platform/telegram.zig");
 const matrix_platform = @import("platform/matrix.zig");
 const xmpp_platform = @import("platform/xmpp.zig");
 const store_pool = @import("store/pool.zig");
+const api_server = @import("api/server.zig");
 const migrate = @import("store/migrate.zig");
 const chats = @import("store/chats.zig");
 const identities = @import("store/identities.zig");
@@ -479,6 +480,23 @@ pub fn main(init: std.process.Init) !void {
         log.warn("failed to start self-watchdog thread: {t}", .{err});
     }
 
+    // warden-ui's HTTP+WebSocket API (see /home/armin/claude/warden-ui) —
+    // entirely off unless WARDEN_API_PORT is set (see `Config.api_port`'s
+    // doc comment for why this stays opt-in while still under active
+    // development). A failure to start it is logged, not fatal — same
+    // convention as the self-watchdog thread above; the bot itself must
+    // never fail to start because of a problem in this newer, optional
+    // surface.
+    if (config.api_port) |port| {
+        const api_ctx = try gpa.create(api_server.ServerContext);
+        api_ctx.* = .{ .allocator = gpa, .io = io, .pool = &pool, .config = &config };
+        if (std.Thread.spawn(.{}, apiServerThread, .{ api_ctx, port, config.api_workers })) |thread| {
+            thread.detach();
+        } else |err| {
+            log.warn("failed to start API server thread: {t}", .{err});
+        }
+    }
+
     // Due-digest/reminder/alert/feed checks used to piggyback on the old
     // round-robin loop's natural ~30s-ish cadence; now that connectors
     // poll independently (no shared "lap" to hang off of), this is its own
@@ -672,6 +690,17 @@ fn selfWatchdogLoop(io: Io, heartbeat: *Heartbeat) void {
             log.fatal("self-watchdog: a connector or the scheduler has gone stale for over {d}s — exiting so the container restarts", .{watchdog_stale_seconds});
         }
     }
+}
+
+/// Thread entry point for `api_server.run` — a thin wrapper only because
+/// `std.Thread.spawn`'s function must return `void`, not `!void`. A
+/// startup failure here (e.g. the port is already in use) is logged, not
+/// fatal to the whole bot — same convention as every other optional
+/// subsystem's own thread spawn.
+fn apiServerThread(ctx: *const api_server.ServerContext, port: u16, workers: usize) void {
+    api_server.run(ctx, port, workers) catch |err| {
+        log.err("api server exited: {t}", .{err});
+    };
 }
 
 /// One connector's own poll-forever loop (see the call site's doc comment
@@ -3904,6 +3933,14 @@ test {
     _ = @import("features/piechart.zig");
     _ = @import("text/civil_time.zig");
     _ = @import("store/user_settings.zig");
+    _ = @import("store/accounts.zig");
+    _ = @import("store/web_sessions.zig");
+    _ = @import("store/feature_flags.zig");
+    _ = @import("store/dynamic_config.zig");
+    _ = @import("store/audit_log.zig");
+    _ = @import("store/oauth_providers.zig");
+    _ = @import("api/auth.zig");
+    _ = @import("api/router.zig");
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
     _ = @import("features/qa.zig");

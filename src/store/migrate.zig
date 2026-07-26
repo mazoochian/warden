@@ -27,6 +27,12 @@ const migrations = [_]Migration{
     .{ .version = 13, .name = "0013_identities_username_lookup_index", .sql = @embedFile("migrations/0013_identities_username_lookup_index.sql") },
     .{ .version = 14, .name = "0014_bot_pending_grants", .sql = @embedFile("migrations/0014_bot_pending_grants.sql") },
     .{ .version = 15, .name = "0015_user_settings", .sql = @embedFile("migrations/0015_user_settings.sql") },
+    .{ .version = 16, .name = "0016_web_accounts", .sql = @embedFile("migrations/0016_web_accounts.sql") },
+    .{ .version = 17, .name = "0017_web_sessions", .sql = @embedFile("migrations/0017_web_sessions.sql") },
+    .{ .version = 18, .name = "0018_oauth_providers", .sql = @embedFile("migrations/0018_oauth_providers.sql") },
+    .{ .version = 19, .name = "0019_feature_flags", .sql = @embedFile("migrations/0019_feature_flags.sql") },
+    .{ .version = 20, .name = "0020_dynamic_config", .sql = @embedFile("migrations/0020_dynamic_config.sql") },
+    .{ .version = 21, .name = "0021_audit_log", .sql = @embedFile("migrations/0021_audit_log.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each

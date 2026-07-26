@@ -392,6 +392,15 @@ export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
 # export WARDEN_CONVERT_TIMEOUT_SECONDS=300
 # export WARDEN_MENU_TIMEOUT_SECONDS=180
 
+# warden-ui's HTTP+WebSocket API (see /home/armin/claude/warden-ui) — off
+# entirely by default (WARDEN_API_PORT unset) since it's still under
+# active development. Setting WARDEN_API_PORT without
+# WARDEN_API_SESSION_SECRET set refuses to start (fails loudly rather
+# than signing sessions with no real key).
+# export WARDEN_API_PORT=8081
+# export WARDEN_API_WORKERS=4
+# export WARDEN_API_SESSION_SECRET=some-long-random-value
+
 # Logging: debug | info | notice | warn | error | fatal (default: info).
 # Controls src/log.zig's runtime verbosity — every log line renders as
 # fixed-width columns (timestamp, level, scope, message) to stderr, which
