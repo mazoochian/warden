@@ -3941,6 +3941,7 @@ test {
     _ = @import("store/oauth_providers.zig");
     _ = @import("api/auth.zig");
     _ = @import("api/router.zig");
+    _ = @import("api/server.zig");
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
     _ = @import("features/qa.zig");
