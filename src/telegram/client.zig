@@ -225,21 +225,19 @@ pub const Client = struct {
         inline_keyboard: []const []const InlineKeyboardButton,
     };
 
-    /// Sends a message with an inline keyboard built from `buttons`,
-    /// arranged 2 per row (a single long row renders badly once there are
-    /// more than a handful of choices — "every supported format" can mean
-    /// close to a dozen). Returns the sent message's id, like
-    /// `sendMessageReturningId` — needed so a later button press can be
-    /// matched back to this specific prompt.
-    pub fn sendChoicePrompt(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, buttons: []const Button, reply_to_message_id: ?i64) !i64 {
-        const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{self.bot_token});
-        defer allocator.free(url);
-
-        const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
-
+    /// Arranges `buttons` 2 per row (a single long row renders badly once
+    /// there are more than a handful of choices) as the nested-slice shape
+    /// `InlineKeyboardMarkup` needs. Caller owns and must free both the
+    /// returned outer slice and each row slice it contains — shared by
+    /// `sendChoicePrompt` and `editMessageTextWithKeyboard` so both build
+    /// the exact same keyboard shape from the same button list.
+    fn buildInlineKeyboardRows(allocator: std.mem.Allocator, buttons: []const Button) ![]const []const InlineKeyboardButton {
         const buttons_per_row = 2;
         var rows: std.ArrayList([]const InlineKeyboardButton) = .empty;
-        defer rows.deinit(allocator);
+        errdefer {
+            for (rows.items) |row| allocator.free(row);
+            rows.deinit(allocator);
+        }
         var i: usize = 0;
         while (i < buttons.len) : (i += buttons_per_row) {
             var row: std.ArrayList(InlineKeyboardButton) = .empty;
@@ -248,14 +246,31 @@ pub const Client = struct {
             for (buttons[i..end]) |b| try row.append(allocator, .{ .text = b.text, .callback_data = b.callback_data });
             try rows.append(allocator, try row.toOwnedSlice(allocator));
         }
-        defer for (rows.items) |row| allocator.free(row);
+        return rows.toOwnedSlice(allocator);
+    }
+
+    /// Sends a message with an inline keyboard built from `buttons`.
+    /// Returns the sent message's id, like `sendMessageReturningId` —
+    /// needed so a later button press can be matched back to this specific
+    /// prompt.
+    pub fn sendChoicePrompt(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, buttons: []const Button, reply_to_message_id: ?i64) !i64 {
+        const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{self.bot_token});
+        defer allocator.free(url);
+
+        const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
+
+        const rows = try buildInlineKeyboardRows(allocator, buttons);
+        defer {
+            for (rows) |row| allocator.free(row);
+            allocator.free(rows);
+        }
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
         // See `sendMessageErr`'s doc comment on why this needs
         // `emit_null_optional_fields = false`.
         try json.Stringify.value(
-            .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters, .reply_markup = InlineKeyboardMarkup{ .inline_keyboard = rows.items } },
+            .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters, .reply_markup = InlineKeyboardMarkup{ .inline_keyboard = rows } },
             .{ .emit_null_optional_fields = false },
             &payload_writer.writer,
         );
@@ -277,6 +292,27 @@ pub const Client = struct {
             return error.TelegramApiError;
         };
         return result.message_id;
+    }
+
+    /// Replaces a message's text AND inline keyboard together in one call
+    /// (Telegram's `editMessageText` accepts `reply_markup` directly) — how
+    /// `features/menu.zig` navigates a multi-level menu by editing one
+    /// living message instead of sending a new one per level. Deliberately
+    /// plain text, no HTML/markdown conversion (menu content doesn't need
+    /// it, and keeping this separate from `editMessage`'s HTML-fallback
+    /// path keeps that one simple for its own callers).
+    pub fn editMessageTextWithKeyboard(self: *Client, allocator: std.mem.Allocator, chat_id: i64, message_id: i64, text: []const u8, buttons: []const Button) !void {
+        const rows = try buildInlineKeyboardRows(allocator, buttons);
+        defer {
+            for (rows) |row| allocator.free(row);
+            allocator.free(rows);
+        }
+        return self.callMethod(allocator, "editMessageText", .{
+            .chat_id = chat_id,
+            .message_id = message_id,
+            .text = text,
+            .reply_markup = InlineKeyboardMarkup{ .inline_keyboard = rows },
+        });
     }
 
     /// Dismisses the client-side loading spinner Telegram shows on a

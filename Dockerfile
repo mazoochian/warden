@@ -40,6 +40,8 @@ COPY tools/diagram/package.json tools/diagram/package-lock.json ./diagram/
 RUN cd diagram && npm ci --omit=dev
 COPY tools/wordcloud/package.json tools/wordcloud/package-lock.json ./wordcloud/
 RUN cd wordcloud && npm ci --omit=dev
+COPY tools/piechart/package.json tools/piechart/package-lock.json ./piechart/
+RUN cd piechart && npm ci --omit=dev
 
 # ---------------------------------------------------------------------------
 # Final image: node runtime + system Chromium for mermaid-cli, plus the
@@ -65,6 +67,8 @@ COPY --from=node-deps /deps/diagram/node_modules ./tools/diagram/node_modules
 COPY tools/wordcloud/render.mjs ./tools/wordcloud/render.mjs
 COPY tools/wordcloud/fonts ./tools/wordcloud/fonts
 COPY --from=node-deps /deps/wordcloud/node_modules ./tools/wordcloud/node_modules
+COPY tools/piechart/render.mjs ./tools/piechart/render.mjs
+COPY --from=node-deps /deps/piechart/node_modules ./tools/piechart/node_modules
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 # Chat/message data lives in Postgres now (WARDEN_POSTGRES_DSN) — /app/data
 # only holds WARDEN_TMP_DIR's throwaway scratch files (wordcloud/diagram

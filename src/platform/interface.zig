@@ -265,6 +265,15 @@ pub const Connector = struct {
         /// method's plain-text fallback for that case.
         sendChoicePrompt: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, choices: []const Choice, reply_to_message_id: ?[]const u8) anyerror!?[]const u8 = null,
 
+        /// Replaces a previously-sent `sendChoicePrompt` message's text AND
+        /// buttons together, in place — the mechanism `features/menu.zig`
+        /// uses to navigate a multi-level menu by editing one living
+        /// message instead of sending a new one per level. Optional: a
+        /// connector without it (or without any keyboard-edit primitive on
+        /// its platform) reports `error.Unsupported`, and the caller falls
+        /// back to sending a fresh `sendChoicePrompt` instead.
+        editChoicePrompt: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8, text: []const u8, choices: []const Choice) anyerror!void = null,
+
         /// Restricts a user from sending messages until `until_unix_time`
         /// (0 = forever, until explicitly unmuted).
         muteUser: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, until_unix_time: i64) anyerror!void = null,
@@ -388,6 +397,11 @@ pub const Connector = struct {
             return null;
         };
         return try f(self.ptr, allocator, chat_id, text, choices, reply_to_message_id);
+    }
+
+    pub fn editChoicePrompt(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8, text: []const u8, choices: []const Choice) !void {
+        const f = self.vtable.editChoicePrompt orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id, message_id, text, choices);
     }
 
     pub fn muteUser(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, until_unix_time: i64) !void {

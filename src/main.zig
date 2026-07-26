@@ -36,6 +36,11 @@ const bot_allowlist = @import("store/bot_allowlist.zig");
 const bot_pending_grants = @import("store/bot_pending_grants.zig");
 const trivial_reply = @import("features/trivial_reply.zig");
 const redact_feature = @import("features/redact.zig");
+const menu_tree = @import("features/menu_tree.zig");
+const menu = @import("features/menu.zig");
+const piechart = @import("features/piechart.zig");
+const civil_time = @import("text/civil_time.zig");
+const user_settings = @import("store/user_settings.zig");
 const messages = @import("store/messages.zig");
 const stats = @import("store/stats.zig");
 const reminders = @import("store/reminders.zig");
@@ -91,6 +96,7 @@ const web_search_tool = @import("tools/web_search.zig").tool;
 /// gates in `handleMessage`).
 const public_commands = [_]iface.CommandSpec{
     .{ .name = "help", .description = "Show available commands and how to talk to Warden." },
+    .{ .name = "menu", .description = "Open a button-driven menu of every module (alerts, watches, stats, admin, settings, help)." },
     .{ .name = "ping", .description = "Check that Warden is responsive." },
     .{ .name = "stats", .description = "Show message stats for this chat." },
     .{ .name = "wordcloud", .description = "Generate a word cloud from recent chat activity." },
@@ -139,6 +145,7 @@ const help_text =
     \\
     \\General
     \\/ping -- check I'm responsive
+    \\/menu -- button menu covering everything below (Matrix: !menu too)
     \\/stats -- message stats for this chat
     \\/wordcloud -- word cloud from recent activity
     \\/digest on|off|now -- enable/disable/generate a recent-activity summary
@@ -181,9 +188,8 @@ const help_text =
     \\  /kick/ban if you're an admin
     \\/redact <N> | (reply) [N] | text <substring> | regex <pattern> --
     \\  delete messages, up to 100 at a time. Plain /redact <N> walks
-    \\  backward by message id on Telegram, reaching messages this bot
-    \\  never logged. regex mode is bot admin/owner only; everything else
-    \\  is the same access as /kick
+    \\  backward by id on Telegram, reaching messages this bot never
+    \\  logged. regex mode is bot admin/owner only
     \\
     \\Tokens and credits (reply to a user, or pass @username, to view/set)
     \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban per
@@ -347,6 +353,9 @@ pub fn main(init: std.process.Init) !void {
     var pending_conversions = convert_flow.PendingConversions.init(gpa, io, config.convert_timeout_seconds);
     defer pending_conversions.deinit();
 
+    var menu_sessions = menu.Sessions.init(gpa, io, config.menu_timeout_seconds);
+    defer menu_sessions.deinit();
+
     // Heap-allocated: whichever variant isn't selected never gets
     // constructed, and the process-lifetime singleton is fine to leave for
     // the OS to reclaim on exit rather than threading a deinit through
@@ -384,7 +393,7 @@ pub fn main(init: std.process.Init) !void {
     // slot regardless of whether its own startup below succeeds; a
     // connector that never starts simply never stamps its slot, which
     // correctly reads as permanently unhealthy rather than "absent."
-    var heartbeat = Heartbeat.init(gpa, connectors) catch |err| {
+    var heartbeat = Heartbeat.init(gpa, io, connectors) catch |err| {
         log.fatal("failed to allocate heartbeat state: {t}", .{err});
     };
 
@@ -440,6 +449,7 @@ pub fn main(init: std.process.Init) !void {
             &pending_confirmations,
             &digest_scheduler,
             &pending_conversions,
+            &menu_sessions,
             io,
             gpa,
             max_message_len,
@@ -482,6 +492,7 @@ pub fn main(init: std.process.Init) !void {
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
         pending_conversions.sweepExpired(gpa, now);
+        menu_sessions.sweepExpired(now);
         heartbeat.stampScheduler(now);
         heartbeat.writeToFile(io, gpa, config.tmp_dir);
         const tick_ms = @divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - tick_started.toNanoseconds(), std.time.ns_per_ms);
@@ -527,12 +538,24 @@ const Heartbeat = struct {
     connector_last_ok: []std.atomic.Value(i64),
     scheduler_last_tick: std.atomic.Value(i64) = .init(0),
 
-    fn init(gpa: std.mem.Allocator, connectors: []const iface.Connector) !Heartbeat {
+    /// Seeds every timestamp to `now` (startup time), not `0` — seeding to
+    /// `0` made `allFreshInMemory`'s `now - slot` come out astronomically
+    /// large (decades) for any connector/the scheduler that hasn't
+    /// stamped yet, so a connector merely slow to complete its first poll
+    /// (e.g. retrying a flaky `getUpdates` a few times) read as "stale for
+    /// over 300s" the very first time `selfWatchdogLoop` checked at
+    /// startup+60s, killing a perfectly healthy fresh process. Confirmed
+    /// live 2026-07-27: this crash-looped a just-started container every
+    /// ~60-90s. Seeding to `now` gives every connector/the scheduler the
+    /// full `watchdog_stale_seconds` grace period from actual startup,
+    /// same as it already gets for every check after the first.
+    fn init(gpa: std.mem.Allocator, io: Io, connectors: []const iface.Connector) !Heartbeat {
+        const now = Io.Timestamp.now(io, .real).toSeconds();
         const last_ok = try gpa.alloc(std.atomic.Value(i64), connectors.len);
-        for (last_ok) |*slot| slot.* = .init(0);
+        for (last_ok) |*slot| slot.* = .init(now);
         const platforms = try gpa.alloc(iface.Platform, connectors.len);
         for (connectors, platforms) |c, *p| p.* = c.platform();
-        return .{ .connector_platforms = platforms, .connector_last_ok = last_ok };
+        return .{ .connector_platforms = platforms, .connector_last_ok = last_ok, .scheduler_last_tick = .init(now) };
     }
 
     fn stampConnector(self: *Heartbeat, idx: usize, now: i64) void {
@@ -664,6 +687,7 @@ fn connectorPollLoop(
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
     pending_conversions: *convert_flow.PendingConversions,
+    menu_sessions: *menu.Sessions,
     io: Io,
     gpa: std.mem.Allocator,
     max_message_len: usize,
@@ -744,6 +768,7 @@ fn connectorPollLoop(
                 .pending = pending,
                 .digest_scheduler = digest_scheduler,
                 .pending_conversions = pending_conversions,
+                .menu_sessions = menu_sessions,
                 .io = io,
                 .gpa = gpa,
                 .ts = ts,
@@ -825,6 +850,7 @@ const MessageTask = struct {
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
     pending_conversions: *convert_flow.PendingConversions,
+    menu_sessions: *menu.Sessions,
     io: Io,
     gpa: std.mem.Allocator,
     ts: i64,
@@ -842,6 +868,7 @@ const MessageTask = struct {
             self.pending,
             self.digest_scheduler,
             self.pending_conversions,
+            self.menu_sessions,
             self.io,
             self.gpa,
             self.ts,
@@ -865,6 +892,7 @@ fn processMessageTask(
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
     pending_conversions: *convert_flow.PendingConversions,
+    menu_sessions: *menu.Sessions,
     io: Io,
     gpa: std.mem.Allocator,
     ts: i64,
@@ -972,7 +1000,7 @@ fn processMessageTask(
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, pending_conversions, io, ts, max_message_len, msg);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -1296,6 +1324,7 @@ fn handleMessage(
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
     pending_conversions: *convert_flow.PendingConversions,
+    menu_sessions: *menu.Sessions,
     io: Io,
     now: i64,
     max_message_len: usize,
@@ -1327,7 +1356,17 @@ fn handleMessage(
     // A button press / reaction pick has neither text nor an attachment of
     // its own, so this must run before the "neither" bail-out just below.
     if (msg.choice_picked) |picked| {
-        convert_flow.handleChoicePicked(connector, a, io, config.tmp_dir, pending_conversions, now, msg, picked);
+        // Both flows key their pending state the same way ((chat, user)),
+        // so only one of them should ever actually claim a given pick --
+        // `isAwaitingFormat` decides which, rather than trying `menu` only
+        // when `convert_flow` misses (that would make convert_flow's own
+        // "prompt isn't active anymore" reply fire on a pick that was
+        // actually meant for the menu).
+        if (pending_conversions.isAwaitingFormat(now, msg.chat_id, msg.user_id)) {
+            convert_flow.handleChoicePicked(connector, a, io, config.tmp_dir, pending_conversions, now, msg, picked);
+        } else {
+            menu_sessions.handleChoicePicked(menu_runner, now, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions), picked);
+        }
         return false;
     }
 
@@ -1361,6 +1400,19 @@ fn handleMessage(
         text = std.fmt.allocPrint(a, "/{s}", .{std.mem.trim(u8, text["/sudo ".len..], " ")}) catch text;
     }
 
+    // A plain message (or reply) arriving while (chat, user) has an open
+    // `/menu` prompt waiting on free-form input (e.g. Group Administration's
+    // "reply with the person you want to kick") — consumed here, before
+    // normal dispatch, so it never needs its own slash command. `/cancel`
+    // is deliberately exempted so it always reaches its own handler below
+    // (one of whose fallback tiers is exactly this session), rather than
+    // being swallowed as a failed target-resolution attempt.
+    if (!std.mem.eql(u8, text, "/cancel") and
+        menu_sessions.handleAwaitingInputMessage(menu_runner, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions)))
+    {
+        return false;
+    }
+
     // An attachment arriving while (chat, user) is mid-flow, waiting for a
     // file — claimed here, before the big dispatch chain and before
     // `isAddressedToBot`, so a captionless upload in a group (no mention/
@@ -1379,6 +1431,11 @@ fn handleMessage(
         connector.sendMessage(a, msg.chat_id, "pong", msg.message_id);
     } else if (std.mem.eql(u8, text, "/help") or std.mem.startsWith(u8, text, "/help ")) {
         handleHelp(connector, a, msg);
+    } else if (std.mem.eql(u8, text, "/menu")) {
+        // `!menu` already reaches here as `/menu` too --
+        // `normalizeCommandMention` rewrites any leading `!` to `/` for
+        // every platform, not just Matrix's requested trigger.
+        menu_sessions.open(connector, a, menu_runner, now, msg);
     } else if (std.mem.eql(u8, text, "/stats")) {
         replyWithStats(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/wordcloud")) {
@@ -1422,13 +1479,17 @@ fn handleMessage(
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "confirm")) return false;
         group_admin.confirm(connector, a, pending, now, msg);
     } else if (std.mem.eql(u8, text, "/cancel")) {
-        // Dual-purpose: a pending conversion is per-user, not a moderation
-        // action, so it can only ever affect something the sender
-        // themselves started — no admin gate needed for that half. Falls
-        // through to the existing admin-gated ban/kick cancel, unchanged,
-        // only when there's nothing of the sender's own to cancel.
+        // Three tiers, tried in order — a pending conversion or an open
+        // `/menu` prompt waiting on input are both per-user, not a
+        // moderation action, so either can only ever affect something the
+        // sender themselves started (no admin gate needed for those two).
+        // Falls through to the existing admin-gated ban/kick cancel,
+        // unchanged, only when there's nothing of the sender's own to
+        // cancel.
         if (pending_conversions.cancel(a, msg.chat_id, msg.user_id)) {
             reply(connector, a, msg.chat_id, msg.message_id, "Conversion cancelled.");
+        } else if (menu_sessions.cancel(msg.chat_id, msg.user_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Menu prompt cancelled.");
         } else {
             if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "cancel")) return false;
             group_admin.cancel(connector, a, pending, msg);
@@ -2437,7 +2498,7 @@ fn handleRemindCommand(
     msg: iface.Message,
     text: []const u8,
 ) void {
-    const usage = "Usage: /remind <duration e.g. 30m/2h/1d, or a clock time like 14:30> <message>, /remind every <interval> <message>, or /remind cancel <id>";
+    const usage = "Usage: /remind <duration e.g. 30m/2h/1d, a clock time like 14:30, or a date like 5/22 14:30> <message>, /remind every <interval> <message>, or /remind cancel <id>";
     const arg = std.mem.trim(u8, text["/remind".len..], " ");
     if (arg.len == 0) {
         reply(connector, a, msg.chat_id, msg.message_id, usage);
@@ -2501,11 +2562,15 @@ fn handleRemindCommand(
         return;
     }
 
+    const offset_minutes = user_settings.getEffectiveOffsetMinutes(pool, a, identity_id);
+    const date_format = user_settings.getEffectiveDateFormat(pool, a, identity_id);
+    const time_format = user_settings.getEffectiveTimeFormat(pool, a, identity_id);
+
     const due_at = if (recur_interval) |interval|
         now + interval
     else
-        reminder_format.parseWhen(when_str, now) orelse {
-            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that time — use a duration like 30m/2h/1d, or a 24h clock time like 14:30.");
+        reminder_format.parseWhenLocal(when_str, now, offset_minutes, date_format) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that time — use a duration like 30m/2h/1d, a clock time like 14:30, or a date like 5/22 14:30.");
             return;
         };
 
@@ -2515,12 +2580,16 @@ fn handleRemindCommand(
         return;
     };
 
+    const local = civil_time.localFromUnix(due_at, offset_minutes);
+    const date_str = civil_time.formatDate(a, local, date_format);
+    const time_str = civil_time.formatTime(a, local, time_format);
+
     const confirmation = if (recur_interval) |interval|
-        std.fmt.allocPrint(a, "Reminder #{d} set, repeating every {s}.", .{ id, reminder_format.formatInterval(a, interval) }) catch return
+        std.fmt.allocPrint(a, "Reminder #{d} set, repeating every {s} (next at {s} {s}).", .{ id, reminder_format.formatInterval(a, interval), date_str, time_str }) catch return
     else if (reminder_format.parseDuration(when_str) != null)
-        std.fmt.allocPrint(a, "Reminder #{d} set for {s} from now.", .{ id, when_str }) catch return
+        std.fmt.allocPrint(a, "Reminder #{d} set for {s} from now ({s} {s}).", .{ id, when_str, date_str, time_str }) catch return
     else
-        std.fmt.allocPrint(a, "Reminder #{d} set for {s}.", .{ id, when_str }) catch return;
+        std.fmt.allocPrint(a, "Reminder #{d} set for {s} {s}.", .{ id, date_str, time_str }) catch return;
     connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
 }
 
@@ -2538,7 +2607,7 @@ fn handleRemindersList(
         connector.sendMessage(a, native_chat_id, "Couldn't load reminders, try again.", reply_to);
         return;
     };
-    connector.sendMessage(a, native_chat_id, formatPendingReminders(a, pending, now), reply_to);
+    connector.sendMessage(a, native_chat_id, formatPendingReminders(a, pool, pending, now), reply_to);
 }
 
 /// `/alert <crypto|weather|aqi> <subject> <above|below> <threshold>` sets a
@@ -2830,17 +2899,27 @@ fn handleConvertCommand(
 }
 
 /// Shared by `/reminders` and the `set_reminder` LLM tool's `action=list`.
-fn formatPendingReminders(a: std.mem.Allocator, pending: []const reminders.PendingReminder, now: i64) []const u8 {
-    if (pending.len == 0) return "No pending reminders. Set one with /remind <duration> <message> (or just ask).";
+/// Renders each reminder's absolute due moment in *its own setter's*
+/// timezone/format (`store/user_settings.zig`), not the viewer's — a chat's
+/// pending reminders can belong to several people, and each one set their
+/// own "14:30" meaning their own local 14:30.
+fn formatPendingReminders(a: std.mem.Allocator, pool: *store_pool.PgPool, pending: []const reminders.PendingReminder, now: i64) []const u8 {
+    if (pending.len == 0) return "No pending reminders. Set one with /remind <duration, clock time, or date> <message> (or just ask).";
 
     var buf: std.Io.Writer.Allocating = .init(a);
     const w = &buf.writer;
     w.print("Pending reminders:\n", .{}) catch return "";
     for (pending) |r| {
+        const offset_minutes = user_settings.getEffectiveOffsetMinutes(pool, a, r.identity_id);
+        const date_format = user_settings.getEffectiveDateFormat(pool, a, r.identity_id);
+        const time_format = user_settings.getEffectiveTimeFormat(pool, a, r.identity_id);
+        const local = civil_time.localFromUnix(r.due_at, offset_minutes);
+        const date_str = civil_time.formatDate(a, local, date_format);
+        const time_str = civil_time.formatTime(a, local, time_format);
         if (r.recur_interval_seconds) |interval| {
-            w.print("  #{d} in {s} (repeats every {s}): {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), reminder_format.formatInterval(a, interval), r.message }) catch return "";
+            w.print("  #{d} in {s} ({s} {s}, repeats every {s}): {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), date_str, time_str, reminder_format.formatInterval(a, interval), r.message }) catch return "";
         } else {
-            w.print("  #{d} in {s}: {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), r.message }) catch return "";
+            w.print("  #{d} in {s} ({s} {s}): {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), date_str, time_str, r.message }) catch return "";
         }
     }
     return buf.writer.buffered();
@@ -2886,7 +2965,7 @@ const ReminderToolAdapter = struct {
     fn listPendingFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8 {
         const self: *ReminderToolAdapter = @ptrCast(@alignCast(ptr));
         const pending = try reminders.listPending(self.pool, allocator, self.chat_id);
-        return formatPendingReminders(allocator, pending, self.now);
+        return formatPendingReminders(allocator, self.pool, pending, self.now);
     }
 };
 
@@ -3388,6 +3467,417 @@ fn replyWithStats(connector: iface.Connector, a: std.mem.Allocator, pool: *store
     connector.sendMessage(a, native_chat_id, buf.writer.buffered(), reply_to);
 }
 
+// ---------------------------------------------------------------------------
+// /menu ActionRunner — the switch that actually performs every module's
+// buttons/prompts. Deliberately thin: almost every branch below calls
+// straight into a handler function (or store mutation) that already exists
+// and is already gated by its own `auth.*` check for the slash-command
+// equivalent — the menu is a UI layer over those, never a second
+// permission system. See `features/menu.zig`'s module doc comment for the
+// engine this plugs into.
+// ---------------------------------------------------------------------------
+
+fn menuCtx(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    config: *const config_mod.Config,
+    chat_id: i64,
+    identity_id: i64,
+    now: i64,
+    msg: iface.Message,
+    io: Io,
+    digest_scheduler: *scheduler.DigestScheduler,
+    pending_conversions: *convert_flow.PendingConversions,
+) menu.ActionContext {
+    return .{
+        .connector = connector,
+        .a = a,
+        .pool = pool,
+        .config = config,
+        .chat_id = chat_id,
+        .identity_id = identity_id,
+        .now = now,
+        .msg = msg,
+        .io = io,
+        .digest_scheduler = digest_scheduler,
+        .pending_conversions = pending_conversions,
+    };
+}
+
+const menu_runner: menu.ActionRunner = .{
+    .perform = menuPerform,
+    .dynamicChoices = menuDynamicChoices,
+    .performDynamicPick = menuPerformDynamicPick,
+    .resumeAwaitingInput = menuResumeAwaitingInput,
+    .beginWizard = menuBeginWizard,
+    .finishWizard = menuFinishWizard,
+};
+
+fn menuSendAndShow(ctx: menu.ActionContext, text: []const u8, show: menu_tree.NodeId) menu.Outcome {
+    ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, text, null);
+    return .{ .show = show };
+}
+
+/// Distinct, ordered emoji for a `.dynamic_list`'s live entries — same
+/// index-based idiom as `convert_flow.zig`'s own `choice_emoji`
+/// (duplicated rather than shared: it's four lines, and exporting it would
+/// couple two otherwise-independent features over a trivial helper).
+const dynamic_list_emoji = [_][]const u8{ "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟" };
+fn dynamicEmojiFor(i: usize) []const u8 {
+    return dynamic_list_emoji[i % dynamic_list_emoji.len];
+}
+
+fn menuPerform(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.Outcome {
+    return switch (id) {
+        .alerts_new => menuSendAndShow(ctx, menu_tree.node(id).body, .alerts),
+        .watches_new => menuSendAndShow(ctx, menu_tree.node(id).body, .watches),
+        .stats_text => blk: {
+            replyWithStats(ctx.connector, ctx.a, ctx.pool, ctx.chat_id, ctx.msg.chat_id, null);
+            break :blk .{ .show = .stats };
+        },
+        .stats_wordcloud => blk: {
+            replyWithWordcloud(ctx.connector, ctx.a, ctx.pool, ctx.chat_id, ctx.config.tmp_dir, ctx.io, ctx.msg.chat_id, null);
+            break :blk .{ .show = .stats };
+        },
+        .stats_piechart => blk: {
+            const s = stats.compute(ctx.pool, ctx.a, ctx.chat_id, 8) catch |err| {
+                log.err("menu: stats query failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
+                break :blk menuSendAndShow(ctx, "Couldn't load stats, try again.", .stats);
+            };
+            if (s.top_users.len == 0) break :blk menuSendAndShow(ctx, "Not enough logged messages yet.", .stats);
+            const slices = piechart.slicesFromTopUsers(ctx.a, s.top_users) catch break :blk menuSendAndShow(ctx, "Couldn't build the chart, try again.", .stats);
+            const png = piechart.render(ctx.a, ctx.io, ctx.config.tmp_dir, slices) catch |err| {
+                log.err("menu: piechart render failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
+                break :blk menuSendAndShow(ctx, "Couldn't render the chart (is Node installed?).", .stats);
+            };
+            ctx.connector.sendPhoto(ctx.a, ctx.msg.chat_id, png, "Top participants");
+            break :blk .{ .show = .stats };
+        },
+        .convert => blk: {
+            convert_flow.beginConvertFlow(ctx.connector, ctx.a, ctx.pending_conversions, ctx.now, ctx.msg);
+            break :blk .close; // /convert's own flow takes over from here.
+        },
+        .group_admin_unpin => blk: {
+            group_admin.unpin(ctx.connector, ctx.a, ctx.msg);
+            break :blk .{ .show = .group_admin };
+        },
+        .settings_global_allowchat => blk: {
+            bot_allowlist.addAllowedChat(ctx.pool, ctx.chat_id, ctx.identity_id) catch |err| {
+                log.err("menu: allowchat failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
+            };
+            break :blk menuSendAndShow(ctx, "This chat is now allowed to use the bot.", .settings_global);
+        },
+        .settings_global_disallowchat => blk: {
+            bot_allowlist.removeAllowedChat(ctx.pool, ctx.chat_id) catch |err| {
+                log.err("menu: disallowchat failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
+            };
+            break :blk menuSendAndShow(ctx, "This chat is no longer allowed to use the bot.", .settings_global);
+        },
+        .settings_global_scraper => blk: {
+            const snap = bot_config.loadScraperConfig(ctx.pool, ctx.a);
+            const text = std.fmt.allocPrint(
+                ctx.a,
+                "Scraper mode: {t}\nRemote URL: {s}\n\nUse /scraper to change (several independent options, so this stays a typed command).",
+                .{ snap.mode, snap.remote_url orelse "(none)" },
+            ) catch "Couldn't load the current scraper config.";
+            break :blk menuSendAndShow(ctx, text, .settings_global);
+        },
+        .settings_chat_thinking_on => blk: {
+            chat_settings.setShowThinkingOverride(ctx.pool, ctx.chat_id, true) catch {};
+            break :blk menuSendAndShow(ctx, "Thinking will be shown for this chat.", .settings_chat);
+        },
+        .settings_chat_thinking_off => blk: {
+            chat_settings.setShowThinkingOverride(ctx.pool, ctx.chat_id, false) catch {};
+            break :blk menuSendAndShow(ctx, "Thinking will be hidden for this chat.", .settings_chat);
+        },
+        .settings_chat_thinking_default => blk: {
+            chat_settings.setShowThinkingOverride(ctx.pool, ctx.chat_id, null) catch {};
+            break :blk menuSendAndShow(ctx, "This chat now follows the bot-wide thinking default.", .settings_chat);
+        },
+        .settings_chat_digest_on => blk: {
+            ctx.digest_scheduler.enable(ctx.connector.platform(), ctx.msg.chat_id) catch |err| {
+                log.err("menu: digest enable failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
+                break :blk menuSendAndShow(ctx, "Couldn't enable the digest, try again.", .settings_chat);
+            };
+            chat_settings.setDigestEnabled(ctx.pool, ctx.chat_id, true) catch {};
+            break :blk menuSendAndShow(ctx, "Digest enabled.", .settings_chat);
+        },
+        .settings_chat_digest_off => blk: {
+            ctx.digest_scheduler.disable(ctx.a, ctx.connector.platform(), ctx.msg.chat_id);
+            chat_settings.setDigestEnabled(ctx.pool, ctx.chat_id, false) catch {};
+            break :blk menuSendAndShow(ctx, "Digest disabled.", .settings_chat);
+        },
+        .settings_personal_dateformat_mdy => blk: {
+            user_settings.setDateFormat(ctx.pool, ctx.identity_id, .mdy) catch {};
+            break :blk menuSendAndShow(ctx, "Date format set to M/D/Y.", .settings_personal_dateformat);
+        },
+        .settings_personal_dateformat_dmy => blk: {
+            user_settings.setDateFormat(ctx.pool, ctx.identity_id, .dmy) catch {};
+            break :blk menuSendAndShow(ctx, "Date format set to D/M/Y.", .settings_personal_dateformat);
+        },
+        .settings_personal_dateformat_ymd => blk: {
+            user_settings.setDateFormat(ctx.pool, ctx.identity_id, .ymd) catch {};
+            break :blk menuSendAndShow(ctx, "Date format set to Y-M-D.", .settings_personal_dateformat);
+        },
+        .settings_personal_timeformat_24h => blk: {
+            user_settings.setTimeFormat(ctx.pool, ctx.identity_id, .h24) catch {};
+            break :blk menuSendAndShow(ctx, "Time format set to 24h.", .settings_personal_timeformat);
+        },
+        .settings_personal_timeformat_12h => blk: {
+            user_settings.setTimeFormat(ctx.pool, ctx.identity_id, .h12) catch {};
+            break :blk menuSendAndShow(ctx, "Time format set to 12h (AM/PM).", .settings_personal_timeformat);
+        },
+        else => .{ .show = .root },
+    };
+}
+
+fn menuDynamicChoices(id: menu_tree.NodeId, ctx: menu.ActionContext) []const iface.Choice {
+    var out: std.ArrayList(iface.Choice) = .empty;
+    switch (id) {
+        .alerts_view => {
+            const pending = alert_store.listPending(ctx.pool, ctx.a, ctx.chat_id) catch return &.{};
+            for (pending, 0..) |al, i| {
+                const label = std.fmt.allocPrint(ctx.a, "#{d} {s} {t} {d} {s}", .{ al.id, al.subject, al.condition, al.threshold, al.currency orelse "" }) catch continue;
+                const value = std.fmt.allocPrint(ctx.a, "{d}", .{al.id}) catch continue;
+                out.append(ctx.a, .{ .emoji = dynamicEmojiFor(i), .label = label, .value = value }) catch continue;
+            }
+        },
+        .watches_view => {
+            const pending = feed_watches.listPending(ctx.pool, ctx.a, ctx.chat_id) catch return &.{};
+            for (pending, 0..) |fw, i| {
+                out.append(ctx.a, .{ .emoji = dynamicEmojiFor(i), .label = fw.feed_url, .value = fw.feed_url }) catch continue;
+            }
+        },
+        .reminders_view => {
+            const pending = reminders.listPending(ctx.pool, ctx.a, ctx.chat_id) catch return &.{};
+            for (pending, 0..) |r, i| {
+                // Each reminder's setter's own timezone/format, not the
+                // viewer's -- see `formatPendingReminders`'s doc comment.
+                const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.a, r.identity_id);
+                const date_format = user_settings.getEffectiveDateFormat(ctx.pool, ctx.a, r.identity_id);
+                const time_format = user_settings.getEffectiveTimeFormat(ctx.pool, ctx.a, r.identity_id);
+                const local = civil_time.localFromUnix(r.due_at, offset_minutes);
+                const date_str = civil_time.formatDate(ctx.a, local, date_format);
+                const time_str = civil_time.formatTime(ctx.a, local, time_format);
+                const label = std.fmt.allocPrint(ctx.a, "#{d} {s} {s}: {s}", .{ r.id, date_str, time_str, r.message }) catch continue;
+                const value = std.fmt.allocPrint(ctx.a, "{d}", .{r.id}) catch continue;
+                out.append(ctx.a, .{ .emoji = dynamicEmojiFor(i), .label = label, .value = value }) catch continue;
+            }
+        },
+        else => {},
+    }
+    return out.items;
+}
+
+fn menuPerformDynamicPick(id: menu_tree.NodeId, value: []const u8, ctx: menu.ActionContext) menu.Outcome {
+    return switch (id) {
+        .alerts_view => blk: {
+            const alert_id = std.fmt.parseInt(i64, value, 10) catch break :blk .{ .show = .alerts };
+            const al = (alert_store.get(ctx.pool, ctx.a, alert_id) catch null) orelse break :blk menuSendAndShow(ctx, "No alert with that id.", .alerts);
+            if (al.chat_id != ctx.chat_id) break :blk menuSendAndShow(ctx, "No alert with that id.", .alerts);
+            if (al.identity_id != ctx.identity_id and !auth.isOwner(ctx.config, ctx.connector.platform(), ctx.msg.user_id)) {
+                break :blk menuSendAndShow(ctx, "Only whoever set that alert (or the owner) can cancel it.", .alerts);
+            }
+            alert_store.cancel(ctx.pool, alert_id) catch |err| {
+                log.err("menu: alert cancel failed for id {d}: {t}", .{ alert_id, err });
+                break :blk menuSendAndShow(ctx, "Couldn't cancel that alert, try again.", .alerts);
+            };
+            break :blk menuSendAndShow(ctx, "Alert canceled.", .alerts);
+        },
+        .watches_view => blk: {
+            const removed = feed_watches.remove(ctx.pool, ctx.chat_id, value) catch |err| {
+                log.err("menu: unwatch failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
+                break :blk menuSendAndShow(ctx, "Couldn't remove that watch, try again.", .watches);
+            };
+            break :blk menuSendAndShow(ctx, if (removed) "Unwatched." else "Wasn't watching that feed anymore.", .watches);
+        },
+        .reminders_view => blk: {
+            const rem_id = std.fmt.parseInt(i64, value, 10) catch break :blk .{ .show = .reminders };
+            const rem = (reminders.get(ctx.pool, ctx.a, rem_id) catch null) orelse break :blk menuSendAndShow(ctx, "No pending reminder with that id.", .reminders);
+            if (rem.chat_id != ctx.chat_id) break :blk menuSendAndShow(ctx, "No pending reminder with that id.", .reminders);
+            if (rem.identity_id != ctx.identity_id and !auth.isOwner(ctx.config, ctx.connector.platform(), ctx.msg.user_id)) {
+                break :blk menuSendAndShow(ctx, "Only whoever set that reminder (or the owner) can cancel it.", .reminders);
+            }
+            reminders.cancel(ctx.pool, rem_id) catch |err| {
+                log.err("menu: reminder cancel failed for id {d}: {t}", .{ rem_id, err });
+                break :blk menuSendAndShow(ctx, "Couldn't cancel that reminder, try again.", .reminders);
+            };
+            break :blk menuSendAndShow(ctx, "Reminder canceled.", .reminders);
+        },
+        else => .{ .show = .root },
+    };
+}
+
+fn menuResumeAwaitingInput(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.Outcome {
+    const parent = menu_tree.node(id).parent orelse .root;
+    switch (id) {
+        .group_admin_mute => group_admin.mute(ctx.connector, ctx.a, ctx.msg, ctx.now),
+        .group_admin_unmute => group_admin.unmute(ctx.connector, ctx.a, ctx.msg),
+        .group_admin_pin => group_admin.pin(ctx.connector, ctx.a, ctx.msg),
+        .group_admin_delete => group_admin.deleteMessage(ctx.connector, ctx.a, ctx.msg),
+        .group_admin_promote => {
+            if (!auth.isOwner(ctx.config, ctx.connector.platform(), ctx.msg.user_id)) {
+                ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Bot owner only.", null);
+            } else {
+                group_admin.promote(ctx.connector, ctx.a, ctx.msg);
+            }
+        },
+        .group_admin_demote => {
+            if (!auth.isOwner(ctx.config, ctx.connector.platform(), ctx.msg.user_id)) {
+                ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Bot owner only.", null);
+            } else {
+                group_admin.demote(ctx.connector, ctx.a, ctx.msg);
+            }
+        },
+        .group_admin_kick => menuResumeViaCommand(ctx, "/kick", handleKickBanCommandKick),
+        .group_admin_ban => menuResumeViaCommand(ctx, "/ban", handleKickBanCommandBan),
+        .group_admin_redact_lastn => {
+            const n = std.fmt.parseInt(i64, std.mem.trim(u8, ctx.msg.text orelse "", " "), 10) catch 0;
+            redact_feature.redactLastN(ctx.connector, ctx.a, ctx.pool, ctx.chat_id, ctx.msg, n);
+        },
+        .group_admin_redact_user => {
+            const target = replyTarget(ctx.msg) orelse {
+                ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Reply to that user's message.", null);
+                return .{ .show = id }; // let them try again without re-navigating
+            };
+            const target_identity_id = identities.getOrCreateMinimal(ctx.pool, ctx.connector.platform(), target.user_id, target.label, ctx.msg.reply_to_username, false, ctx.now) catch |err| {
+                log.err("menu: redact target resolve failed: {t}", .{err});
+                return .{ .show = parent };
+            };
+            const trailing = std.mem.trim(u8, ctx.msg.text orelse "", " ");
+            const n = std.fmt.parseInt(i64, trailing, 10) catch 0;
+            redact_feature.redactUserLastN(ctx.connector, ctx.a, ctx.pool, ctx.chat_id, ctx.msg, target_identity_id, n);
+        },
+        .group_admin_redact_text => redact_feature.redactText(ctx.connector, ctx.a, ctx.pool, ctx.chat_id, ctx.msg, std.mem.trim(u8, ctx.msg.text orelse "", " ")),
+        .group_admin_redact_regex => {
+            const is_bot_admin = auth.isOwner(ctx.config, ctx.connector.platform(), ctx.msg.user_id) or bot_admins.isBotAdmin(ctx.pool, ctx.identity_id);
+            if (!is_bot_admin) {
+                ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Regex redact is bot admin/owner only.", null);
+            } else {
+                redact_feature.redactRegex(ctx.connector, ctx.a, ctx.pool, ctx.chat_id, ctx.msg, std.mem.trim(u8, ctx.msg.text orelse "", " "));
+            }
+        },
+        .settings_global_addadmin => menuResumeViaTextAdd(ctx, "/addadmin", handleAddAdminCommand),
+        .settings_global_removeadmin => menuResumeViaText(ctx, "/removeadmin", handleRemoveAdminCommand),
+        .settings_global_adduser => menuResumeViaTextAdd(ctx, "/adduser", handleAddUserCommand),
+        .settings_global_removeuser => menuResumeViaText(ctx, "/removeuser", handleRemoveUserCommand),
+        .settings_global_whois => handleWhoisCommand(ctx.connector, ctx.a, ctx.config, ctx.pool, ctx.now, ctx.msg, menuSyntheticText(ctx, "/whois")),
+        .settings_chat_magicword => handleMagicWord(ctx.connector, ctx.a, ctx.config, ctx.pool, ctx.chat_id, ctx.msg, menuSyntheticText(ctx, "/magicword")),
+        .settings_chat_persona => handlePersonaCommand(ctx.connector, ctx.a, ctx.config, ctx.pool, ctx.chat_id, ctx.msg, menuSyntheticText(ctx, "/persona")),
+        .settings_personal_timezone => {
+            const raw = std.mem.trim(u8, ctx.msg.text orelse "", " ");
+            const offset = parseUtcOffsetInput(raw) orelse {
+                ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Couldn't parse that — send a signed UTC offset like +3:30, -5, or +0.", null);
+                return .{ .show = id };
+            };
+            user_settings.setUtcOffsetMinutes(ctx.pool, ctx.identity_id, offset) catch |err| {
+                log.err("menu: set utc offset failed for identity {d}: {t}", .{ ctx.identity_id, err });
+            };
+            ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Timezone updated.", null);
+        },
+        else => {},
+    }
+    return .{ .show = parent };
+}
+
+/// A signed `H[:MM]` UTC offset, e.g. "+3:30", "-5", "+0" — an explicit
+/// sign is required (no bare "5", to avoid guessing whether it means +5 or
+/// local convention) since this is the one place a personal timezone is
+/// set directly rather than guessed from `language_code`.
+fn parseUtcOffsetInput(text: []const u8) ?i32 {
+    if (text.len < 2) return null;
+    const sign: i32 = switch (text[0]) {
+        '+' => 1,
+        '-' => -1,
+        else => return null,
+    };
+    const rest = text[1..];
+    const colon = std.mem.indexOfScalar(u8, rest, ':');
+    const hour_str = if (colon) |c| rest[0..c] else rest;
+    const minute_str = if (colon) |c| rest[c + 1 ..] else "0";
+    const hour = std.fmt.parseInt(i32, hour_str, 10) catch return null;
+    const minute = std.fmt.parseInt(i32, minute_str, 10) catch return null;
+    if (hour < 0 or hour > 14 or minute < 0 or minute > 59) return null;
+    return sign * (hour * 60 + minute);
+}
+
+/// `ActionRunner.beginWizard` — the reminder wizard's initial draft:
+/// today, local current-hour-plus-one on the dot (a sensible "later
+/// today" default the stepper buttons can nudge from).
+fn menuBeginWizard(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.ReminderDraft {
+    _ = id;
+    const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.a, ctx.identity_id);
+    const local = civil_time.localFromUnix(ctx.now, offset_minutes);
+    return .{
+        .year = local.year,
+        .month = local.month,
+        .day = local.day,
+        .hour = @intCast(@mod(@as(i32, local.hour) + 1, 24)),
+        .minute = 0,
+        .second = 0,
+    };
+}
+
+/// `ActionRunner.finishWizard` — the confirm screen's "Create" button.
+fn menuFinishWizard(draft: menu.ReminderDraft, ctx: menu.ActionContext) menu.Outcome {
+    if (draft.message.len == 0) {
+        ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Reminder message can't be empty.", null);
+        return .retry;
+    }
+    if (draft.message.len > max_reminder_message_len) {
+        ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "That reminder text is too long (max 500 bytes).", null);
+        return .retry;
+    }
+
+    const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.a, ctx.identity_id);
+    const c: civil_time.Civil = .{ .year = draft.year, .month = draft.month, .day = draft.day, .hour = draft.hour, .minute = draft.minute, .second = draft.second };
+    const due_at = civil_time.unixFromLocal(c, offset_minutes);
+
+    const id = reminders.create(ctx.pool, ctx.chat_id, ctx.identity_id, draft.message, due_at, null) catch |err| {
+        log.err("menu: wizard failed to create reminder for chat {d}: {t}", .{ ctx.chat_id, err });
+        ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Couldn't save that reminder, try again.", null);
+        return .retry;
+    };
+
+    const date_format = user_settings.getEffectiveDateFormat(ctx.pool, ctx.a, ctx.identity_id);
+    const time_format = user_settings.getEffectiveTimeFormat(ctx.pool, ctx.a, ctx.identity_id);
+    const date_str = civil_time.formatDate(ctx.a, c, date_format);
+    const time_str = civil_time.formatTime(ctx.a, c, time_format);
+    const confirmation = std.fmt.allocPrint(ctx.a, "Reminder #{d} set for {s} {s}.", .{ id, date_str, time_str }) catch "Reminder set.";
+    return menuSendAndShow(ctx, confirmation, .reminders);
+}
+
+/// Builds the synthetic `"<cmd> <captured input>"` string every awaiting-
+/// input resume below feeds to an existing slash-command handler, so the
+/// menu and the command end up running the literal same code (including
+/// its own `auth.*` gate) rather than a re-implementation of it. `ctx.msg`
+/// itself (not this string) is what carries a reply, if the user replied
+/// instead of typing `@username`/an id/free text.
+fn menuSyntheticText(ctx: menu.ActionContext, comptime cmd: []const u8) []const u8 {
+    return std.fmt.allocPrint(ctx.a, cmd ++ " {s}", .{ctx.msg.text orelse ""}) catch cmd;
+}
+
+fn menuResumeViaText(ctx: menu.ActionContext, comptime cmd: []const u8, handler: fn (iface.Connector, std.mem.Allocator, *store_pool.PgPool, i64, iface.Message, []const u8) void) void {
+    handler(ctx.connector, ctx.a, ctx.pool, ctx.now, ctx.msg, menuSyntheticText(ctx, cmd));
+}
+
+fn menuResumeViaTextAdd(ctx: menu.ActionContext, comptime cmd: []const u8, handler: fn (iface.Connector, std.mem.Allocator, *store_pool.PgPool, i64, i64, iface.Message, []const u8) void) void {
+    handler(ctx.connector, ctx.a, ctx.pool, ctx.identity_id, ctx.now, ctx.msg, menuSyntheticText(ctx, cmd));
+}
+
+fn menuResumeViaCommand(ctx: menu.ActionContext, comptime cmd: []const u8, handler: fn (iface.Connector, std.mem.Allocator, *store_pool.PgPool, i64, iface.Message, []const u8) void) void {
+    handler(ctx.connector, ctx.a, ctx.pool, ctx.now, ctx.msg, menuSyntheticText(ctx, cmd));
+}
+
+fn handleKickBanCommandKick(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
+    handleKickBanCommand(connector, a, pool, now, msg, text, "/kick", .kick);
+}
+
+fn handleKickBanCommandBan(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
+    handleKickBanCommand(connector, a, pool, now, msg, text, "/ban", .ban);
+}
+
 // Zig's test collector only walks `test` blocks reachable from the file
 // passed to `addTest` — it does NOT transitively pull in tests from files
 // that are merely `@import`ed for their declarations. Each module below
@@ -3409,6 +3899,11 @@ test {
     _ = @import("features/trivial_reply.zig");
     _ = @import("text/safe_regex.zig");
     _ = @import("features/redact.zig");
+    _ = @import("features/menu_tree.zig");
+    _ = @import("features/menu.zig");
+    _ = @import("features/piechart.zig");
+    _ = @import("text/civil_time.zig");
+    _ = @import("store/user_settings.zig");
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
     _ = @import("features/qa.zig");

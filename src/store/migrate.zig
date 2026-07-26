@@ -26,6 +26,7 @@ const migrations = [_]Migration{
     .{ .version = 12, .name = "0012_identities_credits", .sql = @embedFile("migrations/0012_identities_credits.sql") },
     .{ .version = 13, .name = "0013_identities_username_lookup_index", .sql = @embedFile("migrations/0013_identities_username_lookup_index.sql") },
     .{ .version = 14, .name = "0014_bot_pending_grants", .sql = @embedFile("migrations/0014_bot_pending_grants.sql") },
+    .{ .version = 15, .name = "0015_user_settings", .sql = @embedFile("migrations/0015_user_settings.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each

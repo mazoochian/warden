@@ -1,6 +1,7 @@
 # Warden - An assistant bot you don't entirely hate
 
 Warden is a powerful AI-powered bot that can connect to various AI providers and social messaging platforms. Here is a list of the features it supports:
+- Button Menu: `/menu` (or `!menu` on Matrix) opens a navigable, button-driven front end over every module below — Alerts, Reminders, Watches, Statistics, Convert, Group Administration, Settings, and a read-only Help browser — instead of needing to remember slash-command syntax. On Telegram it edits one message in place as you navigate; on Matrix it uses reactions (a fresh message per level, for now — see "Menu" below); on XMPP (no button/reaction support) it degrades to a plain text overview. Only the person who opened a menu can drive its buttons. Reminders get a proper stepper wizard: ±1/±5 buttons for date/hour/minute/second, or just reply with a time/date to jump straight there
 - Weather: Provides weather information for a given location
 - Stats: Provides statistics about the group's conversations
 - Word Cloud: Shows a word cloud of the most common words used in the group's conversations
@@ -13,7 +14,7 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Dictionaries: English definitions (dictionaryapi.dev) and slang (Urban Dictionary)
 - Hacker News: Searches HN stories and discussions
 - Site Scraping: Reads a page's clean text (not raw HTML), optionally crawling a few same-site links deep. Runs on-device by default; the owner can point it at an external scraping service instead
-- Reminders: `/remind 30m walk the dog` (a relative duration, or a 24h clock time like `/remind 14:30 ...`; or just ask in natural language) sets a one-off reminder; `/remind every 1d stretch` sets a recurring one; `/reminders` lists what's pending (including each recurring one's interval), `/remind cancel <id>` cancels one — restricted to whoever set it, or the bot owner
+- Reminders: `/remind 30m walk the dog` (a relative duration, a clock time like `/remind 14:30 ...`, or a specific date like `/remind 5/22 14:30 ...`; or just ask in natural language) sets a one-off reminder; `/remind every 1d stretch` sets a recurring one; `/reminders` lists what's pending (including each recurring one's interval), `/remind cancel <id>` cancels one — restricted to whoever set it, or the bot owner. Every time shown is in *your own* timezone (a personal setting, guessed from your Telegram language and always overridable — see "Menu" below) and your own date/time formatting
 - Alerts: `/alert crypto bitcoin above 70000`, `/alert weather Tehran above 35`, `/alert aqi Beijing above 150` (or just ask) set a standing watch, checked every few minutes in the background and delivered as a message once true — `/alerts` lists what's set, `/alert cancel <id>` cancels one, re-notifies only after a cooldown once already triggered — restricted to whoever set it, or the bot owner
 - Feed Watching: `/watch <feed url>` watches an RSS/Atom feed and posts a short AI-written blurb here whenever something new shows up (checked every 15 minutes); `/watches` lists what's watched, `/unwatch <feed url>` removes one — open to anyone in the chat, like `/digest`
 - Per-Chat Persona: `/persona <text>` overrides the bot's system prompt for just this chat — a sarcastic assistant in one group, a terse formal one in another — without redeploying; `/persona off` resets to the global default. Viewing the current persona is open to anyone; changing it is owner-only, like `/magicword`
@@ -133,6 +134,61 @@ cancel their own in-progress conversion). A pending conversion expires
 after `WARDEN_CONVERT_TIMEOUT_SECONDS` (default 5 minutes) if left
 untouched. The existing one-shot `/convert <format>`-as-caption command
 keeps working exactly as before — this is additive, not a replacement.
+
+# Menu
+`/menu` (or `!menu` on Matrix — `!command` is rewritten to `/command` for
+every command on every platform, not just this one) opens a navigable
+button menu covering every module: Alerts, Reminders, Watches, Statistics,
+Convert, Group Administration, Settings (Global/This chat/Personal), and
+Help. It's a thin front end over the exact same commands and permission
+checks described elsewhere in this file — a button never does anything its
+slash-command equivalent couldn't already do, and kick/ban fired through
+the menu are exactly as immediate as typing `/kick`/`/ban` (no extra
+confirmation step).
+
+Only the person who opened a menu can drive its buttons — someone else
+tapping the same message gets a "this menu isn't yours" reply on Telegram
+(silently ignored on Matrix, which has no per-press alert channel). A
+"Back"/"Close" pair is always available; `/cancel` also clears an open
+menu prompt, same tier as clearing a pending `/convert`/ban-kick
+confirmation. A menu session (including one waiting on a follow-up reply)
+expires after `WARDEN_MENU_TIMEOUT_SECONDS` (default 3 minutes) if left
+untouched.
+
+Some actions need a target the button press itself can't carry — tapping
+e.g. Group Administration → Kick prompts "reply to the message of the
+person you want to kick, or send their @username or user id," and your
+next message (reply, `@username`, or raw id all work) completes it. Alerts
+and Watches' "view" screens list this chat's actual pending items live,
+each tappable to cancel/unwatch; *creating* a new one stays a typed
+command (or natural language), since those take several independent
+parameters a button flow doesn't meaningfully simplify.
+
+Reminders' "New reminder" is the one exception — it's a real multi-step
+wizard, not a "go type the command" placeholder. Each step (date, then
+hour, then minute in 5s, then second) shows `[◀ -] [value] [+ ▶]` plus
+`[⬅ Previous] [Next ➡]`; the last step hands off to a plain text prompt for
+the message, then a final confirm screen with `[✅ Create]`/`[✖ Discard]`.
+At any stepper step you can skip the buttons entirely and just reply with
+a time (`13:37`) or date (`5/22/26`) to jump straight there. Reminders'
+"View / cancel" screen shows each pending reminder's time in *its own
+setter's* timezone/format, not the viewer's.
+
+Settings → Personal holds your own timezone (a fixed UTC offset, not a
+real DST-aware zone — good enough for a personal bot, see `/remind`'s own
+doc comment) and date/time formatting. It defaults to a rough guess from
+your Telegram `language_code` (the only locale hint Telegram's API exposes
+— there's no real location/timezone field to key off), and is always
+overridable by sending e.g. `+3:30`, `-5`, or `+0`.
+
+Telegram edits one message in place as you navigate. Matrix (no
+`editMessageReplyMarkup`-equivalent primitive) sends a fresh message per
+navigation step instead, using the same reaction mechanism as `/convert`'s
+prompts — functional, but stale reactions from earlier screens aren't
+cleaned up yet; a persistent Telegram reply-keyboard mirroring the top-level
+modules is also planned but not built yet (see `ROADMAP.md`). XMPP has no
+button/reaction concept at all, so `/menu` there just renders as a plain
+text overview.
 
 # Site scraping
 The `scrape_site` tool reads a page's clean, readable text — title and body
@@ -334,6 +390,7 @@ export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
 # export WARDEN_DIGEST_INTERVAL_SECONDS=86400
 # export WARDEN_CONFIRM_TIMEOUT_SECONDS=60
 # export WARDEN_CONVERT_TIMEOUT_SECONDS=300
+# export WARDEN_MENU_TIMEOUT_SECONDS=180
 
 # Logging: debug | info | notice | warn | error | fatal (default: info).
 # Controls src/log.zig's runtime verbosity — every log line renders as

@@ -22,9 +22,13 @@ pub const DueReminder = struct {
 /// One row for `/reminders` — `due_at` is an absolute unix timestamp; the
 /// caller formats it relative to its own `now`. `recur_interval_seconds`
 /// set means this reminder repeats (see `reminder_format.formatInterval`
-/// for rendering it back to shorthand).
+/// for rendering it back to shorthand). `identity_id` is who set it — the
+/// caller uses it to render `due_at` in *that* person's own timezone/format
+/// (see `store/user_settings.zig`), since a chat's pending reminders can
+/// belong to several people.
 pub const PendingReminder = struct {
     id: i64,
+    identity_id: i64,
     message: []const u8,
     due_at: i64,
     recur_interval_seconds: ?i64,
@@ -123,7 +127,7 @@ pub fn listPending(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT id, message, EXTRACT(EPOCH FROM due_at)::bigint, recur_interval_seconds
+        \\SELECT id, identity_id, message, EXTRACT(EPOCH FROM due_at)::bigint, recur_interval_seconds
         \\FROM reminders WHERE chat_id = $1 AND delivered_at IS NULL
         \\ORDER BY due_at ASC;
     );
@@ -134,9 +138,10 @@ pub fn listPending(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![
     while (try stmt.step()) {
         try out.append(allocator, .{
             .id = stmt.columnInt64(0),
-            .message = try allocator.dupe(u8, stmt.columnText(1)),
-            .due_at = stmt.columnInt64(2),
-            .recur_interval_seconds = if (stmt.columnIsNull(3)) null else stmt.columnInt64(3),
+            .identity_id = stmt.columnInt64(1),
+            .message = try allocator.dupe(u8, stmt.columnText(2)),
+            .due_at = stmt.columnInt64(3),
+            .recur_interval_seconds = if (stmt.columnIsNull(4)) null else stmt.columnInt64(4),
         });
     }
     return out.toOwnedSlice(allocator);

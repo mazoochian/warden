@@ -187,6 +187,26 @@ pub const PendingConversions = struct {
         return true;
     }
 
+    /// True if (chat_id, user_id) currently has an unexpired
+    /// `awaiting_format` entry — the mirror image of `isAwaitingFile`,
+    /// read-only. Used to route an inbound `choice_picked` event to this
+    /// flow rather than `features/menu.zig`'s own (both are keyed the same
+    /// way, and only one of them should ever actually claim a given pick).
+    pub fn isAwaitingFormat(self: *PendingConversions, now: i64, chat_id: []const u8, user_id: []const u8) bool {
+        const key = compositeKey(self.allocator, chat_id, user_id) catch return false;
+        defer self.allocator.free(key);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const entry = self.map.get(key) orelse return false;
+        if (now > entry.expires_at) return false;
+        return switch (entry.stage) {
+            .awaiting_file => false,
+            .awaiting_format => true,
+        };
+    }
+
     /// Consumes an `awaiting_format` entry for (chat_id, user_id) if it
     /// exists, matches `prompt_message_id`, and hasn't expired — a stale
     /// pick (a superseded prompt, or one arriving after expiry) is a no-op
@@ -441,6 +461,8 @@ test "beginAwaitingFile then claimFile then takeAwaitingFormat round trip" {
     };
     try testing.expect(try pending.claimFile(a, 1000, "chat1", "user1", "/tmp/foo.png", "foo.png", "prompt1", &choices));
     try testing.expect(!pending.isAwaitingFile(a, 1000, "chat1", "user1"));
+    try testing.expect(pending.isAwaitingFormat(1000, "chat1", "user1"));
+    try testing.expect(!pending.isAwaitingFormat(1000, "chat1", "user2"));
 
     // A stale prompt id doesn't match.
     try testing.expectEqual(@as(?AwaitingFormat, null), pending.takeAwaitingFormat(a, 1000, "chat1", "user1", "wrong-prompt"));

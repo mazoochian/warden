@@ -39,6 +39,55 @@ as a reply to anything. Fixed in `telegram/client.zig` with
 by inserting a due reminder directly into the database and confirming
 clean delivery.
 
+**Also unplanned, shipped outside the phase sequence** (direct user
+request, 2026-07-26): a button-driven `/menu`/`!menu` system covering every
+module (Alerts, Watches, Statistics, Convert, Group Administration,
+Settings, Help) as a thin front end over their existing commands —
+`features/menu_tree.zig` (the comptime module tree, doubling as the Help
+browser's content) and `features/menu.zig` (the generic navigation
+engine: per-(chat,user) sessions, an `ActionRunner` the actual command
+logic plugs into, ownership enforcement, `awaiting_input` free-text
+prompts for actions needing a target). New in this pass: a genuinely new
+"top participants" pie chart (`features/piechart.zig` + `tools/piechart/
+render.mjs`, same JSON-temp-file → `@napi-rs/canvas` → PNG pipeline as
+the existing word cloud) and a new `Connector.editChoicePrompt` capability
+(Telegram: edits a message's text+keyboard together in one call) that
+lets Telegram navigation edit one message in place instead of spamming a
+new one per level. Matrix reuses `sendChoicePrompt` as-is for now (a fresh
+message per navigation step, stale reactions from earlier screens left in
+place) and the Telegram persistent reply-keyboard mirroring the top-level
+modules wasn't built — both are explicitly deferred, see the backlog entry
+below. `zig build test` green.
+
+**Also unplanned, shipped outside the phase sequence** (direct user
+request, 2026-07-26): real calendar dates and per-user timezone/formatting
+for reminders, plus a stepper-based creation wizard in `/menu`. New
+`text/civil_time.zig` (Howard Hinnant's constant-time civil-calendar
+algorithm — days-since-epoch ↔ y/m/d — plus local-offset split/combine and
+date/time formatting; no calendar math existed anywhere in this codebase
+before) and `store/user_settings.zig` (migration `0015_user_settings`) back
+a personal timezone/date-format/time-format setting per identity, seeded
+with a rough guess from Telegram's `language_code` (the only locale hint
+its API exposes) and always overridable. **Scope decision**: a personal
+timezone is a fixed UTC offset in minutes, not a real DST-aware IANA zone —
+twice-a-year DST drift is an accepted, documented limitation, the same
+"good enough for a personal bot" tradeoff `reminder_format.zig`'s own
+pre-existing naive-timezone doc comment already made process-wide, just
+made per-user instead. `reminder_format.parseWhenLocal` is the new
+timezone-aware, date-capable sibling of `parseWhen` (accepts an explicit
+`M/D`, `D/M`, or ISO `Y-M-D` date — year optional, rolling to next year
+once passed — ahead of the existing duration/clock-time shapes); the old
+naive `parseWhen` stays as-is for `tools/remind.zig`'s LLM tool. `/menu`
+gained a Reminders module (view/cancel live pending reminders, each in its
+own setter's timezone/format) and a genuinely new `NodeKind.wizard` in
+`features/menu_tree.zig`/`features/menu.zig` — a linear date → hour →
+minute (5s) → second → message → confirm flow with `[◀ -][value][+ ▶]`
+steppers, `[⬅ Previous][Next ➡]` nav, and a text-reply shortcut ("13:37" or
+"5/22/26") that jumps straight to a value and skips ahead. Settings →
+Personal, a placeholder since the `/menu` pass above, now has real content
+(Timezone/Date format/Time format). `zig build` + `zig build test` green
+(381/382, 1 skipped without a local Postgres).
+
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
 
@@ -498,3 +547,17 @@ planned in detail, listed so they aren't forgotten.
   immediately and start requiring a follow-up `/confirm`), not a targeting
   bugfix — worth a deliberate decision on which behavior is actually
   wanted before touching it.
+- **`/menu` polish: Telegram reply-keyboard + Matrix reaction cleanup** —
+  deferred 2026-07-26 out of the initial `/menu` pass (see its "shipped
+  outside the phase sequence" note above). Two independent pieces:
+  (1) a persistent Telegram reply-keyboard (`ReplyKeyboardMarkup`/
+  `KeyboardButton` — neither exists in `telegram/types.zig`/`client.zig`
+  today) surfacing the same top-level modules as `/menu`'s root, so they're
+  reachable from the keyboard docked at the input box, not just the inline
+  menu; (2) real in-place editing for Matrix (redacting stale reactions
+  from a screen the session has navigated away from, via
+  `matrix/client.zig`'s already-existing but currently-unused
+  `redactMessage`) instead of `menu.zig`'s current fallback of sending a
+  fresh message per navigation step there. Neither blocks using `/menu` on
+  either platform today, just leaves Matrix messier and Telegram
+  discoverable only via `/menu`/the "/" command list.

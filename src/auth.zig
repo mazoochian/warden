@@ -141,6 +141,7 @@ fn testConfig(comptime owner_id: []const u8) Config {
         .llm = .{ .anthropic = .{ .api_key = "x", .model = "x" } },
         .confirm_timeout_seconds = 60,
         .convert_timeout_seconds = 300,
+        .menu_timeout_seconds = 180,
         .tmp_dir = "data/tmp",
         .digest_interval_seconds = 86_400,
         .system_prompt = null,

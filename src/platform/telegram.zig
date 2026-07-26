@@ -211,6 +211,7 @@ pub const TelegramConnector = struct {
         .sendMessageReturningId = sendMessageReturningIdFn,
         .editMessage = editMessageFn,
         .sendChoicePrompt = sendChoicePromptFn,
+        .editChoicePrompt = editChoicePromptFn,
         .muteUser = muteUserFn,
         .unmuteUser = unmuteUserFn,
         .kickUser = kickUserFn,
@@ -400,20 +401,37 @@ pub const TelegramConnector = struct {
         return std.fmt.allocPrint(allocator, "{d}", .{sent_id});
     }
 
+    /// Shared by `sendChoicePromptFn`/`editChoicePromptFn` — translates
+    /// `iface.Choice`'s emoji+label+value into `raw.Client.Button`'s
+    /// text+callback_data ("{emoji} {label}" as the button text, matching
+    /// this platform's existing convention of putting the emoji directly on
+    /// the button rather than only in the message body).
+    fn choicesToButtons(allocator: std.mem.Allocator, choices: []const iface.Choice) !std.ArrayList(raw.Client.Button) {
+        var buttons: std.ArrayList(raw.Client.Button) = .empty;
+        for (choices) |c| {
+            const label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ c.emoji, c.label });
+            try buttons.append(allocator, .{ .text = label, .callback_data = c.value });
+        }
+        return buttons;
+    }
+
     fn sendChoicePromptFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, choices: []const iface.Choice, reply_to_message_id: ?[]const u8) anyerror!?[]const u8 {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         const id = try parseId(chat_id);
         const reply_id: ?i64 = if (reply_to_message_id) |r| parseId(r) catch null else null;
 
-        var buttons: std.ArrayList(raw.Client.Button) = .empty;
+        var buttons = try choicesToButtons(allocator, choices);
         defer buttons.deinit(allocator);
-        for (choices) |c| {
-            const label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ c.emoji, c.label });
-            try buttons.append(allocator, .{ .text = label, .callback_data = c.value });
-        }
 
         const sent_id = try self.client.sendChoicePrompt(allocator, id, text, buttons.items, reply_id);
         return try std.fmt.allocPrint(allocator, "{d}", .{sent_id});
+    }
+
+    fn editChoicePromptFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8, text: []const u8, choices: []const iface.Choice) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        var buttons = try choicesToButtons(allocator, choices);
+        defer buttons.deinit(allocator);
+        return self.client.editMessageTextWithKeyboard(allocator, try parseId(chat_id), try parseId(message_id), text, buttons.items);
     }
 
     fn editMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8, text: []const u8) anyerror!void {

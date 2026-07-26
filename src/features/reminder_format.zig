@@ -1,4 +1,5 @@
 const std = @import("std");
+const civil_time = @import("../text/civil_time.zig");
 
 /// Parses a duration like "30m"/"2h"/"1d" into seconds. Deliberately
 /// relative-only (no timezone conversion) — see `parseAbsoluteTime`'s doc
@@ -49,6 +50,137 @@ pub fn parseAbsoluteTime(text: []const u8, now: i64) ?i64 {
 pub fn parseWhen(text: []const u8, now: i64) ?i64 {
     if (parseDuration(text)) |secs| return now + secs;
     return parseAbsoluteTime(text, now);
+}
+
+pub const DateParts = struct { year: ?i32, month: u8, day: u8 };
+
+/// Parses a date with no time component: ISO `Y-M-D` (always available,
+/// `-`-separated), or `/`-separated `M/D[/Y]`/`D/M[/Y]` per `format` (`.ymd`
+/// falls back to `Y/M/D` for the `/` form, mirroring the `-` one). Year is
+/// optional only in the `/` form; a 2-digit year is treated as 2000+yy.
+/// `null` on anything malformed — deliberately not validating day-of-month
+/// against the actual days in `month` (`civil_time.daysFromCivil` already
+/// normalizes an out-of-range day rather than rejecting it, same tradeoff).
+/// Exported (not just used internally by `parseWhenLocal`) since `menu.zig`'s
+/// reminder wizard reuses it for its "reply with a date to jump there" text
+/// shortcut.
+pub fn parseDatePart(text: []const u8, format: civil_time.DateFormat) ?DateParts {
+    if (std.mem.indexOfScalar(u8, text, '-') != null) {
+        var it = std.mem.splitScalar(u8, text, '-');
+        const y = it.next() orelse return null;
+        const m = it.next() orelse return null;
+        const d = it.next() orelse return null;
+        if (it.next() != null) return null;
+        const year = std.fmt.parseInt(i32, y, 10) catch return null;
+        const month = std.fmt.parseInt(u8, m, 10) catch return null;
+        const day = std.fmt.parseInt(u8, d, 10) catch return null;
+        if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+        return .{ .year = year, .month = month, .day = day };
+    }
+    if (std.mem.indexOfScalar(u8, text, '/') != null) {
+        var it = std.mem.splitScalar(u8, text, '/');
+        const first = it.next() orelse return null;
+        const second = it.next() orelse return null;
+        const third = it.next();
+        if (third != null and it.next() != null) return null;
+
+        const first_val = std.fmt.parseInt(u8, first, 10) catch return null;
+        const second_val = std.fmt.parseInt(u8, second, 10) catch return null;
+        var month: u8 = undefined;
+        var day: u8 = undefined;
+        switch (format) {
+            .dmy => {
+                day = first_val;
+                month = second_val;
+            },
+            .mdy, .ymd => {
+                month = first_val;
+                day = second_val;
+            },
+        }
+        if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+
+        var year: ?i32 = null;
+        if (third) |t| {
+            const y_val = std.fmt.parseInt(i32, t, 10) catch return null;
+            year = if (y_val < 100) 2000 + y_val else y_val;
+        }
+        return .{ .year = year, .month = month, .day = day };
+    }
+    return null;
+}
+
+/// Parses a bare 24h clock time like "9:00" or "14:30" into its components
+/// (no date, no rollover — just validates ranges). Exported for
+/// `menu.zig`'s reminder wizard's "reply with a time to jump there" text
+/// shortcut; `parseWhenLocal` below uses it too instead of duplicating the
+/// same two lines.
+pub fn parseClockTime(text: []const u8) ?struct { hour: u8, minute: u8 } {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
+    const hour = std.fmt.parseInt(u8, text[0..colon], 10) catch return null;
+    const minute = std.fmt.parseInt(u8, text[colon + 1 ..], 10) catch return null;
+    if (hour > 23 or minute > 59) return null;
+    return .{ .hour = hour, .minute = minute };
+}
+
+/// Timezone-aware, date-capable sibling of `parseWhen` — the wizard/`/menu`
+/// era's entry point, tried by `/remind`/`/reminders` instead of the naive
+/// version above (which stays for `tools/remind.zig`'s LLM tool, which
+/// already gets an absolute-feeling instruction and has no per-user offset
+/// wired to it). `offset_minutes`/`date_format` come from
+/// `store/user_settings.zig`'s `getEffectiveOffsetMinutes`/
+/// `getEffectiveDateFormat` for whoever is setting the reminder.
+///
+/// Accepted shapes, tried in order:
+///  - relative duration (`30m`/`2h`/`1d`) — unchanged, timezone-irrelevant.
+///  - bare `HH:MM` — resolves against *local* now (today if not yet passed,
+///    else tomorrow), same rollover rule `parseAbsoluteTime` uses.
+///  - `<date> HH:MM` — an explicit calendar date (see `parseDatePart`)
+///    followed by a time, both interpreted in the local offset. A year
+///    omitted from `<date>` defaults to the local current year, rolling to
+///    next year if that local moment has already passed (mirroring the
+///    bare-time rollover one level up); an explicit year is trusted as-is
+///    even if it's already past.
+///  - a bare date with no time defaults to 09:00 local — good enough for
+///    anyone who doesn't care about the exact time; the wizard is the real
+///    path for that.
+pub fn parseWhenLocal(text: []const u8, now: i64, offset_minutes: i32, date_format: civil_time.DateFormat) ?i64 {
+    if (parseDuration(text)) |secs| return now + secs;
+
+    const trimmed = std.mem.trim(u8, text, " \t");
+    var date_text: ?[]const u8 = null;
+    var time_text: []const u8 = trimmed;
+    if (std.mem.indexOfScalar(u8, trimmed, ' ')) |sp| {
+        date_text = trimmed[0..sp];
+        time_text = std.mem.trim(u8, trimmed[sp + 1 ..], " \t");
+    } else if (std.mem.indexOfScalar(u8, trimmed, ':') == null and
+        (std.mem.indexOfScalar(u8, trimmed, '/') != null or std.mem.indexOfScalar(u8, trimmed, '-') != null))
+    {
+        date_text = trimmed;
+        time_text = "09:00";
+    }
+
+    const clock = parseClockTime(time_text) orelse return null;
+    const hour = clock.hour;
+    const minute = clock.minute;
+
+    const local_now = civil_time.localFromUnix(now, offset_minutes);
+
+    if (date_text) |dt| {
+        const parts = parseDatePart(dt, date_format) orelse return null;
+        const year = parts.year orelse local_now.year;
+        const civil: civil_time.Civil = .{ .year = year, .month = parts.month, .day = parts.day, .hour = hour, .minute = minute };
+        const ts = civil_time.unixFromLocal(civil, offset_minutes);
+        if (parts.year == null and ts <= now) {
+            const rolled: civil_time.Civil = .{ .year = year + 1, .month = parts.month, .day = parts.day, .hour = hour, .minute = minute };
+            return civil_time.unixFromLocal(rolled, offset_minutes);
+        }
+        return ts;
+    }
+
+    const candidate: civil_time.Civil = .{ .year = local_now.year, .month = local_now.month, .day = local_now.day, .hour = hour, .minute = minute };
+    const ts = civil_time.unixFromLocal(candidate, offset_minutes);
+    return if (ts > now) ts else ts + 86400;
 }
 
 /// Advances a recurring reminder's `due_at` to the next occurrence strictly
@@ -121,6 +253,67 @@ test "parseWhen tries a relative duration before an absolute time" {
     try testing.expectEqual(@as(?i64, 1000 + 1800), parseWhen("30m", 1000));
     try testing.expectEqual(@as(?i64, 14 * 3600 + 30 * 60), parseWhen("14:30", 0));
     try testing.expectEqual(@as(?i64, null), parseWhen("nonsense", 0));
+}
+
+test "parseWhenLocal: duration shorthand ignores offset entirely" {
+    try testing.expectEqual(@as(?i64, 1000 + 1800), parseWhenLocal("30m", 1000, 210, .mdy));
+}
+
+test "parseWhenLocal: bare HH:MM resolves against local now, not server now" {
+    // now = 2026-05-22 12:00 local at +3:30.
+    const now = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 22, .hour = 12, .minute = 0 }, 210);
+
+    const later_today = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 22, .hour = 14, .minute = 30 }, 210);
+    try testing.expectEqual(@as(?i64, later_today), parseWhenLocal("14:30", now, 210, .mdy));
+
+    const tomorrow = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 23, .hour = 9, .minute = 0 }, 210);
+    try testing.expectEqual(@as(?i64, tomorrow), parseWhenLocal("9:00", now, 210, .mdy));
+}
+
+test "parseWhenLocal: explicit date + time, mdy vs dmy vs ISO all agree" {
+    const now: i64 = 0;
+    const expected = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 22, .hour = 13, .minute = 37 }, 0);
+
+    try testing.expectEqual(@as(?i64, expected), parseWhenLocal("5/22/2026 13:37", now, 0, .mdy));
+    try testing.expectEqual(@as(?i64, expected), parseWhenLocal("22/5/2026 13:37", now, 0, .dmy));
+    try testing.expectEqual(@as(?i64, expected), parseWhenLocal("2026-05-22 13:37", now, 0, .mdy));
+    try testing.expectEqual(@as(?i64, expected), parseWhenLocal("2026-05-22 13:37", now, 0, .dmy)); // ISO ignores format
+}
+
+test "parseWhenLocal: a 2-digit year shorthand means 2000+yy" {
+    const expected = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 22, .hour = 13, .minute = 37 }, 0);
+    try testing.expectEqual(@as(?i64, expected), parseWhenLocal("5/22/26 13:37", 0, 0, .mdy));
+}
+
+test "parseWhenLocal: an omitted year rolls to next year once the local moment has passed, else stays" {
+    // now = 2026-05-22 12:00 local, no offset.
+    const now = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 22, .hour = 12, .minute = 0 }, 0);
+
+    // 09:00 on 5/22 already passed today -> rolls to 2027.
+    const rolled = civil_time.unixFromLocal(.{ .year = 2027, .month = 5, .day = 22, .hour = 9, .minute = 0 }, 0);
+    try testing.expectEqual(@as(?i64, rolled), parseWhenLocal("5/22 09:00", now, 0, .mdy));
+
+    // 15:00 on 5/22 hasn't passed yet today -> stays this year.
+    const same_year = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 22, .hour = 15, .minute = 0 }, 0);
+    try testing.expectEqual(@as(?i64, same_year), parseWhenLocal("5/22 15:00", now, 0, .mdy));
+}
+
+test "parseWhenLocal: an explicit year is trusted as-is even if already past" {
+    const now = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 22, .hour = 12, .minute = 0 }, 0);
+    const past = civil_time.unixFromLocal(.{ .year = 2020, .month = 1, .day = 1, .hour = 0, .minute = 0 }, 0);
+    try testing.expectEqual(@as(?i64, past), parseWhenLocal("1/1/2020 00:00", now, 0, .mdy));
+}
+
+test "parseWhenLocal: a bare date with no time defaults to 09:00 local" {
+    const expected = civil_time.unixFromLocal(.{ .year = 2026, .month = 5, .day = 22, .hour = 9, .minute = 0 }, 0);
+    try testing.expectEqual(@as(?i64, expected), parseWhenLocal("5/22/2026", 0, 0, .mdy));
+    try testing.expectEqual(@as(?i64, expected), parseWhenLocal("2026-05-22", 0, 0, .mdy));
+}
+
+test "parseWhenLocal: rejects garbage and malformed dates/times" {
+    try testing.expectEqual(@as(?i64, null), parseWhenLocal("nonsense", 0, 0, .mdy));
+    try testing.expectEqual(@as(?i64, null), parseWhenLocal("13/45/2026 25:00", 0, 0, .mdy));
+    try testing.expectEqual(@as(?i64, null), parseWhenLocal("5/22/2026 25:00", 0, 0, .mdy));
 }
 
 test "nextOccurrence jumps straight past every missed interval in one step" {
