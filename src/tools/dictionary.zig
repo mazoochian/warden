@@ -11,7 +11,7 @@ pub const tool: registry.ToolDef = .{
     .name = "dictionary",
     .description = "Looks up an English word: definitions by part of speech, phonetics, and usage examples (dictionaryapi.dev, no API key).",
     .input_schema_json =
-        \\{"type":"object","properties":{"word":{"type":"string","description":"A single English word, e.g. \"serendipity\""}},"required":["word"]}
+    \\{"type":"object","properties":{"word":{"type":"string","description":"A single English word, e.g. \"serendipity\""}},"required":["word"]}
     ,
     .execute = execute,
 };

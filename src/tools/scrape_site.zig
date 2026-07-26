@@ -43,7 +43,7 @@ pub const tool: registry.ToolDef = .{
     .name = "scrape_site",
     .description = "Fetches a web page and returns clean readable text (title + body, with tags/scripts/nav markup stripped) instead of raw HTML — prefer this over fetch_url when you want to actually read a page's content. Optionally crawls a few same-site pages breadth-first via max_pages. Runs on-device by default; the bot owner can point it at an external scraping service instead via /scraper.",
     .input_schema_json =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"A fully-qualified http(s) URL"},"max_pages":{"type":"integer","description":"How many same-site pages to visit, following links breadth-first from url (1-5, default 1)."}},"required":["url"]}
+    \\{"type":"object","properties":{"url":{"type":"string","description":"A fully-qualified http(s) URL"},"max_pages":{"type":"integer","description":"How many same-site pages to visit, following links breadth-first from url (1-5, default 1)."}},"required":["url"]}
     ,
     .execute = execute,
 };

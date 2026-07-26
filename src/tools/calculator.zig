@@ -7,7 +7,7 @@ pub const tool: registry.ToolDef = .{
     .name = "calculator",
     .description = "Evaluates a basic arithmetic expression (+ - * / and parentheses, decimals, negatives). Use this for any math instead of computing it yourself.",
     .input_schema_json =
-        \\{"type":"object","properties":{"expression":{"type":"string","description":"An arithmetic expression, e.g. \"(2 + 3) * 4\""}},"required":["expression"]}
+    \\{"type":"object","properties":{"expression":{"type":"string","description":"An arithmetic expression, e.g. \"(2 + 3) * 4\""}},"required":["expression"]}
     ,
     .execute = execute,
 };

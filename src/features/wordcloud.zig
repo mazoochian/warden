@@ -15,17 +15,17 @@ const max_word_len = 30;
 /// Common English function words filtered out before counting — without
 /// this the cloud is just "the/and/that" in giant letters.
 const stopwords = [_][]const u8{
-    "the",  "and",  "for",  "are",  "but",  "not",  "you",  "your",
-    "with", "this", "that", "have", "has",  "had",  "was",  "were",
-    "will", "would", "can", "could", "should", "just", "like", "get",
-    "got",  "its",  "it's", "about", "what", "when", "where", "who",
-    "why",  "how",  "all",  "any",   "some", "such", "than",  "then",
-    "them", "they", "their", "there", "here", "from", "into", "out",
-    "over", "under", "again", "also", "very", "one",  "two",  "now",
-    "yeah", "yes",  "no",   "ok",    "okay", "lol",  "haha",  "did",
-    "does", "doing", "done", "being", "been", "our",  "his",  "her",
-    "she",  "him",   "these", "those", "because", "still", "want",
-    "think", "know", "really", "much", "more", "well", "make", "made",
+    "the",  "and",    "for",   "are",   "but",     "not",   "you",   "your",
+    "with", "this",   "that",  "have",  "has",     "had",   "was",   "were",
+    "will", "would",  "can",   "could", "should",  "just",  "like",  "get",
+    "got",  "its",    "it's",  "about", "what",    "when",  "where", "who",
+    "why",  "how",    "all",   "any",   "some",    "such",  "than",  "then",
+    "them", "they",   "their", "there", "here",    "from",  "into",  "out",
+    "over", "under",  "again", "also",  "very",    "one",   "two",   "now",
+    "yeah", "yes",    "no",    "ok",    "okay",    "lol",   "haha",  "did",
+    "does", "doing",  "done",  "being", "been",    "our",   "his",   "her",
+    "she",  "him",    "these", "those", "because", "still", "want",  "think",
+    "know", "really", "much",  "more",  "well",    "make",  "made",
 };
 
 fn isStopword(word: []const u8) bool {

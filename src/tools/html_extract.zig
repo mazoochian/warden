@@ -238,8 +238,9 @@ fn isRawTextTag(name: []const u8) bool {
 }
 
 const block_tags = [_][]const u8{
-    "p", "div", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6",
-    "tr", "section", "article", "header", "footer", "nav", "ul", "ol", "table", "blockquote", "pre",
+    "p",   "div",     "li",      "br",     "h1",     "h2",  "h3", "h4", "h5",    "h6",
+    "tr",  "section", "article", "header", "footer", "nav", "ul", "ol", "table", "blockquote",
+    "pre",
 };
 
 fn isBlockTag(name: []const u8) bool {
@@ -325,7 +326,7 @@ fn resolveHref(allocator: std.mem.Allocator, base: Uri, href: []const u8) !?[]co
 }
 
 const named_entities = .{
-    .{ "amp", '&' },  .{ "lt", '<' },   .{ "gt", '>' },
+    .{ "amp", '&' },  .{ "lt", '<' },    .{ "gt", '>' },
     .{ "quot", '"' }, .{ "apos", '\'' }, .{ "nbsp", ' ' },
 };
 

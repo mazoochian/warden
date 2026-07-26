@@ -125,7 +125,8 @@ test "StreamFeatures.fromElement reads starttls, mechanisms, bind, and session" 
 }
 
 test "StreamFeatures.fromElement reads bind+session with no mechanisms" {
-    var parsed = try xml.parseElement(testing.allocator,
+    var parsed = try xml.parseElement(
+        testing.allocator,
         "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/><session xmlns='urn:ietf:params:xml:ns:xmpp-session'/></stream:features>",
     );
     defer parsed.deinit();
@@ -146,7 +147,8 @@ test "parseSaslOutcome recognizes success and extracts the failure reason tag" {
         .failure => try testing.expect(false),
     }
 
-    var failure_parsed = try xml.parseElement(testing.allocator,
+    var failure_parsed = try xml.parseElement(
+        testing.allocator,
         "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
     );
     defer failure_parsed.deinit();
@@ -160,7 +162,8 @@ test "parseSaslOutcome recognizes success and extracts the failure reason tag" {
 }
 
 test "boundJid extracts the bound JID from a bind result IQ" {
-    var parsed = try xml.parseElement(testing.allocator,
+    var parsed = try xml.parseElement(
+        testing.allocator,
         "<iq type='result' id='bind1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>test@localhost/warden</jid></bind></iq>",
     );
     defer parsed.deinit();
@@ -177,7 +180,8 @@ test "boundJid returns null for an IQ with no bind child" {
 }
 
 test "MessageStanza.fromElement extracts a chat message's body" {
-    var parsed = try xml.parseElement(testing.allocator,
+    var parsed = try xml.parseElement(
+        testing.allocator,
         "<message from='alice@localhost/phone' to='warden@localhost' type='chat' id='m1'><body>hi there</body></message>",
     );
     defer parsed.deinit();

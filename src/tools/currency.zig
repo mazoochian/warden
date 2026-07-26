@@ -15,7 +15,7 @@ pub const tool: registry.ToolDef = .{
     .name = "currency_convert",
     .description = "Converts an amount between currencies using current exchange rates. No API key required (Frankfurter/ECB rates). Use ISO 4217 codes like USD, EUR, JPY.",
     .input_schema_json =
-        \\{"type":"object","properties":{"amount":{"type":"number","description":"Amount to convert, defaults to 1"},"from":{"type":"string","description":"Source currency code, e.g. USD"},"to":{"type":"string","description":"Target currency code, e.g. EUR"}},"required":["from","to"]}
+    \\{"type":"object","properties":{"amount":{"type":"number","description":"Amount to convert, defaults to 1"},"from":{"type":"string","description":"Source currency code, e.g. USD"},"to":{"type":"string","description":"Target currency code, e.g. EUR"}},"required":["from","to"]}
     ,
     .execute = execute,
 };

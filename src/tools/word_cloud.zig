@@ -12,7 +12,7 @@ pub const tool: registry.ToolDef = .{
     .name = "word_cloud",
     .description = "Builds a word-cloud image out of text you provide (an article you fetched or scraped, pasted content, etc.) and sends it directly to this chat as a photo. You must inline the full text itself in the `text` field — not a reference to an earlier tool result — since each tool call is otherwise stateless. For the group's own chat history, the user has a separate /wordcloud command instead — don't use this tool for that.",
     .input_schema_json =
-        \\{"type":"object","properties":{"text":{"type":"string","description":"The full text to build the word cloud from, inlined here (not referenced from an earlier message) — the more of it, the better the cloud."}},"required":["text"]}
+    \\{"type":"object","properties":{"text":{"type":"string","description":"The full text to build the word cloud from, inlined here (not referenced from an earlier message) — the more of it, the better the cloud."}},"required":["text"]}
     ,
     .execute = execute,
 };

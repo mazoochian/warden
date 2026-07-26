@@ -11,7 +11,7 @@ pub const tool: registry.ToolDef = .{
     .name = "hackernews_search",
     .description = "Searches Hacker News stories (Algolia API, no key): tech news, launches, and their discussion threads. Returns title, link, points, and comment count — follow the discussion link with fetch_url if the thread itself matters.",
     .input_schema_json =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Search terms, e.g. \"zig 1.0\" or \"openwrt\""}},"required":["query"]}
+    \\{"type":"object","properties":{"query":{"type":"string","description":"Search terms, e.g. \"zig 1.0\" or \"openwrt\""}},"required":["query"]}
     ,
     .execute = execute,
 };

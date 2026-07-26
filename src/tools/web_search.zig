@@ -17,7 +17,7 @@ pub const tool: registry.ToolDef = .{
     .name = "web_search",
     .description = "Searches the web and returns the top results (title, URL, snippet). Use this whenever the answer needs facts beyond the chat history — current events, prices, docs, anything you're not sure about. Follow up with fetch_url to read a promising result in full.",
     .input_schema_json =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]}
+    \\{"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]}
     ,
     .execute = execute,
 };

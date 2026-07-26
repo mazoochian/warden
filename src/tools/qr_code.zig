@@ -15,7 +15,7 @@ pub const tool: registry.ToolDef = .{
     .name = "qr_code",
     .description = "Generates a QR code image for any text — a URL, WiFi credentials, contact info, plain text — and sends it directly to this chat as a photo. Use when someone asks for a QR code or wants to share something scannable.",
     .input_schema_json =
-        \\{"type":"object","properties":{"data":{"type":"string","description":"The text or URL to encode in the QR code"}},"required":["data"]}
+    \\{"type":"object","properties":{"data":{"type":"string","description":"The text or URL to encode in the QR code"}},"required":["data"]}
     ,
     .execute = execute,
 };

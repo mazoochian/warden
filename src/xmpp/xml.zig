@@ -337,8 +337,7 @@ test "parseElement handles both attribute quote styles" {
 }
 
 test "parseElement parses nested elements and text content" {
-    var parsed = try parseElement(testing.allocator,
-        "<message to='a@b' type='chat'><body>hi &amp; bye</body></message>tail");
+    var parsed = try parseElement(testing.allocator, "<message to='a@b' type='chat'><body>hi &amp; bye</body></message>tail");
     defer parsed.deinit();
     try testing.expectEqualStrings("message", parsed.element.name);
     try testing.expectEqualStrings("chat", parsed.element.attr("type").?);

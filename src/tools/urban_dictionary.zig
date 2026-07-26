@@ -11,7 +11,7 @@ pub const tool: registry.ToolDef = .{
     .name = "urban_dictionary",
     .description = "Looks up slang, memes, and internet expressions on Urban Dictionary (no API key). Use for informal words a normal dictionary won't have. Definitions are user-submitted and often crude — summarize tastefully.",
     .input_schema_json =
-        \\{"type":"object","properties":{"term":{"type":"string","description":"The slang term or phrase, e.g. \"rizz\""}},"required":["term"]}
+    \\{"type":"object","properties":{"term":{"type":"string","description":"The slang term or phrase, e.g. \"rizz\""}},"required":["term"]}
     ,
     .execute = execute,
 };

@@ -8,7 +8,7 @@ pub const tool: registry.ToolDef = .{
     .name = "draw_diagram",
     .description = "Renders a Mermaid diagram (flowchart, sequence diagram, class diagram, timeline, etc.) and sends it as an image directly to this chat. Provide valid Mermaid syntax. Use this whenever a diagram would explain something better than text — e.g. summarizing a process, decision flow, or structure discussed in the chat.",
     .input_schema_json =
-        \\{"type":"object","properties":{"mermaid":{"type":"string","description":"Valid Mermaid diagram source, e.g. \"flowchart TD\\n  A --> B\""}},"required":["mermaid"]}
+    \\{"type":"object","properties":{"mermaid":{"type":"string","description":"Valid Mermaid diagram source, e.g. \"flowchart TD\\n  A --> B\""}},"required":["mermaid"]}
     ,
     .execute = execute,
 };

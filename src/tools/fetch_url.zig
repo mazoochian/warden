@@ -14,7 +14,7 @@ pub const tool: registry.ToolDef = .{
     .name = "fetch_url",
     .description = "Fetches the raw text content of a URL (an article, RSS/Atom feed, or any other http(s) page) so you can read and summarize it yourself. Returns raw content, not a summary.",
     .input_schema_json =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"A fully-qualified http(s) URL"}},"required":["url"]}
+    \\{"type":"object","properties":{"url":{"type":"string","description":"A fully-qualified http(s) URL"}},"required":["url"]}
     ,
     .execute = execute,
 };
