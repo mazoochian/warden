@@ -422,3 +422,65 @@ planned in detail, listed so they aren't forgotten.
   owner-only-Q&A trust model (it'd need to act on messages regardless of
   addressing) and risks false-positive moderation in real groups; revisit
   only if a real need shows up.
+- **History-aware context downsampling/summarization** — added
+  2026-07-26: every LLM call currently sends the last `WARDEN_LLM_HISTORY_MESSAGES`
+  raw "who: text" lines verbatim (see `qa.zig`'s `recentFormatted` call),
+  no compression at all. A real upgrade path once the current flat window
+  stops being "good enough": periodically collapse older history into a
+  running per-chat digest/summary (reusing the existing `/digest` feature's
+  summarization machinery as a starting point) so the prompt sends "recent
+  raw messages + a compressed summary of everything older" instead of a
+  strictly bigger raw window. Needs a real design pass (when to
+  regenerate the summary, how stale it's allowed to get, cost of the
+  summarization call itself) before starting — not a quick patch.
+- **ML/embedding-based trivial-message classifier** — added 2026-07-26:
+  `features/trivial_reply.zig`'s regex-based greeting/ack matcher (see
+  its module doc) is a deliberately simple v1 (fixed phrase list, whole-
+  message match). A real classifier (small embedding model + similarity
+  threshold, or a tiny fine-tuned intent model) would generalize far
+  better than a fixed pattern list, at the cost of an extra model call
+  (defeats some of the point unless it's cheap/local) or a bundled
+  lightweight model. Revisit once the fixed-list version's false-negative
+  rate in practice is actually known.
+- **Per-group LLM usage cap** — requested 2026-07-26, explicitly deferred:
+  let a chat's own admins (not just bot admins/owner) cap how many credits
+  (or how much LLM spend) that specific *chat* can burn through in a
+  period, independent of any individual member's personal credit balance
+  (see README's "Access control" section for the current global-per-
+  identity credits model). Would need its own per-chat counter/limit in
+  `chat_settings` (or a new table) and a spend-check alongside
+  `identities.spendCredit` at the same choke point in `main.zig`. Not
+  implemented — tracked here only.
+- **LLM response/token caching** — noted 2026-07-26, explicitly deferred:
+  cache identical or near-identical prompts/answers (e.g. the same
+  trivial-adjacent question asked repeatedly, or Anthropic's own
+  prompt-caching feature for the shared system-prompt/tool-schema prefix
+  every request resends) to cut repeat-request cost. Anthropic's native
+  prompt caching (cache the system prompt + tool schemas, which don't
+  change turn to turn) is probably the highest-value, lowest-risk version
+  of this — worth checking `llm/anthropic.zig`'s request builder against
+  the current caching API shape when this phase starts.
+- **Multi-model routing** — added 2026-07-26: today `llm.Provider` is a
+  single fixed instance for the whole process (`WARDEN_LLM_PROVIDER`, one
+  provider/model, chosen once at startup — see `main.zig`'s provider
+  construction). A real router component would sit in front of it and:
+  - classify each question (cheaply — a small model call, or a classifier
+    reusing the trivial-message matcher's approach) and send it to
+    whichever configured provider/model actually fits (a cheap/fast model
+    for simple questions, a stronger one for anything that needs real
+    reasoning or a big context);
+  - let a cheap model's answer optionally get "consulted"/escalated to a
+    heavier model rather than every question paying the heavy model's cost
+    up front;
+  - cache/reuse responses across near-duplicate questions (ties into the
+    token-caching item above);
+  - load-balance across multiple configured providers/keys for the same
+    tier (throughput/rate-limit headroom, and a cheap way to get
+    redundancy if one provider is down — directly relevant given this
+    session's router9-down incident that prompted the Anthropic switch).
+  This is a genuinely bigger architectural change than anything else in
+  this backlog — `llm.Provider` would need to become a set of providers
+  plus a routing policy, not a single instance — so it deserves its own
+  dedicated phase/design pass rather than an incremental patch. Worth
+  revisiting once the current single-provider setup's cost/latency
+  tradeoffs are actually felt in practice.

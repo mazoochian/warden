@@ -1,5 +1,6 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
+const Stmt = @import("db.zig").Stmt;
 const PgPool = @import("pool.zig").PgPool;
 
 /// Inserts one message row, scoped to `chat_id`/`identity_id` (the internal
@@ -69,6 +70,125 @@ pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
     return std.mem.join(allocator, "\n", lines.items);
 }
 
+pub const MessageRef = struct {
+    id: i64,
+    native_message_id: []const u8,
+    text: ?[]const u8,
+};
+
+/// Escapes `%`, `_`, and `\` for safe embedding in a `LIKE ... ESCAPE '\'`
+/// pattern — same approach as `chat_members.zig`'s private `likePattern`,
+/// duplicated here rather than shared cross-module (small, self-contained,
+/// matches this codebase's existing preference for module-local helpers
+/// over a shared utils file — see e.g. `http_util.zig`'s own `redactUrl`).
+fn escapeLikeLiteral(allocator: std.mem.Allocator, substring: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.append(allocator, '%');
+    for (substring) |c| {
+        if (c == '\\' or c == '%' or c == '_') try buf.append(allocator, '\\');
+        try buf.append(allocator, c);
+    }
+    try buf.append(allocator, '%');
+    return buf.toOwnedSlice(allocator);
+}
+
+fn collectDeletable(stmt: *Stmt, allocator: std.mem.Allocator) ![]MessageRef {
+    var out: std.ArrayList(MessageRef) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .id = stmt.columnInt64(0),
+            .native_message_id = try allocator.dupe(u8, stmt.columnText(1)),
+            .text = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Most recent `limit` deletable (`native_message_id IS NOT NULL`) messages
+/// in `chat_id`, newest first — backs `/redact <N>`.
+pub fn recentDeletable(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, limit: i64) ![]MessageRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT id, native_message_id, text FROM messages
+        \\WHERE chat_id = $1 AND native_message_id IS NOT NULL
+        \\ORDER BY id DESC LIMIT $2;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, limit);
+    return collectDeletable(&stmt, allocator);
+}
+
+/// Same as `recentDeletable`, scoped to one sender — backs
+/// "`/redact [N]` as a reply to a user's message".
+pub fn recentDeletableByIdentity(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, identity_id: i64, limit: i64) ![]MessageRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT id, native_message_id, text FROM messages
+        \\WHERE chat_id = $1 AND identity_id = $2 AND native_message_id IS NOT NULL
+        \\ORDER BY id DESC LIMIT $3;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, identity_id);
+    stmt.bindInt64(3, limit);
+    return collectDeletable(&stmt, allocator);
+}
+
+/// Literal (non-regex) case-insensitive substring search among deletable
+/// messages, newest first — backs `/redact text <substring>`. Bounded by
+/// BOTH `match_limit` (how many matches to return) and `scan_limit` (how
+/// far back into history to look), using the same id-offset-subquery idiom
+/// `pruneKeepLast` uses to bound its own window — `COALESCE(..., 0)` makes
+/// "fewer than `scan_limit` messages exist" mean "scan everything" rather
+/// than `pruneKeepLast`'s opposite convention of no-op-ing in that case (the
+/// two functions want opposite fallback behavior from the same NULL-when-
+/// insufficient-rows subquery result, so this isn't reusable as one helper).
+pub fn searchDeletable(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, substring: []const u8, match_limit: i64, scan_limit: i64) ![]MessageRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    const pattern = try escapeLikeLiteral(allocator, substring);
+    defer allocator.free(pattern);
+
+    var stmt = try db.prepare(
+        \\SELECT id, native_message_id, text FROM messages
+        \\WHERE chat_id = $1 AND native_message_id IS NOT NULL AND text ILIKE $2 ESCAPE '\'
+        \\  AND id >= COALESCE((SELECT id FROM messages WHERE chat_id = $1 ORDER BY id DESC LIMIT 1 OFFSET $4), 0)
+        \\ORDER BY id DESC LIMIT $3;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindText(2, pattern);
+    stmt.bindInt64(3, match_limit);
+    stmt.bindInt64(4, scan_limit - 1);
+    return collectDeletable(&stmt, allocator);
+}
+
+/// Up to `scan_limit` most recent deletable+texted messages, newest first —
+/// for `/redact regex <pattern>`, which must filter client-side
+/// (`text/safe_regex.zig`'s matcher; Postgres can't run it). Callers stop
+/// consuming once they've collected enough matches or exhausted this slice,
+/// whichever comes first.
+pub fn recentForScan(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, scan_limit: i64) ![]MessageRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT id, native_message_id, text FROM messages
+        \\WHERE chat_id = $1 AND native_message_id IS NOT NULL AND text IS NOT NULL
+        \\ORDER BY id DESC LIMIT $2;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, scan_limit);
+    return collectDeletable(&stmt, allocator);
+}
+
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const chats = @import("chats.zig");
@@ -116,4 +236,145 @@ test "insert/recentFormatted/pruneKeepLast scoped correctly per chat" {
     try pruneKeepLast(&pool, chat1, 1);
     const pruned = try recentFormatted(&pool, a, chat1, 10);
     try testing.expectEqualStrings("alice: again", pruned);
+}
+
+test "recentDeletable excludes messages with no native_message_id, newest first" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try insert(&pool, chat1, alice, "1", "first", 1000);
+    try insert(&pool, chat1, alice, null, "undeletable (no native id)", 1001);
+    try insert(&pool, chat1, alice, "3", "third", 1002);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const refs = try recentDeletable(&pool, a, chat1, 10);
+    try testing.expectEqual(@as(usize, 2), refs.len);
+    try testing.expectEqualStrings("3", refs[0].native_message_id);
+    try testing.expectEqualStrings("1", refs[1].native_message_id);
+}
+
+test "recentDeletableByIdentity scopes to one sender within a chat" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    const bob = try identities.getOrCreateMinimal(&pool, .telegram, "2", "bob", null, false, 1000);
+
+    try insert(&pool, chat1, alice, "1", "alice says hi", 1000);
+    try insert(&pool, chat1, bob, "2", "bob says hi", 1001);
+    try insert(&pool, chat1, alice, "3", "alice again", 1002);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const refs = try recentDeletableByIdentity(&pool, a, chat1, alice, 10);
+    try testing.expectEqual(@as(usize, 2), refs.len);
+    try testing.expectEqualStrings("3", refs[0].native_message_id);
+    try testing.expectEqualStrings("1", refs[1].native_message_id);
+}
+
+test "searchDeletable matches literal substrings case-insensitively and respects the match limit" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try insert(&pool, chat1, alice, "1", "buy CHEAP watches now", 1000);
+    try insert(&pool, chat1, alice, "2", "totally unrelated", 1001);
+    try insert(&pool, chat1, alice, "3", "cheap watches again", 1002);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const all_matches = try searchDeletable(&pool, a, chat1, "cheap watches", 10, 100);
+    try testing.expectEqual(@as(usize, 2), all_matches.len);
+
+    const limited = try searchDeletable(&pool, a, chat1, "cheap watches", 1, 100);
+    try testing.expectEqual(@as(usize, 1), limited.len);
+}
+
+test "searchDeletable's scan window still finds everything when fewer messages exist than scan_limit" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    try insert(&pool, chat1, alice, "1", "spam here", 1000);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Only 1 message exists, well under a 2000 scan_limit — the COALESCE
+    // fallback must still find it rather than the lower-bound subquery
+    // returning NULL and matching nothing.
+    const matches = try searchDeletable(&pool, a, chat1, "spam", 100, 2000);
+    try testing.expectEqual(@as(usize, 1), matches.len);
+}
+
+test "searchDeletable treats % and _ in the query as literal characters, not wildcards" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    try insert(&pool, chat1, alice, "1", "100% real deal", 1000);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const literal_hit = try searchDeletable(&pool, a, chat1, "100%", 10, 100);
+    try testing.expectEqual(@as(usize, 1), literal_hit.len);
+
+    const no_such = try searchDeletable(&pool, a, chat1, "1_0", 10, 100);
+    try testing.expectEqual(@as(usize, 0), no_such.len);
+}
+
+test "recentForScan excludes null-text and undeletable messages, respects scan_limit" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try insert(&pool, chat1, alice, "1", "one", 1000);
+    try insert(&pool, chat1, alice, null, "two (no native id)", 1001);
+    try insert(&pool, chat1, alice, "3", null, 1002);
+    try insert(&pool, chat1, alice, "4", "four", 1003);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const refs = try recentForScan(&pool, a, chat1, 100);
+    try testing.expectEqual(@as(usize, 2), refs.len);
+    try testing.expectEqualStrings("4", refs[0].native_message_id);
+    try testing.expectEqualStrings("1", refs[1].native_message_id);
+
+    const capped = try recentForScan(&pool, a, chat1, 1);
+    try testing.expectEqual(@as(usize, 1), capped.len);
+    try testing.expectEqualStrings("4", capped[0].native_message_id);
 }

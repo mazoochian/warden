@@ -1,9 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
-const PgPool = @import("../store/pool.zig").PgPool;
-const identities = @import("../store/identities.zig");
-const chat_members = @import("../store/chat_members.zig");
 
 pub const ActionKind = enum { ban, kick };
 
@@ -205,13 +202,17 @@ pub fn deleteMessage(connector: iface.Connector, a: std.mem.Allocator, msg: ifac
 }
 
 /// Starts the confirm-before-acting flow for ban/kick — does not perform
-/// the action yet.
+/// the action yet. Permission (owner / sudo bot admin / live platform admin
+/// / spend-a-token fallback) is entirely the caller's responsibility now —
+/// see `auth.checkGroupAdminAccess`, called once by `main.zig` before this
+/// ever runs. This function no longer touches the database at all (it used
+/// to re-check and spend the actor's token balance here, unconditionally,
+/// which was the bug: a confirmed owner/platform-admin could still get
+/// blocked by a 0 token balance, since this ran *after* they'd already
+/// proven authorization a different way).
 pub fn requestConfirmation(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    pool: *PgPool,
-    chat_id: i64,
-    now: i64,
     msg: iface.Message,
     kind: ActionKind,
 ) void {
@@ -219,18 +220,6 @@ pub fn requestConfirmation(
         reply(connector, a, msg.chat_id, msg.message_id, "Reply to the message of the person you want to {s}.", .{@tagName(kind)});
         return;
     };
-    // The actor (not the target) is who spends a token — resolved via
-    // `getOrCreateMinimal` rather than assuming they've already been seen,
-    // since token gating shouldn't depend on message-logging order.
-    const actor_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), msg.user_id, msg.username orelse msg.user_id, false, now) catch |err| {
-        std.log.err("token: failed to resolve identity for user {s}: {t}", .{ msg.user_id, err });
-        return;
-    };
-    var count = chat_members.getTokens(pool, chat_id, actor_identity_id, 0);
-    if (count <= 0) {
-        connector.sendMessage(a, msg.chat_id, "You do not have enough tokens to perform this action", msg.message_id);
-        return;
-    }
     if (kind == .kick) {
         connector.kickUser(a, msg.chat_id, target.user_id) catch |err| {
             reportFailure(connector, a, msg.chat_id, msg.message_id, "kick", err);
@@ -242,10 +231,6 @@ pub fn requestConfirmation(
             return;
         };
     }
-    count -= 1;
-    chat_members.setTokens(pool, chat_id, actor_identity_id, count) catch |err| {
-        std.log.err("Could not update user's token count: {}", .{err});
-    };
 }
 
 pub fn confirm(connector: iface.Connector, a: std.mem.Allocator, pending: *PendingConfirmations, now: i64, msg: iface.Message) void {

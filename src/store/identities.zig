@@ -124,28 +124,129 @@ const Platform = @import("../platform/interface.zig").Platform;
 /// by id alone (e.g. replying to ban/kick/token, or the bot resolving its
 /// own identity to log its own replies) without a full `Identity` already
 /// in hand. Unlike `upsertIdentity`, never overwrites an existing row's
-/// fields (the `DO UPDATE SET native_id = excluded.native_id` is a no-op
-/// update purely so `RETURNING` still works on conflict — Postgres's `DO
-/// NOTHING` doesn't return the pre-existing row) — `is_bot` therefore only
-/// takes effect the first time a given (platform, native_id) is seen.
-pub fn getOrCreateMinimal(pool: *PgPool, platform: Platform, native_id: []const u8, fallback_display_name: []const u8, is_bot: bool, now: i64) !i64 {
+/// `display_name`/`is_bot` (`is_bot` therefore only takes effect the first
+/// time a given (platform, native_id) is seen) — but `username` IS
+/// backfilled on conflict when the existing row doesn't have one yet
+/// (`COALESCE(identities.username, excluded.username)`), never overwriting
+/// a real value that's already there. Without this backfill, an identity
+/// first created through a reply-based command (which only ever has the
+/// target's native id in hand, not necessarily their username) could never
+/// be resolved by `@username` afterward even once a caller *did* supply
+/// one — confirmed live: `/adduser` via reply on a never-before-seen user,
+/// then `/adduser @username`/`/removeuser @username` on that same person,
+/// failed every time because the first call's row had `username = NULL`
+/// and nothing ever went back to fill it in.
+pub fn getOrCreateMinimal(pool: *PgPool, platform: Platform, native_id: []const u8, fallback_display_name: []const u8, username: ?[]const u8, is_bot: bool, now: i64) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\INSERT INTO identities (platform, native_id, display_name, is_bot, first_seen, last_seen)
-        \\VALUES ($1, $2, $3, $4, to_timestamp($5), to_timestamp($5))
-        \\ON CONFLICT (platform, native_id) DO UPDATE SET native_id = excluded.native_id
+        \\INSERT INTO identities (platform, native_id, display_name, username, is_bot, first_seen, last_seen)
+        \\VALUES ($1, $2, $3, $4, $5, to_timestamp($6), to_timestamp($6))
+        \\ON CONFLICT (platform, native_id) DO UPDATE SET
+        \\  username = COALESCE(identities.username, excluded.username)
         \\RETURNING id;
     );
     defer stmt.finalize();
     stmt.bindText(1, @tagName(platform));
     stmt.bindText(2, native_id);
     stmt.bindText(3, fallback_display_name);
-    stmt.bindBool(4, is_bot);
-    stmt.bindInt64(5, now);
+    if (username) |u| stmt.bindText(4, u) else stmt.bindNull(4);
+    stmt.bindBool(5, is_bot);
+    stmt.bindInt64(6, now);
     _ = try stmt.step();
     return stmt.columnInt64(0);
+}
+
+pub const IdentityRef = struct {
+    id: i64,
+    display_name: []const u8,
+    native_id: []const u8,
+};
+
+/// Exact-match (case-insensitive) username lookup, scoped to `platform` —
+/// usernames aren't guaranteed unique across platforms, so a bare username
+/// alone isn't enough to resolve an identity. Backs `@username` targeting
+/// for `/token`, `/credit`, `/adduser`, `/removeuser`, `/addadmin`,
+/// `/removeadmin` — the leading `@` is stripped by the caller (command-
+/// argument-parsing concern, not a store concern), same shape as
+/// `handleToken`'s own arg trimming. Unlike `chat_members.search`, this is
+/// NOT fuzzy and NOT chat-scoped: those commands act bot-wide (bot admin
+/// grants, global credits) or need a specific single target, not a list of
+/// candidates. Bot accounts are excluded, matching `chat_members.search`.
+/// `null` when no identity on this platform has that username.
+pub fn findByUsername(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform, username: []const u8) !?IdentityRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT id, display_name, native_id FROM identities
+        \\WHERE platform = $1 AND NOT is_bot AND lower(username) = lower($2)
+        \\LIMIT 1;
+    );
+    defer stmt.finalize();
+    stmt.bindText(1, @tagName(platform));
+    stmt.bindText(2, username);
+    if (!try stmt.step()) return null;
+    return .{
+        .id = stmt.columnInt64(0),
+        .display_name = try allocator.dupe(u8, stmt.columnText(1)),
+        .native_id = try allocator.dupe(u8, stmt.columnText(2)),
+    };
+}
+
+/// Global (not per-chat, unlike `chat_members.tokens`) LLM credit balance —
+/// see `0012_identities_credits.sql`. `default` is only returned on a
+/// pool/query error (an `identities` row is always guaranteed to exist by
+/// the time any handler calls this — `resolveSenderIdentity` runs before
+/// `handleMessage` for every message), matching `chat_members.getTokens`'s
+/// shape.
+pub fn getCredits(pool: *PgPool, identity_id: i64, default: i64) i64 {
+    const db = pool.acquire() catch return default;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT credits FROM identities WHERE id = $1;") catch return default;
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    const has_row = stmt.step() catch return default;
+    if (!has_row) return default;
+    return stmt.columnInt64(0);
+}
+
+/// Plain `UPDATE`, not an upsert like `chat_members.setTokens` — an
+/// `identities` row is always guaranteed to exist already (see
+/// `getCredits`'s doc comment).
+pub fn setCredits(pool: *PgPool, identity_id: i64, value: i64) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("UPDATE identities SET credits = $2 WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64(2, value);
+    _ = try stmt.step();
+}
+
+/// Atomically decrements `credits` by 1 iff it's currently positive —
+/// unlike the pre-existing token spend (`chat_members.getTokens` then
+/// `setTokens`, a non-atomic read-modify-write with a real TOCTOU race
+/// under concurrent per-message tasks), this is a single conditional
+/// `UPDATE ... RETURNING`, so two concurrent spends against a balance of 1
+/// can't both succeed. Returns `true` if a credit was spent, `false` if the
+/// balance was already 0 (or on any pool/query error — fails closed, so a
+/// DB hiccup denies a free LLM answer rather than granting one).
+pub fn spendCredit(pool: *PgPool, identity_id: i64) !bool {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\UPDATE identities SET credits = credits - 1
+        \\WHERE id = $1 AND credits > 0
+        \\RETURNING credits;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    return try stmt.step();
 }
 
 const testing = std.testing;
@@ -284,7 +385,7 @@ test "getOrCreateMinimal creates a placeholder once, then resolves without overw
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
 
-    const id1 = try getOrCreateMinimal(&pool, .telegram, "99", "spammer", false, 1000);
+    const id1 = try getOrCreateMinimal(&pool, .telegram, "99", "spammer", null, false, 1000);
 
     // A real message from this user later fills in the full profile...
     _ = try upsertIdentity(&pool, .{
@@ -297,7 +398,7 @@ test "getOrCreateMinimal creates a placeholder once, then resolves without overw
     });
 
     // ...and resolving the placeholder again afterward must not stomp it.
-    const id2 = try getOrCreateMinimal(&pool, .telegram, "99", "spammer", false, 3000);
+    const id2 = try getOrCreateMinimal(&pool, .telegram, "99", "spammer", null, false, 3000);
     try testing.expectEqual(id1, id2);
 
     var stmt = try db.prepare("SELECT display_name FROM identities WHERE id = $1;");
@@ -313,8 +414,8 @@ test "getOrCreateMinimal persists is_bot on first creation" {
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
 
-    const bot_id = try getOrCreateMinimal(&pool, .telegram, "1", "warden", true, 1000);
-    const human_id = try getOrCreateMinimal(&pool, .telegram, "2", "alice", false, 1000);
+    const bot_id = try getOrCreateMinimal(&pool, .telegram, "1", "warden", null, true, 1000);
+    const human_id = try getOrCreateMinimal(&pool, .telegram, "2", "alice", null, false, 1000);
 
     var stmt = try db.prepare("SELECT is_bot FROM identities WHERE id = $1;");
     defer stmt.finalize();
@@ -328,4 +429,110 @@ test "getOrCreateMinimal persists is_bot on first creation" {
     stmt2.bindInt64(1, human_id);
     try testing.expect(try stmt2.step());
     try testing.expect(!stmt2.columnBool(0));
+}
+
+test "getOrCreateMinimal persists username on first creation, and backfills it later if it was never set" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Username supplied on first creation is persisted immediately.
+    const id1 = try getOrCreateMinimal(&pool, .telegram, "1", "Alice", "alice_tg", false, 1000);
+    const found1 = (try findByUsername(&pool, a, .telegram, "alice_tg")).?;
+    try testing.expectEqual(id1, found1.id);
+
+    // A reply-based command that only has a native id in hand (e.g. Telegram
+    // didn't surface a username for that reply) creates the row with no
+    // username at all — this is the exact shape that broke `@username`
+    // resolution for anyone first seen this way.
+    const id2 = try getOrCreateMinimal(&pool, .telegram, "2", "Bob", null, false, 1000);
+    try testing.expect(try findByUsername(&pool, a, .telegram, "bob_tg") == null);
+
+    // The same person is resolved again later, this time with their real
+    // username in hand (e.g. they were `@username`-targeted, or replied to
+    // again with Telegram now supplying it) — must backfill, not silently
+    // stay unresolvable forever.
+    const id2_again = try getOrCreateMinimal(&pool, .telegram, "2", "Bob", "bob_tg", false, 2000);
+    try testing.expectEqual(id2, id2_again);
+    const found2 = (try findByUsername(&pool, a, .telegram, "bob_tg")).?;
+    try testing.expectEqual(id2, found2.id);
+
+    // But a real, already-set username must never be clobbered by a later
+    // call passing a different (or no) one.
+    const id1_again = try getOrCreateMinimal(&pool, .telegram, "1", "Alice", "someone_elses_new_handle", false, 3000);
+    try testing.expectEqual(id1, id1_again);
+    try testing.expect((try findByUsername(&pool, a, .telegram, "alice_tg")) != null);
+    try testing.expect((try findByUsername(&pool, a, .telegram, "someone_elses_new_handle")) == null);
+}
+
+test "findByUsername matches case-insensitively, is platform-scoped, and excludes bots" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tg_alice = try upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "1",
+        .display_name = "Alice",
+        .username = "Alice_TG",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+    // Same username, different platform — must not resolve here.
+    _ = try upsertIdentity(&pool, .{
+        .platform = .matrix,
+        .native_id = "@alice:example.org",
+        .display_name = "Alice (Matrix)",
+        .username = "Alice_TG",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+    _ = try upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "3",
+        .display_name = "Some Bot",
+        .username = "alice_tg_bot",
+        .is_bot = true,
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+
+    const found = (try findByUsername(&pool, a, .telegram, "alice_tg")).?;
+    try testing.expectEqual(tg_alice, found.id);
+    try testing.expectEqualStrings("Alice", found.display_name);
+
+    try testing.expect(try findByUsername(&pool, a, .xmpp, "alice_tg") == null);
+    try testing.expect(try findByUsername(&pool, a, .telegram, "no_such_user") == null);
+}
+
+test "getCredits/setCredits/spendCredit round-trip and spendCredit fails at zero without going negative" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const id = try getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try testing.expectEqual(@as(i64, 0), getCredits(&pool, id, 0));
+
+    try setCredits(&pool, id, 2);
+    try testing.expectEqual(@as(i64, 2), getCredits(&pool, id, 0));
+
+    try testing.expect(try spendCredit(&pool, id));
+    try testing.expectEqual(@as(i64, 1), getCredits(&pool, id, 0));
+
+    try testing.expect(try spendCredit(&pool, id));
+    try testing.expectEqual(@as(i64, 0), getCredits(&pool, id, 0));
+
+    // Balance is now 0 — spending again must fail, not go negative.
+    try testing.expect(!try spendCredit(&pool, id));
+    try testing.expectEqual(@as(i64, 0), getCredits(&pool, id, 0));
 }

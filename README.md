@@ -4,7 +4,8 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Weather: Provides weather information for a given location
 - Stats: Provides statistics about the group's conversations
 - Word Cloud: Shows a word cloud of the most common words used in the group's conversations
-- Group Management: Allows the bot to manage the group's conversations, including kicking and banning users. Restricted to the chat's own Telegram admins (or the bot owner) — checked live against Telegram on every use, not cached
+- Group Management: Allows the bot to manage the group's conversations, including kicking and banning users. Restricted to the chat's own Telegram admins (or the bot owner) — checked live against Telegram on every use, not cached. A non-admin can still `/kick`/`/ban` by spending a token (see "Access control" below), and a bot admin can override the check entirely with `/sudo`
+- Access Control: nobody but the owner talks to the bot at all by default — `/adduser`/`/allowchat` opt a user or a whole chat in. A separate `bot admin` role (`/addadmin`, owner-only to grant) is trusted bot-wide, not scoped to one chat, and can run any moderation command via `/sudo <command>` even where they aren't a real chat admin. `/redact` deletes messages in bulk (by count, by user, by literal text, or by a hardened regex engine — bot-admin-only, immune to catastrophic-backtracking hangs by construction)
 - Web Search: Answers questions using a private SearXNG metasearch instance — no API keys or bot checks
 - Air Quality: Current US AQI / PM2.5 / PM10 for any city (Open-Meteo)
 - Crypto Prices: Live prices with 24h change (CoinGecko)
@@ -21,13 +22,17 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Live Answers: Replies to your questions arrive as a threaded reply that updates in place — an animated "thinking" indicator while the model works, switching to "using <tool>…" while it calls a tool, then editing into the final answer. Each chat's messages are handled independently and concurrently, so one slow or stuck reply never blocks the rest of the bot
 
 # Talking to the bot
-The bot's free-form LLM Q&A (mentioning it, replying to it, saying the magic
-word, or DMing it) only answers the bot owner — everyone else's mention,
-reply, or magic word gets silently ignored rather than a "not allowed"
-reply. Every other command (stats, word cloud, digests, dictionaries,
-weather, etc.) still works for anyone; group-management commands
-(`/mute`, `/kick`, `/ban`, ...) work for that chat's Telegram admins too,
-not just the owner (see "Group management" below).
+Nobody but the owner (and any bot admins — see "Access control" below) can
+make the bot do *anything* by default: every message from anyone else is
+silently ignored unless their user id or their whole chat has been
+explicitly allowed via `/adduser`/`/allowchat`. Once allowed, the bot's
+free-form LLM Q&A is still owner/bot-admin-only by default (toggle with
+`WARDEN_LLM_OWNER_ONLY`) — an allowed regular user spends one "credit" per
+question instead (see "Access control"). Every other command (stats, word
+cloud, digests, dictionaries, weather, etc.) works for anyone allowed;
+group-management commands (`/mute`, `/kick`, `/ban`, ...) work for that
+chat's Telegram admins too, not just the owner (see "Group management"
+below).
 
 Within that owner-only Q&A, warden still only jumps in when actually
 addressed — mentioning it (`@your_bot_username ...`), replying to one of
@@ -44,11 +49,37 @@ trigger needed.
 
 # Group management
 `/mute`, `/unmute`, `/pin`, `/unpin`, `/delete`, `/kick`, `/ban`,
-`/confirm`, and `/cancel` are gated to that specific chat's current
-Telegram admins/creator, or the bot owner — checked live via Telegram's
-`getChatMember` on every use (not cached, since admin status can change at
-any moment). Anyone else's attempt is silently ignored, matching how owner-
-only commands like `/token` and `/scraper` already behave.
+`/confirm`, `/cancel`, and `/redact` are gated, in order: the bot owner;
+a bot admin who prefixed the command with `/sudo` (e.g. `/sudo kick`,
+which also announces the override in-chat); that specific chat's current
+Telegram admins/creator — checked live via Telegram's `getChatMember` on
+every use, not cached; and finally (`/redact` excluded) anyone holding a
+token for this chat, which gets spent on use. Falling through every tier
+is silently ignored, except running out of tokens, which gets a reply
+saying so. `/promote`/`/demote` (granting real Telegram admin) and
+`/scraper` stay owner-only, not extended to bot admins or `/sudo`.
+
+# Access control
+Two independent trust tiers, both DB-backed (not just `.env`, unlike the
+single owner):
+- **Allowed users/chats** (`/adduser`, `/removeuser`, `/allowchat`,
+  `/disallowchat`, owner or bot admin only) — whether the bot responds to a
+  given person or chat at all. Nobody is allowed by default except the
+  owner.
+- **Bot admins** (`/addadmin`, `/removeadmin`, owner only) — trusted
+  bot-wide, not scoped to one chat, unlike a platform's own admin flag.
+  Bypass the allowed-users gate automatically, can run `/token`/`/adduser`/
+  etc. directly, and can override a group-management command's live
+  platform-admin check with `/sudo` (see "Group management" above).
+
+Two currencies, both reply-to-a-message or `/command [balance] [@username]`:
+- **Tokens** (`/token`, per-chat) — let a non-admin run one `/kick`/`/ban`
+  per token spent, without being an admin. Grantable by that chat's own
+  Telegram admins or any bot admin.
+- **Credits** (`/credit`, bot-wide) — let an allowed user talk to the LLM
+  at all when `WARDEN_LLM_OWNER_ONLY` is on; one credit is spent per
+  question. Grantable by bot admins/owner only, since it spends real LLM
+  API cost.
 
 # Interactive prompts (buttons / reactions)
 Some flows — right now, the interactive `/convert` — ask you to pick one of

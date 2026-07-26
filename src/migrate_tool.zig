@@ -160,7 +160,7 @@ fn migrateChat(a: std.mem.Allocator, pool: *store_pool.PgPool, native_chat_id: [
             const ts = stmt.columnInt64(3);
 
             const identity_id = identity_by_user_id.get(user_id) orelse blk: {
-                const id = try identities.getOrCreateMinimal(pool, .telegram, user_id, if (username.len > 0) username else user_id, std.mem.eql(u8, user_id, "warden"), ts);
+                const id = try identities.getOrCreateMinimal(pool, .telegram, user_id, if (username.len > 0) username else user_id, if (username.len > 0) username else null, std.mem.eql(u8, user_id, "warden"), ts);
                 try identity_by_user_id.put(try a.dupe(u8, user_id), id);
                 break :blk id;
             };

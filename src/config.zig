@@ -138,6 +138,24 @@ pub const Config = struct {
     /// spin a CPU core indefinitely, past even its own timeout — confirmed
     /// live, not theoretical. Flip on to test a fix; leave off otherwise.
     llm_streaming: bool,
+    /// Overrides `qa.zig`'s `answerMaxTokens` (which sizes the budget off
+    /// the active platform's message-length cap plus a reasoning-model
+    /// thinking reserve) with a flat ceiling instead — for keeping a
+    /// deployment's answers short and its token spend predictable
+    /// regardless of platform limits. `null` (unset) preserves the
+    /// existing dynamic sizing.
+    llm_max_tokens_override: ?u32 = null,
+    /// How many recent chat messages `qa.zig` sends verbatim as context on
+    /// every LLM call — the entire history mechanism today (no
+    /// summarization/downsampling, see `ROADMAP.md`'s backlog entry on
+    /// that). Smaller means less context (cheaper, faster) at the cost of
+    /// the model potentially missing something further back.
+    llm_history_messages: i64 = default_llm_history_messages,
+    /// Whether a message that's addressed to the bot but is essentially
+    /// just a greeting/acknowledgement/sign-off ("hi", "thanks", "lol", ...)
+    /// gets an instant canned reply instead of a real (paid) LLM call —
+    /// see `features/trivial_reply.zig`.
+    skip_trivial_messages: bool = default_skip_trivial_messages,
     /// Null when Matrix isn't configured — `main.zig` only constructs a
     /// `MatrixConnector` (and adds it to the active connector list) when
     /// this is set.
@@ -269,6 +287,15 @@ pub const Config = struct {
         const llm_owner_only = parseBoolEnv(env, "WARDEN_LLM_OWNER_ONLY", default_llm_owner_only);
         const llm_show_thinking = parseBoolEnv(env, "WARDEN_LLM_SHOW_THINKING", default_llm_show_thinking);
         const llm_streaming = parseBoolEnv(env, "WARDEN_LLM_STREAMING", default_llm_streaming);
+        const llm_max_tokens_override: ?u32 = if (env.get("WARDEN_LLM_MAX_TOKENS")) |raw|
+            std.fmt.parseInt(u32, raw, 10) catch null
+        else
+            null;
+        const llm_history_messages: i64 = if (env.get("WARDEN_LLM_HISTORY_MESSAGES")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_llm_history_messages
+        else
+            default_llm_history_messages;
+        const skip_trivial_messages = parseBoolEnv(env, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", default_skip_trivial_messages);
 
         return .{
             .telegram_bot_token = telegram_bot_token,
@@ -290,6 +317,9 @@ pub const Config = struct {
             .llm_owner_only = llm_owner_only,
             .llm_show_thinking = llm_show_thinking,
             .llm_streaming = llm_streaming,
+            .llm_max_tokens_override = llm_max_tokens_override,
+            .llm_history_messages = llm_history_messages,
+            .skip_trivial_messages = skip_trivial_messages,
             .matrix = matrix,
             .matrix_pickle_key = matrix_pickle_key,
             .xmpp = xmpp,
@@ -445,6 +475,11 @@ pub const Config = struct {
     pub const default_llm_owner_only: bool = true;
     pub const default_llm_show_thinking: bool = false;
     pub const default_llm_streaming: bool = false;
+    /// Unchanged from the hardcoded value `qa.zig` used before this was
+    /// configurable — existing behavior by default, override via
+    /// `WARDEN_LLM_HISTORY_MESSAGES` for a cheaper/smaller context window.
+    pub const default_llm_history_messages: i64 = 200;
+    pub const default_skip_trivial_messages: bool = true;
     pub const default_xmpp_port: u16 = 5222;
 
     /// Armin's numeric Telegram user id, as a string. Deliberately not

@@ -31,6 +31,11 @@ const identities = @import("store/identities.zig");
 const chat_members = @import("store/chat_members.zig");
 const chat_settings = @import("store/chat_settings.zig");
 const bot_config = @import("store/bot_config.zig");
+const bot_admins = @import("store/bot_admins.zig");
+const bot_allowlist = @import("store/bot_allowlist.zig");
+const bot_pending_grants = @import("store/bot_pending_grants.zig");
+const trivial_reply = @import("features/trivial_reply.zig");
+const redact_feature = @import("features/redact.zig");
 const messages = @import("store/messages.zig");
 const stats = @import("store/stats.zig");
 const reminders = @import("store/reminders.zig");
@@ -80,8 +85,10 @@ const web_search_tool = @import("tools/web_search.zig").tool;
 /// the platform's own UI (Telegram's "/" autocomplete / attachment menu)
 /// instead of only working for people who already know the exact text to
 /// type — see `handleHelp`/`help_text` below for the fuller reference,
-/// including the owner-only `/token`/`/scraper` deliberately left out of
-/// this public menu (see their own dispatch-table gates in `handleMessage`).
+/// including the owner/bot-admin-only `/token /credit /scraper /adduser
+/// /removeuser /allowchat /disallowchat /addadmin /removeadmin /sudo`
+/// deliberately left out of this public menu (see their own dispatch-table
+/// gates in `handleMessage`).
 const public_commands = [_]iface.CommandSpec{
     .{ .name = "help", .description = "Show available commands and how to talk to Warden." },
     .{ .name = "ping", .description = "Check that Warden is responsive." },
@@ -111,6 +118,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "demote", .description = "Reply to a user's message to revoke their admin. Bot owner only." },
     .{ .name = "confirm", .description = "Confirm a pending /kick or /ban. Admins only." },
     .{ .name = "cancel", .description = "Cancel your pending file conversion, or a pending /kick or /ban." },
+    .{ .name = "redact", .description = "<N> | reply [N] | text <substring> | regex <pattern> -- delete messages. Admins only." },
 };
 
 /// `/help`'s reply — kept as a single static string (matches `reply()`'s
@@ -168,9 +176,26 @@ const help_text =
     \\/confirm -- confirm a pending /kick or /ban
     \\/cancel -- cancel your pending file conversion, or a pending
     \\  /kick/ban if you're an admin
+    \\/redact <N> | (reply) [N] | text <substring> | regex <pattern> --
+    \\  delete messages, up to 100 at a time. regex mode is bot admin/owner
+    \\  only; everything else is the same access as /kick
     \\
-    \\Bot owner only
-    \\/token -- reply to a user's message to view/set their token count
+    \\Tokens and credits (reply to a user, or pass @username, to view/set)
+    \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban per
+    \\  token spent. This chat's admins or any bot admin can grant these
+    \\/credit [balance] [@user] -- lets someone talk to the LLM, 1 credit per
+    \\  question. Bot admin/owner only (spends real API cost)
+    \\
+    \\Bot admins (trusted bot-wide, not scoped to one chat -- owner only to
+    \\grant/revoke)
+    \\/addadmin, /removeadmin -- reply to a user (or @user) to grant/revoke
+    \\/adduser, /removeuser -- reply to a user (or @user) to let them use
+    \\  this bot at all (nobody but the owner/bot admins can by default)
+    \\/allowchat, /disallowchat -- allow/disallow this whole chat
+    \\/sudo <command> -- a bot admin can run any moderation command above
+    \\  even where they aren't a real chat admin, e.g. /sudo kick
+    \\
+    \\Owner only
     \\/scraper -- configure the web-scraping backend
 ;
 
@@ -1062,26 +1087,61 @@ fn resolveQuestion(connector: iface.Connector, a: std.mem.Allocator, io: Io, con
 /// absent) so a message never fails to log just because identity data was
 /// thin.
 fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, msg: iface.Message, ts: i64) !i64 {
-    if (msg.identity) |identity| {
-        const identity_id = try identities.upsertIdentity(pool, identity);
-        if (msg.telegram_profile) |profile| {
-            identities.upsertTelegramProfile(pool, identity_id, profile) catch |err| {
-                log.err("failed to upsert telegram profile for identity {d}: {t}", .{ identity_id, err });
-            };
+    const identity_id = blk: {
+        if (msg.identity) |identity| {
+            const id = try identities.upsertIdentity(pool, identity);
+            if (msg.telegram_profile) |profile| {
+                identities.upsertTelegramProfile(pool, id, profile) catch |err| {
+                    log.err("failed to upsert telegram profile for identity {d}: {t}", .{ id, err });
+                };
+            }
+            if (msg.matrix_profile) |profile| {
+                identities.upsertMatrixProfile(pool, id, profile) catch |err| {
+                    log.err("failed to upsert matrix profile for identity {d}: {t}", .{ id, err });
+                };
+            }
+            if (msg.xmpp_profile) |profile| {
+                identities.upsertXmppProfile(pool, id, profile) catch |err| {
+                    log.err("failed to upsert xmpp profile for identity {d}: {t}", .{ id, err });
+                };
+            }
+            break :blk id;
         }
-        if (msg.matrix_profile) |profile| {
-            identities.upsertMatrixProfile(pool, identity_id, profile) catch |err| {
-                log.err("failed to upsert matrix profile for identity {d}: {t}", .{ identity_id, err });
-            };
-        }
-        if (msg.xmpp_profile) |profile| {
-            identities.upsertXmppProfile(pool, identity_id, profile) catch |err| {
-                log.err("failed to upsert xmpp profile for identity {d}: {t}", .{ identity_id, err });
-            };
-        }
-        return identity_id;
+        break :blk try identities.getOrCreateMinimal(pool, connector.platform(), msg.user_id, msg.username orelse msg.user_id, msg.username, false, ts);
+    };
+    // Completes a grant queued by `/adduser`/`/addadmin` against a
+    // `@username` the bot had no identity for yet — checked on every
+    // message that carries a username, before `handleMessage`'s allowlist
+    // gate ever runs, so this same (this person's very first) message
+    // already sees the completed grant. See `store/bot_pending_grants.zig`.
+    if (msg.username) |username| {
+        completePendingGrants(pool, connector.platform(), username, identity_id);
     }
-    return identities.getOrCreateMinimal(pool, connector.platform(), msg.user_id, msg.username orelse msg.user_id, false, ts);
+    return identity_id;
+}
+
+fn completePendingGrants(pool: *store_pool.PgPool, platform: iface.Platform, username: []const u8, identity_id: i64) void {
+    const pending_user = bot_pending_grants.takePending(pool, platform, username, .allowed_user) catch |err| blk: {
+        log.err("failed to check pending user-allow grant for @{s}: {t}", .{ username, err });
+        break :blk null;
+    };
+    if (pending_user) |added_by| {
+        bot_allowlist.addAllowedUser(pool, identity_id, added_by) catch |err| {
+            log.err("failed to complete pending user-allow grant for @{s}: {t}", .{ username, err });
+        };
+        log.notice("completed pending allow-user grant for @{s} (identity {d})", .{ username, identity_id });
+    }
+
+    const pending_admin = bot_pending_grants.takePending(pool, platform, username, .bot_admin) catch |err| blk: {
+        log.err("failed to check pending bot-admin grant for @{s}: {t}", .{ username, err });
+        break :blk null;
+    };
+    if (pending_admin) |added_by| {
+        bot_admins.addBotAdmin(pool, identity_id, added_by) catch |err| {
+            log.err("failed to complete pending bot-admin grant for @{s}: {t}", .{ username, err });
+        };
+        log.notice("completed pending bot-admin grant for @{s} (identity {d})", .{ username, identity_id });
+    }
 }
 
 /// Registers every identity a message revealed *besides* its own sender
@@ -1231,6 +1291,23 @@ fn handleMessage(
     max_message_len: usize,
     msg: iface.Message,
 ) bool {
+    // Coarse "does the bot even respond here" gate — checked before
+    // anything else in this function (including the choice_picked/
+    // attachment-continuation paths below, for uniformity: a disallowed
+    // sender gets no action taken on any kind of message, not just slash
+    // commands). Owners and bot admins bypass unconditionally; everyone
+    // else needs their own identity or their current chat explicitly
+    // allowed. Silent — this is "will the bot talk here at all", not a
+    // moderation decision, so it doesn't announce itself. Message
+    // recording/stats (`recordMessage`/`recordObservedUsers`) already ran
+    // earlier in `processMessageTask`, before `handleMessage`, and are
+    // unaffected by this gate.
+    const is_bot_admin = bot_admins.isBotAdmin(pool, identity_id);
+    const is_owner = auth.isOwner(config, connector.platform(), msg.user_id);
+    if (!is_owner and !is_bot_admin) {
+        if (!(bot_allowlist.isUserAllowed(pool, identity_id) or bot_allowlist.isChatAllowed(pool, chat_id))) return false;
+    }
+
     // A button press / reaction pick has neither text nor an attachment of
     // its own, so this must run before the "neither" bail-out just below.
     if (msg.choice_picked) |picked| {
@@ -1249,7 +1326,24 @@ fn handleMessage(
     // See `normalizeCommandMention`'s doc comment: makes `/ping@warden_bot`
     // dispatch exactly like `/ping`, and drops a command explicitly
     // addressed to a different bot instance sharing this chat.
-    const text = normalizeCommandMention(a, raw_text, connector.selfUsername()) orelse return false;
+    var text = normalizeCommandMention(a, raw_text, connector.selfUsername()) orelse return false;
+
+    // `/sudo <command>` lets a bot admin override a platform-level
+    // permission check for one command — see `auth.checkGroupAdminAccess`'s
+    // doc comment for the full ladder. Rewriting `text` here (rather than
+    // threading a separate "sudo command" string through the whole dispatch
+    // chain below) is the minimal-diff mechanism: every existing
+    // `std.mem.eql(u8, text, "/foo")`/`startsWith` site keeps working
+    // unchanged, just possibly seeing the de-sudo'd command instead of the
+    // original. A non-bot-admin's "/sudo foo" is deliberately left
+    // untouched here — it matches no command below and falls through to
+    // the existing "unrecognized slash command" silent-ignore path, so no
+    // special-casing is needed for that case.
+    var sudo_active = false;
+    if (std.mem.startsWith(u8, text, "/sudo ") and is_bot_admin) {
+        sudo_active = true;
+        text = std.fmt.allocPrint(a, "/{s}", .{std.mem.trim(u8, text["/sudo ".len..], " ")}) catch text;
+    }
 
     // An attachment arriving while (chat, user) is mid-flow, waiting for a
     // file — claimed here, before the big dispatch chain and before
@@ -1276,39 +1370,40 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/digest") or std.mem.startsWith(u8, text, "/digest ")) {
         handleDigestCommand(connector, a, pool, chat_id, digest_scheduler, llm_provider, tool_ctx, now, max_message_len, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
         group_admin.mute(connector, a, msg, now);
     } else if (std.mem.eql(u8, text, "/unmute")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "unmute")) return false;
         group_admin.unmute(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/pin")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "pin")) return false;
         group_admin.pin(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/unpin")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "unpin")) return false;
         group_admin.unpin(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/delete")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "delete")) return false;
         group_admin.deleteMessage(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/promote")) {
-        // Owner-only, not `isAuthorizedForGroupAdmin` — granting real
-        // admin rights is more consequential than mute/kick/pin, and
-        // Telegram's own admin flag doesn't tell us whether a given admin
-        // actually has permission to add further admins themselves (see
-        // `group_admin.promote`'s doc comment).
-        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        // Owner-only, not `checkGroupAdminAccess` — granting real admin
+        // rights is more consequential than mute/kick/pin, and Telegram's
+        // own admin flag doesn't tell us whether a given admin actually has
+        // permission to add further admins themselves (see
+        // `group_admin.promote`'s doc comment). Deliberately not extended
+        // to bot admins/`/sudo` either, same reasoning.
+        if (!is_owner) return false;
         group_admin.promote(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/demote")) {
-        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        if (!is_owner) return false;
         group_admin.demote(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/kick")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
-        group_admin.requestConfirmation(connector, a, pool, chat_id, now, msg, .kick);
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "kick")) return false;
+        group_admin.requestConfirmation(connector, a, msg, .kick);
     } else if (std.mem.eql(u8, text, "/ban")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
-        group_admin.requestConfirmation(connector, a, pool, chat_id, now, msg, .ban);
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "ban")) return false;
+        group_admin.requestConfirmation(connector, a, msg, .ban);
     } else if (std.mem.eql(u8, text, "/confirm")) {
-        if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "confirm")) return false;
         group_admin.confirm(connector, a, pending, now, msg);
     } else if (std.mem.eql(u8, text, "/cancel")) {
         // Dual-purpose: a pending conversion is per-user, not a moderation
@@ -1319,12 +1414,38 @@ fn handleMessage(
         if (pending_conversions.cancel(a, msg.chat_id, msg.user_id)) {
             reply(connector, a, msg.chat_id, msg.message_id, "Conversion cancelled.");
         } else {
-            if (!isAuthorizedForGroupAdmin(connector, a, config, msg)) return false;
+            if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "cancel")) return false;
             group_admin.cancel(connector, a, pending, msg);
         }
     } else if (std.mem.startsWith(u8, text, "/token")) {
-        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        if (!auth.checkTokenGrantAccess(connector, a, config, msg, is_bot_admin)) return false;
         handleToken(connector, a, pool, chat_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/credit") or std.mem.startsWith(u8, text, "/credit ")) {
+        if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
+        handleCredit(connector, a, pool, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/adduser") or std.mem.startsWith(u8, text, "/adduser ")) {
+        if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
+        handleAddUserCommand(connector, a, pool, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/removeuser") or std.mem.startsWith(u8, text, "/removeuser ")) {
+        if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
+        handleRemoveUserCommand(connector, a, pool, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/allowchat")) {
+        if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
+        handleAllowChatCommand(connector, a, pool, chat_id, identity_id, msg);
+    } else if (std.mem.eql(u8, text, "/disallowchat")) {
+        if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
+        handleDisallowChatCommand(connector, a, pool, chat_id, msg);
+    } else if (std.mem.eql(u8, text, "/addadmin") or std.mem.startsWith(u8, text, "/addadmin ")) {
+        if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
+        handleAddAdminCommand(connector, a, pool, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/removeadmin") or std.mem.startsWith(u8, text, "/removeadmin ")) {
+        if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
+        handleRemoveAdminCommand(connector, a, pool, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/redact") or std.mem.startsWith(u8, text, "/redact ")) {
+        // Per-mode gating happens inside handleRedactCommand itself (regex
+        // mode is stricter than the other modes) rather than here, since
+        // which gate applies depends on parsing the mode first.
+        handleRedactCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text, sudo_active);
     } else if (std.mem.eql(u8, text, "/magicword") or std.mem.startsWith(u8, text, "/magicword ")) {
         handleMagicWord(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/persona") or std.mem.startsWith(u8, text, "/persona ")) {
@@ -1363,12 +1484,36 @@ fn handleMessage(
         // LLM as if it were a question.
         return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
+        // A greeting/ack/sign-off addressed to the bot doesn't need a real
+        // (paid) LLM call to answer meaningfully — short-circuit with an
+        // instant canned reply instead. Checked before the owner-only/
+        // credit gates below: this costs nothing, so it isn't subject to
+        // either (a random allowed user's "hi" gets a friendly reply
+        // regardless of whether they're privileged enough for real Q&A).
+        if (config.skip_trivial_messages and trivial_reply.isTrivialMessage(a, text)) {
+            const canned = trivial_reply.pickResponse(@intCast(now));
+            connector.sendMessage(a, msg.chat_id, canned, msg.message_id);
+            return false;
+        }
         // The bot's free-form LLM Q&A is owner-only by default (toggle via
         // WARDEN_LLM_OWNER_ONLY) — every other command above this stays
         // open to anyone (unchanged). Silent, not an error reply: an
         // unaddressed mention from someone else shouldn't announce "I only
         // answer my owner" to the whole group.
-        if (config.llm_owner_only and !auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        const is_privileged = is_owner or is_bot_admin;
+        if (config.llm_owner_only and !is_privileged) return false;
+        // Credits gate LLM usage specifically (spends the owner's real API
+        // budget) — separate from, and checked after, the owner-only gate
+        // above. Owner/bot admins get unlimited use; unlike the allowlist
+        // gate, running out of credits gets a reply (the sender IS allowed
+        // to talk to the bot, just out of budget) rather than silence.
+        if (!is_privileged and !(identities.spendCredit(pool, identity_id) catch |err| blk: {
+            log.err("qa: credit spend check failed for identity {d}: {t}", .{ identity_id, err });
+            break :blk false;
+        })) {
+            connector.sendMessage(a, msg.chat_id, "You're out of LLM credits — ask the bot owner for more.", msg.message_id);
+            return false;
+        }
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
         const resolved = resolveQuestion(connector, a, io, config, tool_ctx, msg, text);
         // Per-chat /persona override, falling back to the global default —
@@ -1390,7 +1535,7 @@ fn handleMessage(
             .username = msg.username,
             .native_id = msg.user_id,
         };
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, config.llm_streaming, show_thinking);
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, config.llm_streaming, show_thinking, config.llm_max_tokens_override, config.llm_history_messages);
     }
     return false;
 }
@@ -1495,24 +1640,6 @@ test "normalizeCommandMention treats a leading '!' the same as '/'" {
 fn isOneShotConvertCaption(text: []const u8) bool {
     if (!std.mem.startsWith(u8, text, "/convert ")) return false;
     return std.mem.trim(u8, text["/convert ".len..], " ").len > 0;
-}
-
-/// Gate for every group-management command (/mute, /kick, /ban, etc.) —
-/// the bot owner always passes (no network round trip needed), otherwise
-/// this asks Telegram directly whether the sender currently administers
-/// this chat. Queried fresh each time rather than cached, since admin
-/// status can change at any moment; any error (network hiccup, or a
-/// platform connector that doesn't implement `isGroupAdmin` at all) fails
-/// closed — treated as "not authorized" rather than silently allowing the
-/// action through. Silent on rejection, matching /token's and /scraper's
-/// existing owner-gate convention rather than announcing "you're not
-/// allowed" to the chat.
-fn isAuthorizedForGroupAdmin(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, msg: iface.Message) bool {
-    if (auth.isOwner(config, connector.platform(), msg.user_id)) return true;
-    return connector.isGroupAdmin(a, msg.chat_id, msg.user_id) catch |err| {
-        log.warn("group_admin: admin check failed for user {s} in chat {s}: {t}", .{ msg.user_id, msg.chat_id, err });
-        return false;
-    };
 }
 
 /// A non-command message deserves a reply when it's a DM, mentions the bot,
@@ -1777,6 +1904,50 @@ fn handleScraperCommand(
     }
 }
 
+/// Splits an arg string like "5 @alice", "@alice 5", "@alice", or "5" into
+/// its balance and `@username` pieces, order-independent — a lone numeric
+/// token is the balance, a lone `@`-prefixed token is the username, and
+/// either may be absent. Shared by `/token` and `/credit`, whose arg shape
+/// is identical (`<balance> [@username]`, either order).
+fn parseBalanceAndUsernameArgs(arg: []const u8) struct { balance_str: []const u8, username_arg: []const u8 } {
+    var balance_str: []const u8 = "";
+    var username_arg: []const u8 = "";
+    var it = std.mem.tokenizeScalar(u8, arg, ' ');
+    while (it.next()) |tok| {
+        if (tok.len > 0 and tok[0] == '@') {
+            username_arg = tok;
+        } else if (balance_str.len == 0) {
+            balance_str = tok;
+        }
+    }
+    return .{ .balance_str = balance_str, .username_arg = username_arg };
+}
+
+/// Resolves a command's target identity: a reply to the target's message
+/// takes priority (unchanged, pre-existing behavior); failing that, an
+/// `@username` argument is resolved via `identities.findByUsername` — the
+/// exact-match, platform-scoped lookup (NOT `getOrCreateMinimal`: a
+/// `@username` the bot has never seen post from can't be resolved to an
+/// identity at all, unlike a reply target, whose native user id is always
+/// present and creatable). `null` when neither is present/resolvable.
+/// Shared by `/token`, `/credit`, `/adduser`, `/removeuser`, `/addadmin`,
+/// `/removeadmin`.
+fn resolveTargetIdentity(pool: *store_pool.PgPool, connector: iface.Connector, a: std.mem.Allocator, now: i64, msg: iface.Message, username_arg: []const u8) !?identities.IdentityRef {
+    if (replyTarget(msg)) |target| {
+        // `msg.reply_to_username` (not `target.label`, which already
+        // substituted the raw user id when no username is known) — passing
+        // the raw, possibly-null value through lets `getOrCreateMinimal`
+        // persist/backfill the real username so a later `@username` lookup
+        // for this same person can actually find them.
+        const id = try identities.getOrCreateMinimal(pool, connector.platform(), target.user_id, target.label, msg.reply_to_username, false, now);
+        return .{ .id = id, .display_name = target.label, .native_id = target.user_id };
+    }
+    if (username_arg.len > 1 and username_arg[0] == '@') {
+        return identities.findByUsername(pool, a, connector.platform(), username_arg[1..]);
+    }
+    return null;
+}
+
 fn handleToken(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -1786,18 +1957,19 @@ fn handleToken(
     msg: iface.Message,
     text: []const u8,
 ) void {
-    const target = replyTarget(msg) orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user you want to view/change tokens for.");
-        return;
-    };
     const arg = std.mem.trim(u8, text["/token".len..], " ");
-    const target_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), target.user_id, target.label, false, now) catch |err| {
-        log.err("token: failed to resolve identity for user {s}: {t}", .{ target.user_id, err });
+    const parsed = parseBalanceAndUsernameArgs(arg);
+
+    const target = (resolveTargetIdentity(pool, connector, a, now, msg, parsed.username_arg) catch |err| {
+        log.err("token: failed to resolve target: {t}", .{err});
+        return;
+    }) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username) you want to view/change tokens for.");
         return;
     };
-    // If there is no argument, get the current token count and reply with it.
-    if (arg.len == 0) {
-        const count = chat_members.getTokens(pool, chat_id, target_identity_id, 0);
+    // If there is no balance argument, get the current token count and reply with it.
+    if (parsed.balance_str.len == 0) {
+        const count = chat_members.getTokens(pool, chat_id, target.id, 0);
         const message = std.fmt.allocPrint(a, "Current token count: {}", .{count}) catch |err| {
             log.err("token: failed to allocate message string: {t}", .{err});
             return; // Exit the function early since we couldn't format the message
@@ -1805,20 +1977,260 @@ fn handleToken(
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
         return;
     }
-    // Else just set the token count to the parsed value and reply with a confirmation.
-    else {
-        const count = std.fmt.parseInt(i64, arg, 10) catch 0;
-        log.debug("token: parsed count {d}", .{count});
-        chat_members.setTokens(pool, chat_id, target_identity_id, count) catch |err| {
-            log.err("token: failed to set tokens: {t}", .{err});
+    // Else set the token count to the parsed value and reply with a confirmation.
+    const count = std.fmt.parseInt(i64, parsed.balance_str, 10) catch 0;
+    log.debug("token: parsed count {d}", .{count});
+    chat_members.setTokens(pool, chat_id, target.id, count) catch |err| {
+        log.err("token: failed to set tokens: {t}", .{err});
+        return;
+    };
+    const message = std.fmt.allocPrint(a, "token count updated to {}", .{count}) catch |err| {
+        log.err("token: failed to allocate message string: {t}", .{err});
+        return; // Exit the function early since we couldn't format the message
+    };
+    connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+}
+
+/// `/credit` — same shape as `/token` (reply-or-`@username` targeting,
+/// `<balance> [@username]` argument order), but backed by
+/// `identities.getCredits`/`setCredits` (global per-identity) instead of
+/// `chat_members`'s per-chat tokens. Gate (`auth.isOwnerOrBotAdmin`) is
+/// checked by the caller.
+fn handleCredit(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    now: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/credit".len..], " ");
+    const parsed = parseBalanceAndUsernameArgs(arg);
+
+    const target = (resolveTargetIdentity(pool, connector, a, now, msg, parsed.username_arg) catch |err| {
+        log.err("credit: failed to resolve target: {t}", .{err});
+        return;
+    }) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username) you want to view/change credits for.");
+        return;
+    };
+    if (parsed.balance_str.len == 0) {
+        const count = identities.getCredits(pool, target.id, 0);
+        const message = std.fmt.allocPrint(a, "Current credit count: {}", .{count}) catch |err| {
+            log.err("credit: failed to allocate message string: {t}", .{err});
             return;
         };
-        const message = std.fmt.allocPrint(a, "token count updated to {}", .{count}) catch |err| {
-            log.err("token: failed to allocate message string: {t}", .{err});
-            return; // Exit the function early since we couldn't format the message
-        };
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
     }
+    const count = std.fmt.parseInt(i64, parsed.balance_str, 10) catch 0;
+    identities.setCredits(pool, target.id, count) catch |err| {
+        log.err("credit: failed to set credits: {t}", .{err});
+        return;
+    };
+    const message = std.fmt.allocPrint(a, "credit count updated to {}", .{count}) catch |err| {
+        log.err("credit: failed to allocate message string: {t}", .{err});
+        return;
+    };
+    connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+}
+
+/// The six bot-management commands (`/adduser /removeuser /allowchat
+/// /disallowchat /addadmin /removeadmin`) share this shape: resolve a
+/// target identity (reply-or-`@username`), call one store mutation, reply
+/// with a plain confirmation. Gate (`auth.isOwnerOrBotAdmin`) is checked by
+/// the caller in every case; `granted_by`/`added_by` is always the acting
+/// identity (`identity_id`, already resolved by `processMessageTask` before
+/// `handleMessage` runs).
+/// A bare `@username` argument (not a reply) — used as the fallback path
+/// when `resolveTargetIdentity` can't find an existing identity for that
+/// username, to queue (or cancel) a pending grant instead of just failing.
+/// `null` for a reply-based call (no separate username argument to queue)
+/// or an empty/non-`@` argument.
+fn usernameFromArg(arg: []const u8) ?[]const u8 {
+    if (arg.len > 1 and arg[0] == '@') return arg[1..];
+    return null;
+}
+
+fn handleAddUserCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/adduser".len..], " ");
+    if (resolveTargetIdentity(pool, connector, a, now, msg, arg) catch |err| {
+        log.err("adduser: failed to resolve target: {t}", .{err});
+        return;
+    }) |target| {
+        bot_allowlist.addAllowedUser(pool, target.id, identity_id) catch |err| {
+            log.err("adduser: failed to add: {t}", .{err});
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "{s} can now use this bot.", .{target.display_name}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    }
+    // Not a reply, and no identity exists yet for this @username (the bot
+    // has never seen a message from them) — queue the grant instead of
+    // failing; it completes automatically the moment they do message (see
+    // `resolveSenderIdentity`/`completePendingGrants`).
+    if (usernameFromArg(arg)) |username| {
+        bot_pending_grants.addPending(pool, connector.platform(), username, .allowed_user, identity_id) catch |err| {
+            log.err("adduser: failed to queue pending grant for @{s}: {t}", .{ username, err });
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "@{s} isn't known to me yet -- they'll be allowed automatically as soon as they message me.", .{username}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    }
+    reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username) you want to allow.");
+}
+
+fn handleRemoveUserCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/removeuser".len..], " ");
+    if (resolveTargetIdentity(pool, connector, a, now, msg, arg) catch |err| {
+        log.err("removeuser: failed to resolve target: {t}", .{err});
+        return;
+    }) |target| {
+        bot_allowlist.removeAllowedUser(pool, target.id) catch |err| {
+            log.err("removeuser: failed to remove: {t}", .{err});
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "{s} can no longer use this bot (unless their chat is allowed).", .{target.display_name}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    }
+    // No resolvable identity — the only thing left to undo is a pending
+    // (not yet completed) grant queued by an earlier /adduser @username.
+    if (usernameFromArg(arg)) |username| {
+        bot_pending_grants.removePending(pool, connector.platform(), username, .allowed_user) catch |err| {
+            log.err("removeuser: failed to cancel pending grant for @{s}: {t}", .{ username, err });
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "@{s} won't be allowed automatically anymore.", .{username}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    }
+    reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username) you want to remove.");
+}
+
+fn handleAllowChatCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, msg: iface.Message) void {
+    bot_allowlist.addAllowedChat(pool, chat_id, identity_id) catch |err| {
+        log.err("allowchat: failed to add: {t}", .{err});
+        return;
+    };
+    connector.sendMessage(a, msg.chat_id, "This chat is now allowed to use the bot.", msg.message_id);
+}
+
+fn handleDisallowChatCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message) void {
+    bot_allowlist.removeAllowedChat(pool, chat_id) catch |err| {
+        log.err("disallowchat: failed to remove: {t}", .{err});
+        return;
+    };
+    connector.sendMessage(a, msg.chat_id, "This chat can no longer use the bot (unless individually-allowed users remain).", msg.message_id);
+}
+
+fn handleAddAdminCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/addadmin".len..], " ");
+    if (resolveTargetIdentity(pool, connector, a, now, msg, arg) catch |err| {
+        log.err("addadmin: failed to resolve target: {t}", .{err});
+        return;
+    }) |target| {
+        bot_admins.addBotAdmin(pool, target.id, identity_id) catch |err| {
+            log.err("addadmin: failed to add: {t}", .{err});
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "{s} is now a bot admin.", .{target.display_name}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    }
+    if (usernameFromArg(arg)) |username| {
+        bot_pending_grants.addPending(pool, connector.platform(), username, .bot_admin, identity_id) catch |err| {
+            log.err("addadmin: failed to queue pending grant for @{s}: {t}", .{ username, err });
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "@{s} isn't known to me yet -- they'll become a bot admin automatically as soon as they message me.", .{username}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    }
+    reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username) you want to make a bot admin.");
+}
+
+fn handleRemoveAdminCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/removeadmin".len..], " ");
+    if (resolveTargetIdentity(pool, connector, a, now, msg, arg) catch |err| {
+        log.err("removeadmin: failed to resolve target: {t}", .{err});
+        return;
+    }) |target| {
+        bot_admins.removeBotAdmin(pool, target.id) catch |err| {
+            log.err("removeadmin: failed to remove: {t}", .{err});
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "{s} is no longer a bot admin.", .{target.display_name}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    }
+    if (usernameFromArg(arg)) |username| {
+        bot_pending_grants.removePending(pool, connector.platform(), username, .bot_admin) catch |err| {
+            log.err("removeadmin: failed to cancel pending grant for @{s}: {t}", .{ username, err });
+            return;
+        };
+        const message = std.fmt.allocPrint(a, "@{s} won't become a bot admin automatically anymore.", .{username}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    }
+    reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username) you want to remove as a bot admin.");
+}
+
+/// `/redact` — parses which of the five modes (see `features/redact.zig`'s
+/// doc comments) applies, gates per-mode (regex is stricter — bot-admin/
+/// owner only, via `/sudo` if not otherwise a bot admin — than the other
+/// four, which use the same platform-admin-or-higher ladder as `/kick` et
+/// al., minus the token fallback: bulk deletion isn't something a token
+/// alone should unlock), then dispatches into `features/redact.zig`. Does
+/// its own gating internally (like `handleMagicWord`/`handlePersonaCommand`)
+/// rather than a single gate at the dispatch call site, since which gate
+/// applies depends on the parsed mode.
+fn handleRedactCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    now: i64,
+    msg: iface.Message,
+    text: []const u8,
+    sudo_active: bool,
+) void {
+    const arg = std.mem.trim(u8, text["/redact".len..], " ");
+
+    if (std.mem.startsWith(u8, arg, "regex ")) {
+        if (!auth.isOwnerOrSudoBotAdmin(config, connector.platform(), msg.user_id, sudo_active)) return;
+        const pattern = std.mem.trim(u8, arg["regex ".len..], " ");
+        redact_feature.redactRegex(connector, a, pool, chat_id, msg, pattern);
+        return;
+    }
+
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "redact")) return;
+
+    if (std.mem.startsWith(u8, arg, "text ")) {
+        const substring = std.mem.trim(u8, arg["text ".len..], " ");
+        redact_feature.redactText(connector, a, pool, chat_id, msg, substring);
+        return;
+    }
+
+    if (replyTarget(msg)) |target| {
+        const target_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), target.user_id, target.label, msg.reply_to_username, false, now) catch |err| {
+            log.err("redact: failed to resolve target: {t}", .{err});
+            return;
+        };
+        const n = std.fmt.parseInt(i64, arg, 10) catch 0;
+        redact_feature.redactUserLastN(connector, a, pool, chat_id, msg, target_identity_id, n);
+        return;
+    }
+
+    const n = std.fmt.parseInt(i64, arg, 10) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /redact <N> | (reply) /redact [N] | /redact text <substring> | /redact regex <pattern>");
+        return;
+    };
+    redact_feature.redactLastN(connector, a, pool, chat_id, msg, n);
 }
 
 fn handleDigestCommand(
@@ -2701,6 +3113,8 @@ fn replyWithAnswer(
     existing_placeholder_id: ?[]const u8,
     stream: bool,
     show_thinking: bool,
+    max_tokens_override: ?u32,
+    history_window: i64,
 ) void {
     // The placeholder + ticker only work when the platform supports
     // editing (Telegram does); anything that doesn't falls back to
@@ -2731,7 +3145,7 @@ fn replyWithAnswer(
     }
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking);
+    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, max_tokens_override, history_window);
 
     // Stop the ticker before touching the placeholder ourselves — it's the
     // sole owner of that Future until this point (see `Future.cancel`'s
@@ -2800,7 +3214,7 @@ fn replyWithAnswer(
     // Resolved to a real identity row (the bot's own), not the old
     // hardcoded `user_id = "warden"` placeholder.
     const bot_username = connector.selfUsername() orelse "warden";
-    const bot_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), connector.selfId() orelse "warden", bot_username, true, now) catch |err| {
+    const bot_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), connector.selfId() orelse "warden", bot_username, connector.selfUsername(), true, now) catch |err| {
         log.err("qa: failed to resolve bot identity for chat {s}: {t}", .{ native_chat_id, err });
         return;
     };
@@ -2868,6 +3282,12 @@ test {
     _ = @import("store/chat_settings.zig");
     _ = @import("store/bot_config.zig");
     _ = @import("store/messages.zig");
+    _ = @import("store/bot_admins.zig");
+    _ = @import("store/bot_allowlist.zig");
+    _ = @import("store/bot_pending_grants.zig");
+    _ = @import("features/trivial_reply.zig");
+    _ = @import("text/safe_regex.zig");
+    _ = @import("features/redact.zig");
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
     _ = @import("features/qa.zig");

@@ -14,8 +14,10 @@ pub const default_system_prompt =
     \\conversation.
     \\
     \\Style: reply like a chat participant — short, direct, no headers or
-    \\bullet-point essays unless genuinely needed. Match the language the
-    \\user wrote in.
+    \\bullet-point essays unless genuinely needed. One short paragraph
+    \\answers the large majority of questions; only go longer when the user
+    \\explicitly asks for detail, a list, or something long-form. Match the
+    \\language the user wrote in.
     \\
     \\Grounding: the recent chat history is included below for the cases
     \\where you actually need it — the user explicitly references something
@@ -61,13 +63,14 @@ pub const default_system_prompt =
     \\Tool restraint: only call a tool when the question actually needs its
     \\specific data (a real city's weather, an actual exchange rate, and so
     \\on). Don't reach for one out of habit or because it's in the list
-    \\above. Questions about yourself — your name, what model or LLM you
-    \\are, your capabilities — are answered directly from this prompt, never
-    \\with a tool: your name is Warden, full stop, regardless of the account
-    \\handle or display name this platform shows for you.
+    \\above. But when a question DOES map to one of these tools, use it
+    \\decisively and answer from its result — don't guess, hedge, or pad a
+    \\tool-backed answer with generic filler once you have the real data.
+    \\Questions about yourself — your name, what model or LLM you are, your
+    \\capabilities — are answered directly from this prompt, never with a
+    \\tool: your name is Warden, full stop, regardless of the account handle
+    \\or display name this platform shows for you.
 ;
-
-const history_window = 200;
 
 /// Reserved token budget for a reasoning model's `<think>...</think>` phase,
 /// on top of whatever the visible answer itself needs — a chain-of-thought
@@ -121,8 +124,12 @@ pub const Asker = struct {
 /// `config.zig`'s `llm_streaming` doc comment and
 /// `store/chat_settings.zig`'s `getShowThinkingOverride` for why both are
 /// caller-controlled (a global default that can be overridden) rather than
-/// fixed. `max_tokens` is derived from `max_answer_len` — see
-/// `answerMaxTokens`.
+/// fixed. `max_tokens` is derived from `max_answer_len` unless
+/// `max_tokens_override` is set — see `answerMaxTokens`. `history_window`
+/// caps how many recent messages `recentFormatted` sends verbatim as
+/// context (`config.zig`'s `llm_history_messages`) — the whole context-
+/// sizing mechanism today; see `ROADMAP.md`'s backlog for a real
+/// summarization-based downsampling strategy.
 pub fn answer(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -138,6 +145,8 @@ pub fn answer(
     progress: toolcall.Progress,
     stream: bool,
     show_thinking: bool,
+    max_tokens_override: ?u32,
+    history_window: i64,
 ) ![]const u8 {
     const history = try messages.recentFormatted(pool, allocator, chat_id, history_window);
 
@@ -159,6 +168,21 @@ pub fn answer(
             .{ history, asker_line, question },
         );
 
+    const effective_max_tokens = max_tokens_override orelse answerMaxTokens(max_answer_len);
+
+    // When a flat `max_tokens_override` is active (a deployment tuned for
+    // short, cheap answers), steer the model toward a length that actually
+    // fits inside it — chars ≈ tokens × `min_chars_per_token` — rather than
+    // the full platform limit, so the hard cutoff at `effective_max_tokens`
+    // rarely has to actually bite (an answer cut off mid-sentence reads far
+    // worse than one that was simply asked to stay short). Otherwise
+    // (`max_tokens_override == null`), same behavior as before: aim for the
+    // platform's own limit.
+    const length_hint_chars = if (max_tokens_override) |t|
+        @min(max_answer_len, @as(usize, t) * min_chars_per_token)
+    else
+        max_answer_len;
+
     // A hard file-fallback exists for whatever slips through (see
     // `main.zig`'s `sendTextOrFile`), but steering the model to stay under
     // budget up front means that rarely has to fire — most answers should
@@ -166,10 +190,10 @@ pub fn answer(
     const system_with_budget = try std.fmt.allocPrint(
         allocator,
         "{s}\n\nLength budget: keep replies under {d} characters when at all possible — that's the active platform's message-size limit. If the answer genuinely needs to be longer (e.g. the user asked for something long-form), that's fine: anything over the limit is sent as a file attachment automatically, so don't refuse or truncate awkwardly instead of finishing your answer.",
-        .{ system_prompt orelse default_system_prompt, max_answer_len },
+        .{ system_prompt orelse default_system_prompt, length_hint_chars },
     );
 
-    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, answerMaxTokens(max_answer_len));
+    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, effective_max_tokens);
 }
 
 test "answerMaxTokens reserves a thinking budget on top of the answer's own character-derived budget" {

@@ -147,7 +147,7 @@ test "getTokens defaults when no row exists; setTokens upserts even for a never-
     defer pool.deinitTestWrap();
 
     const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
-    const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", false, 1000);
+    const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
 
     try testing.expectEqual(@as(i64, 0), getTokens(&pool, chat_id, identity_id, 0));
 
@@ -162,7 +162,7 @@ test "touch creates a chat_members row and updates last_seen without touching to
     defer pool.deinitTestWrap();
 
     const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
-    const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", false, 1000);
+    const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
 
     try setTokens(&pool, chat_id, identity_id, 3);
     try touch(&pool, chat_id, identity_id, 2000);

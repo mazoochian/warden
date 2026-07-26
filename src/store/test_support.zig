@@ -20,7 +20,8 @@ fn truncateAll(db: *Db) !void {
     try db.exec(
         \\TRUNCATE TABLE messages, chat_members, telegram_profiles, matrix_profiles,
         \\  xmpp_profiles, chat_settings, chats, identities, bot_config,
-        \\  crypto_account, crypto_sessions, crypto_megolm_outbound, crypto_megolm_inbound
+        \\  crypto_account, crypto_sessions, crypto_megolm_outbound, crypto_megolm_inbound,
+        \\  bot_admins, bot_allowed_users, bot_allowed_chats, bot_pending_grants
         \\  RESTART IDENTITY CASCADE;
     );
 }

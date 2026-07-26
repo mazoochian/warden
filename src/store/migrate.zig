@@ -21,6 +21,11 @@ const migrations = [_]Migration{
     .{ .version = 7, .name = "0007_show_thinking", .sql = @embedFile("migrations/0007_show_thinking.sql") },
     .{ .version = 8, .name = "0008_matrix_crypto", .sql = @embedFile("migrations/0008_matrix_crypto.sql") },
     .{ .version = 9, .name = "0009_feed_watches_seen_guids", .sql = @embedFile("migrations/0009_feed_watches_seen_guids.sql") },
+    .{ .version = 10, .name = "0010_bot_admins", .sql = @embedFile("migrations/0010_bot_admins.sql") },
+    .{ .version = 11, .name = "0011_bot_allowlist", .sql = @embedFile("migrations/0011_bot_allowlist.sql") },
+    .{ .version = 12, .name = "0012_identities_credits", .sql = @embedFile("migrations/0012_identities_credits.sql") },
+    .{ .version = 13, .name = "0013_identities_username_lookup_index", .sql = @embedFile("migrations/0013_identities_username_lookup_index.sql") },
+    .{ .version = 14, .name = "0014_bot_pending_grants", .sql = @embedFile("migrations/0014_bot_pending_grants.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each
