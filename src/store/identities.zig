@@ -195,6 +195,64 @@ pub fn findByUsername(pool: *PgPool, allocator: std.mem.Allocator, platform: Pla
     };
 }
 
+/// Exact lookup by (platform, native_id) — unlike `getOrCreateMinimal`,
+/// never creates a placeholder row. Backs read-only by-id lookups (e.g.
+/// `/whois`, and `resolveTargetIdentity`'s non-mutating callers) where
+/// fabricating a row for an id the bot has genuinely never seen would be a
+/// surprising side effect for what's meant to be a plain info command.
+/// `null` when no identity on this platform has that native id.
+pub fn findByNativeId(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform, native_id: []const u8) !?IdentityRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT id, display_name, native_id FROM identities
+        \\WHERE platform = $1 AND native_id = $2
+        \\LIMIT 1;
+    );
+    defer stmt.finalize();
+    stmt.bindText(1, @tagName(platform));
+    stmt.bindText(2, native_id);
+    if (!try stmt.step()) return null;
+    return .{
+        .id = stmt.columnInt64(0),
+        .display_name = try allocator.dupe(u8, stmt.columnText(1)),
+        .native_id = try allocator.dupe(u8, stmt.columnText(2)),
+    };
+}
+
+pub const WhoisInfo = struct {
+    platform: Platform,
+    native_id: []const u8,
+    display_name: []const u8,
+    username: ?[]const u8,
+    is_bot: bool,
+};
+
+/// Full identity row by internal id — backs `/whois`, which needs every
+/// shared field (unlike `IdentityRef`'s minimal id/display_name/native_id,
+/// enough for targeting but not for a full profile view). `null` if `id`
+/// doesn't exist (shouldn't happen in practice: callers only ever have an
+/// `id` in hand via a prior successful lookup).
+pub fn getWhoisInfo(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?WhoisInfo {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT platform, native_id, display_name, username, is_bot FROM identities WHERE id = $1;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, id);
+    if (!try stmt.step()) return null;
+    return .{
+        .platform = std.meta.stringToEnum(Platform, stmt.columnText(0)) orelse .telegram,
+        .native_id = try allocator.dupe(u8, stmt.columnText(1)),
+        .display_name = try allocator.dupe(u8, stmt.columnText(2)),
+        .username = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
+        .is_bot = stmt.columnBool(4),
+    };
+}
+
 /// Global (not per-chat, unlike `chat_members.tokens`) LLM credit balance —
 /// see `0012_identities_credits.sql`. `default` is only returned on a
 /// pool/query error (an `identities` row is always guaranteed to exist by
@@ -511,6 +569,53 @@ test "findByUsername matches case-insensitively, is platform-scoped, and exclude
 
     try testing.expect(try findByUsername(&pool, a, .xmpp, "alice_tg") == null);
     try testing.expect(try findByUsername(&pool, a, .telegram, "no_such_user") == null);
+}
+
+test "findByNativeId matches exactly, is platform-scoped, and never creates a row" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const alice = try getOrCreateMinimal(&pool, .telegram, "42", "Alice", null, false, 1000);
+
+    const found = (try findByNativeId(&pool, a, .telegram, "42")).?;
+    try testing.expectEqual(alice, found.id);
+    try testing.expectEqualStrings("Alice", found.display_name);
+
+    // Different platform, same native id string — must not match.
+    try testing.expect(try findByNativeId(&pool, a, .matrix, "42") == null);
+    // Never seen at all — null, and (implicitly, since a second lookup below
+    // still finds nothing) no row was created as a side effect.
+    try testing.expect(try findByNativeId(&pool, a, .telegram, "99999") == null);
+    try testing.expect(try findByNativeId(&pool, a, .telegram, "99999") == null);
+}
+
+test "getWhoisInfo returns every shared field, including a null username" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bot_id = try getOrCreateMinimal(&pool, .telegram, "1", "SomeBot", "some_bot", true, 1000);
+    const human_id = try getOrCreateMinimal(&pool, .telegram, "2", "Bob", null, false, 1000);
+
+    const bot_info = (try getWhoisInfo(&pool, a, bot_id)).?;
+    try testing.expectEqual(Platform.telegram, bot_info.platform);
+    try testing.expectEqualStrings("1", bot_info.native_id);
+    try testing.expectEqualStrings("SomeBot", bot_info.display_name);
+    try testing.expectEqualStrings("some_bot", bot_info.username.?);
+    try testing.expect(bot_info.is_bot);
+
+    const human_info = (try getWhoisInfo(&pool, a, human_id)).?;
+    try testing.expectEqual(@as(?[]const u8, null), human_info.username);
+    try testing.expect(!human_info.is_bot);
 }
 
 test "getCredits/setCredits/spendCredit round-trip and spendCredit fails at zero without going negative" {

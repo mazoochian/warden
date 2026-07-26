@@ -484,3 +484,17 @@ planned in detail, listed so they aren't forgotten.
   dedicated phase/design pass rather than an incremental patch. Worth
   revisiting once the current single-provider setup's cost/latency
   tradeoffs are actually felt in practice.
+- **`/confirm`/`/cancel` are dead code for `/kick`/`/ban`** — found
+  2026-07-26 while fixing `/kick`/`/ban` targeting: `group_admin.
+  requestConfirmation` runs the kick/ban immediately and never calls
+  `PendingConfirmations.set`, so nothing is ever actually queued for
+  `/confirm`/`/cancel` to act on — both commands (and the whole
+  `PendingConfirmations` map, which only has unit tests exercising it
+  directly, never through the real dispatch path) are unreachable in
+  practice. Every doc comment/README line describing a "confirm-before-
+  acting" flow for `/kick`/`/ban` is currently inaccurate — they act
+  immediately, full stop. Left unfixed for now since wiring it up for real
+  is a genuine behavior change (an admin's `/kick` would stop working
+  immediately and start requiring a follow-up `/confirm`), not a targeting
+  bugfix — worth a deliberate decision on which behavior is actually
+  wanted before touching it.

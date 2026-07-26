@@ -41,9 +41,70 @@ fn reportDeleted(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Me
     connector.sendMessage(a, msg.chat_id, text, msg.message_id);
 }
 
-/// `/redact <N>` (no reply target) — deletes the last `n` messages in the
-/// chat, clamped to `max_redact_count`.
+/// `/redact <N>` (no reply target, no text/regex filter) — deletes the last
+/// `n` messages in the chat, clamped to `max_redact_count`.
+///
+/// On Telegram, whose `message_id` is a contiguous per-chat integer counter,
+/// this walks backward from the `/redact` command's own message id
+/// (`redactLastNByIdWalk`) rather than consulting the `messages` table at
+/// all — the bot's own DB is a record of what it happened to see, not the
+/// chat's actual history, and this mode's whole point ("delete the last N
+/// messages", full stop) doesn't need to know anything about a message
+/// beyond its id to delete it. This is what actually reaches a message from
+/// another bot, or one sent before this bot was in the chat/online, which
+/// `recentDeletable`'s DB-only view could never have logged in the first
+/// place. Every other mode (reply-scoped, `text`, `regex`) still needs
+/// message *content* to filter on, which id-walking can't provide, so those
+/// stay DB-backed (`redactUserLastN`/`redactText`/`redactRegex` below).
+///
+/// Falls back to the DB-backed `redactLastNFromDb` when the platform isn't
+/// Telegram, or the command message's own id isn't a parseable integer
+/// (shouldn't happen for a real Telegram message, but fails safe rather than
+/// silently deleting nothing).
 pub fn redactLastN(connector: iface.Connector, a: std.mem.Allocator, pool: *PgPool, chat_id: i64, msg: iface.Message, n: i64) void {
+    if (connector.platform() == .telegram) {
+        if (msg.message_id) |mid_str| {
+            if (std.fmt.parseInt(i64, mid_str, 10) catch null) |mid| {
+                redactLastNByIdWalk(connector, a, msg, mid, n);
+                return;
+            }
+        }
+    }
+    redactLastNFromDb(connector, a, pool, chat_id, msg, n);
+}
+
+/// Walks backward `count` ids from `from_message_id` (the `/redact` command's
+/// own message, so it gets swept up too — matching `redactLastNFromDb`,
+/// which already included it: `recordMessage` logs every message, including
+/// slash commands, before `handleMessage`/this ever runs), best-effort
+/// deleting each regardless of whether the bot ever saw that id — see
+/// `redactLastN`'s doc comment for why.
+fn redactLastNByIdWalk(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, from_message_id: i64, n: i64) void {
+    const count = @min(@max(n, 0), max_redact_count);
+    if (count == 0) {
+        connector.sendMessage(a, msg.chat_id, "Nothing to redact.", msg.message_id);
+        return;
+    }
+    var deleted: usize = 0;
+    var i: i64 = 0;
+    while (i < count) : (i += 1) {
+        const candidate = from_message_id - i;
+        if (candidate <= 0) break;
+        // Heap-allocated (not a reused stack buffer): `deleteMessage`
+        // implementations are free to retain the string past this call
+        // returning (e.g. a test stub recording it for later assertions),
+        // so each candidate needs its own stable allocation.
+        const id_str = std.fmt.allocPrint(a, "{d}", .{candidate}) catch continue;
+        connector.deleteMessage(a, msg.chat_id, id_str) catch |err| {
+            log.warn("failed to delete message {d}: {t}", .{ candidate, err });
+            continue;
+        };
+        deleted += 1;
+    }
+    reportDeleted(connector, a, msg, deleted, @intCast(count));
+}
+
+fn redactLastNFromDb(connector: iface.Connector, a: std.mem.Allocator, pool: *PgPool, chat_id: i64, msg: iface.Message, n: i64) void {
     const count = @min(@max(n, 0), max_redact_count);
     if (count == 0) {
         connector.sendMessage(a, msg.chat_id, "Nothing to redact.", msg.message_id);
@@ -128,6 +189,9 @@ const StubConnector = struct {
     fail_ids: []const []const u8 = &.{},
     deleted_ids: std.ArrayList([]const u8) = .empty,
     sent_messages: std.ArrayList([]const u8) = .empty,
+    /// Overridable so tests can exercise `redactLastN`'s "not Telegram, fall
+    /// back to the DB" branch — every other test relies on the default.
+    platform: iface.Platform = .telegram,
 
     fn connector(self: *StubConnector) iface.Connector {
         return .{ .ptr = self, .vtable = &vtable };
@@ -141,8 +205,8 @@ const StubConnector = struct {
     };
 
     fn platformFn(ptr: *anyopaque) iface.Platform {
-        _ = ptr;
-        return .telegram;
+        const self: *StubConnector = @ptrCast(@alignCast(ptr));
+        return self.platform;
     }
     fn pollFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]iface.Message {
         _ = ptr;
@@ -235,6 +299,95 @@ test "redactLastN(0) and negative n redact nothing" {
     redactLastN(stub.connector(), a, &pool, chat_id, baseMsg(), 0);
     redactLastN(stub.connector(), a, &pool, chat_id, baseMsg(), -5);
     try testing.expectEqual(@as(usize, 0), stub.deleted_ids.items.len);
+}
+
+test "redactLastN on Telegram walks backward by id from the command's own message, ignoring the DB entirely" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // No messages ever recorded for this chat at all — proves this mode
+    // doesn't consult `messages` the way `redactLastNFromDb` does.
+    const chat_id = try chats.upsertChat(&pool, .telegram, "chat1", null, null);
+
+    var stub = StubConnector{};
+    var msg = baseMsg();
+    msg.message_id = "100";
+    redactLastN(stub.connector(), a, &pool, chat_id, msg, 3);
+
+    try testing.expectEqual(@as(usize, 3), stub.deleted_ids.items.len);
+    try testing.expectEqualStrings("100", stub.deleted_ids.items[0]);
+    try testing.expectEqualStrings("99", stub.deleted_ids.items[1]);
+    try testing.expectEqualStrings("98", stub.deleted_ids.items[2]);
+    try testing.expectEqualStrings("Deleted 3 message(s).", stub.sent_messages.items[0]);
+}
+
+test "redactLastN's id walk stops at id 1, never going negative or wrapping" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "chat1", null, null);
+
+    var stub = StubConnector{};
+    var msg = baseMsg();
+    msg.message_id = "2";
+    redactLastN(stub.connector(), a, &pool, chat_id, msg, 5);
+
+    try testing.expectEqual(@as(usize, 2), stub.deleted_ids.items.len);
+    try testing.expectEqualStrings("2", stub.deleted_ids.items[0]);
+    try testing.expectEqualStrings("1", stub.deleted_ids.items[1]);
+}
+
+test "redactLastN falls back to the DB on a non-Telegram platform" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chat_id = try chats.upsertChat(&pool, .matrix, "chat1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .matrix, "1", "alice", null, false, 1000);
+    try msg_insert(&pool, chat_id, alice, "$abc:example.org", "one", 1000);
+
+    var stub = StubConnector{ .platform = .matrix };
+    var msg = baseMsg();
+    msg.message_id = "$def:example.org"; // not an integer -- couldn't id-walk anyway
+    redactLastN(stub.connector(), a, &pool, chat_id, msg, 5);
+
+    try testing.expectEqual(@as(usize, 1), stub.deleted_ids.items.len);
+    try testing.expectEqualStrings("$abc:example.org", stub.deleted_ids.items[0]);
+}
+
+test "redactLastN falls back to the DB on Telegram when the command message has no parseable id" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "chat1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    try msg_insert(&pool, chat_id, alice, "1", "one", 1000);
+
+    var stub = StubConnector{};
+    // baseMsg() leaves message_id null -- can't id-walk from nothing.
+    redactLastN(stub.connector(), a, &pool, chat_id, baseMsg(), 5);
+
+    try testing.expectEqual(@as(usize, 1), stub.deleted_ids.items.len);
+    try testing.expectEqualStrings("1", stub.deleted_ids.items[0]);
 }
 
 test "redactUserLastN only deletes the target sender's messages" {

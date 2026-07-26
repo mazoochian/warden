@@ -59,6 +59,24 @@ is silently ignored, except running out of tokens, which gets a reply
 saying so. `/promote`/`/demote` (granting real Telegram admin) and
 `/scraper` stay owner-only, not extended to bot admins or `/sudo`.
 
+`/kick` and `/ban` take their target the same three ways every other
+targeted command does: reply to the person's message, pass `@username`, or
+pass their raw platform user id directly (`/kick 123456789`) — useful when
+they have no username, or you already have their id from `/whois` or a
+previous log line. A username/id the bot has never seen still resolves for
+`/kick`/`/ban` (unlike `/whois`, below): its whole point is acting on a
+platform-native id, which is always enough on its own.
+
+`/redact <N>` (the plain, no-reply-no-filter form) doesn't consult the
+bot's own message log on Telegram — it walks backward by id from the
+`/redact` command's own message (Telegram's `message_id` is a contiguous
+per-chat counter), best-effort deleting each one whether or not the bot
+ever saw it. That's what lets it clean up another bot's messages, or ones
+sent before this bot joined/was online — the local DB was never going to
+have those. `/redact [N]` as a reply to someone, `/redact text <substring>`,
+and `/redact regex <pattern>` still search the local log, since those need
+to look at message *content* to know what to delete.
+
 # Access control
 Two independent trust tiers, both DB-backed (not just `.env`, unlike the
 single owner):
@@ -70,7 +88,23 @@ single owner):
   bot-wide, not scoped to one chat, unlike a platform's own admin flag.
   Bypass the allowed-users gate automatically, can run `/token`/`/adduser`/
   etc. directly, and can override a group-management command's live
-  platform-admin check with `/sudo` (see "Group management" above).
+  platform-admin check with `/sudo` (see "Group management" above). The
+  owner is *always* treated as a bot admin too, everywhere one is checked —
+  the owner outranks a bot admin, so there's no reason to also require the
+  owner to `/addadmin` themselves before something bot-admin-gated (like
+  `/sudo`) recognizes them.
+
+`/adduser`/`/removeuser`/`/addadmin`/`/removeadmin` accept a reply,
+`@username`, or a raw user id, same as `/kick`/`/ban` above.
+
+`/whois` (owner/bot admin only) looks up a known identity by reply,
+`@username`, or user id, and reports its full name, username, platform id,
+and three flags: is it a bot account, is it a bot admin, and is it the
+superuser (true only for the owner). Unlike `/kick`/`/ban`/`/adduser`, a
+user id `/whois` has never seen gets "I don't have any record of that
+user" rather than treating the bare id as enough — it's a read-only lookup,
+not an action, so there's nothing to act on for someone the bot has never
+actually observed.
 
 Two currencies, both reply-to-a-message or `/command [balance] [@username]`:
 - **Tokens** (`/token`, per-chat) — let a non-admin run one `/kick`/`/ban`

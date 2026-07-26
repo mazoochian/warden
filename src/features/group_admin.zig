@@ -201,32 +201,32 @@ pub fn deleteMessage(connector: iface.Connector, a: std.mem.Allocator, msg: ifac
     connector.sendMessage(a, msg.chat_id, "Deleted.", msg.message_id);
 }
 
-/// Starts the confirm-before-acting flow for ban/kick — does not perform
-/// the action yet. Permission (owner / sudo bot admin / live platform admin
-/// / spend-a-token fallback) is entirely the caller's responsibility now —
-/// see `auth.checkGroupAdminAccess`, called once by `main.zig` before this
-/// ever runs. This function no longer touches the database at all (it used
-/// to re-check and spend the actor's token balance here, unconditionally,
-/// which was the bug: a confirmed owner/platform-admin could still get
-/// blocked by a 0 token balance, since this ran *after* they'd already
-/// proven authorization a different way).
+/// Runs the ban/kick action immediately against `target_user_id` — a native
+/// platform id the caller has already resolved (reply target, `@username`,
+/// or a raw id; see `main.zig`'s `resolveTargetIdentity`/
+/// `handleKickBanCommand`). Targeting used to be this function's own job,
+/// hardcoded to `replyTarget(msg)` alone — the bug that made `/kick
+/// @username` and `/kick <user_id>` silently do nothing (no dispatch branch
+/// even matched them; see `handleMessage`'s old exact-`eql` match). Resolving
+/// the target is now entirely the caller's job, same division as
+/// permission: (owner / sudo bot admin / live platform admin / spend-a-token
+/// fallback) is checked once by `main.zig` via `auth.checkGroupAdminAccess`
+/// before this ever runs, and this function no longer touches the database
+/// at all.
 pub fn requestConfirmation(
     connector: iface.Connector,
     a: std.mem.Allocator,
     msg: iface.Message,
     kind: ActionKind,
+    target_user_id: []const u8,
 ) void {
-    const target = replyTarget(msg) orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, "Reply to the message of the person you want to {s}.", .{@tagName(kind)});
-        return;
-    };
     if (kind == .kick) {
-        connector.kickUser(a, msg.chat_id, target.user_id) catch |err| {
+        connector.kickUser(a, msg.chat_id, target_user_id) catch |err| {
             reportFailure(connector, a, msg.chat_id, msg.message_id, "kick", err);
             return;
         };
     } else if (kind == .ban) {
-        connector.banUser(a, msg.chat_id, target.user_id) catch |err| {
+        connector.banUser(a, msg.chat_id, target_user_id) catch |err| {
             reportFailure(connector, a, msg.chat_id, msg.message_id, "ban", err);
             return;
         };
