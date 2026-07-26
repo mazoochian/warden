@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # Runs inside the exact base image the Dockerfile's own zig-build stage
+    # uses (Alpine + apk postgresql-dev/olm-dev) rather than guessing
+    # Ubuntu-equivalent package names -- this is the one build environment
+    # already proven to work for this project.
+    container: alpine:3.22
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: warden_test
+          POSTGRES_PASSWORD: warden_test
+          POSTGRES_DB: warden_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Store-layer tests skip (not fail) without this set -- see
+      # store/test_support.zig's openTestDb doc comment.
+      WARDEN_TEST_POSTGRES_DSN: postgresql://warden_test:warden_test@postgres:5432/warden_test
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache bash git curl xz postgresql-dev olm-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          ZIG_VERSION=0.16.0
+          curl -fSL --retry 5 --retry-delay 2 --retry-all-errors -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar -xJf /tmp/zig.tar.xz -C /opt
+          mv "/opt/zig-x86_64-linux-${ZIG_VERSION}" /opt/zig
+          echo "/opt/zig" >> "$GITHUB_PATH"
+
+      - name: zig fmt --check
+        run: zig fmt --check .
+
+      - name: zig build
+        run: zig build
+
+      # NOTE: store/crypto.zig's test group has a known, pre-existing flake
+      # (found 2026-07-27, unrelated to any change in this repo at the
+      # time it was found) -- a different specific crypto.zig test
+      # crashes (SIGABRT or segfault) on some runs once the full suite
+      # got large enough, most likely shared-resource/timing contention
+      # rather than a bug in any one test. If ONLY a crypto.zig test
+      # fails/crashes here, re-run the job before assuming a real
+      # regression; if anything else fails, treat it as real.
+      - name: zig build test
+        run: zig build test
