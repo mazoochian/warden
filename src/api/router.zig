@@ -13,8 +13,14 @@ const ServerContext = server_mod.ServerContext;
 const web_sessions = @import("../store/web_sessions.zig");
 const accounts = @import("../store/accounts.zig");
 const identities = @import("../store/identities.zig");
+const bot_admins = @import("../store/bot_admins.zig");
+const admin_directory = @import("../store/admin_directory.zig");
 const audit_log = @import("../store/audit_log.zig");
 const telegram_login = @import("telegram_login.zig");
+/// The bot's own permission-ladder module (owner check) -- aliased since
+/// `auth` above already names this file's own session-token module
+/// (`api/auth.zig`).
+const perm_auth = @import("../auth.zig");
 const log = @import("../log.zig").scoped("api");
 
 /// Telegram re-issues `auth_date` on every widget load; anything older than
@@ -23,6 +29,12 @@ const log = @import("../log.zig").scoped("api");
 const telegram_login_max_age_seconds: i64 = 24 * 3600;
 
 const me_sessions_prefix = "/api/v1/me/sessions/";
+const admin_chats_prefix = "/api/v1/admin/chats/";
+const admin_identities_prefix = "/api/v1/admin/identities/";
+
+/// Default/max page size, matching `API.md`'s pagination convention.
+const default_page_limit: i64 = 50;
+const max_page_limit: i64 = 200;
 
 /// One request's resolved caller — `null` `account_id` means
 /// unauthenticated (a missing/invalid/expired session cookie), which is a
@@ -66,6 +78,21 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     if (method == .DELETE and std.mem.startsWith(u8, path, me_sessions_prefix)) {
         return handleRevokeSession(ctx, request, path[me_sessions_prefix.len..]);
     }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/stats/overview")) {
+        return handleAdminStatsOverview(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/chats")) {
+        return handleAdminListChats(ctx, request, target);
+    }
+    if (method == .GET and std.mem.startsWith(u8, path, admin_chats_prefix)) {
+        return handleAdminGetChat(ctx, request, path[admin_chats_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/identities")) {
+        return handleAdminListIdentities(ctx, request, target);
+    }
+    if (method == .GET and std.mem.startsWith(u8, path, admin_identities_prefix)) {
+        return handleAdminGetIdentity(ctx, request, path[admin_identities_prefix.len..]);
+    }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
 }
@@ -105,12 +132,18 @@ fn handleGetSession(ctx: *const ServerContext, request: *http.Server.Request) !v
     };
     defer ctx.allocator.free(identity_ids);
 
+    const roles = computeRoles(ctx, account_id) catch |err| {
+        log.err("session: failed to compute roles for account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load session");
+    };
+
     return respondJson(ctx, request, .ok, .{
         .authenticated = true,
         .account_id = account_id,
         .display_name = account.display_name,
         .avatar_url = account.avatar_url,
         .identity_ids = identity_ids,
+        .roles = roles,
     });
 }
 
@@ -329,6 +362,174 @@ fn handleRevokeSession(ctx: *const ServerContext, request: *http.Server.Request,
     audit_log.record(ctx.pool, account_id, "auth.session_revoke", session_id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Admin — stats & directory (Phase 2, read-only)
+// ---------------------------------------------------------------------------
+
+const Roles = struct { owner: bool, bot_admin: bool };
+
+/// An account's effective role is the union across every `identities` row
+/// linked to it (`ARCHITECTURE.md` §7) — most accounts have exactly one
+/// linked identity today (no account-linking flow exists yet), but this
+/// stays correct once one does.
+fn computeRoles(ctx: *const ServerContext, account_id: i64) !Roles {
+    const identity_ids = try accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id);
+    defer ctx.allocator.free(identity_ids);
+
+    var roles = Roles{ .owner = false, .bot_admin = false };
+    for (identity_ids) |identity_id| {
+        if (bot_admins.isBotAdmin(ctx.pool, identity_id)) roles.bot_admin = true;
+        if (identities.getWhoisInfo(ctx.pool, ctx.allocator, identity_id) catch null) |info| {
+            defer ctx.allocator.free(info.native_id);
+            defer ctx.allocator.free(info.display_name);
+            defer if (info.username) |u| ctx.allocator.free(u);
+            if (perm_auth.isOwner(ctx.config, info.platform, info.native_id)) roles.owner = true;
+        }
+    }
+    return roles;
+}
+
+/// Every `/api/v1/admin/*` handler starts with this. `null` means a
+/// response was already sent (`401` unauthenticated, `403` not owner/bot
+/// admin) — the caller just returns.
+fn requireAdmin(ctx: *const ServerContext, request: *http.Server.Request) !?i64 {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        try respondError(request, .unauthorized, "unauthorized", "not logged in");
+        return null;
+    };
+    const roles = try computeRoles(ctx, account_id);
+    if (!roles.owner and !roles.bot_admin) {
+        try respondError(request, .forbidden, "forbidden", "admin access required");
+        return null;
+    }
+    return account_id;
+}
+
+/// `?limit=` clamped to `[1, max_page_limit]`, defaulting to
+/// `default_page_limit`; `?cursor=` parsed as the last-seen id (`0` — the
+/// start of the table — if absent/unparseable).
+fn paginationParams(target: []const u8) struct { after_id: i64, limit: i64 } {
+    const after_id = if (queryParam(target, "cursor")) |c|
+        std.fmt.parseInt(i64, c, 10) catch 0
+    else
+        0;
+    const limit = if (queryParam(target, "limit")) |l|
+        std.math.clamp(std.fmt.parseInt(i64, l, 10) catch default_page_limit, 1, max_page_limit)
+    else
+        default_page_limit;
+    return .{ .after_id = after_id, .limit = limit };
+}
+
+fn queryParam(target: []const u8, name: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, target[q + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+fn handleAdminStatsOverview(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const stats = admin_directory.overview(ctx.pool, now) catch |err| {
+        log.err("admin-stats-overview: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load stats");
+    };
+    return respondJson(ctx, request, .ok, stats);
+}
+
+fn handleAdminListChats(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    const page = paginationParams(target);
+    const chats = admin_directory.listChats(ctx.pool, ctx.allocator, page.after_id, page.limit) catch |err| {
+        log.err("admin-list-chats: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load chats");
+    };
+    defer {
+        for (chats) |c| {
+            ctx.allocator.free(c.native_chat_id);
+            if (c.title) |t| ctx.allocator.free(t);
+        }
+        ctx.allocator.free(chats);
+    }
+
+    const next_cursor: ?i64 = if (chats.len == @as(usize, @intCast(page.limit))) chats[chats.len - 1].id else null;
+    return respondJson(ctx, request, .ok, .{ .items = chats, .next_cursor = next_cursor });
+}
+
+fn handleAdminGetChat(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const detail = admin_directory.getChatDetail(ctx.pool, ctx.allocator, chat_id) catch |err| {
+        log.err("admin-get-chat: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load chat");
+    } orelse {
+        return respondError(request, .not_found, "not_found", "no such chat");
+    };
+    defer {
+        ctx.allocator.free(detail.native_chat_id);
+        if (detail.title) |t| ctx.allocator.free(t);
+        if (detail.chat_type) |t| ctx.allocator.free(t);
+        if (detail.magic_word) |t| ctx.allocator.free(t);
+        for (detail.recent_messages) |m| {
+            ctx.allocator.free(m.sender_display_name);
+            if (m.text) |t| ctx.allocator.free(t);
+        }
+        ctx.allocator.free(detail.recent_messages);
+    }
+
+    return respondJson(ctx, request, .ok, detail);
+}
+
+fn handleAdminListIdentities(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    const page = paginationParams(target);
+    const list = admin_directory.listIdentities(ctx.pool, ctx.allocator, page.after_id, page.limit) catch |err| {
+        log.err("admin-list-identities: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load identities");
+    };
+    defer {
+        for (list) |i| {
+            ctx.allocator.free(i.display_name);
+            if (i.username) |u| ctx.allocator.free(u);
+        }
+        ctx.allocator.free(list);
+    }
+
+    const next_cursor: ?i64 = if (list.len == @as(usize, @intCast(page.limit))) list[list.len - 1].id else null;
+    return respondJson(ctx, request, .ok, .{ .items = list, .next_cursor = next_cursor });
+}
+
+fn handleAdminGetIdentity(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    const identity_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid identity id");
+    };
+    const detail = admin_directory.getIdentityDetail(ctx.pool, ctx.allocator, identity_id) catch |err| {
+        log.err("admin-get-identity: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load identity");
+    } orelse {
+        return respondError(request, .not_found, "not_found", "no such identity");
+    };
+    defer {
+        ctx.allocator.free(detail.native_id);
+        ctx.allocator.free(detail.display_name);
+        if (detail.username) |u| ctx.allocator.free(u);
+    }
+
+    return respondJson(ctx, request, .ok, detail);
 }
 
 /// `user_agent` must have been captured by the caller *before* it read the
