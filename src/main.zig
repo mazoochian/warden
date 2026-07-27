@@ -65,6 +65,7 @@ const scheduler = @import("features/scheduler.zig");
 const convert_file = @import("tools/convert_file.zig");
 const worker_pool = @import("worker_pool.zig");
 const feature_flags = @import("store/feature_flags.zig");
+const dynamic_config = @import("store/dynamic_config.zig");
 
 const base_tools = [_]tool_registry.ToolDef{
     @import("tools/calculator.zig").tool,
@@ -969,7 +970,8 @@ fn processMessageTask(
         return;
     };
     if (msg.choice_picked == null) {
-        recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, config.retention_messages);
+        const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
+        recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, retention_messages);
     }
     recordObservedUsers(pool, chat_id, msg.observed_users);
 
@@ -1320,7 +1322,8 @@ fn checkAndSendDueDigests(
         };
 
         const last_sent = chat_settings.getLastDigestTs(pool, chat_id);
-        if (now - last_sent < config.digest_interval_seconds) continue;
+        const digest_interval_seconds = dynamic_config.getI64(pool, a, "WARDEN_DIGEST_INTERVAL_SECONDS", config.digest_interval_seconds);
+        if (now - last_sent < digest_interval_seconds) continue;
 
         const tool_ctx = tool_registry.ToolContext{
             .allocator = a,
@@ -1340,6 +1343,50 @@ fn checkAndSendDueDigests(
             log.err("digest: failed to persist last_digest_ts for chat {s}: {t}", .{ native_chat_id, err });
         };
     }
+}
+
+const LlmDynamicSettings = struct {
+    owner_only: bool,
+    show_thinking: bool,
+    streaming: bool,
+    max_tokens_override: ?u32,
+    history_messages: i64,
+    skip_trivial_messages: bool,
+};
+
+/// One `dynamic_config.listAll` fetch instead of six separate
+/// `getBool`/`getI64` round trips for every free-form LLM turn — see
+/// `store/dynamic_config.zig`'s `listAll`/`findBool`/`findI64` doc
+/// comments for why that matters here specifically (this codebase has
+/// already hit real Postgres pool exhaustion under load once). Each field
+/// falls back to `config`'s own env-sourced default when no DB row exists,
+/// same "missing row means default" convention as everywhere else
+/// `dynamic_config`/`feature_flags` is read.
+fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, config: *const config_mod.Config) LlmDynamicSettings {
+    const rows = dynamic_config.listAll(pool, a) catch &.{};
+    defer {
+        for (rows) |r| {
+            a.free(r.key);
+            a.free(r.value);
+        }
+        a.free(rows);
+    }
+
+    // `WARDEN_LLM_MAX_TOKENS=0` (or any non-positive value) is treated the
+    // same as "no override" -- a real max-tokens value is never
+    // meaningfully zero or negative, so this is an unambiguous sentinel
+    // rather than a separate "is this key even set" lookup.
+    const max_tokens_default: i64 = if (config.llm_max_tokens_override) |v| v else 0;
+    const max_tokens_raw = dynamic_config.findI64(rows, "WARDEN_LLM_MAX_TOKENS", max_tokens_default);
+
+    return .{
+        .owner_only = dynamic_config.findBool(rows, "WARDEN_LLM_OWNER_ONLY", config.llm_owner_only),
+        .show_thinking = dynamic_config.findBool(rows, "WARDEN_LLM_SHOW_THINKING", config.llm_show_thinking),
+        .streaming = dynamic_config.findBool(rows, "WARDEN_LLM_STREAMING", config.llm_streaming),
+        .max_tokens_override = if (max_tokens_raw > 0) @intCast(max_tokens_raw) else null,
+        .history_messages = dynamic_config.findI64(rows, "WARDEN_LLM_HISTORY_MESSAGES", config.llm_history_messages),
+        .skip_trivial_messages = dynamic_config.findBool(rows, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", config.skip_trivial_messages),
+    };
 }
 
 /// Returns whether this message's attachment (if any) was claimed by the
@@ -1619,13 +1666,18 @@ fn handleMessage(
         // LLM as if it were a question.
         return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
+        // One bulk dynamic_config fetch for every setting this branch
+        // reads, instead of six separate round trips -- see
+        // `resolveLlmDynamicSettings`'s doc comment.
+        const dyn = resolveLlmDynamicSettings(pool, a, config);
+
         // A greeting/ack/sign-off addressed to the bot doesn't need a real
         // (paid) LLM call to answer meaningfully — short-circuit with an
         // instant canned reply instead. Checked before the owner-only/
         // credit gates below: this costs nothing, so it isn't subject to
         // either (a random allowed user's "hi" gets a friendly reply
         // regardless of whether they're privileged enough for real Q&A).
-        if (config.skip_trivial_messages and trivial_reply.isTrivialMessage(a, text)) {
+        if (dyn.skip_trivial_messages and trivial_reply.isTrivialMessage(a, text)) {
             const canned = trivial_reply.pickResponse(@intCast(now));
             connector.sendMessage(a, msg.chat_id, canned, msg.message_id);
             return false;
@@ -1636,7 +1688,7 @@ fn handleMessage(
         // unaddressed mention from someone else shouldn't announce "I only
         // answer my owner" to the whole group.
         const is_privileged = is_owner or is_bot_admin;
-        if (config.llm_owner_only and !is_privileged) return false;
+        if (dyn.owner_only and !is_privileged) return false;
         // Credits gate LLM usage specifically (spends the owner's real API
         // budget) — separate from, and checked after, the owner-only gate
         // above. Owner/bot admins get unlimited use; unlike the allowlist
@@ -1654,9 +1706,10 @@ fn handleMessage(
         // Per-chat /persona override, falling back to the global default —
         // see `store/chat_settings.zig`'s `getSystemPromptOverride`.
         const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
-        // Per-chat /thinking override, falling back to the global default —
-        // see `store/chat_settings.zig`'s `getShowThinkingOverride`.
-        const show_thinking = chat_settings.getShowThinkingOverride(pool, chat_id) orelse config.llm_show_thinking;
+        // Per-chat /thinking override, falling back to the dynamic_config-
+        // or-env global default — see `store/chat_settings.zig`'s
+        // `getShowThinkingOverride`.
+        const show_thinking = chat_settings.getShowThinkingOverride(pool, chat_id) orelse dyn.show_thinking;
         // Prefers the full `Identity` the connector built from the
         // platform's own user object; falls back to the thinner
         // `iface.Message` fields for a platform/message that didn't
@@ -1670,7 +1723,8 @@ fn handleMessage(
             .username = msg.username,
             .native_id = msg.user_id,
         };
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, config.retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, config.llm_streaming, show_thinking, config.llm_max_tokens_override, config.llm_history_messages);
+        const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.max_tokens_override, dyn.history_messages);
     }
     return false;
 }

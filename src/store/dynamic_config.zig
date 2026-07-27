@@ -43,15 +43,75 @@ pub fn getString(pool: *PgPool, allocator: std.mem.Allocator, key: []const u8, d
 pub fn getBool(pool: *PgPool, allocator: std.mem.Allocator, key: []const u8, default: bool) bool {
     const raw = getRaw(pool, allocator, key) orelse return default;
     defer allocator.free(raw);
-    if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
-    if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
-    return default;
+    return parseBool(raw, default);
 }
 
 pub fn getI64(pool: *PgPool, allocator: std.mem.Allocator, key: []const u8, default: i64) i64 {
     const raw = getRaw(pool, allocator, key) orelse return default;
     defer allocator.free(raw);
+    return parseI64(raw, default);
+}
+
+/// Split out from `getBool` so callers that already have a raw value in
+/// hand (`listAll`'s bulk fetch, used where several keys are read together
+/// on one hot path — see `main.zig`'s `resolveLlmDynamicSettings`) don't
+/// need a second round trip through `getRaw` just to parse it.
+pub fn parseBool(raw: []const u8, default: bool) bool {
+    if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return default;
+}
+
+/// See `parseBool`'s doc comment — same reasoning.
+pub fn parseI64(raw: []const u8, default: i64) i64 {
     return std.fmt.parseInt(i64, raw, 10) catch default;
+}
+
+pub const KV = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// Every row in `dynamic_config`, in one query — for hot paths that read
+/// several keys together (e.g. every free-form LLM turn reads six of
+/// them), where six separate `pool.acquire()`/query round trips per
+/// message would be real, not theoretical, overhead (this codebase has
+/// already hit Postgres pool exhaustion under load once — see
+/// `warden-hang-fix-2026-07-22` territory). Callers own the returned
+/// slice and each `KV`'s strings.
+pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]KV {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT key, value FROM dynamic_config;");
+    defer stmt.finalize();
+
+    var out: std.ArrayList(KV) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .key = try allocator.dupe(u8, stmt.columnText(0)),
+            .value = try allocator.dupe(u8, stmt.columnText(1)),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Finds `key` in a `listAll`-fetched row set and parses it as a bool,
+/// falling back to `default` if absent or unparseable — the bulk-fetch
+/// equivalent of `getBool`.
+pub fn findBool(rows: []const KV, key: []const u8, default: bool) bool {
+    for (rows) |row| {
+        if (std.mem.eql(u8, row.key, key)) return parseBool(row.value, default);
+    }
+    return default;
+}
+
+/// See `findBool`'s doc comment — same shape, for `i64`.
+pub fn findI64(rows: []const KV, key: []const u8, default: i64) i64 {
+    for (rows) |row| {
+        if (std.mem.eql(u8, row.key, key)) return parseI64(row.value, default);
+    }
+    return default;
 }
 
 pub fn set(pool: *PgPool, key: []const u8, value: []const u8, updated_by: i64) !void {
@@ -122,4 +182,39 @@ test "getString round-trips a plain string value" {
     const overridden = try getString(&pool, a, "WARDEN_LLM_PROVIDER", "anthropic");
     defer a.free(overridden);
     try testing.expectEqualStrings("openai_compat", overridden);
+}
+
+test "listAll fetches every row, findBool/findI64 parse from it with the same fallback semantics as get*" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const owner = try identities.getOrCreateMinimal(&pool, .telegram, "1", "owner", null, false, 1000);
+    try set(&pool, "WARDEN_LLM_SHOW_THINKING", "true", owner);
+    try set(&pool, "WARDEN_LLM_HISTORY_MESSAGES", "12", owner);
+
+    const rows = try listAll(&pool, a);
+    defer {
+        for (rows) |r| {
+            a.free(r.key);
+            a.free(r.value);
+        }
+        a.free(rows);
+    }
+    try testing.expectEqual(@as(usize, 2), rows.len);
+
+    try testing.expect(findBool(rows, "WARDEN_LLM_SHOW_THINKING", false));
+    try testing.expectEqual(@as(i64, 12), findI64(rows, "WARDEN_LLM_HISTORY_MESSAGES", 20));
+    // Absent key -- falls back, doesn't error or match anything spuriously.
+    try testing.expect(!findBool(rows, "WARDEN_LLM_STREAMING", false));
+    try testing.expectEqual(@as(i64, 999), findI64(rows, "WARDEN_LLM_MAX_TOKENS", 999));
+}
+
+test "parseBool/parseI64 fall back to default on unparseable input" {
+    try testing.expect(parseBool("not-a-bool", true));
+    try testing.expect(!parseBool("not-a-bool", false));
+    try testing.expectEqual(@as(i64, 7), parseI64("not-a-number", 7));
+    try testing.expectEqual(@as(i64, 42), parseI64("42", 7));
 }
