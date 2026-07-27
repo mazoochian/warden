@@ -64,6 +64,7 @@ const digest = @import("features/digest.zig");
 const scheduler = @import("features/scheduler.zig");
 const convert_file = @import("tools/convert_file.zig");
 const worker_pool = @import("worker_pool.zig");
+const feature_flags = @import("store/feature_flags.zig");
 
 const base_tools = [_]tool_registry.ToolDef{
     @import("tools/calculator.zig").tool,
@@ -1123,11 +1124,17 @@ const ResolvedQuestion = struct {
     placeholder_id: ?[]const u8 = null,
 };
 
-fn resolveQuestion(connector: iface.Connector, a: std.mem.Allocator, io: Io, config: *const config_mod.Config, tool_ctx: tool_registry.ToolContext, msg: iface.Message, text: []const u8) ResolvedQuestion {
+fn resolveQuestion(connector: iface.Connector, a: std.mem.Allocator, io: Io, config: *const config_mod.Config, pool: *store_pool.PgPool, tool_ctx: tool_registry.ToolContext, msg: iface.Message, text: []const u8) ResolvedQuestion {
     if (text.len > 0) return .{ .text = text };
     const att = msg.attachment orelse return .{ .text = text };
 
     if (att.kind == .voice) {
+        // Disabled falls back to the generic attachment placeholder below,
+        // same as "whisper not configured" already does -- not a special
+        // error path, just one more reason transcription doesn't happen.
+        if (config.whisper_url != null and !feature_flags.isEnabled(pool, "voice_transcription")) {
+            return .{ .text = attachmentPlaceholder(a, att) catch text };
+        }
         if (config.whisper_url) |whisper_url| {
             if (tool_ctx.attachment_path) |path| {
                 const placeholder_id = connector.sendMessageReturningId(a, msg.chat_id, "🎙️ Transcribing your voice message…", msg.message_id) catch |err| blk: {
@@ -1461,6 +1468,7 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/help") or std.mem.startsWith(u8, text, "/help ")) {
         handleHelp(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/menu")) {
+        if (!feature_flags.isEnabled(pool, "menu")) return false;
         // `!menu` already reaches here as `/menu` too --
         // `normalizeCommandMention` rewrites any leading `!` to `/` for
         // every platform, not just Matrix's requested trigger.
@@ -1470,23 +1478,30 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/wordcloud")) {
         replyWithWordcloud(connector, a, pool, chat_id, config.tmp_dir, io, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/digest") or std.mem.startsWith(u8, text, "/digest ")) {
+        if (!feature_flags.isEnabled(pool, "digest")) return false;
         handleDigestCommand(connector, a, pool, chat_id, digest_scheduler, llm_provider, tool_ctx, now, max_message_len, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
         group_admin.mute(connector, a, msg, now);
     } else if (std.mem.eql(u8, text, "/unmute")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "unmute")) return false;
         group_admin.unmute(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/pin")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "pin")) return false;
         group_admin.pin(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/unpin")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "unpin")) return false;
         group_admin.unpin(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/delete")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "delete")) return false;
         group_admin.deleteMessage(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/promote")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         // Owner-only, not `checkGroupAdminAccess` — granting real admin
         // rights is more consequential than mute/kick/pin, and Telegram's
         // own admin flag doesn't tell us whether a given admin actually has
@@ -1496,15 +1511,19 @@ fn handleMessage(
         if (!is_owner) return false;
         group_admin.promote(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/demote")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!is_owner) return false;
         group_admin.demote(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/kick") or std.mem.startsWith(u8, text, "/kick ")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "kick")) return false;
         handleKickBanCommand(connector, a, pool, now, msg, text, "/kick", .kick);
     } else if (std.mem.eql(u8, text, "/ban") or std.mem.startsWith(u8, text, "/ban ")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "ban")) return false;
         handleKickBanCommand(connector, a, pool, now, msg, text, "/ban", .ban);
     } else if (std.mem.eql(u8, text, "/confirm")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "confirm")) return false;
         group_admin.confirm(connector, a, pending, now, msg);
     } else if (std.mem.eql(u8, text, "/cancel")) {
@@ -1520,6 +1539,7 @@ fn handleMessage(
         } else if (menu_sessions.cancel(msg.chat_id, msg.user_id)) {
             reply(connector, a, msg.chat_id, msg.message_id, "Menu prompt cancelled.");
         } else {
+            if (!feature_flags.isEnabled(pool, "group_admin")) return false;
             if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "cancel")) return false;
             group_admin.cancel(connector, a, pending, msg);
         }
@@ -1565,28 +1585,34 @@ fn handleMessage(
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleScraperCommand(connector, a, pool, msg, text);
     } else if (std.mem.eql(u8, text, "/remind") or std.mem.startsWith(u8, text, "/remind ")) {
+        if (!feature_flags.isEnabled(pool, "reminders")) return false;
         handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/reminders")) {
         handleRemindersList(connector, a, pool, chat_id, now, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/convert")) {
+        if (!feature_flags.isEnabled(pool, "convert")) return false;
         // Bare /convert, no attachment claimed above (either none present,
         // or claiming it failed) — start (or restart) the multi-stage flow.
         convert_flow.beginConvertFlow(connector, a, pending_conversions, now, msg);
     } else if (std.mem.startsWith(u8, text, "/convert ")) {
+        if (!feature_flags.isEnabled(pool, "convert")) return false;
         // UNCHANGED one-shot path: /convert <format> as an attachment's
         // caption, calling convert_file directly, no LLM round trip.
         handleConvertCommand(connector, a, tool_ctx, msg, text);
     } else if (std.mem.eql(u8, text, "/alert") or std.mem.startsWith(u8, text, "/alert ")) {
+        if (!feature_flags.isEnabled(pool, "alerts")) return false;
         handleAlertCommand(connector, a, config, pool, chat_id, identity_id, msg, text);
     } else if (std.mem.eql(u8, text, "/alerts")) {
         handleAlertsList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/watch") or std.mem.startsWith(u8, text, "/watch ")) {
+        if (!feature_flags.isEnabled(pool, "watches")) return false;
         handleWatchCommand(connector, a, pool, chat_id, identity_id, msg, text);
     } else if (std.mem.eql(u8, text, "/unwatch") or std.mem.startsWith(u8, text, "/unwatch ")) {
         handleUnwatchCommand(connector, a, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/watches")) {
         handleWatchesList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/watchcheck") or std.mem.startsWith(u8, text, "/watchcheck ")) {
+        if (!feature_flags.isEnabled(pool, "watches")) return false;
         handleWatchCheckCommand(connector, a, pool, io, llm_provider, chat_id, msg, text, now);
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
@@ -1624,7 +1650,7 @@ fn handleMessage(
             return false;
         }
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
-        const resolved = resolveQuestion(connector, a, io, config, tool_ctx, msg, text);
+        const resolved = resolveQuestion(connector, a, io, config, pool, tool_ctx, msg, text);
         // Per-chat /persona override, falling back to the global default —
         // see `store/chat_settings.zig`'s `getSystemPromptOverride`.
         const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
@@ -1838,6 +1864,13 @@ fn handlePersonaCommand(
         connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
         return;
     }
+
+    // Viewing (above) stays available even when disabled -- matches the
+    // reminders/alerts/watches list commands' own policy elsewhere in this
+    // file (a module toggle blocks *creating*/*changing* things, not
+    // looking at what's already there). Only the actual set/clear path
+    // below is gated.
+    if (!feature_flags.isEnabled(pool, "persona")) return;
 
     if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
         reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can change this chat's persona.");
@@ -2410,6 +2443,8 @@ fn handleRedactCommand(
     text: []const u8,
     sudo_active: bool,
 ) void {
+    if (!feature_flags.isEnabled(pool, "group_admin")) return;
+
     const arg = std.mem.trim(u8, text["/redact".len..], " ");
 
     if (std.mem.startsWith(u8, arg, "regex ")) {
@@ -3321,6 +3356,111 @@ fn tickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []con
     }
 }
 
+/// Maps an LLM tool's own `.name` (the function-calling identifier) to the
+/// `feature_flags` module key that gates it — `null` for tools with no
+/// toggle (calculator, currency, fetch_url, draw_diagram, word_cloud,
+/// find_chat_member), which always stay available. Deliberately covers
+/// more than /home/armin/claude/warden-ui/ARCHITECTURE.md §5's literal
+/// "LLM-tool-shaped features" list: the standalone-module tools
+/// (set_reminder, set_alert, begin_file_conversion, convert_file) map back
+/// to their command's own module key too — disabling "Reminders" bot-wide
+/// should stop *every* way to create one, not just the `/remind` command,
+/// or the toggle would be a half-measure a careful admin would reasonably
+/// call a bug.
+fn toolModuleKey(name: []const u8) ?[]const u8 {
+    const Pair = struct { name: []const u8, key: []const u8 };
+    const pairs = [_]Pair{
+        .{ .name = "weather", .key = "weather" },
+        .{ .name = "air_quality", .key = "air_quality" },
+        .{ .name = "crypto_price", .key = "crypto_price" },
+        .{ .name = "qr_code", .key = "qr_code" },
+        .{ .name = "dictionary", .key = "dictionary" },
+        .{ .name = "urban_dictionary", .key = "urban_dictionary" },
+        .{ .name = "hackernews_search", .key = "hackernews" },
+        .{ .name = "scrape_site", .key = "scrape_site" },
+        .{ .name = "web_search", .key = "web_search" },
+        .{ .name = "set_reminder", .key = "reminders" },
+        .{ .name = "set_alert", .key = "alerts" },
+        .{ .name = "begin_file_conversion", .key = "convert" },
+        .{ .name = "convert_file", .key = "convert" },
+    };
+    for (pairs) |p| {
+        if (std.mem.eql(u8, p.name, name)) return p.key;
+    }
+    return null;
+}
+
+/// Filters `tools` against `feature_flags` right before handing them to
+/// the model — the "handing over" moment ARCHITECTURE.md §5 describes,
+/// checked fresh on every turn so a toggle takes effect immediately, no
+/// restart needed. `a` is expected to be the caller's per-message arena
+/// (same convention every other per-message allocation in this function
+/// follows) — falls back to returning `tools` unfiltered on allocation
+/// failure rather than failing the whole reply over a disabled-tools list.
+fn filterEnabledTools(pool: *store_pool.PgPool, a: std.mem.Allocator, tools: []const tool_registry.ToolDef) []const tool_registry.ToolDef {
+    const out = a.alloc(tool_registry.ToolDef, tools.len) catch return tools;
+    var n: usize = 0;
+    for (tools) |t| {
+        const key = toolModuleKey(t.name) orelse {
+            out[n] = t;
+            n += 1;
+            continue;
+        };
+        if (feature_flags.isEnabled(pool, key)) {
+            out[n] = t;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+test "toolModuleKey maps tool names to their feature_flags module key" {
+    try std.testing.expectEqualStrings("weather", toolModuleKey("weather").?);
+    try std.testing.expectEqualStrings("reminders", toolModuleKey("set_reminder").?);
+    try std.testing.expectEqualStrings("convert", toolModuleKey("convert_file").?);
+    try std.testing.expectEqualStrings("convert", toolModuleKey("begin_file_conversion").?);
+    try std.testing.expectEqualStrings("hackernews", toolModuleKey("hackernews_search").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("calculator"));
+    try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("nonexistent_tool"));
+}
+
+test "filterEnabledTools drops only tools whose module is explicitly disabled" {
+    const test_support = @import("store/test_support.zig");
+    var db = try test_support.openTestDb(std.testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try store_pool.PgPool.wrapForTest(std.testing.allocator, std.testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const owner = try identities.getOrCreateMinimal(&pool, .telegram, "1", "owner", null, false, 1000);
+    try feature_flags.setEnabled(&pool, "weather", false, owner);
+
+    const dummy_execute = struct {
+        fn call(ctx: tool_registry.ToolContext, input_json: []const u8) anyerror![]const u8 {
+            _ = ctx;
+            _ = input_json;
+            return "";
+        }
+    }.call;
+
+    const tools = [_]tool_registry.ToolDef{
+        .{ .name = "weather", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "calculator", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "air_quality", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+    };
+
+    // `filterEnabledTools` is documented to expect an arena (its return
+    // value is a shorter sub-slice of its own internal allocation, which
+    // `std.testing.allocator`'s strict tracking can't free directly) --
+    // same convention every per-message call site already uses it under.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const filtered = filterEnabledTools(&pool, arena.allocator(), &tools);
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    try std.testing.expectEqualStrings("calculator", filtered[0].name);
+    try std.testing.expectEqualStrings("air_quality", filtered[1].name);
+}
+
 fn replyWithAnswer(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -3374,7 +3514,8 @@ fn replyWithAnswer(
     }
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, max_tokens_override, history_window);
+    const enabled_tools = filterEnabledTools(pool, a, tools);
+    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, enabled_tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, max_tokens_override, history_window);
 
     // Stop the ticker before touching the placeholder ourselves — it's the
     // sole owner of that Future until this point (see `Future.cancel`'s
@@ -3557,7 +3698,44 @@ fn dynamicEmojiFor(i: usize) []const u8 {
     return dynamic_list_emoji[i % dynamic_list_emoji.len];
 }
 
+/// Maps a menu action's `NodeId` to the `feature_flags` module key that
+/// gates it — `null` for navigation/settings nodes with no toggle.
+/// Checked once at the top of each menu dispatch function below rather
+/// than duplicated per switch arm, since several of these nodes (group
+/// admin actions, `.convert`, the reminder wizard) are real state-changing
+/// actions reachable *only* through `/menu`, entirely separate from the
+/// slash-command dispatch in `handleMessage` — ARCHITECTURE.md §5
+/// explicitly calls out needing both gated, not just the command form.
+fn menuNodeModuleKey(id: menu_tree.NodeId) ?[]const u8 {
+    return switch (id) {
+        .convert => "convert",
+        .reminders_new => "reminders",
+        .group_admin_mute,
+        .group_admin_unmute,
+        .group_admin_pin,
+        .group_admin_unpin,
+        .group_admin_delete,
+        .group_admin_promote,
+        .group_admin_demote,
+        .group_admin_kick,
+        .group_admin_ban,
+        .group_admin_redact_lastn,
+        .group_admin_redact_user,
+        .group_admin_redact_text,
+        .group_admin_redact_regex,
+        => "group_admin",
+        else => null,
+    };
+}
+
+const module_disabled_text = "This feature is currently disabled.";
+
 fn menuPerform(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.Outcome {
+    if (menuNodeModuleKey(id)) |key| {
+        if (!feature_flags.isEnabled(ctx.pool, key)) {
+            return menuSendAndShow(ctx, module_disabled_text, menu_tree.node(id).parent orelse .root);
+        }
+    }
     return switch (id) {
         .alerts_new => menuSendAndShow(ctx, menu_tree.node(id).body, .alerts),
         .watches_new => menuSendAndShow(ctx, menu_tree.node(id).body, .watches),
@@ -3740,6 +3918,11 @@ fn menuPerformDynamicPick(id: menu_tree.NodeId, value: []const u8, ctx: menu.Act
 
 fn menuResumeAwaitingInput(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.Outcome {
     const parent = menu_tree.node(id).parent orelse .root;
+    if (menuNodeModuleKey(id)) |key| {
+        if (!feature_flags.isEnabled(ctx.pool, key)) {
+            return menuSendAndShow(ctx, module_disabled_text, parent);
+        }
+    }
     switch (id) {
         .group_admin_mute => group_admin.mute(ctx.connector, ctx.a, ctx.msg, ctx.now),
         .group_admin_unmute => group_admin.unmute(ctx.connector, ctx.a, ctx.msg),
@@ -3836,6 +4019,14 @@ fn parseUtcOffsetInput(text: []const u8) ?i32 {
 /// today" default the stepper buttons can nudge from).
 fn menuBeginWizard(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.ReminderDraft {
     _ = id;
+    // Deliberately doesn't check `feature_flags` here -- this only builds
+    // an initial draft (`menu.Session`'s own state machine calls this
+    // directly for a `NodeKind.wizard` node, bypassing `menuPerform`
+    // entirely), and this function's return type can't express "refuse, +
+    // show a message" the way `menu.Outcome` can. Letting someone start
+    // filling out a disabled module's wizard is a UX wart, not a real
+    // gap -- `menuFinishWizard` below is where the reminder actually gets
+    // written, and that's where the real gate lives.
     const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.a, ctx.identity_id);
     const local = civil_time.localFromUnix(ctx.now, offset_minutes);
     return .{
@@ -3850,6 +4041,9 @@ fn menuBeginWizard(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.ReminderD
 
 /// `ActionRunner.finishWizard` — the confirm screen's "Create" button.
 fn menuFinishWizard(draft: menu.ReminderDraft, ctx: menu.ActionContext) menu.Outcome {
+    if (!feature_flags.isEnabled(ctx.pool, "reminders")) {
+        return menuSendAndShow(ctx, module_disabled_text, .reminders);
+    }
     if (draft.message.len == 0) {
         ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Reminder message can't be empty.", null);
         return .retry;

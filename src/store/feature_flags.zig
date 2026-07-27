@@ -43,6 +43,55 @@ pub fn setEnabled(pool: *PgPool, module: []const u8, enabled: bool, updated_by: 
     _ = try stmt.step();
 }
 
+pub const ModuleCategory = enum { standalone, llm_tool };
+
+pub const ModuleInfo = struct {
+    /// The exact string passed to `isEnabled`/`setEnabled` — also the
+    /// `feature_flags.module` column value, so this must never be renamed
+    /// without a migration to rewrite any existing rows.
+    key: []const u8,
+    label: []const u8,
+    category: ModuleCategory,
+};
+
+/// Every module this build knows how to toggle — the single source of
+/// truth both `main.zig`'s dispatch gates and the LLM tool-list filter
+/// check their own module key against, and what the admin API's module
+/// list endpoint unions against `listExplicit` to render a complete
+/// on/off list (a module never explicitly toggled has no DB row at all,
+/// per `isEnabled`'s doc comment, but must still appear in the UI).
+/// Matches /home/armin/claude/warden-ui/ARCHITECTURE.md §5's enumeration
+/// exactly — standalone commands get an early-return check in `main.zig`,
+/// LLM-tool-shaped features get filtered out of the tool list handed to
+/// the model instead.
+pub const known_modules = [_]ModuleInfo{
+    .{ .key = "reminders", .label = "Reminders", .category = .standalone },
+    .{ .key = "alerts", .label = "Alerts", .category = .standalone },
+    .{ .key = "watches", .label = "Watches", .category = .standalone },
+    .{ .key = "convert", .label = "Convert", .category = .standalone },
+    .{ .key = "group_admin", .label = "Group Administration", .category = .standalone },
+    .{ .key = "persona", .label = "Persona", .category = .standalone },
+    .{ .key = "digest", .label = "Digest", .category = .standalone },
+    .{ .key = "voice_transcription", .label = "Voice Transcription", .category = .standalone },
+    .{ .key = "menu", .label = "Menu", .category = .standalone },
+    .{ .key = "weather", .label = "Weather", .category = .llm_tool },
+    .{ .key = "crypto_price", .label = "Crypto Prices", .category = .llm_tool },
+    .{ .key = "air_quality", .label = "Air Quality", .category = .llm_tool },
+    .{ .key = "qr_code", .label = "QR Codes", .category = .llm_tool },
+    .{ .key = "dictionary", .label = "Dictionary", .category = .llm_tool },
+    .{ .key = "urban_dictionary", .label = "Urban Dictionary", .category = .llm_tool },
+    .{ .key = "hackernews", .label = "Hacker News", .category = .llm_tool },
+    .{ .key = "web_search", .label = "Web Search", .category = .llm_tool },
+    .{ .key = "scrape_site", .label = "Site Scraping", .category = .llm_tool },
+};
+
+pub fn isKnownModule(key: []const u8) bool {
+    for (known_modules) |m| {
+        if (std.mem.eql(u8, m.key, key)) return true;
+    }
+    return false;
+}
+
 pub const Flag = struct {
     module: []const u8,
     enabled: bool,

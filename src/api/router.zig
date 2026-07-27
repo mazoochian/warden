@@ -15,6 +15,7 @@ const accounts = @import("../store/accounts.zig");
 const identities = @import("../store/identities.zig");
 const bot_admins = @import("../store/bot_admins.zig");
 const admin_directory = @import("../store/admin_directory.zig");
+const feature_flags = @import("../store/feature_flags.zig");
 const audit_log = @import("../store/audit_log.zig");
 const telegram_login = @import("telegram_login.zig");
 /// The bot's own permission-ladder module (owner check) -- aliased since
@@ -31,6 +32,7 @@ const telegram_login_max_age_seconds: i64 = 24 * 3600;
 const me_sessions_prefix = "/api/v1/me/sessions/";
 const admin_chats_prefix = "/api/v1/admin/chats/";
 const admin_identities_prefix = "/api/v1/admin/identities/";
+const admin_modules_prefix = "/api/v1/admin/modules/";
 
 /// Default/max page size, matching `API.md`'s pagination convention.
 const default_page_limit: i64 = 50;
@@ -92,6 +94,12 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .GET and std.mem.startsWith(u8, path, admin_identities_prefix)) {
         return handleAdminGetIdentity(ctx, request, path[admin_identities_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/modules")) {
+        return handleAdminListModules(ctx, request);
+    }
+    if (method == .PATCH and std.mem.startsWith(u8, path, admin_modules_prefix)) {
+        return handleAdminSetModule(ctx, request, path[admin_modules_prefix.len..]);
     }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
@@ -530,6 +538,60 @@ fn handleAdminGetIdentity(ctx: *const ServerContext, request: *http.Server.Reque
     }
 
     return respondJson(ctx, request, .ok, detail);
+}
+
+/// `GET /api/v1/admin/modules` — `known_modules` unioned with whatever's
+/// been explicitly toggled in `feature_flags` (a module never touched has
+/// no row and defaults to enabled, per `feature_flags.isEnabled`'s doc
+/// comment).
+fn handleAdminListModules(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    const explicit = feature_flags.listExplicit(ctx.pool, ctx.allocator) catch |err| {
+        log.err("admin-list-modules: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load modules");
+    };
+    defer {
+        for (explicit) |f| ctx.allocator.free(f.module);
+        ctx.allocator.free(explicit);
+    }
+
+    const Item = struct { key: []const u8, label: []const u8, category: feature_flags.ModuleCategory, enabled: bool };
+    var items: [feature_flags.known_modules.len]Item = undefined;
+    for (feature_flags.known_modules, 0..) |m, i| {
+        var enabled = true;
+        for (explicit) |f| {
+            if (std.mem.eql(u8, f.module, m.key)) {
+                enabled = f.enabled;
+                break;
+            }
+        }
+        items[i] = .{ .key = m.key, .label = m.label, .category = m.category, .enabled = enabled };
+    }
+
+    return respondJson(ctx, request, .ok, .{ .items = items[0..] });
+}
+
+/// `PATCH /api/v1/admin/modules/:module` — body `{"enabled": bool}`.
+fn handleAdminSetModule(ctx: *const ServerContext, request: *http.Server.Request, module: []const u8) !void {
+    const account_id = (try requireAdmin(ctx, request)) orelse return;
+
+    if (!feature_flags.isKnownModule(module)) {
+        return respondError(request, .not_found, "not_found", "no such module");
+    }
+
+    const Body = struct { enabled: bool };
+    const body = readJsonBody(ctx, request, Body) catch {
+        return respondError(request, .bad_request, "bad_request", "expected {\"enabled\": <bool>}");
+    };
+
+    feature_flags.setEnabled(ctx.pool, module, body.enabled, account_id) catch |err| {
+        log.err("admin-set-module: failed to set {s}={} : {t}", .{ module, body.enabled, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update module");
+    };
+    audit_log.record(ctx.pool, account_id, "module.set", module, if (body.enabled) "{\"enabled\":true}" else "{\"enabled\":false}");
+
+    return respondJson(ctx, request, .ok, .{});
 }
 
 /// `user_agent` must have been captured by the caller *before* it read the
