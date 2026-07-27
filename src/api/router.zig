@@ -653,10 +653,13 @@ fn handleAdminListConfig(ctx: *const ServerContext, request: *http.Server.Reques
 
     try addSecret(&entries, ctx.allocator, "WARDEN_TELEGRAM_BOT_TOKEN", "Telegram bot token", ctx.config.telegram_bot_token);
     try addSecret(&entries, ctx.allocator, "WARDEN_POSTGRES_DSN", "Postgres connection string", ctx.config.postgres_dsn);
-    switch (ctx.config.llm) {
-        .anthropic => |c| try addSecret(&entries, ctx.allocator, "WARDEN_ANTHROPIC_API_KEY", "Anthropic API key", c.api_key),
-        .openai_compat => |c| try addSecret(&entries, ctx.allocator, "WARDEN_OPENAI_API_KEY", "OpenAI-compatible API key", c.api_key),
-    }
+    // Both, not just whichever `config.llm` selected as the startup
+    // default -- `WARDEN_LLM_PROVIDER` is hot-swappable now (see
+    // `llm/dynamic_provider.zig`), so an admin switching providers needs
+    // to see confirmation *both* keys are set, not just the one active
+    // when the process started.
+    if (ctx.config.llm_anthropic) |c| try addSecret(&entries, ctx.allocator, "WARDEN_ANTHROPIC_API_KEY", "Anthropic API key", c.api_key);
+    if (ctx.config.llm_openai_compat) |c| try addSecret(&entries, ctx.allocator, "WARDEN_OPENAI_API_KEY", "OpenAI-compatible API key", c.api_key);
     if (ctx.config.matrix) |m| try addSecret(&entries, ctx.allocator, "WARDEN_MATRIX_ACCESS_TOKEN", "Matrix access token", m.access_token);
     if (ctx.config.xmpp) |x| try addSecret(&entries, ctx.allocator, "WARDEN_XMPP_PASSWORD", "XMPP password", x.password);
     if (ctx.config.matrix_pickle_key) |k| try addSecret(&entries, ctx.allocator, "WARDEN_MATRIX_PICKLE_KEY", "Matrix E2EE pickle key", k);
@@ -705,6 +708,7 @@ fn defaultForKnownKey(a: std.mem.Allocator, config: *const config_mod.Config, ke
     if (std.mem.eql(u8, key, "WARDEN_LLM_MAX_TOKENS")) return std.fmt.allocPrint(a, "{d}", .{config.llm_max_tokens_override orelse 0});
     if (std.mem.eql(u8, key, "WARDEN_LLM_HISTORY_MESSAGES")) return std.fmt.allocPrint(a, "{d}", .{config.llm_history_messages});
     if (std.mem.eql(u8, key, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES")) return std.fmt.allocPrint(a, "{}", .{config.skip_trivial_messages});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_PROVIDER")) return a.dupe(u8, if (config.llm == .openai_compat) "openai_compat" else "anthropic");
     return a.dupe(u8, "");
 }
 
@@ -740,9 +744,27 @@ fn handleAdminSetConfig(ctx: *const ServerContext, request: *http.Server.Request
         .bool => std.ascii.eqlIgnoreCase(body.value, "true") or std.mem.eql(u8, body.value, "1") or
             std.ascii.eqlIgnoreCase(body.value, "false") or std.mem.eql(u8, body.value, "0"),
         .i64 => (std.fmt.parseInt(i64, body.value, 10) catch null) != null,
+        .string => true,
     };
     if (!valid) {
         return respondError(request, .bad_request, "bad_request", "value doesn't match this key's expected type");
+    }
+
+    // WARDEN_LLM_PROVIDER specifically: only a provider that actually has
+    // credentials configured is a real value to switch to -- see
+    // `llm/dynamic_provider.zig`'s doc comment for why "accept anything,
+    // let the runtime silently fall back" would be worse than rejecting
+    // the write up front with a clear reason.
+    if (std.mem.eql(u8, key, "WARDEN_LLM_PROVIDER")) {
+        const configured = if (std.mem.eql(u8, body.value, "anthropic"))
+            ctx.config.llm_anthropic != null
+        else if (std.mem.eql(u8, body.value, "openai_compat"))
+            ctx.config.llm_openai_compat != null
+        else
+            false;
+        if (!configured) {
+            return respondError(request, .bad_request, "bad_request", "must be \"anthropic\" or \"openai_compat\", and that provider must have credentials configured");
+        }
     }
 
     dynamic_config.set(ctx.pool, key, body.value, account_id) catch |err| {
@@ -962,6 +984,7 @@ test "defaultForKnownKey formats every known key's env-sourced default" {
         .{ .key = "WARDEN_LLM_MAX_TOKENS", .expected = "0" },
         .{ .key = "WARDEN_LLM_HISTORY_MESSAGES", .expected = "20" },
         .{ .key = "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", .expected = "true" },
+        .{ .key = "WARDEN_LLM_PROVIDER", .expected = "anthropic" },
     };
     for (cases) |c| {
         const got = try defaultForKnownKey(a, &config, c.key);

@@ -56,6 +56,7 @@ const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
 const qa = @import("features/qa.zig");
+const dynamic_provider_mod = @import("llm/dynamic_provider.zig");
 const toolcall = @import("llm/toolcall.zig");
 const tool_registry = @import("tools/registry.zig");
 const group_admin = @import("features/group_admin.zig");
@@ -359,22 +360,43 @@ pub fn main(init: std.process.Init) !void {
     var menu_sessions = menu.Sessions.init(gpa, io, config.menu_timeout_seconds);
     defer menu_sessions.deinit();
 
-    // Heap-allocated: whichever variant isn't selected never gets
-    // constructed, and the process-lifetime singleton is fine to leave for
-    // the OS to reclaim on exit rather than threading a deinit through
-    // both branches here.
-    const llm_provider: llm.Provider = switch (config.llm) {
-        .anthropic => |a| blk: {
-            const p = try gpa.create(AnthropicProvider);
-            p.* = AnthropicProvider.init(gpa, io, a.api_key, a.model);
-            break :blk p.provider();
-        },
-        .openai_compat => |o| blk: {
-            const p = try gpa.create(OpenAiCompatProvider);
-            p.* = OpenAiCompatProvider.init(gpa, io, o.base_url, o.api_key, o.model);
-            break :blk p.provider();
-        },
+    // Heap-allocated, process-lifetime singletons -- fine to leave for the
+    // OS to reclaim on exit rather than threading a deinit through here.
+    // Unlike before `WARDEN_LLM_PROVIDER` became hot-swappable, *both*
+    // providers get constructed whenever both have credentials (not just
+    // whichever `config.llm` selected as the startup default) -- see
+    // `config.zig`'s `Config.llm_anthropic`/`Config.llm_openai_compat`
+    // doc comments for why, and `llm/dynamic_provider.zig` for the
+    // wrapper that actually does the per-call re-resolution.
+    var anthropic_provider: ?llm.Provider = null;
+    if (config.llm_anthropic) |a| {
+        const p = try gpa.create(AnthropicProvider);
+        p.* = AnthropicProvider.init(gpa, io, a.api_key, a.model);
+        anthropic_provider = p.provider();
+    }
+    var openai_provider: ?llm.Provider = null;
+    if (config.llm_openai_compat) |o| {
+        const p = try gpa.create(OpenAiCompatProvider);
+        p.* = OpenAiCompatProvider.init(gpa, io, o.base_url, o.api_key, o.model);
+        openai_provider = p.provider();
+    }
+    // `Config.load` already guarantees at least one of the two above
+    // exists (same "fails if neither is configured" contract as before
+    // this refactor) -- `config.llm`'s active tag tells us which one to
+    // treat as the fallback/default, and it's always the one that was
+    // just constructed for that tag, never null here.
+    const default_provider_name: []const u8 = if (config.llm == .openai_compat) "openai_compat" else "anthropic";
+    const fallback_provider = if (config.llm == .openai_compat) openai_provider.? else anthropic_provider.?;
+
+    const dynamic_provider = try gpa.create(dynamic_provider_mod.DynamicLlmProvider);
+    dynamic_provider.* = .{
+        .pool = &pool,
+        .anthropic = anthropic_provider,
+        .openai_compat = openai_provider,
+        .fallback = fallback_provider,
+        .default_provider_name = default_provider_name,
     };
+    const llm_provider: llm.Provider = dynamic_provider.provider();
 
     log.info("warden started, {d} connector(s), {d} owner(s) configured", .{ connectors.len, config.owners.len });
 
@@ -4192,6 +4214,7 @@ test {
     _ = @import("api/server.zig");
     _ = @import("api/telegram_login.zig");
     _ = @import("store/admin_directory.zig");
+    _ = @import("llm/dynamic_provider.zig");
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
     _ = @import("features/qa.zig");

@@ -99,7 +99,24 @@ pub const Config = struct {
     workers_per_platform: usize,
     /// Per-chat message retention: keep only the most recent N messages.
     retention_messages: i64,
+    /// Whichever provider `WARDEN_LLM_PROVIDER` selected at startup — the
+    /// default `llm/dynamic_provider.zig` falls back to, and what
+    /// `api/router.zig`'s config-display endpoint reads to decide which
+    /// secret field to show. NOT necessarily what's actually in use on any
+    /// given call once `dynamic_config`'s `WARDEN_LLM_PROVIDER` override
+    /// exists — see `llm_anthropic`/`llm_openai_compat` below.
     llm: LlmConfig,
+    /// Both loaded independently, whichever credentials are present in
+    /// env (unlike `llm` above, which is a tagged union holding only the
+    /// one selected at startup) — `null` for a provider whose required
+    /// env vars weren't set. `Config.load` fails only if *neither* loads,
+    /// same as before this pair of fields existed. Populating both
+    /// (when both are configured) is what makes `WARDEN_LLM_PROVIDER`
+    /// genuinely hot-swappable via `dynamic_config`: swapping to a
+    /// provider whose credentials were never loaded here would have
+    /// nothing to swap *to*.
+    llm_anthropic: ?AnthropicConfig = null,
+    llm_openai_compat: ?OpenAiCompatConfig = null,
     /// How long a ban/kick confirmation stays valid before expiring.
     confirm_timeout_seconds: i64,
     /// How long a pending interactive /convert flow (waiting for a file
@@ -283,7 +300,7 @@ pub const Config = struct {
         else
             default_retention_messages;
 
-        const llm = try loadLlmConfig(env);
+        const llm_loaded = try loadLlmConfig(env);
 
         const confirm_timeout_seconds: i64 = if (env.get("WARDEN_CONFIRM_TIMEOUT_SECONDS")) |raw|
             std.fmt.parseInt(i64, raw, 10) catch default_confirm_timeout_seconds
@@ -375,7 +392,9 @@ pub const Config = struct {
             .postgres_statement_timeout_seconds = postgres_statement_timeout_seconds,
             .workers_per_platform = workers_per_platform,
             .retention_messages = retention_messages,
-            .llm = llm,
+            .llm = llm_loaded.active,
+            .llm_anthropic = llm_loaded.anthropic,
+            .llm_openai_compat = llm_loaded.openai_compat,
             .confirm_timeout_seconds = confirm_timeout_seconds,
             .convert_timeout_seconds = convert_timeout_seconds,
             .menu_timeout_seconds = menu_timeout_seconds,
@@ -500,24 +519,44 @@ pub const Config = struct {
         };
     }
 
-    fn loadLlmConfig(env: *const std.process.Environ.Map) LoadError!LlmConfig {
-        const provider_name = env.get("WARDEN_LLM_PROVIDER") orelse "anthropic";
+    const LoadedLlmConfig = struct {
+        active: LlmConfig,
+        anthropic: ?AnthropicConfig,
+        openai_compat: ?OpenAiCompatConfig,
+    };
 
-        if (std.mem.eql(u8, provider_name, "openai_compat")) {
-            const base_url = env.get("WARDEN_OPENAI_BASE_URL") orelse return error.MissingLlmConfig;
-            return .{ .openai_compat = .{
-                .base_url = base_url,
-                .api_key = env.get("WARDEN_OPENAI_API_KEY") orelse "",
-                .model = env.get("WARDEN_OPENAI_MODEL") orelse "llama3",
-            } };
-        }
-
-        // Default: anthropic.
-        const api_key = env.get("WARDEN_ANTHROPIC_API_KEY") orelse return error.MissingLlmConfig;
-        return .{ .anthropic = .{
+    /// Loads *both* providers' credentials independently, whichever are
+    /// present in env — not just the one `WARDEN_LLM_PROVIDER` selects —
+    /// so `llm/dynamic_provider.zig` has something to hot-swap *to*. Fails
+    /// only if neither is configured; picking which one becomes `active`
+    /// (the startup default) has the exact same precedence/fallback
+    /// behavior this function had before `llm_anthropic`/`llm_openai_compat`
+    /// existed, so a single-provider deployment's behavior is unchanged.
+    fn loadLlmConfig(env: *const std.process.Environ.Map) LoadError!LoadedLlmConfig {
+        const anthropic: ?AnthropicConfig = if (env.get("WARDEN_ANTHROPIC_API_KEY")) |api_key| .{
             .api_key = api_key,
             .model = env.get("WARDEN_ANTHROPIC_MODEL") orelse "claude-sonnet-5",
-        } };
+        } else null;
+
+        const openai_compat: ?OpenAiCompatConfig = if (env.get("WARDEN_OPENAI_BASE_URL")) |base_url| .{
+            .base_url = base_url,
+            .api_key = env.get("WARDEN_OPENAI_API_KEY") orelse "",
+            .model = env.get("WARDEN_OPENAI_MODEL") orelse "llama3",
+        } else null;
+
+        // Selection logic here is byte-for-byte the same decision this
+        // function made before `llm_anthropic`/`llm_openai_compat` existed
+        // (explicitly selecting a provider with missing credentials is
+        // still a hard `error.MissingLlmConfig`, no silent cross-provider
+        // fallback) — only the *loading* changed, to also capture whatever
+        // the other provider's env vars hold, if any.
+        const provider_name = env.get("WARDEN_LLM_PROVIDER") orelse "anthropic";
+        const active: LlmConfig = if (std.mem.eql(u8, provider_name, "openai_compat"))
+            LlmConfig{ .openai_compat = openai_compat orelse return error.MissingLlmConfig }
+        else
+            LlmConfig{ .anthropic = anthropic orelse return error.MissingLlmConfig };
+
+        return .{ .active = active, .anthropic = anthropic, .openai_compat = openai_compat };
     }
 
     pub const max_system_prompt_bytes = 64 * 1024;

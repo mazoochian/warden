@@ -141,7 +141,7 @@ pub fn unset(pool: *PgPool, key: []const u8) !void {
     _ = try stmt.step();
 }
 
-pub const ValueKind = enum { bool, i64 };
+pub const ValueKind = enum { bool, i64, string };
 
 pub const KnownKey = struct {
     key: []const u8,
@@ -165,6 +165,11 @@ pub const known_keys = [_]KnownKey{
     .{ .key = "WARDEN_LLM_MAX_TOKENS", .label = "LLM max tokens override (0 = none)", .kind = .i64 },
     .{ .key = "WARDEN_LLM_HISTORY_MESSAGES", .label = "LLM conversation history window", .kind = .i64 },
     .{ .key = "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", .label = "Skip LLM call for trivial messages", .kind = .bool },
+    // "anthropic" or "openai_compat" only, and only one actually
+    // configured with credentials -- validated in api/router.zig's
+    // handleAdminSetConfig (needs live Config access this module doesn't
+    // have), not here. See llm/dynamic_provider.zig for the runtime side.
+    .{ .key = "WARDEN_LLM_PROVIDER", .label = "Active LLM provider", .kind = .string },
 };
 
 pub fn findKnownKey(key: []const u8) ?KnownKey {
