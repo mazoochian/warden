@@ -29,6 +29,8 @@ const alert_store = @import("../store/alerts.zig");
 const feed_watches = @import("../store/feed_watches.zig");
 const group_admin = @import("../features/group_admin.zig");
 const redact_feature = @import("../features/redact.zig");
+const convert_feature = @import("../features/convert.zig");
+const multipart = @import("multipart.zig");
 const audit_log = @import("../store/audit_log.zig");
 const telegram_login = @import("telegram_login.zig");
 /// The bot's own permission-ladder module (owner check) -- aliased since
@@ -196,6 +198,9 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .DELETE and std.mem.startsWith(u8, path, watches_prefix)) {
         return handleDeleteWatch(ctx, request, path[watches_prefix.len..]);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/convert")) {
+        return handleConvert(ctx, request);
     }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
@@ -1561,6 +1566,156 @@ fn handleChatActionRedact(ctx: *const ServerContext, request: *http.Server.Reque
 
     audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.redact", id_str, null);
     return respondJson(ctx, request, .ok, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Convert (Phase 5c) — not chat-scoped at all, unlike everything above:
+// `features/convert.zig`'s `convert()` is a stateless file-in/file-out
+// utility with no chat/persistence side effects, same as `tools/
+// convert_file.zig`'s LLM-tool wrapper around it. Just needs a login and
+// the `convert` module enabled, matching `/convert`'s own gate.
+// ---------------------------------------------------------------------------
+
+/// Matches `features/convert.zig`'s own extension tables — used only to
+/// pick a `Content-Type` for the response; `result.file_name` is always
+/// `"converted" + one of those known extensions` (see `convert()`'s doc
+/// comment), never attacker-influenced, since any target format that
+/// doesn't match a known extension is rejected by `convert()` itself
+/// before a file_name is ever constructed.
+fn mimeTypeForExt(ext: []const u8) []const u8 {
+    const Entry = struct { ext: []const u8, mime: []const u8 };
+    const table = [_]Entry{
+        .{ .ext = ".txt", .mime = "text/plain" },
+        .{ .ext = ".md", .mime = "text/markdown" },
+        .{ .ext = ".html", .mime = "text/html" },
+        .{ .ext = ".htm", .mime = "text/html" },
+        .{ .ext = ".docx", .mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" },
+        .{ .ext = ".odt", .mime = "application/vnd.oasis.opendocument.text" },
+        .{ .ext = ".rtf", .mime = "application/rtf" },
+        .{ .ext = ".pdf", .mime = "application/pdf" },
+        .{ .ext = ".jpg", .mime = "image/jpeg" },
+        .{ .ext = ".jpeg", .mime = "image/jpeg" },
+        .{ .ext = ".png", .mime = "image/png" },
+        .{ .ext = ".webp", .mime = "image/webp" },
+        .{ .ext = ".gif", .mime = "image/gif" },
+        .{ .ext = ".bmp", .mime = "image/bmp" },
+        .{ .ext = ".tiff", .mime = "image/tiff" },
+        .{ .ext = ".mp3", .mime = "audio/mpeg" },
+        .{ .ext = ".wav", .mime = "audio/wav" },
+        .{ .ext = ".ogg", .mime = "audio/ogg" },
+        .{ .ext = ".opus", .mime = "audio/opus" },
+        .{ .ext = ".flac", .mime = "audio/flac" },
+        .{ .ext = ".aac", .mime = "audio/aac" },
+        .{ .ext = ".m4a", .mime = "audio/mp4" },
+        .{ .ext = ".mp4", .mime = "video/mp4" },
+        .{ .ext = ".webm", .mime = "video/webm" },
+        .{ .ext = ".mov", .mime = "video/quicktime" },
+        .{ .ext = ".mkv", .mime = "video/x-matroska" },
+        .{ .ext = ".avi", .mime = "video/x-msvideo" },
+    };
+    for (table) |e| {
+        if (std.ascii.eqlIgnoreCase(e.ext, ext)) return e.mime;
+    }
+    return "application/octet-stream";
+}
+
+fn respondFile(request: *http.Server.Request, status: http.Status, content_type: []const u8, filename: []const u8, bytes: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const disposition = std.fmt.bufPrint(&buf, "attachment; filename=\"{s}\"", .{filename}) catch "attachment";
+    try request.respond(bytes, .{
+        .status = status,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = content_type },
+            .{ .name = "content-disposition", .value = disposition },
+        },
+    });
+}
+
+/// Max total request body (multipart headers/boundary overhead plus the
+/// file itself) -- matches `convert()`'s own 50MB cap on reading back the
+/// converted output, plus a little headroom for multipart framing.
+const max_convert_upload_bytes: usize = 51 * 1024 * 1024;
+
+/// `POST /api/v1/convert` -- multipart with a `file` part (needs a
+/// `filename`) and a `target_format` text field; synchronous response is
+/// the converted file's bytes, same "one-shot, no interactive flow" shape
+/// as `/convert <format>` used as a caption (see API.md).
+fn handleConvert(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "convert")) {
+        return respondError(request, .forbidden, "forbidden", "the convert module is disabled");
+    }
+
+    const content_type = findHeader(request, "content-type") orelse {
+        return respondError(request, .bad_request, "bad_request", "missing content-type header");
+    };
+    const boundary = multipart.boundaryFromContentType(content_type) orelse {
+        return respondError(request, .bad_request, "bad_request", "expected a multipart/form-data body");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [16 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(max_convert_upload_bytes)) catch {
+        return respondError(request, .payload_too_large, "payload_too_large", "upload too large (max 50MB)");
+    };
+
+    const parts = multipart.parse(arena, raw, boundary) catch {
+        return respondError(request, .bad_request, "bad_request", "malformed multipart body");
+    };
+
+    const file_part = multipart.find(parts, "file") orelse {
+        return respondError(request, .bad_request, "bad_request", "missing a \"file\" part");
+    };
+    const filename = file_part.filename orelse {
+        return respondError(request, .bad_request, "bad_request", "the \"file\" part needs a filename");
+    };
+    const format_part = multipart.find(parts, "target_format") orelse {
+        return respondError(request, .bad_request, "bad_request", "missing a \"target_format\" field");
+    };
+
+    const source_ext = convert_feature.extensionOf(filename);
+    if (source_ext.len == 0 or source_ext.len > 10 or std.mem.indexOfAny(u8, source_ext, "/\\") != null) {
+        return respondError(request, .bad_request, "bad_request", "the uploaded file needs a plain extension");
+    }
+
+    Io.Dir.cwd().createDirPath(ctx.io, ctx.config.tmp_dir) catch |err| {
+        log.err("convert: failed to create tmp_dir {s}: {t}", .{ ctx.config.tmp_dir, err });
+        return respondError(request, .internal_server_error, "internal", "failed to stage upload");
+    };
+    const now_ns = Io.Timestamp.now(ctx.io, .real).toNanoseconds();
+    const upload_path = try std.fmt.allocPrint(arena, "{s}/api_upload_{d}{s}", .{ ctx.config.tmp_dir, now_ns, source_ext });
+
+    {
+        var file = Io.Dir.cwd().createFile(ctx.io, upload_path, .{}) catch |err| {
+            log.err("convert: failed to create upload temp file {s}: {t}", .{ upload_path, err });
+            return respondError(request, .internal_server_error, "internal", "failed to stage upload");
+        };
+        defer file.close(ctx.io);
+        var w = file.writer(ctx.io, &.{});
+        w.interface.writeAll(file_part.content) catch |err| {
+            log.err("convert: failed to write upload temp file {s}: {t}", .{ upload_path, err });
+            return respondError(request, .internal_server_error, "internal", "failed to stage upload");
+        };
+        w.interface.flush() catch {};
+    }
+    defer Io.Dir.cwd().deleteFile(ctx.io, upload_path) catch {};
+
+    const result = convert_feature.convert(arena, ctx.io, ctx.config.tmp_dir, upload_path, format_part.content) catch |err| {
+        return switch (err) {
+            error.UnsupportedTargetFormat => respondError(request, .bad_request, "bad_request", "that target format isn't supported"),
+            error.UnsupportedConversion => respondError(request, .bad_request, "bad_request", "can't convert between those two formats"),
+            error.ConversionFailed => respondError(request, .internal_server_error, "internal", "conversion failed -- the file may be corrupt or unsupported"),
+            else => err,
+        };
+    };
+
+    audit_log.record(ctx.pool, ra.account_id, "convert", filename, null);
+
+    return respondFile(request, .ok, mimeTypeForExt(convert_feature.extensionOf(result.file_name)), result.file_name, result.bytes);
 }
 
 // ---------------------------------------------------------------------------
