@@ -4214,7 +4214,6 @@ test {
     _ = @import("api/multipart.zig");
     _ = @import("api/oidc.zig");
     _ = @import("api/server.zig");
-    _ = @import("api/telegram_login.zig");
     _ = @import("store/admin_directory.zig");
     _ = @import("llm/dynamic_provider.zig");
     _ = @import("store/stats.zig");

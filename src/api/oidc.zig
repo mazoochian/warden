@@ -1,9 +1,9 @@
 //! Generic OIDC login (Authorization Code + PKCE, ES256-signed ID tokens)
-//! — backs `oauth_providers` rows (see that store module's doc comment for
-//! why this is separate from the Telegram Login Widget in
-//! `telegram_login.zig`, which is a different, older, HMAC-signed
-//! mechanism Telegram now describes as legacy/archived in favor of this
-//! one: https://core.telegram.org/bots/telegram-login).
+//! — backs `oauth_providers` rows. Telegram's own OIDC provider
+//! (https://core.telegram.org/bots/telegram-login) is the one production
+//! use of this today; it replaced the old HMAC-signed Telegram Login
+//! Widget outright (removed 2026-07-28), which Telegram itself now
+//! describes as legacy/archived in favor of this.
 //!
 //! Only ES256 (ECDSA P-256 + SHA-256) is supported, not the RS256 most
 //! OIDC providers default to -- Zig's standard library has no RSA
@@ -124,8 +124,7 @@ pub const VerifyError = error{
 /// ES256 signature against one of `jwks`'s keys (matched by `kid`), plus
 /// `iss`/`aud`/`exp`/`iat` per the OIDC core spec. `allocator` should be
 /// an arena. `clock_skew_seconds` gives `exp`/`iat` a little slack for
-/// clock drift between this host and the provider, same reasoning as
-/// `telegram_login.zig`'s `max_age_seconds`.
+/// clock drift between this host and the provider.
 pub fn verifyIdToken(
     allocator: std.mem.Allocator,
     id_token: []const u8,

@@ -32,7 +32,6 @@ const redact_feature = @import("../features/redact.zig");
 const convert_feature = @import("../features/convert.zig");
 const multipart = @import("multipart.zig");
 const audit_log = @import("../store/audit_log.zig");
-const telegram_login = @import("telegram_login.zig");
 /// The bot's own permission-ladder module (owner check) -- aliased since
 /// `auth` above already names this file's own session-token module
 /// (`api/auth.zig`).
@@ -42,11 +41,6 @@ const oidc = @import("oidc.zig");
 const http_util = @import("../http_util.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const log = @import("../log.zig").scoped("api");
-
-/// Telegram re-issues `auth_date` on every widget load; anything older than
-/// this is treated as a captured/replayed payload rather than a
-/// legitimately slow page load.
-const telegram_login_max_age_seconds: i64 = 24 * 3600;
 
 const me_sessions_prefix = "/api/v1/me/sessions/";
 const oidc_auth_prefix = "/api/v1/auth/oidc/";
@@ -98,9 +92,6 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/auth/providers")) {
         return handleGetProviders(ctx, request);
-    }
-    if (method == .POST and std.mem.eql(u8, path, "/api/v1/auth/telegram/callback")) {
-        return handleTelegramCallback(ctx, request);
     }
     if (method == .GET and std.mem.startsWith(u8, path, oidc_auth_prefix)) {
         const rest = path[oidc_auth_prefix.len..];
@@ -277,11 +268,16 @@ fn handleGetSession(ctx: *const ServerContext, request: *http.Server.Request) !v
 /// actually configured server-side (see API.md). Google/generic OIDC
 /// aren't wired up yet (Phase 1 in progress), so those always come back
 /// empty for now.
+/// The Telegram Login Widget (HMAC-signed, `telegram_login.zig`) is gone
+/// as of 2026-07-28 -- Telegram itself now describes it as legacy/
+/// archived in favor of the real OIDC provider `oidc.zig` implements (see
+/// https://core.telegram.org/bots/telegram-login), and once that was
+/// live and confirmed working there was no reason to keep a second,
+/// weaker login path around. `google` stays for API-shape compatibility
+/// with what warden-ui's `Providers` type already expects.
 fn handleGetProviders(ctx: *const ServerContext, request: *http.Server.Request) !void {
-    const TelegramProvider = struct { bot_username: []const u8 };
     const OidcProvider = struct { id: []const u8, name: []const u8 };
     const Response = struct {
-        telegram: ?TelegramProvider,
         google: ?struct {} = null,
         oidc: []const OidcProvider = &.{},
     };
@@ -299,64 +295,16 @@ fn handleGetProviders(ctx: *const ServerContext, request: *http.Server.Request) 
         oidc_items[i] = .{ .id = try std.fmt.allocPrint(arena, "{d}", .{p.id}), .name = p.name };
     }
 
-    return respondJson(ctx, request, .ok, Response{
-        .telegram = if (ctx.config.telegram_bot_username) |username|
-            TelegramProvider{ .bot_username = username }
-        else
-            null,
-        .oidc = oidc_items,
-    });
+    return respondJson(ctx, request, .ok, Response{ .oidc = oidc_items });
 }
 
-/// `POST /api/v1/auth/telegram/callback` — see API.md and
-/// `ARCHITECTURE.md` §3.1/§3.3. Body: the Telegram Login Widget's own
-/// returned fields (`telegram_login.Payload`). Verifies `hash`, resolves
-/// straight to the bot's existing `identities` row for that Telegram user
-/// (no linking step needed — see §3.3 for why this is the one login
-/// method that doesn't need a fresh `identities` row most of the time),
-/// finds-or-creates the linked `accounts` row, issues a session.
-fn handleTelegramCallback(ctx: *const ServerContext, request: *http.Server.Request) !void {
-    // Must happen before any body read below -- `iterateHeaders` asserts
-    // the reader is still in its post-head, pre-body state (see
-    // `issueSessionAndRespond`'s doc comment for the crash this caused
-    // before user-agent capture was moved here).
-    const user_agent = findHeader(request, "user-agent");
-
-    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var buf: [8 * 1024]u8 = undefined;
-    const reader = request.readerExpectNone(&buf);
-    const raw = reader.allocRemaining(arena, .limited(8 * 1024)) catch {
-        return respondError(request, .bad_request, "bad_request", "failed to read body");
-    };
-    const payload = std.json.parseFromSliceLeaky(telegram_login.Payload, arena, raw, .{}) catch {
-        return respondError(request, .bad_request, "bad_request", "invalid telegram login payload");
-    };
-
-    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
-    const ok = telegram_login.verify(ctx.allocator, payload, ctx.config.telegram_bot_token, now, telegram_login_max_age_seconds) catch |err| {
-        log.err("telegram-login: verify errored: {t}", .{err});
-        return respondError(request, .internal_server_error, "internal", "failed to verify login");
-    };
-    if (!ok) {
-        return respondError(request, .unauthorized, "invalid_login", "telegram login verification failed");
-    }
-
-    var id_buf: [20]u8 = undefined;
-    const native_id = std.fmt.bufPrint(&id_buf, "{d}", .{payload.id}) catch unreachable;
-
-    const account_id = (try resolveOrCreateAccountForLogin(ctx, request, .telegram, native_id, payload.first_name, payload.username, payload.photo_url, now)) orelse return;
-
-    return issueSessionAndRespond(ctx, request, account_id, user_agent);
-}
-
-/// Resolves (or creates) the warden account for a verified external login
-/// -- shared by every login mechanism (the Telegram Login Widget above,
-/// and the OIDC callback below) so "how a verified external identity
-/// becomes a warden account" has exactly one implementation. `null` means
-/// a response was already sent.
+/// Resolves (or creates) the warden account for a verified external login.
+/// Only the OIDC callback below calls this today (the older Telegram
+/// Login Widget that used to share it was removed 2026-07-28 in favor of
+/// OIDC), but this stays its own function rather than getting inlined --
+/// "how a verified external identity becomes a warden account" is exactly
+/// the kind of thing a future second login mechanism would need again
+/// unchanged. `null` means a response was already sent.
 fn resolveOrCreateAccountForLogin(
     ctx: *const ServerContext,
     request: *http.Server.Request,
