@@ -24,6 +24,9 @@ const chat_members = @import("../store/chat_members.zig");
 const chat_settings = @import("../store/chat_settings.zig");
 const user_settings = @import("../store/user_settings.zig");
 const civil_time = @import("../text/civil_time.zig");
+const reminders = @import("../store/reminders.zig");
+const alert_store = @import("../store/alerts.zig");
+const feed_watches = @import("../store/feed_watches.zig");
 const audit_log = @import("../store/audit_log.zig");
 const telegram_login = @import("telegram_login.zig");
 /// The bot's own permission-ladder module (owner check) -- aliased since
@@ -45,6 +48,15 @@ const admin_config_prefix = "/api/v1/admin/config/";
 const chats_prefix = "/api/v1/chats/";
 const chat_settings_suffix = "/settings";
 const chat_members_suffix = "/members";
+const reminders_prefix = "/api/v1/reminders/";
+const alerts_prefix = "/api/v1/alerts/";
+const watches_prefix = "/api/v1/watches/";
+
+/// Reminder-message length cap -- mirrors `main.zig`'s own
+/// `max_reminder_message_len` for `/remind` (kept as a separate constant
+/// since `main.zig` is the one that imports this file, not the other way
+/// around -- importing it back here would be circular).
+const max_reminder_message_len = 500;
 
 /// Default/max page size, matching `API.md`'s pagination convention.
 const default_page_limit: i64 = 50;
@@ -139,6 +151,33 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     if (std.mem.eql(u8, path, "/api/v1/me/settings")) {
         if (method == .GET) return handleGetMySettings(ctx, request);
         if (method == .PATCH) return handleSetMySettings(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/reminders")) {
+        return handleListReminders(ctx, request, target);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/reminders")) {
+        return handleCreateReminder(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, reminders_prefix)) {
+        return handleCancelReminder(ctx, request, path[reminders_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/alerts")) {
+        return handleListAlerts(ctx, request, target);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/alerts")) {
+        return handleCreateAlert(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, alerts_prefix)) {
+        return handleCancelAlert(ctx, request, path[alerts_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/watches")) {
+        return handleListWatches(ctx, request, target);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/watches")) {
+        return handleCreateWatch(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, watches_prefix)) {
+        return handleDeleteWatch(ctx, request, path[watches_prefix.len..]);
     }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
@@ -1207,6 +1246,541 @@ fn handleSetMySettings(ctx: *const ServerContext, request: *http.Server.Request)
 
     audit_log.record(ctx.pool, account_id, "me.settings.set", null, null);
 
+    return respondJson(ctx, request, .ok, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Reminders / Alerts / Watches (Phase 5a) -- chat-scoped like Groups above,
+// but "open to anyone actually in the chat" like `/remind`/`/alert`/`/watch`
+// already are, not `requireChatAccess`'s group-admin ladder. Identity-scoped
+// by default (own reminders/alerts/watches across every chat); `chat_id`
+// narrows, `identity_id` (owner/bot_admin only) views/acts on behalf of
+// someone else -- see API.md's "Feature parity" section.
+// ---------------------------------------------------------------------------
+
+const RequesterAuth = struct { account_id: i64, roles: Roles };
+
+/// Every reminders/alerts/watches handler starts with this. `null` means a
+/// response was already sent (`401`).
+fn requireLoggedIn(ctx: *const ServerContext, request: *http.Server.Request) !?RequesterAuth {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        try respondError(request, .unauthorized, "unauthorized", "not logged in");
+        return null;
+    };
+    const roles = computeRoles(ctx, account_id) catch |err| {
+        log.err("require-logged-in: failed to compute roles for account {d}: {t}", .{ account_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to check access");
+        return null;
+    };
+    return .{ .account_id = account_id, .roles = roles };
+}
+
+fn callersOwnIdentity(ctx: *const ServerContext, request: *http.Server.Request, account_id: i64) !?i64 {
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
+        log.err("callers-own-identity: failed to list identities for account {d}: {t}", .{ account_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+        return null;
+    };
+    defer ctx.allocator.free(identity_ids);
+    if (identity_ids.len == 0) {
+        try respondError(request, .internal_server_error, "internal", "account has no linked identity");
+        return null;
+    }
+    return identity_ids[0];
+}
+
+/// Resolves the identity to scope a `GET` list by: an explicit
+/// `?identity_id=` (owner/bot_admin only -- viewing on behalf of someone
+/// else), else the caller's own first linked identity (same "exactly one
+/// identity per account today" simplification as `handleGetMySettings`).
+fn resolveListIdentity(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8, ra: RequesterAuth) !?i64 {
+    if (queryParam(target, "identity_id")) |id_str| {
+        if (!ra.roles.owner and !ra.roles.bot_admin) {
+            try respondError(request, .forbidden, "forbidden", "admin access required to view on behalf of another identity");
+            return null;
+        }
+        return std.fmt.parseInt(i64, id_str, 10) catch {
+            try respondError(request, .bad_request, "bad_request", "invalid identity_id");
+            return null;
+        };
+    }
+    return try callersOwnIdentity(ctx, request, ra.account_id);
+}
+
+/// Resolves the creator identity for a `POST` (create): an explicit
+/// `identity_id` in the body (owner/bot_admin only), else whichever of the
+/// caller's own identities is a member of `chat_id` -- mirroring
+/// `/remind`/`/alert`/`/watch`'s own "open to anyone currently in the
+/// chat" authorization. Also verifies `chat_id` names a real chat.
+fn resolveCreateIdentity(ctx: *const ServerContext, request: *http.Server.Request, ra: RequesterAuth, chat_id: i64, explicit_identity_id: ?i64) !?i64 {
+    const chat = (chats_store.getById(ctx.pool, ctx.allocator, chat_id) catch |err| {
+        log.err("resolve-create-identity: failed to load chat {d}: {t}", .{ chat_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to load chat");
+        return null;
+    }) orelse {
+        try respondError(request, .not_found, "not_found", "no such chat");
+        return null;
+    };
+    ctx.allocator.free(chat.native_chat_id);
+
+    if (explicit_identity_id) |id| {
+        if (!ra.roles.owner and !ra.roles.bot_admin) {
+            try respondError(request, .forbidden, "forbidden", "admin access required to act on behalf of another identity");
+            return null;
+        }
+        return id;
+    }
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+        log.err("resolve-create-identity: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+        return null;
+    };
+    defer ctx.allocator.free(identity_ids);
+    for (identity_ids) |id| {
+        if (chat_members.isMember(ctx.pool, chat_id, id)) return id;
+    }
+    try respondError(request, .forbidden, "forbidden", "not a member of this chat");
+    return null;
+}
+
+// --- Reminders ---
+
+const ReminderWhenBody = struct {
+    kind: []const u8,
+    seconds: ?i64 = null,
+    year: ?i32 = null,
+    month: ?u8 = null,
+    day: ?u8 = null,
+    hour: ?u8 = null,
+    minute: ?u8 = null,
+    second: ?u8 = null,
+};
+
+const CreateReminderBody = struct {
+    chat_id: i64,
+    identity_id: ?i64 = null,
+    message: []const u8,
+    recur_interval_seconds: ?i64 = null,
+    when: ReminderWhenBody,
+};
+
+/// `GET /api/v1/reminders?chat_id=&identity_id=` -- see API.md. Scoped to
+/// one identity (default: the caller's own) unlike the bot's own in-chat
+/// `/reminders`, which lists every setter's pending reminders in that one
+/// chat -- a deliberate difference documented in API.md.
+fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
+        std.fmt.parseInt(i64, c, 10) catch {
+            return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+        }
+    else
+        null;
+
+    const items = reminders.listForIdentity(ctx.pool, ctx.allocator, identity_id, chat_id) catch |err| {
+        log.err("list-reminders: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load reminders");
+    };
+    defer {
+        for (items) |it| {
+            if (it.chat_title) |t| ctx.allocator.free(t);
+            ctx.allocator.free(it.message);
+        }
+        ctx.allocator.free(items);
+    }
+
+    const date_format = user_settings.getEffectiveDateFormat(ctx.pool, ctx.allocator, identity_id);
+    const time_format = user_settings.getEffectiveTimeFormat(ctx.pool, ctx.allocator, identity_id);
+    const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, identity_id);
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Item = struct {
+        id: i64,
+        chat_id: i64,
+        chat_title: ?[]const u8,
+        message: []const u8,
+        due_at: i64,
+        due_at_date: []const u8,
+        due_at_time: []const u8,
+        recur_interval_seconds: ?i64,
+    };
+    const out = try arena.alloc(Item, items.len);
+    for (items, 0..) |it, i| {
+        const local = civil_time.localFromUnix(it.due_at, offset_minutes);
+        out[i] = .{
+            .id = it.id,
+            .chat_id = it.chat_id,
+            .chat_title = it.chat_title,
+            .message = it.message,
+            .due_at = it.due_at,
+            .due_at_date = civil_time.formatDate(arena, local, date_format),
+            .due_at_time = civil_time.formatTime(arena, local, time_format),
+            .recur_interval_seconds = it.recur_interval_seconds,
+        };
+    }
+
+    return respondJson(ctx, request, .ok, .{ .items = out });
+}
+
+/// `POST /api/v1/reminders` -- see API.md; `when` mirrors the `/menu`
+/// wizard's own step data (see `menu.zig`'s `ReminderDraft`) so this form
+/// and the wizard describe the same underlying moment two different ways.
+fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [4 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(4 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateReminderBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    if (body.message.len == 0 or body.message.len > max_reminder_message_len) {
+        return respondError(request, .bad_request, "bad_request", "message must be 1-500 bytes");
+    }
+    if (body.recur_interval_seconds) |interval| {
+        if (interval <= 0) {
+            return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive");
+        }
+    }
+
+    const identity_id = (try resolveCreateIdentity(ctx, request, ra, body.chat_id, body.identity_id)) orelse return;
+
+    var due_at: i64 = undefined;
+    if (std.mem.eql(u8, body.when.kind, "duration")) {
+        const seconds = body.when.seconds orelse {
+            return respondError(request, .bad_request, "bad_request", "when.seconds required for a duration reminder");
+        };
+        if (seconds <= 0) {
+            return respondError(request, .bad_request, "bad_request", "when.seconds must be positive");
+        }
+        const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+        due_at = now + seconds;
+    } else if (std.mem.eql(u8, body.when.kind, "absolute")) {
+        const year = body.when.year orelse {
+            return respondError(request, .bad_request, "bad_request", "when.year required for an absolute reminder");
+        };
+        const month = body.when.month orelse {
+            return respondError(request, .bad_request, "bad_request", "when.month required for an absolute reminder");
+        };
+        const day = body.when.day orelse {
+            return respondError(request, .bad_request, "bad_request", "when.day required for an absolute reminder");
+        };
+        const hour = body.when.hour orelse 0;
+        const minute = body.when.minute orelse 0;
+        const second = body.when.second orelse 0;
+        if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59) {
+            return respondError(request, .bad_request, "bad_request", "invalid date/time");
+        }
+        const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, identity_id);
+        due_at = civil_time.unixFromLocal(.{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second }, offset_minutes);
+    } else {
+        return respondError(request, .bad_request, "bad_request", "when.kind must be \"duration\" or \"absolute\"");
+    }
+
+    const id = reminders.create(ctx.pool, body.chat_id, identity_id, body.message, due_at, body.recur_interval_seconds) catch |err| {
+        log.err("create-reminder: failed for chat {d}: {t}", .{ body.chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to create reminder");
+    };
+
+    audit_log.record(ctx.pool, ra.account_id, "reminder.create", null, null);
+
+    return respondJson(ctx, request, .ok, .{ .id = id, .due_at = due_at });
+}
+
+/// `DELETE /api/v1/reminders/:id` -- same authorization as `/remind
+/// cancel`: whoever set it, or the bot owner (not bot_admin -- mirrors
+/// `handleRemindCommand`'s `auth.isOwner` check exactly).
+fn handleCancelReminder(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid reminder id");
+    };
+
+    const rem = (reminders.get(ctx.pool, ctx.allocator, id) catch |err| {
+        log.err("cancel-reminder: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up reminder");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such reminder");
+    };
+    defer ctx.allocator.free(rem.message);
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+        log.err("cancel-reminder: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to check access");
+    };
+    defer ctx.allocator.free(identity_ids);
+    const is_setter = std.mem.indexOfScalar(i64, identity_ids, rem.identity_id) != null;
+    if (!is_setter and !ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only whoever set this reminder, or the owner, can cancel it");
+    }
+
+    reminders.cancel(ctx.pool, id) catch |err| {
+        log.err("cancel-reminder: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to cancel reminder");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "reminder.cancel", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+// --- Alerts ---
+
+const CreateAlertBody = struct {
+    chat_id: i64,
+    identity_id: ?i64 = null,
+    kind: []const u8,
+    subject: []const u8,
+    condition: []const u8,
+    threshold: f64,
+};
+
+/// `GET /api/v1/alerts?chat_id=&identity_id=` -- same scoping rules as
+/// `handleListReminders`.
+fn handleListAlerts(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
+        std.fmt.parseInt(i64, c, 10) catch {
+            return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+        }
+    else
+        null;
+
+    const items = alert_store.listForIdentity(ctx.pool, ctx.allocator, identity_id, chat_id) catch |err| {
+        log.err("list-alerts: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load alerts");
+    };
+    defer {
+        for (items) |it| {
+            if (it.chat_title) |t| ctx.allocator.free(t);
+            ctx.allocator.free(it.subject);
+            if (it.currency) |c| ctx.allocator.free(c);
+        }
+        ctx.allocator.free(items);
+    }
+
+    const Item = struct {
+        id: i64,
+        chat_id: i64,
+        chat_title: ?[]const u8,
+        kind: []const u8,
+        subject: []const u8,
+        currency: ?[]const u8,
+        condition: []const u8,
+        threshold: f64,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try arena.alloc(Item, items.len);
+    for (items, 0..) |it, i| {
+        out[i] = .{
+            .id = it.id,
+            .chat_id = it.chat_id,
+            .chat_title = it.chat_title,
+            .kind = @tagName(it.kind),
+            .subject = it.subject,
+            .currency = it.currency,
+            .condition = @tagName(it.condition),
+            .threshold = it.threshold,
+        };
+    }
+    return respondJson(ctx, request, .ok, .{ .items = out });
+}
+
+/// `POST /api/v1/alerts` -- see API.md. `currency` isn't accepted from the
+/// client, same as `/alert`: always `"usd"` for `crypto`, `null`
+/// otherwise (see `handleAlertCommand`).
+fn handleCreateAlert(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [2 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(2 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateAlertBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    const kind = std.meta.stringToEnum(alert_store.Kind, body.kind) orelse {
+        return respondError(request, .bad_request, "bad_request", "kind must be crypto, weather, or aqi");
+    };
+    const condition = std.meta.stringToEnum(alert_store.Condition, body.condition) orelse {
+        return respondError(request, .bad_request, "bad_request", "condition must be above or below");
+    };
+    if (body.subject.len == 0) {
+        return respondError(request, .bad_request, "bad_request", "subject is required");
+    }
+
+    const identity_id = (try resolveCreateIdentity(ctx, request, ra, body.chat_id, body.identity_id)) orelse return;
+
+    const currency: ?[]const u8 = if (kind == .crypto) "usd" else null;
+    const id = alert_store.create(ctx.pool, body.chat_id, identity_id, kind, body.subject, currency, condition, body.threshold) catch |err| {
+        log.err("create-alert: failed for chat {d}: {t}", .{ body.chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to create alert");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "alert.create", null, null);
+    return respondJson(ctx, request, .ok, .{ .id = id });
+}
+
+/// `DELETE /api/v1/alerts/:id` -- same authorization as `/alert cancel`:
+/// whoever set it, or the bot owner.
+fn handleCancelAlert(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid alert id");
+    };
+
+    const al = (alert_store.get(ctx.pool, ctx.allocator, id) catch |err| {
+        log.err("cancel-alert: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up alert");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such alert");
+    };
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+        log.err("cancel-alert: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to check access");
+    };
+    defer ctx.allocator.free(identity_ids);
+    const is_setter = std.mem.indexOfScalar(i64, identity_ids, al.identity_id) != null;
+    if (!is_setter and !ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only whoever set this alert, or the owner, can cancel it");
+    }
+
+    alert_store.cancel(ctx.pool, id) catch |err| {
+        log.err("cancel-alert: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to cancel alert");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "alert.cancel", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+// --- Watches ---
+
+const CreateWatchBody = struct {
+    chat_id: i64,
+    identity_id: ?i64 = null,
+    feed_url: []const u8,
+};
+
+/// `GET /api/v1/watches?chat_id=&identity_id=` -- same scoping rules as
+/// `handleListReminders`; note this shows watches *added by* the scoped
+/// identity, but (matching `/unwatch`) removing one isn't restricted to
+/// its adder -- see `handleDeleteWatch`.
+fn handleListWatches(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
+        std.fmt.parseInt(i64, c, 10) catch {
+            return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+        }
+    else
+        null;
+
+    const items = feed_watches.listForIdentity(ctx.pool, ctx.allocator, identity_id, chat_id) catch |err| {
+        log.err("list-watches: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load watches");
+    };
+    defer {
+        for (items) |it| {
+            if (it.chat_title) |t| ctx.allocator.free(t);
+            ctx.allocator.free(it.feed_url);
+        }
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `POST /api/v1/watches` -- see API.md.
+fn handleCreateWatch(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [2 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(2 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateWatchBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    if (!std.mem.startsWith(u8, body.feed_url, "http://") and !std.mem.startsWith(u8, body.feed_url, "https://")) {
+        return respondError(request, .bad_request, "bad_request", "feed_url must be an http(s) URL");
+    }
+
+    const identity_id = (try resolveCreateIdentity(ctx, request, ra, body.chat_id, body.identity_id)) orelse return;
+
+    const created = feed_watches.create(ctx.pool, body.chat_id, identity_id, body.feed_url) catch |err| {
+        log.err("create-watch: failed for chat {d}: {t}", .{ body.chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to create watch");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "watch.create", null, null);
+    return respondJson(ctx, request, .ok, .{ .created = created });
+}
+
+/// `DELETE /api/v1/watches/:id` -- open to anyone currently in the watch's
+/// chat, not restricted to whoever added it (mirrors `/unwatch`'s own
+/// authorization -- see `feed_watches.remove`'s doc comment).
+fn handleDeleteWatch(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid watch id");
+    };
+
+    const watch = (feed_watches.getById(ctx.pool, ctx.allocator, id) catch |err| {
+        log.err("delete-watch: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up watch");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such watch");
+    };
+    defer ctx.allocator.free(watch.feed_url);
+
+    if (!ra.roles.owner and !ra.roles.bot_admin) {
+        const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+            log.err("delete-watch: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to check access");
+        };
+        defer ctx.allocator.free(identity_ids);
+        var is_member = false;
+        for (identity_ids) |member_identity_id| {
+            if (chat_members.isMember(ctx.pool, watch.chat_id, member_identity_id)) {
+                is_member = true;
+                break;
+            }
+        }
+        if (!is_member) {
+            return respondError(request, .forbidden, "forbidden", "not a member of this chat");
+        }
+    }
+
+    feed_watches.removeById(ctx.pool, id) catch |err| {
+        log.err("delete-watch: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to delete watch");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "watch.delete", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 

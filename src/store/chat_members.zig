@@ -24,6 +24,21 @@ pub fn touch(pool: *PgPool, chat_id: i64, identity_id: i64, ts: i64) !void {
     _ = try stmt.step();
 }
 
+/// `true` if this identity has a `chat_members` row for this chat — the
+/// API layer's stand-in for "is this person actually part of this chat",
+/// gating who may create reminders/alerts/watches on their own behalf
+/// (see `api/router.zig`'s Phase 5a handlers).
+pub fn isMember(pool: *PgPool, chat_id: i64, identity_id: i64) bool {
+    const db = pool.acquire() catch return false;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT 1 FROM chat_members WHERE chat_id = $1 AND identity_id = $2;") catch return false;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, identity_id);
+    return stmt.step() catch false;
+}
+
 /// Ensures a `chat_members` row exists for (chat_id, identity_id), but
 /// unlike `touch` never bumps `last_seen` — for identities Warden only
 /// learned about *passively* (a reply target, a text-mention, a join/leave

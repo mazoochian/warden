@@ -121,6 +121,50 @@ pub fn reschedule(pool: *PgPool, id: i64, new_due_at: i64) !void {
     _ = try stmt.step();
 }
 
+/// One row for the web API's `GET /api/v1/reminders` — identity-scoped
+/// (not chat-scoped like `PendingReminder`/`listPending` above, which back
+/// the bot's own in-chat `/reminders`), so each row carries its own chat
+/// context for a "my reminders across every chat" view.
+pub const PendingReminderForIdentity = struct {
+    id: i64,
+    chat_id: i64,
+    chat_title: ?[]const u8,
+    message: []const u8,
+    due_at: i64,
+    recur_interval_seconds: ?i64,
+};
+
+/// Pending reminders for one identity, optionally narrowed to one chat —
+/// see `PendingReminderForIdentity`'s doc comment for why this is a
+/// separate query from `listPending` rather than a filter on top of it.
+pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]PendingReminderForIdentity {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT r.id, r.chat_id, c.title, r.message, EXTRACT(EPOCH FROM r.due_at)::bigint, r.recur_interval_seconds
+        \\FROM reminders r JOIN chats c ON c.id = r.chat_id
+        \\WHERE r.delivered_at IS NULL AND r.identity_id = $1 AND ($2::bigint IS NULL OR r.chat_id = $2)
+        \\ORDER BY r.due_at ASC;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
+
+    var out: std.ArrayList(PendingReminderForIdentity) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .id = stmt.columnInt64(0),
+            .chat_id = stmt.columnInt64(1),
+            .chat_title = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+            .message = try allocator.dupe(u8, stmt.columnText(3)),
+            .due_at = stmt.columnInt64(4),
+            .recur_interval_seconds = if (stmt.columnIsNull(5)) null else stmt.columnInt64(5),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Pending (undelivered) reminders for one chat, soonest-due first.
 pub fn listPending(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![]PendingReminder {
     const db = try pool.acquire();
@@ -266,4 +310,47 @@ test "a recurring reminder reschedules instead of being marked delivered" {
 
     const due_again = try dueUndelivered(&pool, a, 2000 + 3600);
     try testing.expectEqual(@as(usize, 1), due_again.len);
+}
+
+test "listForIdentity scopes by identity across chats, optionally narrowed to one" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, "Chat One");
+    const chat2 = try chats.upsertChat(&pool, .telegram, "2", null, "Chat Two");
+    const alice = try identities.upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "1",
+        .display_name = "Alice",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+    const bob = try identities.upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "2",
+        .display_name = "Bob",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    _ = try create(&pool, chat1, alice, "alice in chat1", 2000, null);
+    _ = try create(&pool, chat2, alice, "alice in chat2", 3000, null);
+    _ = try create(&pool, chat1, bob, "bob in chat1", 4000, null);
+
+    const alice_all = try listForIdentity(&pool, a, alice, null);
+    try testing.expectEqual(@as(usize, 2), alice_all.len);
+    try testing.expectEqualStrings("Chat One", alice_all[0].chat_title.?);
+
+    const alice_chat1 = try listForIdentity(&pool, a, alice, chat1);
+    try testing.expectEqual(@as(usize, 1), alice_chat1.len);
+    try testing.expectEqualStrings("alice in chat1", alice_chat1[0].message);
+
+    const bob_all = try listForIdentity(&pool, a, bob, null);
+    try testing.expectEqual(@as(usize, 1), bob_all.len);
 }

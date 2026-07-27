@@ -66,6 +66,86 @@ pub fn remove(pool: *PgPool, chat_id: i64, feed_url: []const u8) !bool {
     return try stmt.step();
 }
 
+/// One row for the web API's `GET /api/v1/watches` — identity-scoped
+/// ("watches I've added"), with its own chat context, same reasoning as
+/// `reminders.PendingReminderForIdentity`. Deleting a watch is still open
+/// to anyone in the chat (see `remove`/`removeById` below), not just
+/// whoever's listed here as the adder.
+pub const FeedWatchRowForIdentity = struct {
+    id: i64,
+    chat_id: i64,
+    chat_title: ?[]const u8,
+    feed_url: []const u8,
+};
+
+/// Watches added by one identity, optionally narrowed to one chat — see
+/// `reminders.listForIdentity`'s doc comment for why this is separate
+/// from `listPending`.
+pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]FeedWatchRowForIdentity {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT f.id, f.chat_id, c.title, f.feed_url
+        \\FROM feed_watches f JOIN chats c ON c.id = f.chat_id
+        \\WHERE f.identity_id = $1 AND ($2::bigint IS NULL OR f.chat_id = $2)
+        \\ORDER BY f.id ASC;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
+
+    var out: std.ArrayList(FeedWatchRowForIdentity) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .id = stmt.columnInt64(0),
+            .chat_id = stmt.columnInt64(1),
+            .chat_title = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+            .feed_url = try allocator.dupe(u8, stmt.columnText(3)),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Enough to authorize+locate a web API delete-by-id (the web API exposes
+/// `DELETE /api/v1/watches/:id`, unlike `/unwatch`'s natural-key lookup) —
+/// same shape/reasoning as `reminders.Reminder`/`alerts.Alert`, minus an
+/// `identity_id` since watch removal was never creator-restricted (see
+/// `remove`'s doc comment).
+pub const WatchRef = struct {
+    id: i64,
+    chat_id: i64,
+    feed_url: []const u8,
+};
+
+pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?WatchRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT chat_id, feed_url FROM feed_watches WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, id);
+    if (!try stmt.step()) return null;
+    return .{
+        .id = id,
+        .chat_id = stmt.columnInt64(0),
+        .feed_url = try allocator.dupe(u8, stmt.columnText(1)),
+    };
+}
+
+/// Removes a watch by its own id — the web API's delete path (see
+/// `getById`'s doc comment for why this exists alongside the natural-key
+/// `remove` the bot's own `/unwatch` uses).
+pub fn removeById(pool: *PgPool, id: i64) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("DELETE FROM feed_watches WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, id);
+    _ = try stmt.step();
+}
+
 /// Every watch for one chat.
 pub fn listPending(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![]FeedWatchRow {
     const db = try pool.acquire();
@@ -255,4 +335,42 @@ test "create/dueForCheck/markChecked/listPending/remove" {
     try testing.expectEqual(@as(usize, 0), (try listPending(&pool, a, chat_id)).len);
     // Removing again: nothing to remove.
     try testing.expect(!(try remove(&pool, chat_id, "https://example.com/feed.xml")));
+}
+
+test "listForIdentity/getById/removeById" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, "Chat One");
+    const chat2 = try chats.upsertChat(&pool, .telegram, "2", null, "Chat Two");
+    const alice = try identities.upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "1",
+        .display_name = "Alice",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expect(try create(&pool, chat1, alice, "https://example.com/a.xml"));
+    try testing.expect(try create(&pool, chat2, alice, "https://example.com/b.xml"));
+
+    const all = try listForIdentity(&pool, a, alice, null);
+    try testing.expectEqual(@as(usize, 2), all.len);
+    try testing.expectEqualStrings("Chat One", all[0].chat_title.?);
+
+    const narrowed = try listForIdentity(&pool, a, alice, chat1);
+    try testing.expectEqual(@as(usize, 1), narrowed.len);
+
+    const ref = (try getById(&pool, a, narrowed[0].id)) orelse return error.TestExpectedValue;
+    try testing.expectEqual(chat1, ref.chat_id);
+    try testing.expectEqualStrings("https://example.com/a.xml", ref.feed_url);
+
+    try removeById(&pool, narrowed[0].id);
+    try testing.expectEqual(@as(?WatchRef, null), try getById(&pool, a, narrowed[0].id));
 }
