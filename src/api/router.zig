@@ -37,6 +37,10 @@ const telegram_login = @import("telegram_login.zig");
 /// `auth` above already names this file's own session-token module
 /// (`api/auth.zig`).
 const perm_auth = @import("../auth.zig");
+const oauth_providers = @import("../store/oauth_providers.zig");
+const oidc = @import("oidc.zig");
+const http_util = @import("../http_util.zig");
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const log = @import("../log.zig").scoped("api");
 
 /// Telegram re-issues `auth_date` on every widget load; anything older than
@@ -45,6 +49,7 @@ const log = @import("../log.zig").scoped("api");
 const telegram_login_max_age_seconds: i64 = 24 * 3600;
 
 const me_sessions_prefix = "/api/v1/me/sessions/";
+const oidc_auth_prefix = "/api/v1/auth/oidc/";
 const admin_chats_prefix = "/api/v1/admin/chats/";
 const admin_identities_prefix = "/api/v1/admin/identities/";
 const admin_modules_prefix = "/api/v1/admin/modules/";
@@ -96,6 +101,17 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/auth/telegram/callback")) {
         return handleTelegramCallback(ctx, request);
+    }
+    if (method == .GET and std.mem.startsWith(u8, path, oidc_auth_prefix)) {
+        const rest = path[oidc_auth_prefix.len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse {
+            return respondError(request, .not_found, "not_found", "no such endpoint");
+        };
+        const provider_id_str = rest[0..slash];
+        const action = rest[slash + 1 ..];
+        if (std.mem.eql(u8, action, "start")) return handleOidcStart(ctx, request, provider_id_str);
+        if (std.mem.eql(u8, action, "callback")) return handleOidcCallback(ctx, request, provider_id_str, target);
+        return respondError(request, .not_found, "not_found", "no such endpoint");
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/auth/dev-login")) {
         return handleDevLogin(ctx, request);
@@ -269,11 +285,26 @@ fn handleGetProviders(ctx: *const ServerContext, request: *http.Server.Request) 
         google: ?struct {} = null,
         oidc: []const OidcProvider = &.{},
     };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const providers = oauth_providers.listEnabledPublic(ctx.pool, arena) catch |err| {
+        log.err("get-providers: failed to list oauth providers: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load providers");
+    };
+    const oidc_items = try arena.alloc(OidcProvider, providers.len);
+    for (providers, 0..) |p, i| {
+        oidc_items[i] = .{ .id = try std.fmt.allocPrint(arena, "{d}", .{p.id}), .name = p.name };
+    }
+
     return respondJson(ctx, request, .ok, Response{
         .telegram = if (ctx.config.telegram_bot_username) |username|
             TelegramProvider{ .bot_username = username }
         else
             null,
+        .oidc = oidc_items,
     });
 }
 
@@ -316,24 +347,42 @@ fn handleTelegramCallback(ctx: *const ServerContext, request: *http.Server.Reque
     var id_buf: [20]u8 = undefined;
     const native_id = std.fmt.bufPrint(&id_buf, "{d}", .{payload.id}) catch unreachable;
 
-    const identity_id = identities.getOrCreateMinimal(ctx.pool, .telegram, native_id, payload.first_name, payload.username, false, now) catch |err| {
-        log.err("telegram-login: failed to resolve identity for telegram id {d}: {t}", .{ payload.id, err });
-        return respondError(request, .internal_server_error, "internal", "failed to resolve identity");
-    };
-
-    const account_id = blk: {
-        if (accounts.findByIdentity(ctx.pool, ctx.allocator, identity_id) catch null) |existing| {
-            ctx.allocator.free(existing.display_name);
-            if (existing.avatar_url) |u| ctx.allocator.free(u);
-            break :blk existing.id;
-        }
-        break :blk accounts.create(ctx.pool, identity_id, payload.first_name, payload.photo_url) catch |err| {
-            log.err("telegram-login: failed to create account for identity {d}: {t}", .{ identity_id, err });
-            return respondError(request, .internal_server_error, "internal", "failed to create account");
-        };
-    };
+    const account_id = (try resolveOrCreateAccountForLogin(ctx, request, .telegram, native_id, payload.first_name, payload.username, payload.photo_url, now)) orelse return;
 
     return issueSessionAndRespond(ctx, request, account_id, user_agent);
+}
+
+/// Resolves (or creates) the warden account for a verified external login
+/// -- shared by every login mechanism (the Telegram Login Widget above,
+/// and the OIDC callback below) so "how a verified external identity
+/// becomes a warden account" has exactly one implementation. `null` means
+/// a response was already sent.
+fn resolveOrCreateAccountForLogin(
+    ctx: *const ServerContext,
+    request: *http.Server.Request,
+    platform: iface.Platform,
+    native_id: []const u8,
+    display_name: []const u8,
+    username: ?[]const u8,
+    avatar_url: ?[]const u8,
+    now: i64,
+) !?i64 {
+    const identity_id = identities.getOrCreateMinimal(ctx.pool, platform, native_id, display_name, username, false, now) catch |err| {
+        log.err("login: failed to resolve identity for {t} id {s}: {t}", .{ platform, native_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+        return null;
+    };
+
+    if (accounts.findByIdentity(ctx.pool, ctx.allocator, identity_id) catch null) |existing| {
+        ctx.allocator.free(existing.display_name);
+        if (existing.avatar_url) |u| ctx.allocator.free(u);
+        return existing.id;
+    }
+    return accounts.create(ctx.pool, identity_id, display_name, avatar_url) catch |err| {
+        log.err("login: failed to create account for identity {d}: {t}", .{ identity_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to create account");
+        return null;
+    };
 }
 
 /// `POST /api/v1/auth/dev-login` — see `Config.api_dev_login`'s doc
@@ -2372,13 +2421,21 @@ fn handleDeleteWatch(ctx: *const ServerContext, request: *http.Server.Request, i
 /// (found 2026-07-28, in a local full-DB test run — not the pre-existing
 /// http_util.zig flake, a real bug in this file, fixed by moving capture
 /// earlier in every caller instead of doing it here).
-fn issueSessionAndRespond(ctx: *const ServerContext, request: *http.Server.Request, account_id: i64, user_agent: ?[]const u8) !void {
+///
+/// Returns the `Set-Cookie` header value for the new session, or `null` if
+/// minting failed (a response has NOT been sent in that case — every
+/// caller must still send one). Shared core of `issueSessionAndRespond`
+/// (a JSON body, for the widget's `fetch()`-driven login) and
+/// `issueSessionAndRedirect` (a 302, for a browser-navigation login like
+/// the OIDC callback) — both mint the exact same kind of session, they
+/// just need to hand it back to the browser two different ways.
+fn mintSessionCookie(ctx: *const ServerContext, account_id: i64, user_agent: ?[]const u8) !?[]const u8 {
     const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
     const expires_at = now + 30 * 24 * 3600; // 30 days
 
     const session_id = web_sessions.create(ctx.pool, account_id, now, expires_at, user_agent, null) catch |err| {
         log.err("failed to create session for account {d}: {t}", .{ account_id, err });
-        return respondError(request, .internal_server_error, "internal", "failed to create session");
+        return null;
     };
     audit_log.record(ctx.pool, account_id, "auth.login", null, null);
 
@@ -2386,18 +2443,22 @@ fn issueSessionAndRespond(ctx: *const ServerContext, request: *http.Server.Reque
         // Unreachable in practice: `Config.load` refuses to start the API
         // at all without this set (see config.zig) — this branch exists
         // only so the type system doesn't need an artificial `.?`.
-        return respondError(request, .internal_server_error, "internal", "session signing not configured");
+        return null;
     };
-    const token = auth.sign(ctx.allocator, session_id, secret) catch {
-        return respondError(request, .internal_server_error, "internal", "failed to sign session");
-    };
+    const token = auth.sign(ctx.allocator, session_id, secret) catch return null;
     defer ctx.allocator.free(token);
 
-    const cookie_value = try std.fmt.allocPrint(
+    return try std.fmt.allocPrint(
         ctx.allocator,
         "{s}={s}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000",
         .{ auth.cookie_name, token },
     );
+}
+
+fn issueSessionAndRespond(ctx: *const ServerContext, request: *http.Server.Request, account_id: i64, user_agent: ?[]const u8) !void {
+    const cookie_value = (try mintSessionCookie(ctx, account_id, user_agent)) orelse {
+        return respondError(request, .internal_server_error, "internal", "failed to create session");
+    };
     defer ctx.allocator.free(cookie_value);
 
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .account_id = account_id }, .{});
@@ -2410,6 +2471,298 @@ fn issueSessionAndRespond(ctx: *const ServerContext, request: *http.Server.Reque
             .{ .name = "set-cookie", .value = cookie_value },
         },
     });
+}
+
+/// The OIDC callback's sibling to `issueSessionAndRespond`: the browser
+/// itself navigated here (following the provider's redirect), so the
+/// response is a 302 back into the app, not a JSON body for a `fetch()`
+/// caller to parse.
+fn issueSessionAndRedirect(ctx: *const ServerContext, request: *http.Server.Request, account_id: i64, user_agent: ?[]const u8, location: []const u8) !void {
+    const cookie_value = (try mintSessionCookie(ctx, account_id, user_agent)) orelse {
+        return respondError(request, .internal_server_error, "internal", "failed to create session");
+    };
+    defer ctx.allocator.free(cookie_value);
+
+    try request.respond("", .{
+        .status = .found,
+        .extra_headers = &.{
+            .{ .name = "location", .value = location },
+            .{ .name = "set-cookie", .value = cookie_value },
+        },
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Generic OIDC login (`oauth_providers`, `oidc.zig`) — Authorization Code
+// + PKCE against a provider stored in `oauth_providers`. The in-flight
+// flow's PKCE verifier and anti-CSRF state travel in a short-lived,
+// HMAC-signed cookie (`oidc_pkce_cookie_name`) between `.../start` and
+// `.../callback` — no server-side session-in-progress table needed, same
+// "we're the only ones who need to trust this" reasoning as
+// `api/auth.zig`'s session token signing.
+// ---------------------------------------------------------------------------
+
+const oidc_pkce_cookie_name = "warden_oidc_pkce";
+/// How long the PKCE cookie survives — generous for a real login flow
+/// (Telegram's own authorization page, a user reading/approving it) but
+/// still short enough that a leaked/replayed cookie is only ever a
+/// narrow window.
+const oidc_flow_max_age_seconds: i64 = 600;
+
+/// Packs `provider_id:state:verifier` and HMAC-signs it — same
+/// `<payload>.<base64url(HMAC-SHA256)>` shape as `api/auth.zig`'s session
+/// tokens. `state`/`verifier` are themselves base64url (see `oidc.zig`'s
+/// `generateState`/`generateVerifier`), so they can never contain `:` —
+/// safe to split the payload on that character with no escaping needed.
+fn signOidcFlowCookie(allocator: std.mem.Allocator, provider_id: i64, state: []const u8, verifier: []const u8, secret: []const u8) ![]const u8 {
+    const payload = try std.fmt.allocPrint(allocator, "{d}:{s}:{s}", .{ provider_id, state, verifier });
+
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, payload, secret);
+    var mac_b64_buf: [std.base64.url_safe_no_pad.Encoder.calcSize(HmacSha256.mac_length)]u8 = undefined;
+    const mac_b64 = std.base64.url_safe_no_pad.Encoder.encode(&mac_b64_buf, &mac);
+
+    return std.fmt.allocPrint(allocator, "{s}.{s}", .{ payload, mac_b64 });
+}
+
+const OidcFlowState = struct { provider_id: i64, state: []const u8, verifier: []const u8 };
+
+/// `null` if `cookie_value` is malformed or its signature doesn't match —
+/// every field borrows directly from `cookie_value`, no allocation.
+fn verifyOidcFlowCookie(cookie_value: []const u8, secret: []const u8) ?OidcFlowState {
+    const dot = std.mem.lastIndexOfScalar(u8, cookie_value, '.') orelse return null;
+    const payload = cookie_value[0..dot];
+    const given_mac_b64 = cookie_value[dot + 1 ..];
+
+    var expected_mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&expected_mac, payload, secret);
+    const b64_len = comptime std.base64.url_safe_no_pad.Encoder.calcSize(HmacSha256.mac_length);
+    var expected_mac_b64_buf: [b64_len]u8 = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&expected_mac_b64_buf, &expected_mac);
+
+    if (given_mac_b64.len != b64_len) return null;
+    var given_mac_b64_buf: [b64_len]u8 = undefined;
+    @memcpy(&given_mac_b64_buf, given_mac_b64);
+    if (!std.crypto.timing_safe.eql([b64_len]u8, expected_mac_b64_buf, given_mac_b64_buf)) return null;
+
+    var parts = std.mem.splitScalar(u8, payload, ':');
+    const provider_id_str = parts.next() orelse return null;
+    const state = parts.next() orelse return null;
+    const verifier = parts.next() orelse return null;
+    if (parts.next() != null) return null; // exactly 3 fields
+
+    const provider_id = std.fmt.parseInt(i64, provider_id_str, 10) catch return null;
+    return .{ .provider_id = provider_id, .state = state, .verifier = verifier };
+}
+
+/// Our own callback URL for `provider_id` — reconstructed from the
+/// inbound request's own `Host` header (trusted: production is one
+/// reverse-proxied domain terminating TLS in front of this process, see
+/// ARCHITECTURE.md §2) rather than a hardcoded config value, so this
+/// works unmodified behind whatever domain Traefik/the proxy is actually
+/// serving. Always `https://` — a provider's "Allowed URLs" registration
+/// (BotFather, for Telegram) only ever lists the real production origin.
+fn oidcRedirectUri(allocator: std.mem.Allocator, host: []const u8, provider_id: i64) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "https://{s}/api/v1/auth/oidc/{d}/callback", .{ host, provider_id });
+}
+
+/// `GET /api/v1/auth/oidc/:providerId/start` — see API.md. Looks up the
+/// provider, fetches its OIDC discovery document, generates a fresh PKCE
+/// verifier/challenge and anti-CSRF state, stashes them in a signed
+/// cookie, and 302s the browser to the provider's own authorization page.
+fn handleOidcStart(ctx: *const ServerContext, request: *http.Server.Request, provider_id_str: []const u8) !void {
+    const host = findHeader(request, "host") orelse {
+        return respondError(request, .bad_request, "bad_request", "missing host header");
+    };
+    const provider_id = std.fmt.parseInt(i64, provider_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid provider id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const provider = (oauth_providers.get(ctx.pool, arena, provider_id) catch |err| {
+        log.err("oidc-start: failed to load provider {d}: {t}", .{ provider_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load provider");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such provider");
+    };
+    if (!provider.enabled) {
+        return respondError(request, .not_found, "not_found", "no such provider");
+    }
+
+    const discovery = oidc.discover(arena, ctx.io, provider.issuer_url) catch |err| {
+        log.err("oidc-start: discovery failed for provider {d} ({s}): {t}", .{ provider_id, provider.issuer_url, err });
+        return respondError(request, .internal_server_error, "internal", "failed to reach the login provider");
+    };
+
+    const verifier = try oidc.generateVerifier(arena, ctx.io);
+    const challenge = try oidc.challengeFromVerifier(arena, verifier);
+    const state = try oidc.generateState(arena, ctx.io);
+    const redirect_uri = try oidcRedirectUri(arena, host, provider_id);
+
+    const auth_url = try std.fmt.allocPrint(
+        arena,
+        "{s}?client_id={s}&redirect_uri={s}&response_type=code&scope=openid+profile&state={s}&code_challenge={s}&code_challenge_method=S256",
+        .{
+            discovery.authorization_endpoint,
+            try http_util.encodeQueryComponent(arena, provider.client_id),
+            try http_util.encodeQueryComponent(arena, redirect_uri),
+            state,
+            challenge,
+        },
+    );
+
+    const secret = ctx.config.api_session_secret orelse {
+        return respondError(request, .internal_server_error, "internal", "session signing not configured");
+    };
+    const cookie_value = try signOidcFlowCookie(arena, provider_id, state, verifier, secret);
+    const cookie_header = try std.fmt.allocPrint(
+        arena,
+        "{s}={s}; Path=/api/v1/auth/oidc/; HttpOnly; Secure; SameSite=Lax; Max-Age={d}",
+        .{ oidc_pkce_cookie_name, cookie_value, oidc_flow_max_age_seconds },
+    );
+
+    try request.respond("", .{
+        .status = .found,
+        .extra_headers = &.{
+            .{ .name = "location", .value = auth_url },
+            .{ .name = "set-cookie", .value = cookie_header },
+        },
+    });
+}
+
+/// `GET /api/v1/auth/oidc/:providerId/callback` — see API.md. Verifies
+/// the PKCE cookie set by `.../start` (signature, provider match, `state`
+/// match against the query param), exchanges `code` at the provider's
+/// token endpoint, verifies the returned `id_token` against the
+/// provider's own JWKS (`oidc.verifyIdToken` — ES256 only, see that
+/// file's module doc comment), then resolves/creates an account exactly
+/// like the Telegram widget does.
+///
+/// Telegram-issuer special case: Telegram's own OIDC provider shares the
+/// *same* user-id space as the bot platform itself (the `id` claim IS a
+/// real Telegram user id) — so a login through this provider resolves to
+/// a real `.telegram` identity, the same row the widget or the bot itself
+/// would use for that person, not a separate "web-only" identity. A
+/// genuinely external IdP (Google, some other org's SSO) has no
+/// corresponding bot platform to map onto and would need the account-
+/// *linking* path (`POST /api/v1/auth/link/:method/start` in API.md's
+/// sketch) instead — not implemented yet, and out of scope for what this
+/// provider needs, so this handler refuses any issuer it doesn't
+/// recognize rather than guessing.
+fn handleOidcCallback(ctx: *const ServerContext, request: *http.Server.Request, provider_id_str: []const u8, target: []const u8) !void {
+    // Must happen before any body-touching call -- none needed for this
+    // GET, but captured up front anyway to match the established
+    // convention (see `issueSessionAndRespond`'s doc comment).
+    const user_agent = findHeader(request, "user-agent");
+    const host = findHeader(request, "host") orelse {
+        return respondError(request, .bad_request, "bad_request", "missing host header");
+    };
+    const cookie_header = findHeader(request, "cookie") orelse "";
+
+    const provider_id = std.fmt.parseInt(i64, provider_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid provider id");
+    };
+    const code = queryParam(target, "code") orelse {
+        return respondError(request, .bad_request, "bad_request", "missing code");
+    };
+    const given_state = queryParam(target, "state") orelse {
+        return respondError(request, .bad_request, "bad_request", "missing state");
+    };
+
+    const secret = ctx.config.api_session_secret orelse {
+        return respondError(request, .internal_server_error, "internal", "session signing not configured");
+    };
+    const pkce_cookie_value = parseCookieValue(cookie_header, oidc_pkce_cookie_name) orelse {
+        return respondError(request, .bad_request, "bad_request", "missing or expired login flow cookie");
+    };
+    const flow = verifyOidcFlowCookie(pkce_cookie_value, secret) orelse {
+        return respondError(request, .bad_request, "bad_request", "invalid login flow cookie");
+    };
+    if (flow.provider_id != provider_id) {
+        return respondError(request, .bad_request, "bad_request", "provider mismatch");
+    }
+    if (!std.mem.eql(u8, flow.state, given_state)) {
+        return respondError(request, .bad_request, "bad_request", "state mismatch");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const provider = (oauth_providers.get(ctx.pool, arena, provider_id) catch |err| {
+        log.err("oidc-callback: failed to load provider {d}: {t}", .{ provider_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load provider");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such provider");
+    };
+    if (!provider.enabled) {
+        return respondError(request, .not_found, "not_found", "no such provider");
+    }
+    // See this function's doc comment -- only Telegram's own OIDC issuer
+    // is understood right now.
+    if (std.mem.indexOf(u8, provider.issuer_url, "telegram") == null) {
+        log.err("oidc-callback: provider {d} has an unsupported (non-Telegram) issuer {s}", .{ provider_id, provider.issuer_url });
+        return respondError(request, .internal_server_error, "internal", "this login provider isn't supported yet");
+    }
+
+    const discovery = oidc.discover(arena, ctx.io, provider.issuer_url) catch |err| {
+        log.err("oidc-callback: discovery failed for provider {d}: {t}", .{ provider_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to reach the login provider");
+    };
+
+    const redirect_uri = try oidcRedirectUri(arena, host, provider_id);
+    const form_body = try std.fmt.allocPrint(
+        arena,
+        "grant_type=authorization_code&code={s}&redirect_uri={s}&code_verifier={s}",
+        .{
+            try http_util.encodeQueryComponent(arena, code),
+            try http_util.encodeQueryComponent(arena, redirect_uri),
+            try http_util.encodeQueryComponent(arena, flow.verifier),
+        },
+    );
+
+    const basic_auth_raw = try std.fmt.allocPrint(arena, "{s}:{s}", .{ provider.client_id, provider.client_secret });
+    const basic_auth_b64_buf = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(basic_auth_raw.len));
+    const basic_auth_b64 = std.base64.standard.Encoder.encode(basic_auth_b64_buf, basic_auth_raw);
+    const authorization_header = try std.fmt.allocPrint(arena, "Basic {s}", .{basic_auth_b64});
+
+    var client: http.Client = .{ .allocator = arena, .io = ctx.io };
+    const token_response_body = http_util.postRaw(
+        &client,
+        arena,
+        discovery.token_endpoint,
+        "application/x-www-form-urlencoded",
+        &.{.{ .name = "authorization", .value = authorization_header }},
+        form_body,
+    ) catch |err| {
+        log.err("oidc-callback: token exchange failed for provider {d}: {t}", .{ provider_id, err });
+        return respondError(request, .unauthorized, "invalid_login", "login failed");
+    };
+
+    const TokenResponse = struct { id_token: []const u8 };
+    const token_response = std.json.parseFromSliceLeaky(TokenResponse, arena, token_response_body, .{ .ignore_unknown_fields = true }) catch {
+        log.err("oidc-callback: malformed token response for provider {d}", .{provider_id});
+        return respondError(request, .internal_server_error, "internal", "malformed response from login provider");
+    };
+
+    const jwks = oidc.fetchJwks(arena, ctx.io, discovery.jwks_uri) catch |err| {
+        log.err("oidc-callback: jwks fetch failed for provider {d}: {t}", .{ provider_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to verify login");
+    };
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const claims = oidc.verifyIdToken(arena, token_response.id_token, jwks, discovery.issuer, provider.client_id, now, 60) catch |err| {
+        log.warn("oidc-callback: id token verification failed for provider {d}: {t}", .{ provider_id, err });
+        return respondError(request, .unauthorized, "invalid_login", "login verification failed");
+    };
+
+    const display_name = claims.name orelse claims.preferred_username orelse claims.id;
+    const account_id = (try resolveOrCreateAccountForLogin(ctx, request, .telegram, claims.id, display_name, claims.preferred_username, claims.picture, now)) orelse return;
+
+    return issueSessionAndRedirect(ctx, request, account_id, user_agent, "/");
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ data/
 prosody/data/
 .env
 prod.env
+.oidc
 node_modules/
 bfg.jar
 compose.override.yaml
