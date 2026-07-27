@@ -16,6 +16,8 @@ const identities = @import("../store/identities.zig");
 const bot_admins = @import("../store/bot_admins.zig");
 const admin_directory = @import("../store/admin_directory.zig");
 const feature_flags = @import("../store/feature_flags.zig");
+const dynamic_config = @import("../store/dynamic_config.zig");
+const config_mod = @import("../config.zig");
 const audit_log = @import("../store/audit_log.zig");
 const telegram_login = @import("telegram_login.zig");
 /// The bot's own permission-ladder module (owner check) -- aliased since
@@ -33,6 +35,7 @@ const me_sessions_prefix = "/api/v1/me/sessions/";
 const admin_chats_prefix = "/api/v1/admin/chats/";
 const admin_identities_prefix = "/api/v1/admin/identities/";
 const admin_modules_prefix = "/api/v1/admin/modules/";
+const admin_config_prefix = "/api/v1/admin/config/";
 
 /// Default/max page size, matching `API.md`'s pagination convention.
 const default_page_limit: i64 = 50;
@@ -100,6 +103,12 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .PATCH and std.mem.startsWith(u8, path, admin_modules_prefix)) {
         return handleAdminSetModule(ctx, request, path[admin_modules_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/config")) {
+        return handleAdminListConfig(ctx, request);
+    }
+    if (method == .PATCH and std.mem.startsWith(u8, path, admin_config_prefix)) {
+        return handleAdminSetConfig(ctx, request, path[admin_config_prefix.len..]);
     }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
@@ -594,6 +603,154 @@ fn handleAdminSetModule(ctx: *const ServerContext, request: *http.Server.Request
     return respondJson(ctx, request, .ok, .{});
 }
 
+/// Never returns any part of `value` verbatim — only its last 4 characters
+/// (enough to help someone recognize "yes, that's the right key" without
+/// the API ever transmitting a secret that could be captured in a log,
+/// screenshot, or browser history). `"(not set)"` for an empty value
+/// (matches the `OpenAiCompatConfig.api_key` "empty if unset" convention).
+/// Always returns memory owned by `a` (even the fixed-text cases) so
+/// callers can unconditionally free every `ConfigEntry.value` the same
+/// way regardless of which branch produced it.
+fn maskSecret(a: std.mem.Allocator, value: []const u8) []const u8 {
+    if (value.len == 0) return a.dupe(u8, "(not set)") catch "(not set)";
+    if (value.len <= 4) return a.dupe(u8, "••••") catch "••••";
+    return std.fmt.allocPrint(a, "••••{s}", .{value[value.len - 4 ..]}) catch "••••";
+}
+
+const ConfigEntry = struct {
+    key: []const u8,
+    label: []const u8,
+    category: []const u8,
+    value: []const u8,
+    is_override: ?bool,
+};
+
+/// `GET /api/v1/admin/config` — per ARCHITECTURE.md §6: secrets (masked,
+/// read live from `ctx.config`, never touching `dynamic_config`) plus
+/// every `dynamic_config.known_keys` entry with its current effective
+/// value and whether a DB override exists. Deliberately doesn't yet list
+/// identity/infra/restart-required fields (§6's other two categories) --
+/// those aren't editable either way today, and this endpoint's real job
+/// is surfacing what's actually live; a display-only catalog of the rest
+/// is a reasonable follow-up, not done here.
+fn handleAdminListConfig(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    var entries: std.ArrayList(ConfigEntry) = .empty;
+    defer {
+        for (entries.items) |e| ctx.allocator.free(e.value);
+        entries.deinit(ctx.allocator);
+    }
+
+    const addSecret = struct {
+        fn call(list: *std.ArrayList(ConfigEntry), a: std.mem.Allocator, key: []const u8, label: []const u8, value: []const u8) !void {
+            try list.append(a, .{ .key = key, .label = label, .category = "secret", .value = maskSecret(a, value), .is_override = null });
+        }
+    }.call;
+
+    try addSecret(&entries, ctx.allocator, "WARDEN_TELEGRAM_BOT_TOKEN", "Telegram bot token", ctx.config.telegram_bot_token);
+    try addSecret(&entries, ctx.allocator, "WARDEN_POSTGRES_DSN", "Postgres connection string", ctx.config.postgres_dsn);
+    switch (ctx.config.llm) {
+        .anthropic => |c| try addSecret(&entries, ctx.allocator, "WARDEN_ANTHROPIC_API_KEY", "Anthropic API key", c.api_key),
+        .openai_compat => |c| try addSecret(&entries, ctx.allocator, "WARDEN_OPENAI_API_KEY", "OpenAI-compatible API key", c.api_key),
+    }
+    if (ctx.config.matrix) |m| try addSecret(&entries, ctx.allocator, "WARDEN_MATRIX_ACCESS_TOKEN", "Matrix access token", m.access_token);
+    if (ctx.config.xmpp) |x| try addSecret(&entries, ctx.allocator, "WARDEN_XMPP_PASSWORD", "XMPP password", x.password);
+    if (ctx.config.matrix_pickle_key) |k| try addSecret(&entries, ctx.allocator, "WARDEN_MATRIX_PICKLE_KEY", "Matrix E2EE pickle key", k);
+
+    const rows = dynamic_config.listAll(ctx.pool, ctx.allocator) catch &.{};
+    defer {
+        for (rows) |r| {
+            ctx.allocator.free(r.key);
+            ctx.allocator.free(r.value);
+        }
+        ctx.allocator.free(rows);
+    }
+
+    for (dynamic_config.known_keys) |k| {
+        var override_row: ?dynamic_config.KV = null;
+        for (rows) |r| {
+            if (std.mem.eql(u8, r.key, k.key)) {
+                override_row = r;
+                break;
+            }
+        }
+        const value = if (override_row) |r|
+            try ctx.allocator.dupe(u8, r.value)
+        else
+            try defaultForKnownKey(ctx.allocator, ctx.config, k.key);
+        try entries.append(ctx.allocator, .{
+            .key = k.key,
+            .label = k.label,
+            .category = "dynamic",
+            .value = value,
+            .is_override = override_row != null,
+        });
+    }
+
+    return respondJson(ctx, request, .ok, .{ .items = entries.items });
+}
+
+/// The env-sourced fallback for one of `dynamic_config.known_keys`,
+/// formatted as a string for the uniform `ConfigEntry.value` shape.
+fn defaultForKnownKey(a: std.mem.Allocator, config: *const config_mod.Config, key: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, key, "WARDEN_RETENTION_MESSAGES")) return std.fmt.allocPrint(a, "{d}", .{config.retention_messages});
+    if (std.mem.eql(u8, key, "WARDEN_DIGEST_INTERVAL_SECONDS")) return std.fmt.allocPrint(a, "{d}", .{config.digest_interval_seconds});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_OWNER_ONLY")) return std.fmt.allocPrint(a, "{}", .{config.llm_owner_only});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_SHOW_THINKING")) return std.fmt.allocPrint(a, "{}", .{config.llm_show_thinking});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_STREAMING")) return std.fmt.allocPrint(a, "{}", .{config.llm_streaming});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_MAX_TOKENS")) return std.fmt.allocPrint(a, "{d}", .{config.llm_max_tokens_override orelse 0});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_HISTORY_MESSAGES")) return std.fmt.allocPrint(a, "{d}", .{config.llm_history_messages});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES")) return std.fmt.allocPrint(a, "{}", .{config.skip_trivial_messages});
+    return a.dupe(u8, "");
+}
+
+/// `PATCH /api/v1/admin/config/:key` — body `{"value": "..."}`. Only
+/// accepts keys in `dynamic_config.known_keys`; `403` for anything else
+/// (secrets can never be written here — there's no endpoint that accepts
+/// them at all, matching "never accepted on write" from ARCHITECTURE.md
+/// §6 — and identity/infra/restart-required keys aren't wired to be read
+/// back live yet, so accepting a write for them would silently go
+/// nowhere).
+fn handleAdminSetConfig(ctx: *const ServerContext, request: *http.Server.Request, key: []const u8) !void {
+    const account_id = (try requireAdmin(ctx, request)) orelse return;
+
+    const known = dynamic_config.findKnownKey(key) orelse {
+        return respondError(request, .forbidden, "forbidden", "this key isn't editable");
+    };
+
+    const Body = struct { value: []const u8 };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [4 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(4 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(Body, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "expected {\"value\": \"...\"}");
+    };
+
+    const valid = switch (known.kind) {
+        .bool => std.ascii.eqlIgnoreCase(body.value, "true") or std.mem.eql(u8, body.value, "1") or
+            std.ascii.eqlIgnoreCase(body.value, "false") or std.mem.eql(u8, body.value, "0"),
+        .i64 => (std.fmt.parseInt(i64, body.value, 10) catch null) != null,
+    };
+    if (!valid) {
+        return respondError(request, .bad_request, "bad_request", "value doesn't match this key's expected type");
+    }
+
+    dynamic_config.set(ctx.pool, key, body.value, account_id) catch |err| {
+        log.err("admin-set-config: failed to set {s}: {t}", .{ key, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update config");
+    };
+    audit_log.record(ctx.pool, account_id, "config.set", key, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
 /// `user_agent` must have been captured by the caller *before* it read the
 /// request body (if any) — `findHeader`/`iterateHeaders` requires the
 /// request reader to still be in its post-head, pre-body state; calling it
@@ -705,6 +862,72 @@ test "parseCookieValue handles a single cookie, extra whitespace, and an empty h
     try testing.expectEqualStrings("solo", parseCookieValue("warden_session=solo", "warden_session").?);
     try testing.expectEqualStrings("spaced", parseCookieValue("  warden_session=spaced  ", "warden_session").?);
     try testing.expectEqual(@as(?[]const u8, null), parseCookieValue("", "warden_session"));
+}
+
+test "maskSecret never returns more than the last 4 characters, and labels empty as not-set" {
+    const a = testing.allocator;
+
+    const empty = maskSecret(a, "");
+    defer a.free(empty);
+    try testing.expectEqualStrings("(not set)", empty);
+
+    const short = maskSecret(a, "abcd");
+    defer a.free(short);
+    try testing.expectEqualStrings("••••", short);
+
+    const long = maskSecret(a, "sk-verysecretlongkeyab12");
+    defer a.free(long);
+    try testing.expectEqualStrings("••••ab12", long);
+    try testing.expect(std.mem.indexOf(u8, long, "verysecret") == null);
+}
+
+fn testConfigForDefaults() config_mod.Config {
+    return .{
+        .telegram_bot_token = "x",
+        .owners = &.{},
+        .postgres_dsn = "postgresql:///warden_test",
+        .postgres_pool_size = 1,
+        .postgres_acquire_timeout_seconds = 30,
+        .postgres_statement_timeout_seconds = 30,
+        .workers_per_platform = 2,
+        .retention_messages = 500,
+        .llm = .{ .anthropic = .{ .api_key = "x", .model = "x" } },
+        .confirm_timeout_seconds = 60,
+        .convert_timeout_seconds = 300,
+        .menu_timeout_seconds = 180,
+        .tmp_dir = "data/tmp",
+        .digest_interval_seconds = 86_400,
+        .system_prompt = null,
+        .searxng_url = null,
+        .whisper_url = null,
+        .llm_owner_only = true,
+        .llm_show_thinking = false,
+        .llm_streaming = true,
+        .llm_max_tokens_override = null,
+        .llm_history_messages = 20,
+        .skip_trivial_messages = true,
+    };
+}
+
+test "defaultForKnownKey formats every known key's env-sourced default" {
+    const a = testing.allocator;
+    const config = testConfigForDefaults();
+
+    const cases = [_]struct { key: []const u8, expected: []const u8 }{
+        .{ .key = "WARDEN_RETENTION_MESSAGES", .expected = "500" },
+        .{ .key = "WARDEN_DIGEST_INTERVAL_SECONDS", .expected = "86400" },
+        .{ .key = "WARDEN_LLM_OWNER_ONLY", .expected = "true" },
+        .{ .key = "WARDEN_LLM_SHOW_THINKING", .expected = "false" },
+        .{ .key = "WARDEN_LLM_STREAMING", .expected = "true" },
+        .{ .key = "WARDEN_LLM_MAX_TOKENS", .expected = "0" },
+        .{ .key = "WARDEN_LLM_HISTORY_MESSAGES", .expected = "20" },
+        .{ .key = "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", .expected = "true" },
+    };
+    for (cases) |c| {
+        const got = try defaultForKnownKey(a, &config, c.key);
+        defer a.free(got);
+        try testing.expectEqualStrings(c.expected, got);
+    }
 }
 
 // ---------------------------------------------------------------------------

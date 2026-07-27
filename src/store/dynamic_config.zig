@@ -141,6 +141,39 @@ pub fn unset(pool: *PgPool, key: []const u8) !void {
     _ = try stmt.step();
 }
 
+pub const ValueKind = enum { bool, i64 };
+
+pub const KnownKey = struct {
+    key: []const u8,
+    label: []const u8,
+    kind: ValueKind,
+};
+
+/// Every `dynamic_config` key this build actually reads back live — see
+/// `main.zig`'s `resolveLlmDynamicSettings` and the two single-key reads
+/// next to `recordMessage`/the digest-interval check. The single source
+/// of truth the admin config API (`GET`/`PATCH /api/v1/admin/config`)
+/// checks against: only these are ever accepted on `PATCH` — everything
+/// else (secrets, identity, restart-required tunables) is display-only,
+/// per /home/armin/claude/warden-ui/ARCHITECTURE.md §6.
+pub const known_keys = [_]KnownKey{
+    .{ .key = "WARDEN_RETENTION_MESSAGES", .label = "Message retention (per chat)", .kind = .i64 },
+    .{ .key = "WARDEN_DIGEST_INTERVAL_SECONDS", .label = "Digest interval (seconds)", .kind = .i64 },
+    .{ .key = "WARDEN_LLM_OWNER_ONLY", .label = "LLM Q&A owner-only", .kind = .bool },
+    .{ .key = "WARDEN_LLM_SHOW_THINKING", .label = "Show LLM thinking by default", .kind = .bool },
+    .{ .key = "WARDEN_LLM_STREAMING", .label = "Stream LLM responses", .kind = .bool },
+    .{ .key = "WARDEN_LLM_MAX_TOKENS", .label = "LLM max tokens override (0 = none)", .kind = .i64 },
+    .{ .key = "WARDEN_LLM_HISTORY_MESSAGES", .label = "LLM conversation history window", .kind = .i64 },
+    .{ .key = "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", .label = "Skip LLM call for trivial messages", .kind = .bool },
+};
+
+pub fn findKnownKey(key: []const u8) ?KnownKey {
+    for (known_keys) |k| {
+        if (std.mem.eql(u8, k.key, key)) return k;
+    }
+    return null;
+}
+
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const identities = @import("identities.zig");
@@ -210,6 +243,12 @@ test "listAll fetches every row, findBool/findI64 parse from it with the same fa
     // Absent key -- falls back, doesn't error or match anything spuriously.
     try testing.expect(!findBool(rows, "WARDEN_LLM_STREAMING", false));
     try testing.expectEqual(@as(i64, 999), findI64(rows, "WARDEN_LLM_MAX_TOKENS", 999));
+}
+
+test "findKnownKey finds known keys and rejects unknown ones" {
+    const found = findKnownKey("WARDEN_LLM_STREAMING") orelse return error.TestExpectedValue;
+    try testing.expectEqual(ValueKind.bool, found.kind);
+    try testing.expectEqual(@as(?KnownKey, null), findKnownKey("WARDEN_TELEGRAM_BOT_TOKEN"));
 }
 
 test "parseBool/parseI64 fall back to default on unparseable input" {
