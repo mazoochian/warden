@@ -22,6 +22,8 @@ const log = @import("../log.zig").scoped("api");
 /// legitimately slow page load.
 const telegram_login_max_age_seconds: i64 = 24 * 3600;
 
+const me_sessions_prefix = "/api/v1/me/sessions/";
+
 /// One request's resolved caller — `null` `account_id` means
 /// unauthenticated (a missing/invalid/expired session cookie), which is a
 /// normal outcome for public endpoints (`GET /api/v1/auth/providers`,
@@ -32,6 +34,10 @@ const telegram_login_max_age_seconds: i64 = 24 * 3600;
 /// single global one.
 const RequestAuth = struct {
     account_id: ?i64,
+    /// The resolved session's own id — `null` whenever `account_id` is
+    /// `null`. Distinct from `account_id` since `/me/sessions` needs to
+    /// mark which listed row is "this device" without a second lookup.
+    session_id: ?i64 = null,
 };
 
 pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void {
@@ -53,6 +59,12 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/auth/logout")) {
         return handleLogout(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/me/sessions")) {
+        return handleListSessions(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, me_sessions_prefix)) {
+        return handleRevokeSession(ctx, request, path[me_sessions_prefix.len..]);
     }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
@@ -131,6 +143,12 @@ fn handleGetProviders(ctx: *const ServerContext, request: *http.Server.Request) 
 /// method that doesn't need a fresh `identities` row most of the time),
 /// finds-or-creates the linked `accounts` row, issues a session.
 fn handleTelegramCallback(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    // Must happen before any body read below -- `iterateHeaders` asserts
+    // the reader is still in its post-head, pre-body state (see
+    // `issueSessionAndRespond`'s doc comment for the crash this caused
+    // before user-agent capture was moved here).
+    const user_agent = findHeader(request, "user-agent");
+
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -173,7 +191,7 @@ fn handleTelegramCallback(ctx: *const ServerContext, request: *http.Server.Reque
         };
     };
 
-    return issueSessionAndRespond(ctx, request, account_id);
+    return issueSessionAndRespond(ctx, request, account_id, user_agent);
 }
 
 /// `POST /api/v1/auth/dev-login` — see `Config.api_dev_login`'s doc
@@ -185,6 +203,10 @@ fn handleDevLogin(ctx: *const ServerContext, request: *http.Server.Request) !voi
     if (!ctx.config.api_dev_login) {
         return respondError(request, .not_found, "not_found", "no such endpoint");
     }
+
+    // Must happen before `readJsonBody` below -- see
+    // `issueSessionAndRespond`'s doc comment.
+    const user_agent = findHeader(request, "user-agent");
 
     const Body = struct { identity_id: i64 };
     const body = readJsonBody(ctx, request, Body) catch {
@@ -203,7 +225,7 @@ fn handleDevLogin(ctx: *const ServerContext, request: *http.Server.Request) !voi
         };
     };
 
-    return issueSessionAndRespond(ctx, request, account_id);
+    return issueSessionAndRespond(ctx, request, account_id, user_agent);
 }
 
 fn handleLogout(ctx: *const ServerContext, request: *http.Server.Request) !void {
@@ -229,11 +251,99 @@ fn handleLogout(ctx: *const ServerContext, request: *http.Server.Request) !void 
     });
 }
 
-fn issueSessionAndRespond(ctx: *const ServerContext, request: *http.Server.Request, account_id: i64) !void {
+/// `GET /api/v1/me/sessions` — every live session for the caller's
+/// account, most recent first, with `current: true` on whichever one the
+/// request itself is authenticated with (so the frontend can label "this
+/// device" instead of making the user guess by user-agent string).
+fn handleListSessions(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const sessions = web_sessions.listLiveForAccount(ctx.pool, ctx.allocator, account_id, now) catch |err| {
+        log.err("list-sessions: failed for account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load sessions");
+    };
+    defer {
+        for (sessions) |s| {
+            if (s.user_agent) |ua| ctx.allocator.free(ua);
+            if (s.ip) |ip| ctx.allocator.free(ip);
+        }
+        ctx.allocator.free(sessions);
+    }
+
+    const Item = struct {
+        id: i64,
+        created_at: i64,
+        expires_at: i64,
+        user_agent: ?[]const u8,
+        ip: ?[]const u8,
+        current: bool,
+    };
+    var items = try ctx.allocator.alloc(Item, sessions.len);
+    defer ctx.allocator.free(items);
+    for (sessions, 0..) |s, i| {
+        items[i] = .{
+            .id = s.id,
+            .created_at = s.created_at,
+            .expires_at = s.expires_at,
+            .user_agent = s.user_agent,
+            .ip = s.ip,
+            .current = a.session_id != null and a.session_id.? == s.id,
+        };
+    }
+
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `DELETE /api/v1/me/sessions/:sessionId` — revokes a session, including
+/// (deliberately) the one making the request itself, which is just "log
+/// out" — same convention `API.md` documents. Refuses (`404`, not `403`,
+/// to avoid confirming *some* session exists at that id to a caller who
+/// doesn't own it) if `sessionId` doesn't resolve to a live session owned
+/// by the caller's own account.
+fn handleRevokeSession(ctx: *const ServerContext, request: *http.Server.Request, session_id_str: []const u8) !void {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    const session_id = std.fmt.parseInt(i64, session_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid session id");
+    };
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const session = web_sessions.getValid(ctx.pool, session_id, now) orelse {
+        return respondError(request, .not_found, "not_found", "no such session");
+    };
+    if (session.account_id != account_id) {
+        return respondError(request, .not_found, "not_found", "no such session");
+    }
+
+    web_sessions.revoke(ctx.pool, session_id, now) catch |err| {
+        log.err("revoke-session: failed to revoke session {d}: {t}", .{ session_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to revoke session");
+    };
+    audit_log.record(ctx.pool, account_id, "auth.session_revoke", session_id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `user_agent` must have been captured by the caller *before* it read the
+/// request body (if any) — `findHeader`/`iterateHeaders` requires the
+/// request reader to still be in its post-head, pre-body state; calling it
+/// from here (after callers like `handleDevLogin` already read the body)
+/// crashed with `assertion failure` in `std.http.Server.Request.iterateHeaders`
+/// (found 2026-07-28, in a local full-DB test run — not the pre-existing
+/// http_util.zig flake, a real bug in this file, fixed by moving capture
+/// earlier in every caller instead of doing it here).
+fn issueSessionAndRespond(ctx: *const ServerContext, request: *http.Server.Request, account_id: i64, user_agent: ?[]const u8) !void {
     const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
     const expires_at = now + 30 * 24 * 3600; // 30 days
 
-    const session_id = web_sessions.create(ctx.pool, account_id, now, expires_at, null, null) catch |err| {
+    const session_id = web_sessions.create(ctx.pool, account_id, now, expires_at, user_agent, null) catch |err| {
         log.err("failed to create session for account {d}: {t}", .{ account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to create session");
     };
@@ -279,7 +389,7 @@ fn resolveAuth(ctx: *const ServerContext, request: *http.Server.Request) Request
     const session_id = auth.verify(token, secret) orelse return .{ .account_id = null };
     const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
     const session = web_sessions.getValid(ctx.pool, session_id, now) orelse return .{ .account_id = null };
-    return .{ .account_id = session.account_id };
+    return .{ .account_id = session.account_id, .session_id = session_id };
 }
 
 /// Scans the request's `Cookie` header(s) for `name=value`, returning the
@@ -292,6 +402,19 @@ fn findCookie(request: *http.Server.Request, name: []const u8) ?[]const u8 {
     while (it.next()) |header| {
         if (!std.ascii.eqlIgnoreCase(header.name, "cookie")) continue;
         if (parseCookieValue(header.value, name)) |value| return value;
+    }
+    return null;
+}
+
+/// First matching header value, or `null`. Used for `User-Agent` when
+/// minting a session (see `issueSessionAndRespond`) — IP isn't captured
+/// yet since the real client IP behind the eventual reverse proxy needs
+/// `X-Forwarded-For` handling, deferred to `ROADMAP.md` Phase 7 rather
+/// than recording the proxy's own address as if it were the client's.
+fn findHeader(request: *http.Server.Request, name: []const u8) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
     }
     return null;
 }
