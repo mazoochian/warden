@@ -12,8 +12,15 @@ const auth = @import("auth.zig");
 const ServerContext = server_mod.ServerContext;
 const web_sessions = @import("../store/web_sessions.zig");
 const accounts = @import("../store/accounts.zig");
+const identities = @import("../store/identities.zig");
 const audit_log = @import("../store/audit_log.zig");
+const telegram_login = @import("telegram_login.zig");
 const log = @import("../log.zig").scoped("api");
+
+/// Telegram re-issues `auth_date` on every widget load; anything older than
+/// this is treated as a captured/replayed payload rather than a
+/// legitimately slow page load.
+const telegram_login_max_age_seconds: i64 = 24 * 3600;
 
 /// One request's resolved caller — `null` `account_id` means
 /// unauthenticated (a missing/invalid/expired session cookie), which is a
@@ -34,6 +41,12 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
 
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/auth/session")) {
         return handleGetSession(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/auth/providers")) {
+        return handleGetProviders(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/auth/telegram/callback")) {
+        return handleTelegramCallback(ctx, request);
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/auth/dev-login")) {
         return handleDevLogin(ctx, request);
@@ -70,6 +83,80 @@ fn handleGetSession(ctx: *const ServerContext, request: *http.Server.Request) !v
         .account_id = account_id,
         .identity_ids = identity_ids,
     });
+}
+
+/// `GET /api/v1/auth/providers` — public, no auth required. Lets the
+/// login page render itself without hardcoding which login methods are
+/// actually configured server-side (see API.md). Google/generic OIDC
+/// aren't wired up yet (Phase 1 in progress), so those always come back
+/// empty for now.
+fn handleGetProviders(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const TelegramProvider = struct { bot_username: []const u8 };
+    const OidcProvider = struct { id: []const u8, name: []const u8 };
+    const Response = struct {
+        telegram: ?TelegramProvider,
+        google: ?struct {} = null,
+        oidc: []const OidcProvider = &.{},
+    };
+    return respondJson(ctx, request, .ok, Response{
+        .telegram = if (ctx.config.telegram_bot_username) |username|
+            TelegramProvider{ .bot_username = username }
+        else
+            null,
+    });
+}
+
+/// `POST /api/v1/auth/telegram/callback` — see API.md and
+/// `ARCHITECTURE.md` §3.1/§3.3. Body: the Telegram Login Widget's own
+/// returned fields (`telegram_login.Payload`). Verifies `hash`, resolves
+/// straight to the bot's existing `identities` row for that Telegram user
+/// (no linking step needed — see §3.3 for why this is the one login
+/// method that doesn't need a fresh `identities` row most of the time),
+/// finds-or-creates the linked `accounts` row, issues a session.
+fn handleTelegramCallback(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [8 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(8 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const payload = std.json.parseFromSliceLeaky(telegram_login.Payload, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid telegram login payload");
+    };
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const ok = telegram_login.verify(ctx.allocator, payload, ctx.config.telegram_bot_token, now, telegram_login_max_age_seconds) catch |err| {
+        log.err("telegram-login: verify errored: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to verify login");
+    };
+    if (!ok) {
+        return respondError(request, .unauthorized, "invalid_login", "telegram login verification failed");
+    }
+
+    var id_buf: [20]u8 = undefined;
+    const native_id = std.fmt.bufPrint(&id_buf, "{d}", .{payload.id}) catch unreachable;
+
+    const identity_id = identities.getOrCreateMinimal(ctx.pool, .telegram, native_id, payload.first_name, payload.username, false, now) catch |err| {
+        log.err("telegram-login: failed to resolve identity for telegram id {d}: {t}", .{ payload.id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+    };
+
+    const account_id = blk: {
+        if (accounts.findByIdentity(ctx.pool, ctx.allocator, identity_id) catch null) |existing| {
+            ctx.allocator.free(existing.display_name);
+            if (existing.avatar_url) |u| ctx.allocator.free(u);
+            break :blk existing.id;
+        }
+        break :blk accounts.create(ctx.pool, identity_id, payload.first_name, payload.photo_url) catch |err| {
+            log.err("telegram-login: failed to create account for identity {d}: {t}", .{ identity_id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to create account");
+        };
+    };
+
+    return issueSessionAndRespond(ctx, request, account_id);
 }
 
 /// `POST /api/v1/auth/dev-login` — see `Config.api_dev_login`'s doc

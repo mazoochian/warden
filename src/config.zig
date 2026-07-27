@@ -63,6 +63,14 @@ pub const LlmConfig = union(LlmProviderKind) {
 /// currently only targets local/dev deployment.
 pub const Config = struct {
     telegram_bot_token: []const u8,
+    /// Only used to render the Telegram Login Widget's `data-telegram-
+    /// login` attribute (`GET /api/v1/auth/providers`) — the bot token
+    /// above is what actually does the HMAC verification, this is purely
+    /// cosmetic/addressing. Null means the Telegram login provider is
+    /// omitted from `/api/v1/auth/providers` entirely (the frontend just
+    /// won't show the button) rather than guessing wrong and rendering a
+    /// widget that can never redirect anywhere.
+    telegram_bot_username: ?[]const u8 = null,
     /// One entry per connected platform. Only `.telegram` is populated
     /// today; adding Matrix/Discord/WhatsApp later means adding another
     /// `OwnerEntry` here plus its own connector, not touching `auth.zig`.
@@ -218,6 +226,7 @@ pub const Config = struct {
     /// lifetime. `io` is only used to read WARDEN_SYSTEM_PROMPT_FILE.
     pub fn load(env: *const std.process.Environ.Map, arena: std.mem.Allocator, io: std.Io) LoadError!Config {
         const telegram_bot_token = env.get("WARDEN_TELEGRAM_BOT_TOKEN") orelse return error.MissingBotToken;
+        const telegram_bot_username = nonEmpty(env.get("WARDEN_TELEGRAM_BOT_USERNAME"));
 
         const telegram_owner_id = env.get("WARDEN_TELEGRAM_OWNER_ID") orelse default_telegram_owner_id;
 
@@ -358,6 +367,7 @@ pub const Config = struct {
 
         return .{
             .telegram_bot_token = telegram_bot_token,
+            .telegram_bot_username = telegram_bot_username,
             .owners = owners,
             .postgres_dsn = postgres_dsn,
             .postgres_pool_size = postgres_pool_size,
