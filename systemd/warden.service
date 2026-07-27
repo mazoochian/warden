@@ -1,6 +1,7 @@
 [Unit]
-# Wraps the existing docker-compose.yaml stack (warden + searxng + the
-# VPS-local postgres override) so systemd — not just Docker's own
+# Wraps the existing docker-compose.yaml stack (warden + warden-ui +
+# searxng + the VPS-local postgres/traefik override) so systemd — not just
+# Docker's own
 # `restart: unless-stopped` — supervises it. Two things this buys over the
 # container-only setup:
 #   1. Boot-time start: containers with `restart: unless-stopped` only come
@@ -19,7 +20,7 @@
 # the `docker compose up` process itself dies (lost its connection to a
 # restarted Docker daemon, was OOM-killed, etc.), `Restart=always` below
 # brings the whole stack back.
-Description=Warden bot (docker compose: warden, searxng, postgres)
+Description=Warden bot (docker compose: warden, warden-ui, searxng, postgres, traefik)
 Documentation=https://github.com/mother-of-all-self-hosting
 After=docker.service network-online.target
 Wants=network-online.target
@@ -33,12 +34,14 @@ WorkingDirectory=/home/armin/warden
 # it off defensively so journal entries never carry stray ANSI escapes.
 # --remove-orphans: drops containers for services removed from
 # compose.yaml over time instead of leaving them running unmanaged.
-# Explicit service names (warden searxng postgres), not a bare `up`: this
-# repo also defines optional sidecar services (llama-server, whisper-
-# server, prosody) meant to be opt-in only — see compose.yaml's own
-# comments on why a bare `docker compose up` would try to start those too.
-ExecStart=/usr/bin/docker compose up --no-color --remove-orphans warden searxng postgres
-ExecStop=/usr/bin/docker compose stop warden searxng postgres
+# Explicit service names, not a bare `up`: this repo also defines optional
+# sidecar services (llama-server, whisper-server, prosody) meant to be
+# opt-in only — see compose.yaml's own comments on why a bare `docker
+# compose up` would try to start those too. `traefik`/`warden-ui` are
+# defined in compose.override.yaml (VPS-only, not shipped in this repo —
+# see ARCHITECTURE.md §2 in the warden-ui repo for the reverse-proxy plan).
+ExecStart=/usr/bin/docker compose up --no-color --remove-orphans warden warden-ui searxng postgres traefik
+ExecStop=/usr/bin/docker compose stop warden warden-ui searxng postgres traefik
 Restart=always
 RestartSec=10
 TimeoutStartSec=180
