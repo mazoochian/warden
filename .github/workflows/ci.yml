@@ -52,22 +52,30 @@ jobs:
       - name: zig build
         run: zig build
 
-      # NOTE: two known, pre-existing, intermittent test-suite flakes as of
-      # 2026-07-28 -- neither is a regression from whatever change you're
-      # looking at unless you touched the specific file involved:
+      # NOTE: two known, pre-existing test-suite crashes as of 2026-07-28 --
+      # neither is a regression from whatever change you're looking at
+      # unless you touched the specific file involved:
       #   1. store/crypto.zig's test group (found 2026-07-27) -- a
       #      different specific crypto.zig test crashes (SIGABRT or
       #      segfault) on some runs once the full suite got large enough,
       #      most likely shared-resource/timing contention rather than a
-      #      bug in any one test.
-      #   2. http_util.zig's HTTP-client-timeout test (`fetchAndFlag`,
-      #      found 2026-07-27 via this CI, re-confirmed 2026-07-28 both
-      #      here and in a local full-DB run on glibc -- not musl-
-      #      specific) -- segfaults inside std.http.Client.fetch itself
-      #      (Client.zig's fetch, freeing redirect_buffer), called from a
-      #      detached timeout-watcher thread in fetchAndFlag.
-      # If ONLY one of these two crashes/fails here, re-run the job before
-      # assuming a real regression; if anything else fails, treat it as
-      # real.
+      #      bug in any one test. Genuinely intermittent here too -- if
+      #      ONLY this one crashes, re-running is worth trying.
+      #   2. http_util.zig's HTTP-client-timeout test (`fetchAndFlag`) --
+      #      segfaults inside std.http.Client.fetch itself (Client.zig's
+      #      fetch, freeing redirect_buffer), called from a detached
+      #      timeout-watcher thread in fetchAndFlag. Found 2026-07-27,
+      #      confirmed 2026-07-28: this one is NOT flaky on THIS runner --
+      #      it has crashed 5/5 consecutive times on GitHub Actions'
+      #      alpine:3.22 container since this workflow was created.
+      #      Re-running will not make it pass here. It IS genuinely
+      #      intermittent locally on glibc, which is the only reason it
+      #      wasn't caught before CI existed. Needs a real debugging pass
+      #      (an Alpine-container local repro would help), not a rerun.
+      # If crypto.zig is the ONLY failure, re-run once. If http_util.zig's
+      # fetchAndFlag is among the failures, that's expected on this runner
+      # today -- don't rerun for it, and don't treat it as a regression
+      # unless you touched http_util.zig yourself. Anything else failing
+      # is real.
       - name: zig build test
         run: zig build test
