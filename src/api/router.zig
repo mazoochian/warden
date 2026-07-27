@@ -27,6 +27,8 @@ const civil_time = @import("../text/civil_time.zig");
 const reminders = @import("../store/reminders.zig");
 const alert_store = @import("../store/alerts.zig");
 const feed_watches = @import("../store/feed_watches.zig");
+const group_admin = @import("../features/group_admin.zig");
+const redact_feature = @import("../features/redact.zig");
 const audit_log = @import("../store/audit_log.zig");
 const telegram_login = @import("telegram_login.zig");
 /// The bot's own permission-ladder module (owner check) -- aliased since
@@ -48,6 +50,7 @@ const admin_config_prefix = "/api/v1/admin/config/";
 const chats_prefix = "/api/v1/chats/";
 const chat_settings_suffix = "/settings";
 const chat_members_suffix = "/members";
+const chat_actions_infix = "/actions/";
 const reminders_prefix = "/api/v1/reminders/";
 const alerts_prefix = "/api/v1/alerts/";
 const watches_prefix = "/api/v1/watches/";
@@ -146,6 +149,21 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
         } else if (std.mem.endsWith(u8, rest, chat_members_suffix)) {
             const id_str = rest[0 .. rest.len - chat_members_suffix.len];
             if (method == .GET) return handleListChatMembers(ctx, request, id_str);
+        } else if (std.mem.indexOf(u8, rest, chat_actions_infix)) |idx| {
+            if (method != .POST) {
+                return respondError(request, .not_found, "not_found", "no such endpoint");
+            }
+            const id_str = rest[0..idx];
+            const action = rest[idx + chat_actions_infix.len ..];
+            if (std.mem.eql(u8, action, "kick")) return handleChatActionKick(ctx, request, id_str);
+            if (std.mem.eql(u8, action, "ban")) return handleChatActionBan(ctx, request, id_str);
+            if (std.mem.eql(u8, action, "mute")) return handleChatActionMute(ctx, request, id_str);
+            if (std.mem.eql(u8, action, "unmute")) return handleChatActionUnmute(ctx, request, id_str);
+            if (std.mem.eql(u8, action, "promote")) return handleChatActionPromote(ctx, request, id_str);
+            if (std.mem.eql(u8, action, "demote")) return handleChatActionDemote(ctx, request, id_str);
+            if (std.mem.eql(u8, action, "pin")) return handleChatActionPin(ctx, request, id_str);
+            if (std.mem.eql(u8, action, "unpin")) return handleChatActionUnpin(ctx, request, id_str);
+            if (std.mem.eql(u8, action, "redact")) return handleChatActionRedact(ctx, request, id_str);
         }
     }
     if (std.mem.eql(u8, path, "/api/v1/me/settings")) {
@@ -1148,6 +1166,404 @@ fn handleListChatMembers(ctx: *const ServerContext, request: *http.Server.Reques
 }
 
 // ---------------------------------------------------------------------------
+// Group Administration actions (Phase 5b) — kick/ban/mute/unmute/pin/unpin/
+// promote/demote/redact, each routed through the *exact* existing
+// `auth.checkGroupAdminAccess`/`isOwnerOrSudoBotAdmin` functions the slash
+// commands and `/menu` already use — this endpoint is simply a third
+// independent entry point to the same actions (see API.md). Two deliberate
+// adaptations for the web, both judgment calls made here rather than
+// spelled out in API.md's original sketch:
+//   - `sudo_active` (normally "the sender is a bot admin AND prefixed their
+//     command with /sudo") maps to plain `roles.bot_admin` here — there's no
+//     text-prefix ritual in a web form, so being logged in as a bot admin
+//     and clicking the button *is* the deliberate elevation. Still sends the
+//     same "granted superuser permissions" message into the real chat, so
+//     the elevation is never silent, matching the original design intent.
+//   - `allow_token_fallback` is always `false` — API.md's own description of
+//     this ladder lists exactly three tiers (platform admin / bot admin /
+//     owner), no token-spend tier, and spending a per-chat token is a
+//     conversational-command mechanic that doesn't map cleanly onto a web
+//     form (the "not enough tokens" reply would land in the real chat as an
+//     unexplained bot message, attributed to nothing the chat itself saw).
+// ---------------------------------------------------------------------------
+
+const ChatActionCtx = struct {
+    ra: RequesterAuth,
+    chat: chats_store.ChatRef,
+    connector: iface.Connector,
+    actor_msg: iface.Message,
+    actor_identity_id: i64,
+};
+
+/// Every action handler below starts with this: logged in, the
+/// `group_admin` module enabled (same gate the slash commands and `/menu`
+/// both already apply), the chat exists and has an active connector, and a
+/// synthetic `iface.Message` standing in for "a message from the caller in
+/// this chat" -- built from the caller's own first linked identity (native
+/// id/platform; `.identity` populated too, for the sudo-grant message's
+/// display name). Everything here is allocated from `arena`, including
+/// `chat.native_chat_id` -- no manual frees needed. `null` means a response
+/// was already sent.
+fn beginChatAction(ctx: *const ServerContext, request: *http.Server.Request, arena: std.mem.Allocator, chat_id: i64) !?ChatActionCtx {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return null;
+
+    if (!feature_flags.isEnabled(ctx.pool, "group_admin")) {
+        try respondError(request, .forbidden, "forbidden", "the group administration module is disabled");
+        return null;
+    }
+
+    const chat = (chats_store.getById(ctx.pool, arena, chat_id) catch |err| {
+        log.err("chat-action: failed to load chat {d}: {t}", .{ chat_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to load chat");
+        return null;
+    }) orelse {
+        try respondError(request, .not_found, "not_found", "no such chat");
+        return null;
+    };
+
+    const connector = findConnectorForPlatform(ctx.connectors, chat.platform) orelse {
+        try respondError(request, .internal_server_error, "internal", "no active connector for this chat's platform");
+        return null;
+    };
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, arena, ra.account_id) catch |err| {
+        log.err("chat-action: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to resolve caller identity");
+        return null;
+    };
+    if (identity_ids.len == 0) {
+        try respondError(request, .internal_server_error, "internal", "account has no linked identity");
+        return null;
+    }
+    const actor_info = (identities.getWhoisInfo(ctx.pool, arena, identity_ids[0]) catch |err| {
+        log.err("chat-action: failed to load whois for identity {d}: {t}", .{ identity_ids[0], err });
+        try respondError(request, .internal_server_error, "internal", "failed to resolve caller identity");
+        return null;
+    }) orelse {
+        try respondError(request, .internal_server_error, "internal", "failed to resolve caller identity");
+        return null;
+    };
+
+    const actor_msg = iface.Message{
+        .chat_id = chat.native_chat_id,
+        .user_id = actor_info.native_id,
+        .username = actor_info.username,
+        .identity = .{
+            .platform = actor_info.platform,
+            .native_id = actor_info.native_id,
+            .display_name = actor_info.display_name,
+            .username = actor_info.username,
+            .is_bot = actor_info.is_bot,
+            .first_seen = 0,
+            .last_seen = 0,
+        },
+    };
+
+    return .{ .ra = ra, .chat = chat, .connector = connector, .actor_msg = actor_msg, .actor_identity_id = identity_ids[0] };
+}
+
+fn resolveTargetNativeId(ctx: *const ServerContext, request: *http.Server.Request, arena: std.mem.Allocator, target_identity_id: i64) !?[]const u8 {
+    const info = (identities.getWhoisInfo(ctx.pool, arena, target_identity_id) catch |err| {
+        log.err("chat-action: failed to load target identity {d}: {t}", .{ target_identity_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to resolve target");
+        return null;
+    }) orelse {
+        try respondError(request, .not_found, "not_found", "no such identity");
+        return null;
+    };
+    return info.native_id;
+}
+
+fn readJsonBodyLeaky(request: *http.Server.Request, arena: std.mem.Allocator, comptime T: type, max_len: usize) !?T {
+    var buf: [4 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(max_len)) catch {
+        try respondError(request, .bad_request, "bad_request", "failed to read body");
+        return null;
+    };
+    return std.json.parseFromSliceLeaky(T, arena, raw, .{}) catch {
+        try respondError(request, .bad_request, "bad_request", "invalid request body");
+        return null;
+    };
+}
+
+const ModTargetBody = struct { identity_id: i64 };
+
+/// Mirrors `group_admin.zig`'s own private `default_mute_seconds` -- kept as
+/// a separate constant since `main.zig` is what imports this file, not the
+/// other way around (see `max_reminder_message_len`'s doc comment for the
+/// same reasoning).
+const default_mute_seconds: i64 = 3600;
+const MuteBody = struct { identity_id: i64, duration_seconds: ?i64 = null };
+const PinBody = struct { message_id: []const u8 };
+const RedactBody = struct {
+    mode: []const u8,
+    n: ?i64 = null,
+    identity_id: ?i64 = null,
+    substring: ?[]const u8 = null,
+    pattern: ?[]const u8 = null,
+};
+
+fn handleChatActionKick(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, ModTargetBody, 1024)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "kick")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to kick in this chat");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
+
+    ac.connector.kickUser(arena, ac.chat.native_chat_id, target_native_id) catch |err| {
+        log.err("chat-action-kick: failed for chat {d} target {d}: {t}", .{ chat_id, body.identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "kick failed");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.kick", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+fn handleChatActionBan(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, ModTargetBody, 1024)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "ban")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to ban in this chat");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
+
+    ac.connector.banUser(arena, ac.chat.native_chat_id, target_native_id) catch |err| {
+        log.err("chat-action-ban: failed for chat {d} target {d}: {t}", .{ chat_id, body.identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "ban failed");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.ban", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+fn handleChatActionMute(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, MuteBody, 1024)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "mute")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to mute in this chat");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const duration = body.duration_seconds orelse default_mute_seconds;
+    ac.connector.muteUser(arena, ac.chat.native_chat_id, target_native_id, now + duration) catch |err| {
+        log.err("chat-action-mute: failed for chat {d} target {d}: {t}", .{ chat_id, body.identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "mute failed");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.mute", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+fn handleChatActionUnmute(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, ModTargetBody, 1024)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "unmute")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to unmute in this chat");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
+
+    ac.connector.unmuteUser(arena, ac.chat.native_chat_id, target_native_id) catch |err| {
+        log.err("chat-action-unmute: failed for chat {d} target {d}: {t}", .{ chat_id, body.identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "unmute failed");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.unmute", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// Owner-only, not `checkGroupAdminAccess` -- mirrors `group_admin.promote`'s
+/// doc comment exactly: granting real platform admin/moderator standing is
+/// more consequential than mute/kick/pin, and deliberately isn't extended to
+/// bot admins either.
+fn handleChatActionPromote(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, ModTargetBody, 1024)) orelse return;
+
+    if (!ac.ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only the owner can promote");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
+
+    ac.connector.promoteUser(arena, ac.chat.native_chat_id, target_native_id) catch |err| {
+        log.err("chat-action-promote: failed for chat {d} target {d}: {t}", .{ chat_id, body.identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "promote failed");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.promote", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// Owner-only -- see `handleChatActionPromote`'s doc comment.
+fn handleChatActionDemote(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, ModTargetBody, 1024)) orelse return;
+
+    if (!ac.ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only the owner can demote");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
+
+    ac.connector.demoteUser(arena, ac.chat.native_chat_id, target_native_id) catch |err| {
+        log.err("chat-action-demote: failed for chat {d} target {d}: {t}", .{ chat_id, body.identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "demote failed");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.demote", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `{message_id}` -- a native platform message id, typed/pasted in by the
+/// caller. No message-browser UI backs this yet (the only place a chat's
+/// recent messages are exposed today, `GET /api/v1/admin/chats/:id`, is
+/// owner/bot-admin-only, while pin itself is open to any live platform
+/// admin of the chat too -- building that picker is follow-up work, not a
+/// blocker for the endpoint existing).
+fn handleChatActionPin(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, PinBody, 1024)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "pin")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to pin in this chat");
+    }
+
+    ac.connector.pinMessage(arena, ac.chat.native_chat_id, body.message_id) catch |err| {
+        log.err("chat-action-pin: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "pin failed");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.pin", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// No body needed -- unpins whatever's currently pinned, same as `/unpin`.
+fn handleChatActionUnpin(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "unpin")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to unpin in this chat");
+    }
+
+    ac.connector.unpinMessage(arena, ac.chat.native_chat_id, null) catch |err| {
+        log.err("chat-action-unpin: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "unpin failed");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.unpin", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `{mode: "lastn"|"user"|"text"|"regex", ...}` -- see API.md. `regex` mode
+/// keeps its own stricter gate (`isOwnerOrSudoBotAdmin` -- excludes even a
+/// live platform admin), unchanged from `/redact regex`'s behavior; the
+/// other three modes use the same ladder as every other action here.
+fn handleChatActionRedact(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, RedactBody, 4 * 1024)) orelse return;
+
+    if (std.mem.eql(u8, body.mode, "regex")) {
+        if (!perm_auth.isOwnerOrSudoBotAdmin(ctx.config, ac.chat.platform, ac.actor_msg.user_id, ac.ra.roles.bot_admin)) {
+            return respondError(request, .forbidden, "forbidden", "regex redact requires the owner or a bot admin");
+        }
+        const pattern = body.pattern orelse {
+            return respondError(request, .bad_request, "bad_request", "pattern is required for regex mode");
+        };
+        redact_feature.redactRegex(ac.connector, arena, ctx.pool, chat_id, ac.actor_msg, pattern);
+    } else {
+        if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "redact")) {
+            return respondError(request, .forbidden, "forbidden", "not authorized to redact in this chat");
+        }
+        if (std.mem.eql(u8, body.mode, "text")) {
+            const substring = body.substring orelse {
+                return respondError(request, .bad_request, "bad_request", "substring is required for text mode");
+            };
+            redact_feature.redactText(ac.connector, arena, ctx.pool, chat_id, ac.actor_msg, substring);
+        } else if (std.mem.eql(u8, body.mode, "user")) {
+            const target_identity_id = body.identity_id orelse {
+                return respondError(request, .bad_request, "bad_request", "identity_id is required for user mode");
+            };
+            redact_feature.redactUserLastN(ac.connector, arena, ctx.pool, chat_id, ac.actor_msg, target_identity_id, body.n orelse 0);
+        } else if (std.mem.eql(u8, body.mode, "lastn")) {
+            redact_feature.redactLastN(ac.connector, arena, ctx.pool, chat_id, ac.actor_msg, body.n orelse 0);
+        } else {
+            return respondError(request, .bad_request, "bad_request", "mode must be lastn, user, text, or regex");
+        }
+    }
+
+    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.redact", id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+// ---------------------------------------------------------------------------
 // Personal settings (Phase 4) — pure UI on top of store/user_settings.zig,
 // already built in full during the reminders/timezone work.
 // ---------------------------------------------------------------------------
@@ -1433,6 +1849,9 @@ fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request,
 /// and the wizard describe the same underlying moment two different ways.
 fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "reminders")) {
+        return respondError(request, .forbidden, "forbidden", "the reminders module is disabled");
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
@@ -1606,6 +2025,9 @@ fn handleListAlerts(ctx: *const ServerContext, request: *http.Server.Request, ta
 /// otherwise (see `handleAlertCommand`).
 fn handleCreateAlert(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "alerts")) {
+        return respondError(request, .forbidden, "forbidden", "the alerts module is disabled");
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
@@ -1713,6 +2135,9 @@ fn handleListWatches(ctx: *const ServerContext, request: *http.Server.Request, t
 /// `POST /api/v1/watches` -- see API.md.
 fn handleCreateWatch(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "watches")) {
+        return respondError(request, .forbidden, "forbidden", "the watches module is disabled");
+    }
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
