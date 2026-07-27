@@ -40,6 +40,25 @@ pub fn findByIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: 
     };
 }
 
+/// `null` if `account_id` doesn't exist — shouldn't happen for an
+/// `account_id` sourced from a valid session (see `web_sessions.zig`), but
+/// callers (the session-resolution middleware) treat it as "not logged in"
+/// rather than an error, same as an expired/revoked session would.
+pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, account_id: i64) !?Account {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT id, display_name, avatar_url FROM accounts WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, account_id);
+    if (!try stmt.step()) return null;
+    return .{
+        .id = stmt.columnInt64(0),
+        .display_name = try allocator.dupe(u8, stmt.columnText(1)),
+        .avatar_url = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+    };
+}
+
 /// Creates a fresh account linked to `identity_id` in one round trip (a
 /// data-modifying CTE, not a manually-managed transaction — Postgres
 /// guarantees the two inserts either both happen or neither does).
@@ -147,6 +166,12 @@ test "create/findByIdentity/listIdentityIds round-trip a fresh account" {
     defer a.free(ids);
     try testing.expectEqual(@as(usize, 1), ids.len);
     try testing.expectEqual(telegram_identity, ids[0]);
+
+    const by_id = (try getById(&pool, a, account_id)) orelse return error.TestExpectedValue;
+    defer a.free(by_id.display_name);
+    try testing.expectEqualStrings("Alice", by_id.display_name);
+
+    try testing.expectEqual(@as(?Account, null), try getById(&pool, a, account_id + 999));
 }
 
 test "linkIdentity adds a second identity to the same account; unlinkIdentity refuses to remove the last one" {

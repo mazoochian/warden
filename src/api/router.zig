@@ -72,6 +72,21 @@ fn handleGetSession(ctx: *const ServerContext, request: *http.Server.Request) !v
         return respondJson(ctx, request, .ok, .{ .authenticated = false });
     };
 
+    // Both lookups reading a session's own just-resolved account_id
+    // failing would mean the account row vanished between the session
+    // being minted and now (never observed, no delete path exists yet) --
+    // treated as a hard error rather than silently downgrading to
+    // "unauthenticated", since that would mask a real data-integrity bug.
+    const account = accounts.getById(ctx.pool, ctx.allocator, account_id) catch |err| {
+        log.err("session: failed to load account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load session");
+    } orelse {
+        log.err("session: account {d} referenced by a valid session no longer exists", .{account_id});
+        return respondError(request, .internal_server_error, "internal", "failed to load session");
+    };
+    defer ctx.allocator.free(account.display_name);
+    defer if (account.avatar_url) |u| ctx.allocator.free(u);
+
     const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
         log.err("session: failed to list identities for account {d}: {t}", .{ account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load session");
@@ -81,6 +96,8 @@ fn handleGetSession(ctx: *const ServerContext, request: *http.Server.Request) !v
     return respondJson(ctx, request, .ok, .{
         .authenticated = true,
         .account_id = account_id,
+        .display_name = account.display_name,
+        .avatar_url = account.avatar_url,
         .identity_ids = identity_ids,
     });
 }
