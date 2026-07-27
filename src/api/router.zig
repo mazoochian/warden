@@ -110,6 +110,9 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     if (method == .PATCH and std.mem.startsWith(u8, path, admin_config_prefix)) {
         return handleAdminSetConfig(ctx, request, path[admin_config_prefix.len..]);
     }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/audit-log")) {
+        return handleAdminAuditLog(ctx, request, target);
+    }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
 }
@@ -749,6 +752,43 @@ fn handleAdminSetConfig(ctx: *const ServerContext, request: *http.Server.Request
     audit_log.record(ctx.pool, account_id, "config.set", key, null);
 
     return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/admin/audit-log?action=&cursor=&limit=` — thin wrapper
+/// over `store/audit_log.zig`'s existing `list` (built in Phase 0, never
+/// exposed over HTTP until now). `action` narrows to exactly one action
+/// name at a time (matches `list`'s own single-filter shape) — the
+/// frontend's "recently changed" widget calls this once per action
+/// (`module.set`, `config.set`) and merges client-side; full multi-action
+/// filtering/browsing is Phase 7's job, not this endpoint's.
+fn handleAdminAuditLog(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    // `paginationParams`'s `after_id` field name assumes ascending-by-id
+    // listings (`listChats`/`listIdentities`'s "id > cursor" shape) --
+    // `audit_log.list` is newest-first ("id < cursor" for the next,
+    // older, page) instead, but reusing the same parsed cursor value as
+    // its `before_id` argument still produces the correct "next page =
+    // strictly older rows" behavior: the SQL itself does `id < $1`
+    // regardless of what this local variable is named.
+    const page = paginationParams(target);
+    const action_filter = queryParam(target, "action");
+
+    const entries = audit_log.list(ctx.pool, ctx.allocator, if (page.after_id > 0) page.after_id else null, action_filter, page.limit) catch |err| {
+        log.err("admin-audit-log: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load audit log");
+    };
+    defer {
+        for (entries) |e| {
+            ctx.allocator.free(e.action);
+            if (e.target) |t| ctx.allocator.free(t);
+            if (e.detail) |d| ctx.allocator.free(d);
+        }
+        ctx.allocator.free(entries);
+    }
+
+    const next_cursor: ?i64 = if (entries.len == @as(usize, @intCast(page.limit))) entries[entries.len - 1].id else null;
+    return respondJson(ctx, request, .ok, .{ .items = entries, .next_cursor = next_cursor });
 }
 
 /// `user_agent` must have been captured by the caller *before* it read the
