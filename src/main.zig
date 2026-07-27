@@ -513,7 +513,7 @@ pub fn main(init: std.process.Init) !void {
     // surface.
     if (config.api_port) |port| {
         const api_ctx = try gpa.create(api_server.ServerContext);
-        api_ctx.* = .{ .allocator = gpa, .io = io, .pool = &pool, .config = &config };
+        api_ctx.* = .{ .allocator = gpa, .io = io, .pool = &pool, .config = &config, .connectors = connectors };
         if (std.Thread.spawn(.{}, apiServerThread, .{ api_ctx, port, config.api_workers })) |thread| {
             thread.detach();
         } else |err| {

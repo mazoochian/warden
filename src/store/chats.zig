@@ -42,6 +42,25 @@ pub const ChatRef = struct {
     platform: Platform,
 };
 
+/// Single-chat lookup by internal id — `null` if it doesn't exist. Backs
+/// the warden-ui API's per-chat settings endpoints (Phase 4), which
+/// receive a chat by internal id from the URL and need its platform +
+/// native id to run a live group-admin check via the matching connector.
+pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) !?ChatRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT id, native_chat_id, platform FROM chats WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    if (!try stmt.step()) return null;
+    return .{
+        .id = stmt.columnInt64(0),
+        .native_chat_id = try allocator.dupe(u8, stmt.columnText(1)),
+        .platform = std.meta.stringToEnum(Platform, stmt.columnText(2)) orelse .telegram,
+    };
+}
+
 /// Lists every known chat — replaces `ChatStore.listExistingChatIds`'s
 /// directory scan (used at startup to restore digest scheduling).
 pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]ChatRef {
@@ -98,4 +117,22 @@ test "listAll returns every chat" {
         testing.allocator.free(refs);
     }
     try testing.expectEqual(@as(usize, 2), refs.len);
+}
+
+test "getById finds an existing chat and returns null for an unknown id" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const chat_id = try upsertChat(&pool, .telegram, "-100", "supergroup", "Test");
+
+    const found = (try getById(&pool, a, chat_id)) orelse return error.TestExpectedValue;
+    defer a.free(found.native_chat_id);
+    try testing.expectEqual(chat_id, found.id);
+    try testing.expectEqualStrings("-100", found.native_chat_id);
+    try testing.expectEqual(Platform.telegram, found.platform);
+
+    try testing.expectEqual(@as(?ChatRef, null), try getById(&pool, a, chat_id + 999));
 }

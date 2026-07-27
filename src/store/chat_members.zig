@@ -1,6 +1,8 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
+const Platform = @import("../platform/interface.zig").Platform;
+const ChatRef = @import("chats.zig").ChatRef;
 
 /// Ensures a `chat_members` row exists for (chat_id, identity_id) and bumps
 /// its `last_seen` — called once per inbound message, replacing the old
@@ -45,11 +47,88 @@ pub fn ensureKnown(pool: *PgPool, chat_id: i64, identity_id: i64) !void {
     _ = try stmt.step();
 }
 
+/// Own shape rather than reusing `chats.ChatRef` — the warden-ui API's
+/// "My Groups" listing needs `title` too, and adding it to `ChatRef`
+/// itself would ripple into every other caller's cleanup code for a field
+/// only this one query actually needs.
+pub const MemberChatRef = struct {
+    id: i64,
+    native_chat_id: []const u8,
+    platform: Platform,
+    title: ?[]const u8,
+};
+
+/// Every chat this identity has a `chat_members` row in — the candidate
+/// set for the warden-ui API's "My Groups" listing (`GET /api/v1/chats?
+/// mine=true`, Phase 4): cheaper than live-checking admin status against
+/// *every* chat in the system, and correct since a live platform admin of
+/// a chat is necessarily also a member of it.
+pub fn listChatsForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ![]MemberChatRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT c.id, c.native_chat_id, c.platform, c.title
+        \\FROM chat_members cm JOIN chats c ON c.id = cm.chat_id
+        \\WHERE cm.identity_id = $1;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+
+    var out: std.ArrayList(MemberChatRef) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .id = stmt.columnInt64(0),
+            .native_chat_id = try allocator.dupe(u8, stmt.columnText(1)),
+            .platform = std.meta.stringToEnum(Platform, stmt.columnText(2)) orelse .telegram,
+            .title = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub const Match = struct {
     display_name: []const u8,
     username: ?[]const u8,
     native_id: []const u8,
 };
+
+pub const Member = struct {
+    identity_id: i64,
+    display_name: []const u8,
+    username: ?[]const u8,
+    last_seen: ?i64,
+};
+
+/// Every known member of a chat (not filtered by query, unlike `search`)
+/// — backs the warden-ui API's `GET /api/v1/chats/:id/members` (Phase 4).
+/// Bots excluded, same convention `search` already uses.
+pub fn listMembers(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, limit: i64) ![]Member {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT i.id, i.display_name, i.username, EXTRACT(EPOCH FROM cm.last_seen)::bigint
+        \\FROM chat_members cm JOIN identities i ON i.id = cm.identity_id
+        \\WHERE cm.chat_id = $1 AND NOT i.is_bot
+        \\ORDER BY cm.last_seen DESC NULLS LAST
+        \\LIMIT $2;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, limit);
+
+    var out: std.ArrayList(Member) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .identity_id = stmt.columnInt64(0),
+            .display_name = try allocator.dupe(u8, stmt.columnText(1)),
+            .username = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+            .last_seen = if (stmt.columnIsNull(3)) null else stmt.columnInt64(3),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 /// Escapes `%`, `_`, and `\` for safe embedding in a `LIKE ... ESCAPE '\'`
 /// pattern, then wraps `query` in `%...%` for a substring match — so a
@@ -196,6 +275,38 @@ test "ensureKnown registers a member without claiming they've ever actually spok
     try testing.expectEqualStrings("Courtney Hale", matches[0].display_name);
 }
 
+test "listChatsForIdentity lists only chats that identity is a member of" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, "Chat One");
+    const chat2 = try chats.upsertChat(&pool, .telegram, "2", null, null);
+    const alice = try identities.upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "1",
+        .display_name = "Alice",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+    try touch(&pool, chat1, alice, 1000);
+
+    const found = try listChatsForIdentity(&pool, a, alice);
+    defer {
+        for (found) |c| {
+            a.free(c.native_chat_id);
+            if (c.title) |t| a.free(t);
+        }
+        a.free(found);
+    }
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqual(chat1, found[0].id);
+    try testing.expectEqualStrings("Chat One", found[0].title.?);
+    _ = chat2;
+}
+
 test "search matches display_name or username case-insensitively, most-recently-active first" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
@@ -271,4 +382,34 @@ test "search treats % and _ in the query as literal characters, not wildcards" {
     // "_" would otherwise wildcard-match any single character (e.g. "100x").
     const no_such_user = try search(&pool, a, chat_id, "1_0", 5);
     try testing.expectEqual(@as(usize, 0), no_such_user.len);
+}
+
+test "listMembers excludes bots, orders most-recently-active first" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.upsertIdentity(&pool, .{ .platform = .telegram, .native_id = "1", .display_name = "Alice", .first_seen = 1000, .last_seen = 1000 });
+    const bob = try identities.upsertIdentity(&pool, .{ .platform = .telegram, .native_id = "2", .display_name = "Bob", .first_seen = 1000, .last_seen = 1000 });
+    const bot = try identities.upsertIdentity(&pool, .{ .platform = .telegram, .native_id = "3", .display_name = "TheBot", .is_bot = true, .first_seen = 1000, .last_seen = 1000 });
+
+    try touch(&pool, chat_id, alice, 1000);
+    try touch(&pool, chat_id, bob, 2000);
+    try ensureKnown(&pool, chat_id, bot);
+
+    const members = try listMembers(&pool, a, chat_id, 50);
+    defer {
+        for (members) |m| {
+            a.free(m.display_name);
+            if (m.username) |u| a.free(u);
+        }
+        a.free(members);
+    }
+    try testing.expectEqual(@as(usize, 2), members.len);
+    try testing.expectEqualStrings("Bob", members[0].display_name);
+    try testing.expectEqualStrings("Alice", members[1].display_name);
+    try testing.expectEqual(@as(?i64, 2000), members[0].last_seen);
 }

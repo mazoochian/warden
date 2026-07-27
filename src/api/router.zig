@@ -18,6 +18,12 @@ const admin_directory = @import("../store/admin_directory.zig");
 const feature_flags = @import("../store/feature_flags.zig");
 const dynamic_config = @import("../store/dynamic_config.zig");
 const config_mod = @import("../config.zig");
+const iface = @import("../platform/interface.zig");
+const chats_store = @import("../store/chats.zig");
+const chat_members = @import("../store/chat_members.zig");
+const chat_settings = @import("../store/chat_settings.zig");
+const user_settings = @import("../store/user_settings.zig");
+const civil_time = @import("../text/civil_time.zig");
 const audit_log = @import("../store/audit_log.zig");
 const telegram_login = @import("telegram_login.zig");
 /// The bot's own permission-ladder module (owner check) -- aliased since
@@ -36,6 +42,9 @@ const admin_chats_prefix = "/api/v1/admin/chats/";
 const admin_identities_prefix = "/api/v1/admin/identities/";
 const admin_modules_prefix = "/api/v1/admin/modules/";
 const admin_config_prefix = "/api/v1/admin/config/";
+const chats_prefix = "/api/v1/chats/";
+const chat_settings_suffix = "/settings";
+const chat_members_suffix = "/members";
 
 /// Default/max page size, matching `API.md`'s pagination convention.
 const default_page_limit: i64 = 50;
@@ -112,6 +121,24 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/audit-log")) {
         return handleAdminAuditLog(ctx, request, target);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/chats")) {
+        return handleListMyChats(ctx, request);
+    }
+    if (std.mem.startsWith(u8, path, chats_prefix)) {
+        const rest = path[chats_prefix.len..];
+        if (std.mem.endsWith(u8, rest, chat_settings_suffix)) {
+            const id_str = rest[0 .. rest.len - chat_settings_suffix.len];
+            if (method == .GET) return handleGetChatSettings(ctx, request, id_str);
+            if (method == .PATCH) return handleSetChatSettings(ctx, request, id_str);
+        } else if (std.mem.endsWith(u8, rest, chat_members_suffix)) {
+            const id_str = rest[0 .. rest.len - chat_members_suffix.len];
+            if (method == .GET) return handleListChatMembers(ctx, request, id_str);
+        }
+    }
+    if (std.mem.eql(u8, path, "/api/v1/me/settings")) {
+        if (method == .GET) return handleGetMySettings(ctx, request);
+        if (method == .PATCH) return handleSetMySettings(ctx, request);
     }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
@@ -813,6 +840,376 @@ fn handleAdminAuditLog(ctx: *const ServerContext, request: *http.Server.Request,
     return respondJson(ctx, request, .ok, .{ .items = entries, .next_cursor = next_cursor });
 }
 
+// ---------------------------------------------------------------------------
+// Groups (Phase 4) — chat-scoped, gated to owner/bot_admin or a *live*
+// platform admin of that specific chat, per ARCHITECTURE.md §7 tier 3.
+// ---------------------------------------------------------------------------
+
+fn findConnectorForPlatform(connectors: []const iface.Connector, platform: iface.Platform) ?iface.Connector {
+    for (connectors) |c| {
+        if (c.platform() == platform) return c;
+    }
+    return null;
+}
+
+/// `true` if any of `identity_ids` is *currently* a live platform admin of
+/// `chat` — checked fresh via the matching connector every call, never
+/// cached, so a demotion on the platform itself takes effect here
+/// immediately (same freshness guarantee `auth.checkGroupAdminAccess`
+/// already gives the bot's own commands). An identity on a different
+/// platform than `chat`, or with no matching connector currently active,
+/// is silently skipped rather than erroring — it simply can't be a live
+/// admin of a chat on a platform it doesn't belong to.
+fn isLiveAdminOfChat(ctx: *const ServerContext, identity_ids: []const i64, chat: chats_store.ChatRef) bool {
+    for (identity_ids) |identity_id| {
+        const info = (identities.getWhoisInfo(ctx.pool, ctx.allocator, identity_id) catch null) orelse continue;
+        defer {
+            ctx.allocator.free(info.native_id);
+            ctx.allocator.free(info.display_name);
+            if (info.username) |u| ctx.allocator.free(u);
+        }
+        if (info.platform != chat.platform) continue;
+        const connector = findConnectorForPlatform(ctx.connectors, chat.platform) orelse continue;
+        const is_admin = connector.isGroupAdmin(ctx.allocator, chat.native_chat_id, info.native_id) catch false;
+        if (is_admin) return true;
+    }
+    return false;
+}
+
+/// Every request handler below starts with this. `null` means a response
+/// was already sent (`401`/`404`/`403`) — the caller just returns.
+/// Ownership: on success, the caller owns `chat.native_chat_id` and must
+/// free it.
+fn requireChatAccess(ctx: *const ServerContext, request: *http.Server.Request, chat_id: i64) !?chats_store.ChatRef {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        try respondError(request, .unauthorized, "unauthorized", "not logged in");
+        return null;
+    };
+
+    const chat = (chats_store.getById(ctx.pool, ctx.allocator, chat_id) catch |err| {
+        log.err("chat-access: failed to load chat {d}: {t}", .{ chat_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to load chat");
+        return null;
+    }) orelse {
+        try respondError(request, .not_found, "not_found", "no such chat");
+        return null;
+    };
+
+    const roles = computeRoles(ctx, account_id) catch |err| {
+        log.err("chat-access: failed to compute roles for account {d}: {t}", .{ account_id, err });
+        ctx.allocator.free(chat.native_chat_id);
+        try respondError(request, .internal_server_error, "internal", "failed to check access");
+        return null;
+    };
+    if (roles.owner or roles.bot_admin) return chat;
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
+        log.err("chat-access: failed to list identities for account {d}: {t}", .{ account_id, err });
+        ctx.allocator.free(chat.native_chat_id);
+        try respondError(request, .internal_server_error, "internal", "failed to check access");
+        return null;
+    };
+    defer ctx.allocator.free(identity_ids);
+
+    if (isLiveAdminOfChat(ctx, identity_ids, chat)) return chat;
+
+    ctx.allocator.free(chat.native_chat_id);
+    try respondError(request, .forbidden, "forbidden", "not a live admin of this chat");
+    return null;
+}
+
+/// `GET /api/v1/chats?mine=true` — every chat the caller can manage: all
+/// of them for owner/bot_admin, or only the ones they're currently a live
+/// platform admin of otherwise (candidate set narrowed to chats they're
+/// at least a *member* of first, via `chat_members.listChatsForIdentity`
+/// — cheaper than live-checking every chat in the system, and correct
+/// since a live admin of a chat is necessarily also a member of it).
+fn handleListMyChats(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const roles = computeRoles(ctx, account_id) catch |err| {
+        log.err("list-my-chats: failed to compute roles for account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load chats");
+    };
+
+    const Item = struct { id: i64, platform: iface.Platform, native_chat_id: []const u8, title: ?[]const u8, is_group_admin: bool };
+    var items: std.ArrayList(Item) = .empty;
+    defer {
+        for (items.items) |it| {
+            ctx.allocator.free(it.native_chat_id);
+            if (it.title) |t| ctx.allocator.free(t);
+        }
+        items.deinit(ctx.allocator);
+    }
+
+    if (roles.owner or roles.bot_admin) {
+        const all = admin_directory.listChats(ctx.pool, ctx.allocator, 0, max_page_limit) catch |err| {
+            log.err("list-my-chats: failed to list all chats: {t}", .{err});
+            return respondError(request, .internal_server_error, "internal", "failed to load chats");
+        };
+        defer {
+            for (all) |c| {
+                ctx.allocator.free(c.native_chat_id);
+                if (c.title) |t| ctx.allocator.free(t);
+            }
+            ctx.allocator.free(all);
+        }
+        for (all) |c| {
+            try items.append(ctx.allocator, .{
+                .id = c.id,
+                .platform = c.platform,
+                .native_chat_id = try ctx.allocator.dupe(u8, c.native_chat_id),
+                .title = if (c.title) |t| try ctx.allocator.dupe(u8, t) else null,
+                .is_group_admin = true,
+            });
+        }
+    } else {
+        const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
+            log.err("list-my-chats: failed to list identities for account {d}: {t}", .{ account_id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to load chats");
+        };
+        defer ctx.allocator.free(identity_ids);
+
+        for (identity_ids) |identity_id| {
+            const info = (identities.getWhoisInfo(ctx.pool, ctx.allocator, identity_id) catch null) orelse continue;
+            defer {
+                ctx.allocator.free(info.native_id);
+                ctx.allocator.free(info.display_name);
+                if (info.username) |u| ctx.allocator.free(u);
+            }
+
+            const candidates = chat_members.listChatsForIdentity(ctx.pool, ctx.allocator, identity_id) catch continue;
+            defer {
+                for (candidates) |c| {
+                    ctx.allocator.free(c.native_chat_id);
+                    if (c.title) |t| ctx.allocator.free(t);
+                }
+                ctx.allocator.free(candidates);
+            }
+            for (candidates) |c| {
+                const connector = findConnectorForPlatform(ctx.connectors, c.platform) orelse continue;
+                const is_admin = connector.isGroupAdmin(ctx.allocator, c.native_chat_id, info.native_id) catch false;
+                if (!is_admin) continue;
+                try items.append(ctx.allocator, .{
+                    .id = c.id,
+                    .platform = c.platform,
+                    .native_chat_id = try ctx.allocator.dupe(u8, c.native_chat_id),
+                    .title = if (c.title) |t| try ctx.allocator.dupe(u8, t) else null,
+                    .is_group_admin = true,
+                });
+            }
+        }
+    }
+
+    return respondJson(ctx, request, .ok, .{ .items = items.items });
+}
+
+const ChatSettingsBody = struct {
+    persona: ?[]const u8,
+    magic_word: ?[]const u8,
+    digest_enabled: bool,
+    thinking_override: ?bool,
+};
+
+/// `GET /api/v1/chats/:id/settings`.
+fn handleGetChatSettings(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    const persona = chat_settings.getSystemPromptOverride(ctx.pool, ctx.allocator, chat_id);
+    defer if (persona) |p| ctx.allocator.free(p);
+    const magic_word = chat_settings.getMagicWord(ctx.pool, ctx.allocator, chat_id);
+    defer if (magic_word) |m| ctx.allocator.free(m);
+
+    return respondJson(ctx, request, .ok, ChatSettingsBody{
+        .persona = persona,
+        .magic_word = magic_word,
+        .digest_enabled = chat_settings.getDigestEnabled(ctx.pool, chat_id),
+        .thinking_override = chat_settings.getShowThinkingOverride(ctx.pool, chat_id),
+    });
+}
+
+/// `PATCH /api/v1/chats/:id/settings` — body is the *entire* settings
+/// object (`ChatSettingsBody`), not a sparse partial update: JSON has no
+/// clean way to distinguish "field omitted, leave unchanged" from "field
+/// explicitly null, clear it" without a wrapper type, and a settings-form
+/// PATCH (the only client this has) naturally submits every field anyway.
+/// `null` on `persona`/`magic_word`/`thinking_override` clears that
+/// override, matching each store setter's own `null`-clears convention.
+fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [8 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(8 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(ChatSettingsBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "expected the full chat settings object");
+    };
+
+    chat_settings.setSystemPromptOverride(ctx.pool, chat_id, body.persona) catch |err| {
+        log.err("set-chat-settings: persona failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setMagicWord(ctx.pool, chat_id, body.magic_word) catch |err| {
+        log.err("set-chat-settings: magic_word failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setDigestEnabled(ctx.pool, chat_id, body.digest_enabled) catch |err| {
+        log.err("set-chat-settings: digest_enabled failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setShowThinkingOverride(ctx.pool, chat_id, body.thinking_override) catch |err| {
+        log.err("set-chat-settings: thinking_override failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+
+    const a = resolveAuth(ctx, request);
+    audit_log.record(ctx.pool, a.account_id, "chat_settings.set", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/chats/:id/members`.
+fn handleListChatMembers(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    ctx.allocator.free(chat.native_chat_id);
+
+    const members = chat_members.listMembers(ctx.pool, ctx.allocator, chat_id, max_page_limit) catch |err| {
+        log.err("list-chat-members: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load members");
+    };
+    defer {
+        for (members) |m| {
+            ctx.allocator.free(m.display_name);
+            if (m.username) |u| ctx.allocator.free(u);
+        }
+        ctx.allocator.free(members);
+    }
+
+    return respondJson(ctx, request, .ok, .{ .items = members });
+}
+
+// ---------------------------------------------------------------------------
+// Personal settings (Phase 4) — pure UI on top of store/user_settings.zig,
+// already built in full during the reminders/timezone work.
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/me/settings` — resolves against the caller's *first*
+/// linked identity. Accounts can only ever have exactly one linked
+/// identity today (no account-linking flow exists yet — see
+/// `ARCHITECTURE.md` §3.3/§11), so this is a documented simplification,
+/// not a real gap yet; whichever identity ends up "first" once linking
+/// exists will need a real decision, not this arbitrary pick.
+fn handleGetMySettings(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
+        log.err("get-my-settings: failed to list identities for account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load settings");
+    };
+    defer ctx.allocator.free(identity_ids);
+    if (identity_ids.len == 0) {
+        return respondError(request, .internal_server_error, "internal", "account has no linked identity");
+    }
+    const identity_id = identity_ids[0];
+
+    return respondJson(ctx, request, .ok, .{
+        .utc_offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, identity_id),
+        .date_format = @tagName(user_settings.getEffectiveDateFormat(ctx.pool, ctx.allocator, identity_id)),
+        .time_format = @tagName(user_settings.getEffectiveTimeFormat(ctx.pool, ctx.allocator, identity_id)),
+    });
+}
+
+const MySettingsBody = struct {
+    utc_offset_minutes: ?i32,
+    date_format: ?[]const u8,
+    time_format: ?[]const u8,
+};
+
+/// `PATCH /api/v1/me/settings` — same "whole object, null clears" contract
+/// as `handleSetChatSettings`.
+fn handleSetMySettings(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
+        log.err("set-my-settings: failed to list identities for account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    defer ctx.allocator.free(identity_ids);
+    if (identity_ids.len == 0) {
+        return respondError(request, .internal_server_error, "internal", "account has no linked identity");
+    }
+    const identity_id = identity_ids[0];
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [2 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(2 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(MySettingsBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "expected the full personal settings object");
+    };
+
+    const date_format: ?civil_time.DateFormat = if (body.date_format) |s|
+        std.meta.stringToEnum(civil_time.DateFormat, s) orelse {
+            return respondError(request, .bad_request, "bad_request", "invalid date_format");
+        }
+    else
+        null;
+    const time_format: ?civil_time.TimeFormat = if (body.time_format) |s|
+        std.meta.stringToEnum(civil_time.TimeFormat, s) orelse {
+            return respondError(request, .bad_request, "bad_request", "invalid time_format");
+        }
+    else
+        null;
+
+    user_settings.setUtcOffsetMinutes(ctx.pool, identity_id, body.utc_offset_minutes) catch |err| {
+        log.err("set-my-settings: utc_offset failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    user_settings.setDateFormat(ctx.pool, identity_id, date_format) catch |err| {
+        log.err("set-my-settings: date_format failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    user_settings.setTimeFormat(ctx.pool, identity_id, time_format) catch |err| {
+        log.err("set-my-settings: time_format failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+
+    audit_log.record(ctx.pool, account_id, "me.settings.set", null, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
 /// `user_agent` must have been captured by the caller *before* it read the
 /// request body (if any) — `findHeader`/`iterateHeaders` requires the
 /// request reader to still be in its post-head, pre-body state; calling it
@@ -912,6 +1309,8 @@ fn parseCookieValue(cookie_header_value: []const u8, name: []const u8) ?[]const 
 }
 
 const testing = std.testing;
+const test_support = @import("../store/test_support.zig");
+const PgPool = @import("../store/pool.zig").PgPool;
 
 test "parseCookieValue finds a named cookie among several, ignores others" {
     const header = "foo=bar; warden_session=abc123.def456; baz=qux";
@@ -924,6 +1323,94 @@ test "parseCookieValue handles a single cookie, extra whitespace, and an empty h
     try testing.expectEqualStrings("solo", parseCookieValue("warden_session=solo", "warden_session").?);
     try testing.expectEqualStrings("spaced", parseCookieValue("  warden_session=spaced  ", "warden_session").?);
     try testing.expectEqual(@as(?[]const u8, null), parseCookieValue("", "warden_session"));
+}
+
+/// Minimal `Connector` stub for `isLiveAdminOfChat`, same shape as
+/// `auth.zig`'s own `StubConnector` (kept separate rather than shared —
+/// this file has no existing dependency on `auth.zig`'s test internals,
+/// and duplicating ~15 lines here is cheaper than exporting a test-only
+/// type across files for one caller).
+const StubConnector = struct {
+    is_group_admin: bool = false,
+
+    fn connector(self: *StubConnector) iface.Connector {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: iface.Connector.VTable = .{
+        .platform = platformFn,
+        .poll = pollFn,
+        .sendMessage = sendMessageFn,
+        .isGroupAdmin = isGroupAdminFn,
+    };
+
+    fn platformFn(ptr: *anyopaque) iface.Platform {
+        _ = ptr;
+        return .telegram;
+    }
+    fn pollFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]iface.Message {
+        _ = ptr;
+        _ = allocator;
+        return &.{};
+    }
+    fn sendMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to_message_id: ?[]const u8) void {
+        _ = ptr;
+        _ = allocator;
+        _ = chat_id;
+        _ = text;
+        _ = reply_to_message_id;
+    }
+    fn isGroupAdminFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!bool {
+        _ = allocator;
+        _ = chat_id;
+        _ = user_id;
+        const self: *StubConnector = @ptrCast(@alignCast(ptr));
+        return self.is_group_admin;
+    }
+};
+
+test "isLiveAdminOfChat: true only when the matching platform's connector confirms it, false for a different platform or no match" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const telegram_identity = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    const matrix_identity = try identities.getOrCreateMinimal(&pool, .matrix, "@alice:server", "alice", null, false, 1000);
+    const chat_id = try chats_store.upsertChat(&pool, .telegram, "-100", "supergroup", "Test");
+    const chat = (try chats_store.getById(&pool, a, chat_id)) orelse return error.TestExpectedValue;
+    defer a.free(chat.native_chat_id);
+
+    const config = testConfigForDefaults();
+    var admin_stub = StubConnector{ .is_group_admin = true };
+    var non_admin_stub = StubConnector{ .is_group_admin = false };
+
+    // Confirmed admin, telegram identity, telegram connector present.
+    {
+        var connectors = [_]iface.Connector{admin_stub.connector()};
+        const ctx = ServerContext{ .allocator = a, .io = testing.io, .pool = &pool, .config = &config, .connectors = &connectors };
+        try testing.expect(isLiveAdminOfChat(&ctx, &.{telegram_identity}, chat));
+    }
+    // Connector says not an admin.
+    {
+        var connectors = [_]iface.Connector{non_admin_stub.connector()};
+        const ctx = ServerContext{ .allocator = a, .io = testing.io, .pool = &pool, .config = &config, .connectors = &connectors };
+        try testing.expect(!isLiveAdminOfChat(&ctx, &.{telegram_identity}, chat));
+    }
+    // Identity is on a different platform than the chat -- skipped, not
+    // matched, even though the stub connector (matched by platform in the
+    // slice below) would say "true" if consulted at all.
+    {
+        var connectors = [_]iface.Connector{admin_stub.connector()};
+        const ctx = ServerContext{ .allocator = a, .io = testing.io, .pool = &pool, .config = &config, .connectors = &connectors };
+        try testing.expect(!isLiveAdminOfChat(&ctx, &.{matrix_identity}, chat));
+    }
+    // No connector at all for the chat's platform.
+    {
+        const ctx = ServerContext{ .allocator = a, .io = testing.io, .pool = &pool, .config = &config, .connectors = &.{} };
+        try testing.expect(!isLiveAdminOfChat(&ctx, &.{telegram_identity}, chat));
+    }
 }
 
 test "maskSecret never returns more than the last 4 characters, and labels empty as not-set" {

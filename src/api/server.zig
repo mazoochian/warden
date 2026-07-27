@@ -15,6 +15,7 @@ const http = std.http;
 const WorkerPool = @import("../worker_pool.zig").WorkerPool;
 const store_pool = @import("../store/pool.zig");
 const config_mod = @import("../config.zig");
+const iface = @import("../platform/interface.zig");
 const router = @import("router.zig");
 const log = @import("../log.zig").scoped("api");
 
@@ -28,6 +29,12 @@ pub const ServerContext = struct {
     io: Io,
     pool: *store_pool.PgPool,
     config: *const config_mod.Config,
+    /// Live platform connectors, for handlers that need to check *current*
+    /// platform-admin status (Phase 4's group settings) rather than
+    /// anything cached in the DB — see `ARCHITECTURE.md` §7's "Group
+    /// admin" tier. Defaults to empty so existing tests that don't touch
+    /// group-admin-gated endpoints don't need updating.
+    connectors: []const iface.Connector = &.{},
 };
 
 const ConnectionItem = struct {
