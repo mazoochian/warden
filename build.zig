@@ -69,4 +69,28 @@ pub fn build(b: *std.Build) void {
     const run_migrate_cmd = b.addRunArtifact(migrate_exe);
     migrate_step.dependOn(&run_migrate_cmd.step);
     if (b.args) |args| run_migrate_cmd.addArgs(args);
+
+    // Retroactive chat-departure reconciliation tool (see
+    // src/cleanup_left_chats.zig) -- installed (unlike migrate_exe) so the
+    // Docker image can also copy it in and run it against production, not
+    // just locally via `zig build cleanup-left-chats`.
+    const cleanup_mod = b.createModule(.{
+        .root_source_file = b.path("src/cleanup_left_chats.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cleanup_mod.link_libc = true;
+    cleanup_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+    cleanup_mod.linkSystemLibrary("pq", .{});
+
+    const cleanup_exe = b.addExecutable(.{
+        .name = "cleanup-left-chats",
+        .root_module = cleanup_mod,
+    });
+    b.installArtifact(cleanup_exe);
+
+    const cleanup_step = b.step("cleanup-left-chats", "Retroactively deletes chats the bot is no longer a member of (dry run by default, pass -- --apply to delete)");
+    const run_cleanup_cmd = b.addRunArtifact(cleanup_exe);
+    cleanup_step.dependOn(&run_cleanup_cmd.step);
+    if (b.args) |args| run_cleanup_cmd.addArgs(args);
 }

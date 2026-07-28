@@ -699,6 +699,64 @@ pub const Client = struct {
         );
     }
 
+    /// Whether the bot itself is still a member of a chat, from a
+    /// `checkMembership` call. `.gone` covers both "the chat/bot's own
+    /// membership row explicitly says left/kicked" and "Telegram won't
+    /// even let us look, because we're not there anymore" (400 "chat not
+    /// found" / 403 "bot was kicked"/"bot is not a member") — both mean
+    /// the same thing for cleanup purposes. `.unknown` is anything else
+    /// (rate-limited, a real server error, a malformed response) — NOT
+    /// safe to treat as "gone" since it says nothing definite either way;
+    /// see `cleanup_left_chats.zig`, the only caller.
+    pub const Membership = enum { member, gone, unknown };
+
+    /// Checks whether the bot (`self_id`) is still a member of `chat_id`,
+    /// via `getChatMember` — the one Bot API call that reports the bot's
+    /// own current status in a chat explicitly, rather than inferring it
+    /// from whether other calls happen to succeed. Uses
+    /// `http_util.getAllowingAnyStatus` instead of the usual `get` because
+    /// the *meaning* of a non-2xx response here is exactly the signal
+    /// being checked for, not an error to propagate.
+    pub fn checkMembership(self: *Client, allocator: std.mem.Allocator, chat_id: i64, self_id: i64) !Membership {
+        const url = try std.fmt.allocPrint(
+            allocator,
+            "https://api.telegram.org/bot{s}/getChatMember?chat_id={d}&user_id={d}",
+            .{ self.bot_token, chat_id, self_id },
+        );
+        defer allocator.free(url);
+
+        const resp = http_util.getAllowingAnyStatus(&self.http_client, allocator, url) catch |err| {
+            std.log.warn("checkMembership: request failed for chat {d}: {t}", .{ chat_id, err });
+            return .unknown;
+        };
+        defer allocator.free(resp.body);
+
+        switch (resp.status.class()) {
+            .success => {},
+            .client_error => return .gone,
+            else => {
+                std.log.warn("checkMembership: unexpected status {d} for chat {d}", .{ @intFromEnum(resp.status), chat_id });
+                return .unknown;
+            },
+        }
+
+        var parsed = json.parseFromSlice(
+            types.ChatMemberResponse,
+            allocator,
+            resp.body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        ) catch |err| {
+            std.log.warn("checkMembership: failed to parse response for chat {d}: {t}", .{ chat_id, err });
+            return .unknown;
+        };
+        defer parsed.deinit();
+
+        if (!parsed.value.ok) return .unknown;
+        const status = (parsed.value.result orelse return .unknown).status;
+        if (std.mem.eql(u8, status, "left") or std.mem.eql(u8, status, "kicked")) return .gone;
+        return .member;
+    }
+
     const MethodResponse = struct {
         ok: bool,
         description: ?[]const u8 = null,

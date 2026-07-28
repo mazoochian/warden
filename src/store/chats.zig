@@ -132,6 +132,21 @@ pub fn deleteLeftBefore(pool: *PgPool, cutoff: i64) !i64 {
     return count;
 }
 
+/// Hard-deletes a single chat by internal id, immediately (no `left_at`
+/// grace period) — same FK cascade as `deleteLeftBefore`. Used by
+/// `cleanup_left_chats.zig`'s one-off reconciliation pass, for chats
+/// directly confirmed gone via a live platform check rather than caught by
+/// the ongoing `chat_left` event tracking.
+pub fn deleteById(pool: *PgPool, chat_id: i64) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("DELETE FROM chats WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    _ = try stmt.step();
+}
+
 /// Lists every known, currently-active (not left) chat — replaces
 /// `ChatStore.listExistingChatIds`'s directory scan (used at startup to
 /// restore digest scheduling; no point reconnecting a digest loop for a
@@ -285,4 +300,16 @@ test "getById finds an existing chat and returns null for an unknown id" {
     try testing.expectEqual(Platform.telegram, found.platform);
 
     try testing.expectEqual(@as(?ChatRef, null), try getById(&pool, a, chat_id + 999));
+}
+
+test "deleteById removes an active chat immediately, without needing left_at set" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const chat_id = try upsertChat(&pool, .telegram, "-100", "supergroup", "Test");
+    try deleteById(&pool, chat_id);
+    try testing.expectEqual(@as(?ChatRef, null), try getById(&pool, a, chat_id));
 }

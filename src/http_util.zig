@@ -310,6 +310,39 @@ fn getOnce(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, 
     return response_writer.toOwnedSlice();
 }
 
+pub const StatusAndBody = struct { status: http.Status, body: []u8 };
+
+/// Like `get`, but returns the HTTP status alongside the body instead of
+/// treating any non-2xx response as fatal — for a caller that needs to
+/// distinguish a specific, meaningful error status (e.g. Telegram's
+/// 400/403 for "this chat isn't reachable by the bot anymore," used by
+/// `cleanup_left_chats.zig` to tell "genuinely gone" apart from "just a
+/// flaky request") from an ordinary transport failure or an unrelated
+/// server error, which the caller should NOT treat the same way. Still
+/// retries genuine transient transport failures exactly like `get` does —
+/// only the "what does a non-2xx status mean" decision moves to the
+/// caller.
+pub fn getAllowingAnyStatus(client: *http.Client, allocator: std.mem.Allocator, url: []const u8) !StatusAndBody {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var response_writer: Io.Writer.Allocating = .init(allocator);
+        errdefer response_writer.deinit();
+        const result = fetchWithTimeout(client, .{
+            .location = .{ .url = url },
+            .extra_headers = &.{},
+            .keep_alive = false,
+            .response_writer = &response_writer.writer,
+        }, default_timeout_ns) catch |err| {
+            if (attempt + 1 >= max_attempts or !isTransient(err)) return err;
+            var url_buf: [512]u8 = undefined;
+            log.warn("GET {s} failed ({t}), retrying (attempt {d}/{d})", .{ redactUrl(&url_buf, url), err, attempt + 2, max_attempts });
+            try backoff(client, attempt);
+            continue;
+        };
+        return .{ .status = result.status, .body = try response_writer.toOwnedSlice() };
+    }
+}
+
 pub fn postJson(
     client: *http.Client,
     allocator: std.mem.Allocator,

@@ -62,6 +62,10 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
 
 WORKDIR /app
 COPY --from=zig-build /build/zig-out/bin/warden ./warden
+# One-off retroactive chat-cleanup tool (see src/cleanup_left_chats.zig) --
+# run manually via `docker compose run --rm warden ./cleanup-left-chats`,
+# never invoked by the entrypoint/HEALTHCHECK.
+COPY --from=zig-build /build/zig-out/bin/cleanup-left-chats ./cleanup-left-chats
 COPY tools/diagram/puppeteer-config.json ./tools/diagram/puppeteer-config.json
 COPY --from=node-deps /deps/diagram/node_modules ./tools/diagram/node_modules
 COPY tools/wordcloud/render.mjs ./tools/wordcloud/render.mjs
