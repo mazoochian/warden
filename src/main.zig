@@ -26,6 +26,8 @@ const matrix_platform = @import("platform/matrix.zig");
 const xmpp_platform = @import("platform/xmpp.zig");
 const store_pool = @import("store/pool.zig");
 const api_server = @import("api/server.zig");
+const bot_view = @import("api/bot_view.zig");
+const rate_limit = @import("api/rate_limit.zig");
 const migrate = @import("store/migrate.zig");
 const chats = @import("store/chats.zig");
 const identities = @import("store/identities.zig");
@@ -360,6 +362,20 @@ pub fn main(init: std.process.Init) !void {
     var menu_sessions = menu.Sessions.init(gpa, io, config.menu_timeout_seconds);
     defer menu_sessions.deinit();
 
+    var bot_view_broadcaster = bot_view.Broadcaster.init(gpa, io);
+    defer bot_view_broadcaster.deinit();
+
+    // Phase 7 hardening -- see `rate_limit.zig`'s doc comment. Generous
+    // limits (this stops naive flooding, not determined abuse from many
+    // IPs, since there's no per-IP key yet): 20 auth-flow attempts/min is
+    // well above any legitimate login retry pattern, 10 bot-view sends/min
+    // per account is well above any legitimate human typing speed for
+    // "reply as the bot" messages.
+    var auth_limiter = rate_limit.Limiter.init(gpa, io, 20, 60);
+    defer auth_limiter.deinit();
+    var bot_view_send_limiter = rate_limit.Limiter.init(gpa, io, 10, 60);
+    defer bot_view_send_limiter.deinit();
+
     // Heap-allocated, process-lifetime singletons -- fine to leave for the
     // OS to reclaim on exit rather than threading a deinit through here.
     // Unlike before `WARDEN_LLM_PROVIDER` became hot-swappable, *both*
@@ -481,6 +497,7 @@ pub fn main(init: std.process.Init) !void {
             msg_pool,
             &heartbeat,
             i,
+            &bot_view_broadcaster,
         }) catch |err| {
             log.err("failed to start poll loop thread for {t}: {t}", .{ connector.platform(), err });
             continue;
@@ -513,7 +530,16 @@ pub fn main(init: std.process.Init) !void {
     // surface.
     if (config.api_port) |port| {
         const api_ctx = try gpa.create(api_server.ServerContext);
-        api_ctx.* = .{ .allocator = gpa, .io = io, .pool = &pool, .config = &config, .connectors = connectors };
+        api_ctx.* = .{
+            .allocator = gpa,
+            .io = io,
+            .pool = &pool,
+            .config = &config,
+            .connectors = connectors,
+            .bot_view = &bot_view_broadcaster,
+            .auth_limiter = &auth_limiter,
+            .bot_view_send_limiter = &bot_view_send_limiter,
+        };
         if (std.Thread.spawn(.{}, apiServerThread, .{ api_ctx, port, config.api_workers })) |thread| {
             thread.detach();
         } else |err| {
@@ -747,6 +773,7 @@ fn connectorPollLoop(
     msg_pool: *MessageWorkerPool,
     heartbeat: *Heartbeat,
     connector_idx: usize,
+    bcast: *bot_view.Broadcaster,
 ) void {
     while (true) {
         var poll_arena = std.heap.ArenaAllocator.init(gpa);
@@ -828,6 +855,7 @@ fn connectorPollLoop(
                 .max_message_len = max_message_len,
                 .task_arena = task_arena,
                 .msg = duped_msg,
+                .bcast = bcast,
             }) catch |err| {
                 // Queueing itself failed (OOM growing the queue's backing
                 // array) — `processMessageTask` never got a chance to free
@@ -910,6 +938,7 @@ const MessageTask = struct {
     max_message_len: usize,
     task_arena: *std.heap.ArenaAllocator,
     msg: iface.Message,
+    bcast: *bot_view.Broadcaster,
 
     fn run(self: MessageTask) void {
         processMessageTask(
@@ -928,6 +957,7 @@ const MessageTask = struct {
             self.max_message_len,
             self.task_arena,
             self.msg,
+            self.bcast,
         );
     }
 };
@@ -952,6 +982,7 @@ fn processMessageTask(
     max_message_len: usize,
     task_arena: *std.heap.ArenaAllocator,
     msg: iface.Message,
+    bcast: *bot_view.Broadcaster,
 ) void {
     defer {
         task_arena.deinit();
@@ -994,6 +1025,13 @@ fn processMessageTask(
     if (msg.choice_picked == null) {
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
         recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, retention_messages);
+
+        // Read-only tap for Bot View's live incoming-message feed (see
+        // bot_view.zig's doc comment) -- a cheap no-op when nobody's
+        // subscribed to this chat, and never influences how/whether this
+        // message actually gets answered.
+        const sender_display_name = if (msg.identity) |identity| identity.display_name else msg.username orelse msg.user_id;
+        bcast.publish(chat_id, sender_display_name, msg.text, ts);
     }
     recordObservedUsers(pool, chat_id, msg.observed_users);
 
@@ -4214,6 +4252,8 @@ test {
     _ = @import("api/multipart.zig");
     _ = @import("api/oidc.zig");
     _ = @import("api/server.zig");
+    _ = @import("api/bot_view.zig");
+    _ = @import("api/rate_limit.zig");
     _ = @import("store/admin_directory.zig");
     _ = @import("llm/dynamic_provider.zig");
     _ = @import("store/stats.zig");

@@ -38,6 +38,8 @@ const audit_log = @import("../store/audit_log.zig");
 const perm_auth = @import("../auth.zig");
 const oauth_providers = @import("../store/oauth_providers.zig");
 const oidc = @import("oidc.zig");
+const bot_view = @import("bot_view.zig");
+const rate_limit = @import("rate_limit.zig");
 const http_util = @import("../http_util.zig");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const log = @import("../log.zig").scoped("api");
@@ -209,6 +211,12 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/convert")) {
         return handleConvert(ctx, request);
     }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/bot-view/ws")) {
+        return handleBotViewWs(ctx, request, target);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/bot-view/send")) {
+        return handleBotViewSend(ctx, request);
+    }
 
     try respondError(request, .not_found, "not_found", "no such endpoint");
 }
@@ -342,6 +350,7 @@ fn handleDevLogin(ctx: *const ServerContext, request: *http.Server.Request) !voi
     if (!ctx.config.api_dev_login) {
         return respondError(request, .not_found, "not_found", "no such endpoint");
     }
+    if (!try checkRateLimit(ctx, request, ctx.auth_limiter, "dev-login")) return;
 
     // Must happen before `readJsonBody` below -- see
     // `issueSessionAndRespond`'s doc comment.
@@ -1716,6 +1725,141 @@ fn handleConvert(ctx: *const ServerContext, request: *http.Server.Request) !void
 }
 
 // ---------------------------------------------------------------------------
+// "Bot View" (Phase 6) -- lets an owner watch a chat's live incoming
+// messages and reply in the bot's own voice. Owner-only, not extended to
+// bot_admins -- see ARCHITECTURE.md §7/§8, decided 2026-07-28 (Armin)
+// given how sensitive impersonating the bot's own voice is.
+// ---------------------------------------------------------------------------
+
+const BotViewSendBody = struct { chat_id: i64, text: []const u8 };
+
+/// `POST /api/v1/bot-view/send` — calls the exact same `connector.sendMessage`
+/// any real automated reply already goes through (no parallel send path to
+/// keep in sync), and is always audit-logged: who, which chat, the text.
+fn handleBotViewSend(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only the owner can send as the bot");
+    }
+    var rate_key_buf: [32]u8 = undefined;
+    const rate_key = std.fmt.bufPrint(&rate_key_buf, "{d}", .{ra.account_id}) catch "?";
+    if (!try checkRateLimit(ctx, request, ctx.bot_view_send_limiter, rate_key)) return;
+
+    const body = (try readJsonBodyLeaky(request, arena, BotViewSendBody, 8192)) orelse return;
+    if (body.text.len == 0) {
+        return respondError(request, .bad_request, "bad_request", "text must not be empty");
+    }
+
+    const chat = (chats_store.getById(ctx.pool, arena, body.chat_id) catch |err| {
+        log.err("bot-view-send: failed to load chat {d}: {t}", .{ body.chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load chat");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such chat");
+    };
+
+    const connector = findConnectorForPlatform(ctx.connectors, chat.platform) orelse {
+        return respondError(request, .internal_server_error, "internal", "no active connector for this chat's platform");
+    };
+
+    connector.sendMessage(arena, chat.native_chat_id, body.text, null);
+
+    var target_buf: [32]u8 = undefined;
+    const target_str = std.fmt.bufPrint(&target_buf, "{d}", .{body.chat_id}) catch "?";
+    const detail_json = std.json.Stringify.valueAlloc(arena, .{ .text = body.text }, .{}) catch null;
+    audit_log.record(ctx.pool, ra.account_id, "bot_view.send", target_str, detail_json);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+const BotViewEventJson = struct { chat_id: i64, sender: []const u8, text: ?[]const u8, ts: i64 };
+
+/// Runs on its own thread for the lifetime of one Bot View WS connection --
+/// pops events off `sub`'s queue (blocking on its condition when empty) and
+/// forwards each as a JSON text frame, until `sub` is closed (see
+/// `bot_view.zig`'s `Subscriber.nextEvent`) or the write itself fails
+/// (client gone). The paired connection's own worker thread runs the
+/// read side (see `handleBotViewWs` below) purely to detect that.
+fn botViewWriterLoop(allocator: std.mem.Allocator, ws: *http.Server.WebSocket, sub: *bot_view.Subscriber, io: Io) void {
+    while (sub.nextEvent(io)) |ev| {
+        defer sub.freeEvent(ev);
+        const json = std.json.Stringify.valueAlloc(allocator, BotViewEventJson{
+            .chat_id = ev.chat_id,
+            .sender = ev.sender_display_name,
+            .text = ev.text,
+            .ts = ev.ts,
+        }, .{}) catch continue;
+        defer allocator.free(json);
+        ws.writeMessage(json, .text) catch return;
+    }
+}
+
+/// `GET /api/v1/bot-view/ws?chat_id=<id>` — WebSocket upgrade streaming
+/// `bot_view.Broadcaster`'s live incoming-message feed for one chat. Auth
+/// happens on the plain HTTP request *before* the 101 upgrade -- once
+/// upgraded, a normal JSON error response can no longer be sent, so
+/// anything that can fail (login, role, chat_id) is checked first.
+///
+/// Concurrency: the calling worker thread becomes the "reader" -- it just
+/// blocks on `readSmallMessage` to detect the client closing/erroring,
+/// discarding whatever it reads (Bot View is send-only from the client's
+/// perspective; replies go through `handleBotViewSend` instead, over a
+/// normal HTTP POST, same as every other mutating action in this API).
+/// `botViewWriterLoop` runs on a second, spawned thread for the actual
+/// data path. Deliberately not `Io.Group.async`/`Io.concurrent` -- see
+/// `worker_pool.zig`'s module doc on why this codebase moved off those for
+/// exactly this kind of long-lived per-connection work.
+fn handleBotViewWs(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only the owner can use bot view");
+    }
+
+    const chat_id_str = queryParam(target, "chat_id") orelse {
+        return respondError(request, .bad_request, "bad_request", "chat_id is required");
+    };
+    const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+    };
+
+    const key = switch (request.upgradeRequested()) {
+        .websocket => |maybe_key| maybe_key orelse {
+            return respondError(request, .bad_request, "bad_request", "missing sec-websocket-key");
+        },
+        else => return respondError(request, .bad_request, "bad_request", "expected a websocket upgrade request"),
+    };
+
+    const broadcaster = ctx.bot_view orelse {
+        return respondError(request, .internal_server_error, "internal", "bot view unavailable");
+    };
+
+    var ws = try request.respondWebSocket(.{ .key = key });
+    // `respondWebSocket` only writes the 101 response into the buffered
+    // writer, it never flushes it (confirmed reading the stdlib source --
+    // the *next* flush is `writeMessage`'s own, on the first outgoing
+    // frame). Without this, a client's handshake would hang until this
+    // chat's first published message, rather than completing immediately.
+    try ws.output.flush();
+
+    const sub = broadcaster.subscribe(chat_id) catch return;
+    defer broadcaster.unsubscribe(chat_id, sub);
+
+    const writer_thread = std.Thread.spawn(.{}, botViewWriterLoop, .{ ctx.allocator, &ws, sub, ctx.io }) catch {
+        broadcaster.close(sub);
+        return;
+    };
+    defer writer_thread.join();
+    defer broadcaster.close(sub);
+
+    while (true) {
+        _ = ws.readSmallMessage() catch break;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Personal settings (Phase 4) — pure UI on top of store/user_settings.zig,
 // already built in full during the reminders/timezone work.
 // ---------------------------------------------------------------------------
@@ -2519,6 +2663,7 @@ fn oidcRedirectUri(allocator: std.mem.Allocator, host: []const u8, provider_id: 
 /// verifier/challenge and anti-CSRF state, stashes them in a signed
 /// cookie, and 302s the browser to the provider's own authorization page.
 fn handleOidcStart(ctx: *const ServerContext, request: *http.Server.Request, provider_id_str: []const u8) !void {
+    if (!try checkRateLimit(ctx, request, ctx.auth_limiter, "oidc-start")) return;
     const host = findHeader(request, "host") orelse {
         return respondError(request, .bad_request, "bad_request", "missing host header");
     };
@@ -2601,6 +2746,7 @@ fn handleOidcStart(ctx: *const ServerContext, request: *http.Server.Request, pro
 /// provider needs, so this handler refuses any issuer it doesn't
 /// recognize rather than guessing.
 fn handleOidcCallback(ctx: *const ServerContext, request: *http.Server.Request, provider_id_str: []const u8, target: []const u8) !void {
+    if (!try checkRateLimit(ctx, request, ctx.auth_limiter, "oidc-callback")) return;
     // Must happen before any body-touching call -- none needed for this
     // GET, but captured up front anyway to match the established
     // convention (see `issueSessionAndRespond`'s doc comment).
@@ -2958,6 +3104,19 @@ fn respondError(request: *http.Server.Request, status: http.Status, code: []cons
         .status = status,
         .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
     });
+}
+
+/// `true` if `key` is under `limiter`'s budget (and this call counts
+/// toward it) -- `false` means a `429` was already sent and the caller
+/// should return immediately. `limiter == null` (every test that doesn't
+/// specifically exercise rate limiting, see `ServerContext.auth_limiter`'s
+/// doc comment) always allows.
+fn checkRateLimit(ctx: *const ServerContext, request: *http.Server.Request, limiter: ?*rate_limit.Limiter, key: []const u8) !bool {
+    const l = limiter orelse return true;
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    if (l.allow(key, now)) return true;
+    try respondError(request, .too_many_requests, "too_many_requests", "rate limit exceeded, try again shortly");
+    return false;
 }
 
 /// Reads and parses the full request body as JSON `T` — fine for the
