@@ -8,4 +8,18 @@ if [ -f /app/.env ]; then
     . /app/.env
     set +a
 fi
-exec /app/warden "$@"
+# No args (the normal `docker compose up warden` path, and every other
+# service's own entrypoint invocation) -> run the bot itself. A command
+# WAS given (e.g. `docker compose run --rm warden ./cleanup-left-chats`)
+# -> exec exactly that instead, with .env already sourced into the
+# environment either way. Previously this unconditionally ran
+# `/app/warden "$@"`, silently passing any other command as an ignored
+# argv to the bot itself instead of actually running it -- confirmed live
+# 2026-07-28: `docker compose run --rm warden ./cleanup-left-chats` just
+# started a second full bot instance, which fought the real one over
+# Telegram's getUpdates long-poll (409 Conflict) for several minutes
+# before being noticed and killed.
+if [ "$#" -eq 0 ]; then
+    exec /app/warden
+fi
+exec "$@"
