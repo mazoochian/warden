@@ -560,7 +560,8 @@ pub fn main(init: std.process.Init) !void {
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
         pending_conversions.sweepExpired(gpa, now);
-        menu_sessions.sweepExpired(now);
+        menu_sessions.sweepExpired(connectors, now);
+        checkAndPurgeLeftChats(&pool, now);
         heartbeat.stampScheduler(now);
         heartbeat.writeToFile(io, gpa, config.tmp_dir);
         const tick_ms = @divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - tick_started.toNanoseconds(), std.time.ns_per_ms);
@@ -1011,6 +1012,25 @@ fn processMessageTask(
         log.err("failed to upsert chat {s}: {t}", .{ msg.chat_id, err });
         return;
     };
+
+    // Housekeeping: synthetic lifecycle signals from a connector (see
+    // `iface.Message.chat_left`/`migrated_to_native_chat_id`'s doc
+    // comments), not real conversational content — handled and returned
+    // early, before identity resolution/recording/LLM dispatch, same as
+    // `choice_picked` being excluded from `recordMessage` a few lines
+    // below.
+    if (msg.migrated_to_native_chat_id) |new_id| {
+        chats.renameNativeChatId(pool, chat_id, new_id) catch |err| {
+            log.err("failed to rename chat {s} (supergroup migration) to {s}: {t}", .{ msg.chat_id, new_id, err });
+        };
+        return;
+    }
+    if (msg.chat_left) {
+        chats.markLeft(pool, chat_id, ts) catch |err| {
+            log.err("failed to mark chat {s} as left: {t}", .{ msg.chat_id, err });
+        };
+        return;
+    }
 
     // Every group member's message counts toward this chat's local record
     // (stats/content recall), regardless of who sent it — only
@@ -3330,6 +3350,23 @@ fn checkAndSendDueReminders(
             };
         }
     }
+}
+
+/// Housekeeping retention sweep: hard-deletes any chat that's been marked
+/// left (see `store/chats.zig`'s `markLeft`, set from a `chat_left`
+/// synthetic message — the bot was removed, left, or the chat was
+/// deleted) for longer than the retention window. Cascades to every FK'd
+/// table via `ON DELETE CASCADE` (`deleteLeftBefore`'s own doc comment
+/// has the full list). Runs every scheduler tick like its neighbors — a
+/// `DELETE` matching zero rows is cheap, no separate cadence needed.
+const chat_retention_seconds: i64 = 30 * 24 * 3600;
+
+fn checkAndPurgeLeftChats(pool: *store_pool.PgPool, now: i64) void {
+    const purged = chats.deleteLeftBefore(pool, now - chat_retention_seconds) catch |err| {
+        log.err("housekeeping: failed to purge left chats: {t}", .{err});
+        return;
+    };
+    if (purged > 0) log.notice("housekeeping: purged {d} chat(s) left over 30 days ago", .{purged});
 }
 
 /// Shown while waiting on the model with nothing more specific to show (see

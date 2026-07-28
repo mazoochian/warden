@@ -99,9 +99,21 @@ pub const InvitedRoom = struct {
     invite_state: ?json.Value = null,
 };
 
+/// `rooms.leave`'s per-room value carries `timeline`/`state` for the
+/// room's final events, but detecting the departure itself only needs the
+/// room id (the map key) — same "just enough to satisfy the schema" style
+/// as `InvitedRoom`. Covers the bot leaving voluntarily, being kicked, or
+/// being banned; Matrix doesn't distinguish these in `/sync`'s shape, and
+/// `platform/matrix.zig` doesn't need to either (see `iface.Message.
+/// chat_left`'s doc comment).
+pub const LeftRoom = struct {
+    timeline: ?json.Value = null,
+};
+
 pub const Rooms = struct {
     join: json.ArrayHashMap(JoinedRoom) = .{},
     invite: json.ArrayHashMap(InvitedRoom) = .{},
+    leave: json.ArrayHashMap(LeftRoom) = .{},
 };
 
 /// One entry of an Olm-encrypted to-device event's `ciphertext` map — keyed
@@ -351,6 +363,16 @@ test "SyncResponse parses a joined room's timeline via ArrayHashMap" {
     var content = try json.parseFromValue(MessageContent, testing.allocator, room.timeline.events[0].content, .{ .ignore_unknown_fields = true });
     defer content.deinit();
     try testing.expectEqualStrings("hi", content.value.body.?);
+}
+
+test "SyncResponse parses rooms.leave, keyed by room id" {
+    const raw =
+        \\{"next_batch":"s1","rooms":{"leave":{"!room:server":{"timeline":{"events":[]}}}}}
+    ;
+    var parsed = try json.parseFromSlice(SyncResponse, testing.allocator, raw, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expect(parsed.value.rooms.leave.map.contains("!room:server"));
+    try testing.expectEqual(@as(usize, 0), parsed.value.rooms.join.map.count());
 }
 
 test "Mentions parses explicit m.mentions user_ids" {

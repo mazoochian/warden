@@ -78,6 +78,10 @@ pub const MemberChatRef = struct {
 /// mine=true`, Phase 4): cheaper than live-checking admin status against
 /// *every* chat in the system, and correct since a live platform admin of
 /// a chat is necessarily also a member of it.
+///
+/// Excludes chats the bot has left (`left_at` set — see
+/// `store/chats.zig`'s `markLeft`), same reasoning as
+/// `admin_directory.listChats`'s doc comment.
 pub fn listChatsForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ![]MemberChatRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -85,7 +89,7 @@ pub fn listChatsForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identit
     var stmt = try db.prepare(
         \\SELECT c.id, c.native_chat_id, c.platform, c.title
         \\FROM chat_members cm JOIN chats c ON c.id = cm.chat_id
-        \\WHERE cm.identity_id = $1;
+        \\WHERE cm.identity_id = $1 AND c.left_at IS NULL;
     );
     defer stmt.finalize();
     stmt.bindInt64(1, identity_id);
@@ -320,6 +324,29 @@ test "listChatsForIdentity lists only chats that identity is a member of" {
     try testing.expectEqual(chat1, found[0].id);
     try testing.expectEqualStrings("Chat One", found[0].title.?);
     _ = chat2;
+}
+
+test "listChatsForIdentity excludes a chat the bot has left" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, "Chat One");
+    const alice = try identities.upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "1",
+        .display_name = "Alice",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+    try touch(&pool, chat1, alice, 1000);
+    try chats.markLeft(&pool, chat1, 2000);
+
+    const found = try listChatsForIdentity(&pool, a, alice);
+    defer a.free(found);
+    try testing.expectEqual(@as(usize, 0), found.len);
 }
 
 test "search matches display_name or username case-insensitively, most-recently-active first" {

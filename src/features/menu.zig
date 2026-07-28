@@ -62,6 +62,11 @@ const Session = struct {
     prompt_message_id: []const u8,
     stage: Stage,
     expires_at: i64,
+    /// Which connector opened this session — set once at creation from
+    /// the `connector` `open` was called with. `sweepExpired` uses this to
+    /// find the right connector (out of possibly several, one per
+    /// platform) to edit the stale message on before evicting.
+    platform: iface.Platform,
 };
 
 /// What a runner call tells the engine to do next.
@@ -314,6 +319,17 @@ fn parseShortcutDate(text: []const u8) ?reminder_format.DateParts {
     return reminder_format.parseDatePart(text, .dmy);
 }
 
+/// Finds the connector whose platform matches `platform` — duplicated from
+/// `main.zig`'s own `findConnector` rather than exported, same reasoning
+/// as `features/alerts.zig`'s copy of the same helper: keeps this feature
+/// file's only dependency on `main.zig` at zero.
+fn findConnectorByPlatform(connectors: []const iface.Connector, platform: iface.Platform) ?iface.Connector {
+    for (connectors) |c| {
+        if (c.platform() == platform) return c;
+    }
+    return null;
+}
+
 pub const Sessions = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -367,7 +383,7 @@ pub const Sessions = struct {
         }
     }
 
-    fn putSession(self: *Sessions, now: i64, chat_id: []const u8, user_id: []const u8, prompt_message_id: []const u8, node_id: NodeId, mode: Mode) !void {
+    fn putSession(self: *Sessions, now: i64, chat_id: []const u8, user_id: []const u8, prompt_message_id: []const u8, node_id: NodeId, mode: Mode, platform: iface.Platform) !void {
         const owned_prompt_id = try self.allocator.dupe(u8, prompt_message_id);
         errdefer self.allocator.free(owned_prompt_id);
 
@@ -384,6 +400,7 @@ pub const Sessions = struct {
             .prompt_message_id = owned_prompt_id,
             .stage = .browsing,
             .expires_at = now + self.timeout_seconds,
+            .platform = platform,
         });
     }
 
@@ -403,7 +420,7 @@ pub const Sessions = struct {
             return;
         }) orelse return; // no button support -- the wrapper already sent a plain-text fallback listing every module.
 
-        self.putSession(now, msg.chat_id, msg.user_id, prompt_id, .root, .normal) catch |err| {
+        self.putSession(now, msg.chat_id, msg.user_id, prompt_id, .root, .normal, connector.platform()) catch |err| {
             log.err("failed to store menu session for chat {s}: {t}", .{ msg.chat_id, err });
         };
     }
@@ -835,20 +852,51 @@ pub const Sessions = struct {
     }
 
     /// Evicts every expired session — called once per main-loop tick
-    /// alongside `PendingConversions.sweepExpired`.
-    pub fn sweepExpired(self: *Sessions, now: i64) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+    /// alongside `PendingConversions.sweepExpired`. Before evicting each
+    /// one, best-effort edits its living message to "Menu timeout" with no
+    /// buttons (rather than leaving dead buttons sitting there forever) —
+    /// `connectors` is searched for the one matching the session's stored
+    /// `platform` (see `Session.platform`'s doc comment); a lookup/edit
+    /// failure (message already deleted, connector gone) is logged and
+    /// doesn't block the eviction itself, same "best-effort, never let a
+    /// connector call block cleanup" convention `closeSession` follows.
+    pub fn sweepExpired(self: *Sessions, connectors: []const iface.Connector, now: i64) void {
+        // Two-phase, same reasoning as `closeSession`: the connector call
+        // below can block on a real network round trip, so it must never
+        // run while `self.mutex` is held (every other menu operation --
+        // navigate/open/etc -- takes the same lock and would stall behind
+        // it). Phase 1 removes every expired entry from the map under the
+        // lock but doesn't free it yet; phase 2 (unlocked) does the
+        // best-effort edit using the not-yet-freed `prompt_message_id`/key,
+        // then frees.
+        const Removed = struct { key: []const u8, value: Session };
+        var removed_list: std.ArrayList(Removed) = .empty;
+        defer removed_list.deinit(self.allocator);
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
-        var expired_keys: std.ArrayList([]const u8) = .empty;
-        defer expired_keys.deinit(self.allocator);
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            if (now > entry.value_ptr.expires_at) expired_keys.append(self.allocator, entry.key_ptr.*) catch continue;
+            var expired_keys: std.ArrayList([]const u8) = .empty;
+            defer expired_keys.deinit(self.allocator);
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                if (now > entry.value_ptr.expires_at) expired_keys.append(self.allocator, entry.key_ptr.*) catch continue;
+            }
+            for (expired_keys.items) |k| {
+                const old = self.map.fetchRemove(k) orelse continue;
+                removed_list.append(self.allocator, .{ .key = old.key, .value = old.value }) catch self.freeEntry(old.key, old.value);
+            }
         }
-        for (expired_keys.items) |k| {
-            const removed = self.map.fetchRemove(k) orelse continue;
-            self.freeEntry(removed.key, removed.value);
+
+        for (removed_list.items) |r| {
+            if (findConnectorByPlatform(connectors, r.value.platform)) |connector| {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                connector.editChoicePrompt(arena.allocator(), chatIdOfKey(r.key), r.value.prompt_message_id, "Menu timeout", &.{}) catch |err| {
+                    log.warn("failed to edit timed-out menu message for chat {s}: {t}", .{ chatIdOfKey(r.key), err });
+                };
+            }
+            self.freeEntry(r.key, r.value);
         }
     }
 };
@@ -1119,9 +1167,37 @@ test "sweepExpired evicts only sessions past their deadline" {
     const a = arena.allocator();
 
     sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
-    sessions.sweepExpired(1000 + 59);
+    sessions.sweepExpired(&.{stub.connector()}, 1000 + 59);
     try testing.expect(sessions.map.count() == 1);
-    sessions.sweepExpired(1000 + 61);
+    sessions.sweepExpired(&.{stub.connector()}, 1000 + 61);
+    try testing.expect(sessions.map.count() == 0);
+}
+
+test "sweepExpired edits the timed-out menu message to \"Menu timeout\" with no buttons before evicting" {
+    var sessions = Sessions.init(testing.allocator, testing.io, 60);
+    defer sessions.deinit();
+    var stub = StubConnector{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    sessions.sweepExpired(&.{stub.connector()}, 1000 + 61);
+
+    try testing.expectEqual(@as(usize, 1), stub.edited.items.len);
+    try testing.expectEqualStrings("Menu timeout", stub.edited.items[0]);
+}
+
+test "sweepExpired doesn't crash when no connector matches the session's platform" {
+    var sessions = Sessions.init(testing.allocator, testing.io, 60);
+    defer sessions.deinit();
+    var stub = StubConnector{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    sessions.sweepExpired(&.{}, 1000 + 61);
     try testing.expect(sessions.map.count() == 0);
 }
 

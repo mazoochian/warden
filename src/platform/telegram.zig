@@ -92,6 +92,37 @@ pub const TelegramConnector = struct {
         };
     }
 
+    /// Translates a `my_chat_member` update into a synthetic `chat_left`
+    /// `iface.Message` — `null` if the status change isn't a departure
+    /// (e.g. the bot was just added, or promoted/demoted). Pulled out as
+    /// its own pure function (rather than inlined in `pollFn`) so it's
+    /// unit-testable without a live/mock HTTP client, matching
+    /// `attachmentFromMessage`/`observedUsersFromMessage`'s shape.
+    fn chatLeftMessageFromUpdate(allocator: std.mem.Allocator, cmu: types.ChatMemberUpdated, self_id_str: ?[]const u8) !?iface.Message {
+        const is_left = std.mem.eql(u8, cmu.new_chat_member.status, "left") or
+            std.mem.eql(u8, cmu.new_chat_member.status, "kicked");
+        if (!is_left) return null;
+        return .{
+            .chat_id = try std.fmt.allocPrint(allocator, "{d}", .{cmu.chat.id}),
+            .user_id = self_id_str orelse "",
+            .chat_left = true,
+        };
+    }
+
+    /// Translates a service message carrying `migrate_to_chat_id` (basic
+    /// group upgraded to a supergroup) into a synthetic
+    /// `migrated_to_native_chat_id` `iface.Message` — `null` for any
+    /// ordinary message. Same testability reasoning as
+    /// `chatLeftMessageFromUpdate`.
+    fn migrationMessageFromMessage(allocator: std.mem.Allocator, msg: types.Message) !?iface.Message {
+        const new_id = msg.migrate_to_chat_id orelse return null;
+        return .{
+            .chat_id = try std.fmt.allocPrint(allocator, "{d}", .{msg.chat.id}),
+            .user_id = "",
+            .migrated_to_native_chat_id = try std.fmt.allocPrint(allocator, "{d}", .{new_id}),
+        };
+    }
+
     /// Collects every identity a message reveals *besides* its own sender —
     /// see `iface.Message.observed_users`'s doc comment for why this exists.
     /// Skips the bot's own account (it's not a "participant" worth
@@ -273,6 +304,11 @@ pub const TelegramConnector = struct {
         for (updates.value.result) |update| {
             self.offset = @max(self.offset, update.update_id + 1);
 
+            if (update.my_chat_member) |cmu| {
+                if (try chatLeftMessageFromUpdate(allocator, cmu, self.self_id_str)) |m| try messages.append(allocator, m);
+                continue;
+            }
+
             if (update.callback_query) |cq| {
                 // Dismisses the client-side spinner regardless of whether
                 // the rest of this update is well-formed enough to act on.
@@ -307,6 +343,11 @@ pub const TelegramConnector = struct {
             }
 
             const msg = update.message orelse continue;
+
+            if (try migrationMessageFromMessage(allocator, msg)) |m| {
+                try messages.append(allocator, m);
+                continue;
+            }
 
             // `updates` (and any strings it owns) is freed via `defer` above,
             // so anything we keep must be duplicated into `allocator`.
@@ -648,4 +689,45 @@ test "observedUsersFromMessage is empty for a plain message with nothing extra t
     const msg = types.Message{ .message_id = 1, .chat = .{ .id = 1 } };
     const observed = try conn.observedUsersFromMessage(a, msg, 1000);
     try testing.expectEqual(@as(usize, 0), observed.len);
+}
+
+test "chatLeftMessageFromUpdate reports chat_left for left/kicked, null otherwise" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const left = types.ChatMemberUpdated{
+        .chat = .{ .id = -100123 },
+        .new_chat_member = .{ .status = "left" },
+    };
+    const m1 = (try TelegramConnector.chatLeftMessageFromUpdate(a, left, "999")).?;
+    try testing.expect(m1.chat_left);
+    try testing.expectEqualStrings("-100123", m1.chat_id);
+    try testing.expectEqualStrings("999", m1.user_id);
+
+    const kicked = types.ChatMemberUpdated{
+        .chat = .{ .id = -100123 },
+        .new_chat_member = .{ .status = "kicked" },
+    };
+    try testing.expect((try TelegramConnector.chatLeftMessageFromUpdate(a, kicked, "999")).?.chat_left);
+
+    const promoted = types.ChatMemberUpdated{
+        .chat = .{ .id = -100123 },
+        .new_chat_member = .{ .status = "administrator" },
+    };
+    try testing.expectEqual(@as(?iface.Message, null), try TelegramConnector.chatLeftMessageFromUpdate(a, promoted, "999"));
+}
+
+test "migrationMessageFromMessage reports the new native id, null for an ordinary message" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const migrated = types.Message{ .message_id = 1, .chat = .{ .id = -100123 }, .migrate_to_chat_id = -100999 };
+    const m = (try TelegramConnector.migrationMessageFromMessage(a, migrated)).?;
+    try testing.expectEqualStrings("-100123", m.chat_id);
+    try testing.expectEqualStrings("-100999", m.migrated_to_native_chat_id.?);
+
+    const ordinary = types.Message{ .message_id = 2, .chat = .{ .id = -100123 } };
+    try testing.expectEqual(@as(?iface.Message, null), try TelegramConnector.migrationMessageFromMessage(a, ordinary));
 }

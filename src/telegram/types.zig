@@ -115,6 +115,12 @@ pub const Message = struct {
     /// Present on the service message Telegram sends when a single user
     /// leaves/is removed from a group.
     left_chat_member: ?User = null,
+    /// Present on the service message Telegram sends to the OLD chat id
+    /// when a basic group is upgraded to a supergroup — Telegram mints a
+    /// brand-new chat id for the same real-world group. See
+    /// `platform/telegram.zig`'s `pollFn` for how this becomes a
+    /// `migrated_to_native_chat_id` signal instead of a normal message.
+    migrate_to_chat_id: ?i64 = null,
 };
 
 /// Response shape of `getFile` — resolves a `file_id` to a downloadable path.
@@ -136,11 +142,27 @@ pub const CallbackQuery = struct {
     data: ?[]const u8 = null,
 };
 
+/// Sent whenever the bot's OWN membership status in a chat changes
+/// (added, promoted/demoted, left, kicked/banned) — Telegram's `my_chat_
+/// member` update, distinct from `chat_member` (other members' status
+/// changes, not requested/parsed here) and from `left_chat_member`
+/// (a *service message* visible in the chat's own timeline, which isn't
+/// reliably delivered depending on the chat's visibility settings and
+/// says nothing about the bot itself unless the bot happens to be who
+/// left). `new_chat_member.status` of `"left"`/`"kicked"` is the
+/// authoritative "the bot's no longer in this chat" signal — see
+/// `platform/telegram.zig`'s `pollFn`.
+pub const ChatMemberUpdated = struct {
+    chat: Chat,
+    new_chat_member: ChatMember,
+};
+
 pub const Update = struct {
     update_id: i64,
     message: ?Message = null,
     edited_message: ?Message = null,
     callback_query: ?CallbackQuery = null,
+    my_chat_member: ?ChatMemberUpdated = null,
 };
 
 pub fn GetUpdatesResponse(comptime T: type) type {

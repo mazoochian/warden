@@ -241,9 +241,15 @@ pub const XmppConnector = struct {
         defer parsed.deinit();
 
         if (std.mem.eql(u8, parsed.element.name, "presence")) {
-            self.handlePresence(allocator, parsed.element) catch |err| {
+            const chat_left = self.handlePresence(allocator, parsed.element) catch |err| blk: {
                 log.warn("failed to handle presence: {t}", .{err});
+                break :blk null;
             };
+            if (chat_left) |m| {
+                const out = try allocator.alloc(iface.Message, 1);
+                out[0] = m;
+                return out;
+            }
             return &.{};
         }
 
@@ -253,14 +259,42 @@ pub const XmppConnector = struct {
         };
     }
 
-    /// Auto-accepts subscription requests — see this file's module doc
-    /// comment on why that's this connector's whole roster story for now.
-    fn handlePresence(self: *XmppConnector, allocator: std.mem.Allocator, el: xml.Element) !void {
-        const from = el.attr("from") orelse return;
-        const kind = el.attr("type") orelse return;
-        if (!std.mem.eql(u8, kind, "subscribe")) return;
-        const client = self.client orelse return;
-        try client.acceptSubscription(allocator, bareJid(from));
+    /// Auto-accepts subscription requests (see this file's module doc
+    /// comment on why that's this connector's whole roster story for now),
+    /// and detects the bot's own departure from a joined MUC room —
+    /// `type="unavailable"` self-presence (the standard MUC status code
+    /// 110 marker, inside an `<x xmlns='...muc#user'>` child — this
+    /// parser treats `xmlns` as an ordinary attribute, see `xml.zig`'s
+    /// module doc comment, so no namespace-aware lookup is needed) covers
+    /// leaving voluntarily, being kicked, being banned, or the room being
+    /// destroyed alike; XMPP doesn't distinguish these in the stanza
+    /// either. Returns a synthetic `chat_left` message in that case, `null`
+    /// otherwise.
+    fn handlePresence(self: *XmppConnector, allocator: std.mem.Allocator, el: xml.Element) !?iface.Message {
+        const from = el.attr("from") orelse return null;
+        const kind = el.attr("type") orelse return null;
+
+        if (std.mem.eql(u8, kind, "subscribe")) {
+            const client = self.client orelse return null;
+            try client.acceptSubscription(allocator, bareJid(from));
+            return null;
+        }
+
+        if (std.mem.eql(u8, kind, "unavailable")) {
+            const room = bareJid(from);
+            if (!self.isJoinedRoom(room)) return null;
+            const muc_user = el.child("x") orelse return null;
+            const status = muc_user.child("status") orelse return null;
+            const code = status.attr("code") orelse return null;
+            if (!std.mem.eql(u8, code, "110")) return null;
+            return .{
+                .chat_id = try allocator.dupe(u8, room),
+                .user_id = self.bound_jid orelse "",
+                .chat_left = true,
+            };
+        }
+
+        return null;
     }
 
     fn messagesFromElement(self: *XmppConnector, allocator: std.mem.Allocator, el: xml.Element) ![]iface.Message {
@@ -362,4 +396,54 @@ test "XmppConnector.sendMessage drops the message and logs when not connected" {
     const c = conn.connector();
     // Not connected (no live server dialed) — must not crash, just drop.
     c.sendMessage(testing.allocator, "alice@example.org", "hi", null);
+}
+
+fn statusCode110Presence(from: []const u8) xml.Element {
+    return .{
+        .name = "presence",
+        .attrs = &.{ .{ .name = "from", .value = from }, .{ .name = "type", .value = "unavailable" } },
+        .children = &.{.{ .element = .{
+            .name = "x",
+            .attrs = &.{},
+            .children = &.{.{ .element = .{
+                .name = "status",
+                .attrs = &.{.{ .name = "code", .value = "110" }},
+                .children = &.{},
+            } }},
+        } }},
+    };
+}
+
+test "handlePresence reports chat_left for a joined room's self-presence (status code 110) unavailable" {
+    var conn = XmppConnector.init(testing.allocator, testing.io, "localhost", 5222, "localhost", "warden", "secret", &.{});
+    defer conn.deinit(); // frees every joined_rooms entry itself -- don't also free conn.joined_rooms.items[0] here.
+    try conn.joined_rooms.append(testing.allocator, try testing.allocator.dupe(u8, "room@conference.example.org"));
+
+    const el = statusCode110Presence("room@conference.example.org/warden");
+    const m = (try conn.handlePresence(testing.allocator, el)).?;
+    defer testing.allocator.free(m.chat_id);
+    try testing.expect(m.chat_left);
+    try testing.expectEqualStrings("room@conference.example.org", m.chat_id);
+}
+
+test "handlePresence ignores unavailable presence for a room we never joined" {
+    var conn = XmppConnector.init(testing.allocator, testing.io, "localhost", 5222, "localhost", "warden", "secret", &.{});
+    defer conn.deinit();
+
+    const el = statusCode110Presence("someother@conference.example.org/warden");
+    try testing.expectEqual(@as(?iface.Message, null), try conn.handlePresence(testing.allocator, el));
+}
+
+test "handlePresence ignores an ordinary subscribe presence (no self-leave reported)" {
+    var conn = XmppConnector.init(testing.allocator, testing.io, "localhost", 5222, "localhost", "warden", "secret", &.{});
+    defer conn.deinit();
+
+    const el = xml.Element{
+        .name = "presence",
+        .attrs = &.{ .{ .name = "from", .value = "alice@example.org" }, .{ .name = "type", .value = "subscribe" } },
+        .children = &.{},
+    };
+    // Not connected -- acceptSubscription is a no-op via the `self.client
+    // orelse return null` early-out, so this must not crash either.
+    try testing.expectEqual(@as(?iface.Message, null), try conn.handlePresence(testing.allocator, el));
 }

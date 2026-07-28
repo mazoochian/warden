@@ -229,6 +229,23 @@ pub const MatrixConnector = struct {
             };
         }
 
+        // Departures (left, kicked, or banned -- `/sync` doesn't
+        // distinguish, see `types.LeftRoom`'s doc comment) are recorded
+        // even on the discarded first sync, same reasoning as invites
+        // above: a room already left before this process started should
+        // still get marked promptly rather than waiting for a second
+        // cycle that may never show it again (`rooms.leave` only reports
+        // a room while it's a *recent* change, not indefinitely).
+        var out: std.ArrayList(iface.Message) = .empty;
+        var leave_it = synced.value.rooms.leave.map.iterator();
+        while (leave_it.next()) |entry| {
+            try out.append(allocator, .{
+                .chat_id = try allocator.dupe(u8, entry.key_ptr.*),
+                .user_id = self.self_user_id orelse "",
+                .chat_left = true,
+            });
+        }
+
         // To-device events (room-key shares, etc.) are consumed by the
         // server the moment `/sync` returns them — unlike room timeline
         // history, there's no backlog to discard, so these are processed
@@ -304,10 +321,9 @@ pub const MatrixConnector = struct {
 
         if (!self.initial_sync_done) {
             self.initial_sync_done = true;
-            return &.{};
+            return out.toOwnedSlice(allocator);
         }
 
-        var out: std.ArrayList(iface.Message) = .empty;
         var room_it = synced.value.rooms.join.map.iterator();
         while (room_it.next()) |room_entry| {
             const room_id = room_entry.key_ptr.*;

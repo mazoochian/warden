@@ -61,6 +61,14 @@ pub const ChatSummary = struct {
 /// caller turns `next_cursor` back into `after_id` on the following
 /// request; the id itself makes a perfectly good opaque cursor here since
 /// ids are already monotonically assigned and never reused).
+///
+/// Excludes chats the bot has left (`left_at` set — see
+/// `store/chats.zig`'s `markLeft`): this backs both the admin chat
+/// directory and, via `router.zig`'s `handleListMyChats`, the owner/
+/// bot_admin branch of `GET /api/v1/chats?mine=true` (the dropdown source
+/// for Bot View/reminders/alerts/group-admin pickers) — a left chat isn't
+/// a valid destination for anything new, even though its historical data
+/// stays queryable by id until the retention sweep purges it.
 pub fn listChats(pool: *PgPool, allocator: std.mem.Allocator, after_id: i64, limit: i64) ![]ChatSummary {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -72,7 +80,7 @@ pub fn listChats(pool: *PgPool, allocator: std.mem.Allocator, after_id: i64, lim
         \\  COALESCE(cs.digest_enabled, false)
         \\FROM chats c
         \\LEFT JOIN chat_settings cs ON cs.chat_id = c.id
-        \\WHERE c.id > $1
+        \\WHERE c.id > $1 AND c.left_at IS NULL
         \\ORDER BY c.id
         \\LIMIT $2;
     );
@@ -372,6 +380,21 @@ test "listChats paginates by id and reports member/message counts" {
     const empty_page = try listChats(&pool, a, seed.chat, 50);
     defer a.free(empty_page);
     try testing.expectEqual(@as(usize, 0), empty_page.len);
+}
+
+test "listChats excludes chats the bot has left" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const seed = try seedBasics(&pool);
+    try chats.markLeft(&pool, seed.chat, 1000);
+
+    const page = try listChats(&pool, a, 0, 50);
+    defer a.free(page);
+    try testing.expectEqual(@as(usize, 0), page.len);
 }
 
 test "getChatDetail returns settings, counts, and recent messages newest-first" {

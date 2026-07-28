@@ -163,6 +163,23 @@ pub const Message = struct {
     /// `find_chat_member` tool) grows from more than just who's actually
     /// spoken. Empty for platforms/messages that reveal nothing extra.
     observed_users: []const Identity = &.{},
+    /// Synthetic signal (not a real chat message) meaning the bot's own
+    /// membership in `chat_id` just ended — left, kicked/banned, or the
+    /// chat itself was deleted; every case is handled identically since
+    /// they're indistinguishable in effect (see each connector's own
+    /// doc comment for how it detects this). `main.zig`'s
+    /// `processMessageTask` checks this before anything else and calls
+    /// `store/chats.zig`'s `markLeft` instead of normal message handling.
+    chat_left: bool = false,
+    /// Synthetic signal for Telegram's basic-group -> supergroup upgrade
+    /// (Telegram mints a brand-new chat id for the same real-world group
+    /// and sends this on a service message) — `chat_id` is the OLD native
+    /// id, this field is the NEW one. `main.zig` renames the existing
+    /// `chats` row in place (`store/chats.zig`'s `renameNativeChatId`)
+    /// instead of letting a second row get created under the new id, which
+    /// was the actual cause of "duplicate" chats. Null on every other
+    /// platform/message.
+    migrated_to_native_chat_id: ?[]const u8 = null,
 
     /// Deep-copies every string field into `allocator`. The poll loop
     /// spawns one concurrent task per message, each owning its own arena;
@@ -200,6 +217,8 @@ pub const Message = struct {
                 for (self.observed_users, 0..) |id, i| out[i] = try id.dupe(allocator);
                 break :blk out;
             },
+            .chat_left = self.chat_left,
+            .migrated_to_native_chat_id = if (self.migrated_to_native_chat_id) |s| try allocator.dupe(u8, s) else null,
         };
     }
 };
@@ -666,4 +685,39 @@ test "Message.dupe passes through an empty observed_users without allocating" {
         testing.allocator.free(dst.user_id);
     }
     try testing.expectEqual(@as(usize, 0), dst.observed_users.len);
+}
+
+test "Message.dupe carries chat_left and deep-copies migrated_to_native_chat_id" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const src_a = arena.allocator();
+
+    const src = Message{
+        .chat_id = try src_a.dupe(u8, "1"),
+        .user_id = try src_a.dupe(u8, "2"),
+        .chat_left = true,
+        .migrated_to_native_chat_id = try src_a.dupe(u8, "-100999"),
+    };
+
+    const dst = try src.dupe(testing.allocator);
+    defer {
+        testing.allocator.free(dst.chat_id);
+        testing.allocator.free(dst.user_id);
+        testing.allocator.free(dst.migrated_to_native_chat_id.?);
+    }
+
+    arena.deinit();
+
+    try testing.expect(dst.chat_left);
+    try testing.expectEqualStrings("-100999", dst.migrated_to_native_chat_id.?);
+}
+
+test "Message.dupe passes through null migrated_to_native_chat_id and false chat_left" {
+    const src = Message{ .chat_id = "1", .user_id = "2" };
+    const dst = try src.dupe(testing.allocator);
+    defer {
+        testing.allocator.free(dst.chat_id);
+        testing.allocator.free(dst.user_id);
+    }
+    try testing.expect(!dst.chat_left);
+    try testing.expectEqual(@as(?[]const u8, null), dst.migrated_to_native_chat_id);
 }
