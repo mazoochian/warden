@@ -1663,13 +1663,27 @@ fn handleConvert(ctx: *const ServerContext, request: *http.Server.Request) !void
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // `boundary` above borrows straight from `request.head_buffer` (via
+    // `findHeader`/`iterateHeaders`). `readerExpectNone` reuses that same
+    // connection-level read buffer for the body once it needs more bytes
+    // than `receiveHead` already had buffered — for any upload past a
+    // couple hundred bytes, that clobbers `boundary` out from under us
+    // *before* `multipart.parse` below ever reads it (confirmed by hand:
+    // a >~450-byte upload turned a real `----formdata-undici-...` boundary
+    // into garbage like `85--formdata-undici-...`, mid-string, which then
+    // never matches anything in the body and silently yields zero parts —
+    // surfacing as "missing a \"file\" part" for every upload past that
+    // size). Copying it into the arena *before* touching the body reader
+    // is the fix.
+    const boundary_owned = try arena.dupe(u8, boundary);
+
     var buf: [16 * 1024]u8 = undefined;
     const reader = request.readerExpectNone(&buf);
     const raw = reader.allocRemaining(arena, .limited(max_convert_upload_bytes)) catch {
         return respondError(request, .payload_too_large, "payload_too_large", "upload too large (max 50MB)");
     };
 
-    const parts = multipart.parse(arena, raw, boundary) catch {
+    const parts = multipart.parse(arena, raw, boundary_owned) catch {
         return respondError(request, .bad_request, "bad_request", "malformed multipart body");
     };
 

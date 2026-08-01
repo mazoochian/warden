@@ -596,3 +596,82 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
     try testing.expectEqual(@as(usize, 1), stub.sent_messages.items.len);
     try testing.expectEqualStrings("reply from the owner", stub.sent_messages.items[0]);
 }
+
+// Regression test for a real bug (found by hand testing the web panel's
+// Convert page against a real browser): `handleConvert` read the
+// `boundary` out of the Content-Type header via `findHeader`, which
+// borrows straight from `request.head_buffer` -- the same connection-level
+// buffer `readerExpectNone`'s body reader reuses once the body needs more
+// bytes than `receiveHead` already had buffered. Any upload whose body
+// didn't already fit in that initial buffered read (in practice, anything
+// much past a few hundred bytes) silently clobbered `boundary` before
+// `multipart.parse` ever read it, so `multipart.find(parts, "file")`
+// always came back empty -- "missing a \"file\" part" for every real
+// upload, while curl/test bodies small enough to land in one read kept
+// passing. The body below is well past both that threshold and the 16KB
+// connection buffer, so a regression here reproduces reliably.
+test "convert endpoint: a real multipart POST whose body exceeds one buffered read still finds the file part" {
+    const gpa = std.heap.page_allocator;
+
+    const db = try gpa.create(Db);
+    db.* = try test_support.openTestDb(gpa) orelse return error.SkipZigTest;
+    const pool = try gpa.create(PgPool);
+    pool.* = try PgPool.wrapForTest(gpa, testing.io, db);
+
+    const identity_id = try identities.getOrCreateMinimal(pool, .telegram, "555", "Convert Test User", null, false, 1000);
+
+    const config = try gpa.create(config_mod.Config);
+    config.* = testConfig();
+
+    const ctx = try gpa.create(ServerContext);
+    ctx.* = .{ .allocator = gpa, .io = testing.io, .pool = pool, .config = config };
+
+    const listener = try gpa.create(Io.net.Server);
+    listener.* = try bind(testing.io, 0);
+    const port = listener.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
+    thread.detach();
+
+    var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+
+    const cookie = try devLogin(&client, port, identity_id);
+    defer testing.allocator.free(cookie);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api/v1/convert", .{port});
+
+    const boundary = "----RegressionTestBoundary1234567890";
+    const file_content = "x" ** (32 * 1024); // past the 16KB connection buffer.
+    const body = "--" ++ boundary ++ "\r\n" ++
+        "Content-Disposition: form-data; name=\"file\"; filename=\"big.txt\"\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "\r\n" ++
+        file_content ++ "\r\n" ++
+        "--" ++ boundary ++ "\r\n" ++
+        "Content-Disposition: form-data; name=\"target_format\"\r\n" ++
+        "\r\n" ++
+        "md\r\n" ++
+        "--" ++ boundary ++ "--\r\n";
+
+    var req = try client.request(.POST, try std.Uri.parse(url), .{
+        .keep_alive = false,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "multipart/form-data; boundary=" ++ boundary },
+            .{ .name = "cookie", .value = cookie },
+        },
+    });
+    defer req.deinit();
+    req.transfer_encoding = .{ .content_length = body.len };
+    var body_writer = try req.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(body);
+    try body_writer.end();
+    try req.connection.?.flush();
+    var response = try req.receiveHead(&.{});
+
+    try testing.expectEqual(.ok, response.head.status);
+    const resp_body = try readBody(&response, testing.allocator);
+    defer testing.allocator.free(resp_body);
+    try testing.expectEqualStrings(file_content ++ "\n", resp_body);
+}
