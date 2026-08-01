@@ -12,6 +12,28 @@ pub const Civil = struct {
     second: u8 = 0,
 };
 
+pub const Weekday = enum(u3) { sunday, monday, tuesday, wednesday, thursday, friday, saturday };
+
+/// Day of the week for a `daysFromCivil`-style day count. 1970-01-01 (day
+/// 0) was a Thursday, so `days + 4` lands Sunday=0..Saturday=6; `@mod` on a
+/// positive divisor is always non-negative in Zig regardless of `days`'
+/// sign, so this holds for pre-epoch dates too.
+pub fn weekdayFromDays(days: i64) Weekday {
+    return @enumFromInt(@as(u3, @intCast(@mod(days + 4, 7))));
+}
+
+pub fn weekdayName(w: Weekday) []const u8 {
+    return switch (w) {
+        .sunday => "Sunday",
+        .monday => "Monday",
+        .tuesday => "Tuesday",
+        .wednesday => "Wednesday",
+        .thursday => "Thursday",
+        .friday => "Friday",
+        .saturday => "Saturday",
+    };
+}
+
 /// Days since the Unix epoch (1970-01-01) for a given proleptic-Gregorian
 /// civil date — Howard Hinnant's well-known constant-time algorithm
 /// (public domain: http://howardhinnant.github.io/date_algorithms.html),
@@ -120,6 +142,21 @@ test "daysFromCivil/civilFromDays round-trip known dates, including the epoch an
         try testing.expectEqual(c.m, back.month);
         try testing.expectEqual(c.d, back.day);
     }
+}
+
+test "weekdayFromDays matches known weekdays, including pre-epoch dates" {
+    // 1970-01-01 (day 0) was a Thursday.
+    try testing.expectEqual(Weekday.thursday, weekdayFromDays(0));
+    try testing.expectEqual(Weekday.friday, weekdayFromDays(1));
+    try testing.expectEqual(Weekday.wednesday, weekdayFromDays(-1));
+    try testing.expectEqual(Weekday.sunday, weekdayFromDays(-4));
+    // 2026-08-01 is a Saturday.
+    try testing.expectEqual(Weekday.saturday, weekdayFromDays(daysFromCivil(2026, 8, 1)));
+}
+
+test "weekdayName covers every day" {
+    try testing.expectEqualStrings("Sunday", weekdayName(.sunday));
+    try testing.expectEqualStrings("Saturday", weekdayName(.saturday));
 }
 
 test "localFromUnix/unixFromLocal round-trip across positive, negative, and half-hour offsets" {

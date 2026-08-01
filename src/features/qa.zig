@@ -4,6 +4,7 @@ const toolcall = @import("../llm/toolcall.zig");
 const registry = @import("../tools/registry.zig");
 const PgPool = @import("../store/pool.zig").PgPool;
 const messages = @import("../store/messages.zig");
+const civil_time = @import("../text/civil_time.zig");
 
 /// Used when the operator hasn't provided their own prompt via
 /// WARDEN_SYSTEM_PROMPT / WARDEN_SYSTEM_PROMPT_FILE.
@@ -36,8 +37,13 @@ pub const default_system_prompt =
     \\diagrams, building a word cloud out of text you provide, web search,
     \\fetching a URL's content, setting/listing/canceling reminders
     \\(set_reminder) — translate whatever natural-language time the user
-    \\gave into that tool's required duration shorthand yourself — and
-    \\converting a photo/document/voice/audio/video the user just sent to a
+    \\gave into that tool's required duration shorthand yourself, except for
+    \\a named weekday ("this Friday", "on Monday"): pass the day name
+    \\straight through (see the tool's own description) rather than
+    \\computing a day offset yourself, since you don't reliably know what
+    \\day of the week today is — the current date/time given below the
+    \\question does, and the tool resolves the weekday server-side from it
+    \\— and converting a photo/document/voice/audio/video the user just sent to a
     \\different format (convert_file), or starting the conversion flow
     \\(begin_file_conversion) when they say they want to convert something
     \\but haven't attached a file to this message yet — that tool just asks
@@ -155,17 +161,37 @@ pub fn answer(
     else
         try std.fmt.allocPrint(allocator, "{s} (platform id {s})", .{ asker.display_name, asker.native_id });
 
+    // The model has no reliable notion of "today" on its own (training
+    // data goes stale, and it has no clock) — spelling out the weekday
+    // here, not just the date, is what lets it get "remind me this
+    // Friday"/"what's today" right instead of guessing. `set_reminder`'s
+    // own weekday-name support (`reminder_format.parseWeekdayWhen`)
+    // resolves the actual reminder server-side rather than trusting the
+    // model's day-of-week arithmetic, but this still helps for anything
+    // date-related that isn't that one tool call. Naive UTC, same
+    // tradeoff `ctx.now`'s other consumers already make.
+    const now_local = civil_time.localFromUnix(ctx.now, 0);
+    const now_line = try std.fmt.allocPrint(
+        allocator,
+        "{s}, {s} {s} UTC",
+        .{
+            civil_time.weekdayName(civil_time.weekdayFromDays(@divFloor(ctx.now, 86400))),
+            civil_time.formatDate(allocator, now_local, .ymd),
+            civil_time.formatTime(allocator, now_local, .h24),
+        },
+    );
+
     const user_content = if (replied_to) |earlier|
         try std.fmt.allocPrint(
             allocator,
-            "Recent chat history:\n{s}\n\nThis message is from: {s}\n\nThe user is replying to this earlier message of yours:\n\"{s}\"\n\nTheir reply: {s}",
-            .{ history, asker_line, earlier, question },
+            "Current date/time: {s}\n\nRecent chat history:\n{s}\n\nThis message is from: {s}\n\nThe user is replying to this earlier message of yours:\n\"{s}\"\n\nTheir reply: {s}",
+            .{ now_line, history, asker_line, earlier, question },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "Recent chat history:\n{s}\n\nThis message is from: {s}\n\nQuestion: {s}",
-            .{ history, asker_line, question },
+            "Current date/time: {s}\n\nRecent chat history:\n{s}\n\nThis message is from: {s}\n\nQuestion: {s}",
+            .{ now_line, history, asker_line, question },
         );
 
     const effective_max_tokens = max_tokens_override orelse answerMaxTokens(max_answer_len);

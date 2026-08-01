@@ -42,14 +42,67 @@ pub fn parseAbsoluteTime(text: []const u8, now: i64) ?i64 {
     return if (candidate > now) candidate else candidate + seconds_per_day;
 }
 
+const weekday_names = [_][]const u8{ "sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday" };
+
+fn parseWeekdayName(text: []const u8) ?civil_time.Weekday {
+    for (weekday_names, 0..) |name, i| {
+        if (std.ascii.eqlIgnoreCase(text, name)) return @enumFromInt(@as(u3, @intCast(i)));
+    }
+    return null;
+}
+
+/// Time of day a bare weekday name resolves to when the user didn't also
+/// give a clock time ("remind me Friday") — a reminder needs *some* time,
+/// and a quiet early-morning default reads as "sometime that day" rather
+/// than implying anything more specific was meant.
+const default_weekday_hour: u8 = 6;
+
+/// Parses a weekday name ("friday"), optionally followed by a space and a
+/// 24h clock time ("friday 18:00"), and resolves it to the next absolute
+/// unix timestamp at or after `now` that lands on that weekday — today if
+/// today *is* that weekday and the time (default `default_weekday_hour`:00
+/// if none given) hasn't passed yet, otherwise the coming occurrence a week
+/// out at most. This is what makes "remind me this Friday" correct without
+/// the caller (the LLM, for `tools/remind.zig`) ever having to know what
+/// day of the week today is — the model has no reliable notion of the
+/// current date, so asking it to compute "Friday is N days from now"
+/// itself was silently landing on the wrong day (including today, if its
+/// guess for today's weekday happened to already be Friday). Same
+/// "deliberately naive about timezones" tradeoff as `parseAbsoluteTime`.
+pub fn parseWeekdayWhen(text: []const u8, now: i64) ?i64 {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    var day_text: []const u8 = trimmed;
+    var hour: u8 = default_weekday_hour;
+    var minute: u8 = 0;
+    if (std.mem.indexOfScalar(u8, trimmed, ' ')) |sp| {
+        day_text = trimmed[0..sp];
+        const clock = parseClockTime(std.mem.trim(u8, trimmed[sp + 1 ..], " \t")) orelse return null;
+        hour = clock.hour;
+        minute = clock.minute;
+    }
+    const target = parseWeekdayName(day_text) orelse return null;
+
+    const seconds_per_day = 86400;
+    const today_days = @divFloor(now, seconds_per_day);
+    const today = civil_time.weekdayFromDays(today_days);
+    var delta_days: i64 = @as(i64, @intFromEnum(target)) - @as(i64, @intFromEnum(today));
+    if (delta_days < 0) delta_days += 7;
+
+    const day_start = today_days * seconds_per_day;
+    const candidate = day_start + delta_days * seconds_per_day + @as(i64, hour) * 3600 + @as(i64, minute) * 60;
+    return if (candidate > now) candidate else candidate + 7 * seconds_per_day;
+}
+
 /// Unified entry point for anything that names a single point in time to
 /// fire at: tries the relative-duration shorthand first (`parseDuration`,
 /// returning `now + that many seconds`), then a "HH:MM" absolute clock time
-/// (`parseAbsoluteTime`). Returns an absolute unix timestamp either way, or
-/// null if `text` matches neither shape.
+/// (`parseAbsoluteTime`), then a weekday name (`parseWeekdayWhen`). Returns
+/// an absolute unix timestamp either way, or null if `text` matches none of
+/// those shapes.
 pub fn parseWhen(text: []const u8, now: i64) ?i64 {
     if (parseDuration(text)) |secs| return now + secs;
-    return parseAbsoluteTime(text, now);
+    if (parseAbsoluteTime(text, now)) |ts| return ts;
+    return parseWeekdayWhen(text, now);
 }
 
 pub const DateParts = struct { year: ?i32, month: u8, day: u8 };
@@ -253,6 +306,32 @@ test "parseWhen tries a relative duration before an absolute time" {
     try testing.expectEqual(@as(?i64, 1000 + 1800), parseWhen("30m", 1000));
     try testing.expectEqual(@as(?i64, 14 * 3600 + 30 * 60), parseWhen("14:30", 0));
     try testing.expectEqual(@as(?i64, null), parseWhen("nonsense", 0));
+}
+
+test "parseWeekdayWhen resolves the next occurrence of a named weekday, defaulting to 6am" {
+    // now = 1970-01-01 12:00:00 UTC — day 0, a Thursday.
+    const thu_noon: i64 = 12 * 3600;
+
+    // Friday is tomorrow regardless of the time of day right now.
+    try testing.expectEqual(@as(?i64, 86400 + 6 * 3600), parseWeekdayWhen("friday", thu_noon));
+    // Case-insensitive.
+    try testing.expectEqual(@as(?i64, 86400 + 6 * 3600), parseWeekdayWhen("Friday", thu_noon));
+
+    // Today (Thursday) with its default 6am already passed this morning
+    // rolls to *next* Thursday, not later today or right now.
+    try testing.expectEqual(@as(?i64, 6 * 3600 + 7 * 86400), parseWeekdayWhen("thursday", thu_noon));
+
+    // Today (Thursday) with an explicit time still ahead of `now` stays today.
+    try testing.expectEqual(@as(?i64, 18 * 3600), parseWeekdayWhen("thursday 18:00", thu_noon));
+
+    try testing.expectEqual(@as(?i64, null), parseWeekdayWhen("funday", thu_noon));
+    try testing.expectEqual(@as(?i64, null), parseWeekdayWhen("friday 25:00", thu_noon));
+}
+
+test "parseWhen falls back to a weekday name after duration and absolute-time both miss" {
+    const thu_noon: i64 = 12 * 3600;
+    try testing.expectEqual(@as(?i64, 86400 + 6 * 3600), parseWhen("friday", thu_noon));
+    try testing.expectEqual(@as(?i64, 18 * 3600), parseWhen("thursday 18:00", thu_noon));
 }
 
 test "parseWhenLocal: duration shorthand ignores offset entirely" {
