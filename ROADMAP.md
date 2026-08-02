@@ -561,3 +561,214 @@ planned in detail, listed so they aren't forgotten.
   fresh message per navigation step there. Neither blocks using `/menu` on
   either platform today, just leaves Matrix messier and Telegram
   discoverable only via `/menu`/the "/" command list.
+
+## Post-v1 feature roadmap (drafted 2026-07-31)
+
+Warden is close to a v1 release. The list below is a forward-looking,
+prioritized backlog for *after* that — not scheduled, nothing here is
+started. It was triggered by a ChatGPT-drafted brainstorm of ~250-300
+generic "AI Telegram assistant" feature ideas spanning everything from
+personal productivity to CRM integrations to dating-profile help. Most of
+that list doesn't fit Warden: it's a single-owner personal bot (see
+"Access control" in `README.md`), not a multi-tenant SaaS product, so
+anything assuming teams/billing/white-labeling/lead-gen was cut outright
+rather than phased. What's below is the subset that's a real fit, folded
+into Warden's existing category groupings (reminders, alerts, tools,
+menu) and ranked most → least critical by how much daily-use value it adds
+per the pattern the shipped phases above already validate: features that
+become part of a daily workflow (memory, reminders, search, document
+handling, proactive notifications) stick; novelty features don't.
+
+Each phase below reuses Warden's established shape — a `store/*.zig` +
+migration, a `features/*.zig` or `tools/*.zig`, a slash command, a `/menu`
+entry — the same pattern every phase above already follows. Sizing (S/M/L)
+is a rough guess, not a commitment; real scoping happens when a phase
+actually starts.
+
+### Phase 9 — Management rooms, channel support & delegated admin notices
+*Effort: M/L.*
+
+Ranked first, ahead of the ChatGPT-derived features below, because it
+closes a real zero-support gap rather than adding a new nice-to-have:
+**Telegram channels aren't administrable by Warden at all today.**
+`platform/interface.zig`'s `chat_type` doc comment already lists
+`"channel"` as a recognized value and the string is persisted if it ever
+arrives, but nothing in `platform/telegram.zig` subscribes to
+`channel_post`/`edited_channel_post` updates, so a channel is never
+ingested as a chat in the first place. This isn't an oversight to
+quick-fix, either — it's structural: a channel has no back-and-forth
+message flow a member could use to type a command into it the way a group
+works, so "just add channel support" alone still leaves no way to
+*command* the bot there. Matrix moderation bots (Mjolnir, Draupnir) hit
+the identical problem — Matrix has no DM concept either, a 1:1 is still
+just a room — and solved it with a **management room**: a separate room
+you talk to the bot in, where commands name which *other* room they act
+on. This phase adopts the same pattern for Warden, generalized to also
+cover ordinary groups (so admin commands don't have to be typed in front
+of the whole group, even where that's optional rather than structurally
+required):
+
+- Subscribe to `channel_post`/`edited_channel_post` so a channel a bot
+  admin is added to gets ingested as a real `chats` row (via the same
+  `my_chat_member`-on-add flow groups already use), even though it will
+  never itself produce ordinary `message` updates.
+- A management-room binding: `/manage bind <chat ref>` issued in the room
+  that should act as control room for a target chat (channel or group),
+  authorized the same way `group_admin.zig`'s live checks already work —
+  the target chat's own Telegram admins (checked live via
+  `getChatMember`, not cached) or the bot owner. A management room isn't
+  exclusive to one target; commands inside it name which bound chat they
+  apply to (`/as <chat ref> <command>`), same shape as Mjolnir's
+  `!mjolnir <command> !room:server`.
+- **Admin notices**: extends Bot View's existing send-as-bot capability
+  (see `warden-bot-view-websocket.md` in memory — shipped 2026-07-28,
+  owner-only at the time) to a target chat's own admins, not just the
+  owner, scoped to chats they actually administer. A message sent this
+  way (from a management room or Bot View) is auto-pinned by the bot as a
+  notice, distinct from an ordinary relayed message — the parallel to
+  Mjolnir posting moderation notices into rooms it manages.
+- **Explicit v1 scoping decision for this pass**: Bot View's owner-only
+  visibility stays as the ceiling for the owner (sees/acts as the bot
+  everywhere, unchanged), but group admins get scoped access — they may
+  view/act only in a chat they are a live-checked admin of, never any
+  other chat, and never another admin's chat. No shared/team visibility
+  beyond that boundary in this first pass.
+
+### Phase 10 — Vision & document understanding
+*Effort: M/L.*
+
+The single biggest capability gap today: `qa.zig`'s Q&A path is text-only.
+Photos and PDFs already flow through the connector's attachment plumbing
+(used by `/convert` and voice transcription) but the LLM itself never
+*sees* them — only mechanically converts or transcribes. Wiring image
+bytes into a multimodal provider call (Anthropic/OpenAI vision support)
+unlocks a cluster of ChatGPT's list at once with one piece of plumbing:
+image understanding, PDF understanding, OCR, handwriting recognition,
+document summarization, homework-helper/math-solver (photo of a problem),
+receipt OCR (feeds Phase 17's finance tracker). Highest priority because
+several later phases assume it exists.
+
+### Phase 11 — Personal knowledge base: notes & lists
+*Effort: S/M.*
+
+Cheapest phase on this list — a near-exact structural copy of
+`reminders.zig`/`alerts.zig` (per-identity or per-chat rows, a
+create/list/delete command trio, `/menu` entries) with no scheduler and no
+external API. Covers: notes, shopping lists, reading list, wishlist,
+packing lists, bucket list, meeting notes, voice notes (transcribe via
+Phase 7's existing whisper pipeline, then store as a note). Foundational
+for Phase 12 (something to actually index) and for "search notes" from
+ChatGPT's Search & Knowledge cluster.
+
+### Phase 12 — Long-term / semantic memory
+*Effort: L.*
+
+Already flagged in Phase 8's backlog as "the most powerful idea
+considered" — this plan doesn't change that assessment, just re-confirms
+it against ChatGPT's own retention analysis (memory is called out as one
+of the highest-retention feature classes). Needs `pgvector`, an embeddings
+call per stored message/note, and a retrieval step in `qa.zig`'s prompt
+construction. Sequenced after Phases 9-10 so there's real content worth
+indexing (notes, document text) beyond raw chat lines. Covers: remember
+preferences/names/projects/goals/writing style, search memories, forget
+memories, memory timeline, cross-chat reasoning.
+
+### Phase 13 — Proactive daily briefings
+*Effort: S/M.*
+
+Pure composition, not new capability — a scheduled job (same
+`checkAndSendDue*` pattern as reminders/alerts/feeds) that assembles a
+morning briefing from primitives that already exist: pending reminders,
+triggered-but-not-yet-delivered alerts, weather, and new feed items since
+last digest. Covers: morning briefing, evening recap, weather alerts
+digest, news digest (already 90% done via `feed_watcher.zig` — this is
+mostly packaging), deadline reminders. High value for low new-code volume.
+
+### Phase 14 — Messaging assistance modes
+*Effort: S/M.*
+
+New prompt-modes layered onto the existing Q&A path plus one new tool that
+reads `store/messages.zig`'s existing log. Covers: summarize long chats
+("catch me up"), translate (incoming or on-demand — ChatGPT's list flags
+this as low-novelty since the model already translates zero-shot, so
+mainly a documented command rather than new capability), rewrite/tone
+adjustment, explain-like-I'm-5, brainstorming/decision-helper framings.
+No new storage.
+
+### Phase 15 — Calendar & email integration
+*Effort: L.*
+
+The biggest new-infra phase after memory: real OAuth against Google
+(Calendar + Gmail scopes), token storage, and a poll or push mechanism for
+"what's on my calendar" / meeting reminders / email summarization/drafting.
+`store/oauth_providers.zig` exists today but is scoped to admin-configured
+*login* OIDC providers (see its doc comment) — this needs its own
+per-identity OAuth grant flow, not a reuse of that table as-is. Sequenced
+after the cheaper phases since it's the first one touching a third-party
+write-capable API (draft/send email) rather than a read-only public one
+(weather, crypto, RSS).
+
+### Phase 16 — Group/Telegram quality-of-life
+*Effort: S/M.*
+
+Extends `group_admin.zig`'s existing moderation surface rather than adding
+a new subsystem. Covers: welcome messages, scheduled announcements,
+auto-pin important messages, keyword alerts, poll generation, group
+summaries (composes `digest.zig`, already exists in spirit). Spam
+detection/auto-moderation stays explicitly out of scope — already
+deferred in Phase 8's backlog over trust-model concerns, and that
+reasoning doesn't change here.
+
+### Phase 17 — Finance trackers
+*Effort: M.*
+
+Extends `alerts.zig` with a new alert kind (product/subscription price)
+rather than a parallel system, plus simple ledger tables for manual entry.
+Covers: expense tracker, budget planner, subscription tracker, bill
+reminders, price/deal alerts. Receipt OCR line item depends on Phase 10.
+Explicitly not building: investment/portfolio tracking, tax tools, KPI
+dashboards — real-money-adjacent features where "close enough" is the
+wrong tradeoff for a spare-time personal project.
+
+### Phase 18 — Media generation
+*Effort: M/L.*
+
+The first phase needing a new paid external provider (image generation —
+no local/free equivalent worth self-hosting at this scale). Covers: image
+generation, stickers, memes, captions, background removal. Lower priority
+than everything above it — fun, but not a daily-workflow feature the way
+reminders/memory/documents are.
+
+### Phase 19 — Power-user tools & light/fun features
+*Effort: S, batchable.*
+
+Grab-bag of cheap wins with no shared theme beyond "small and self-
+contained enough to knock out in a batch": custom command aliases, prompt
+templates, joke/riddle/trivia/word-of-day, motivational-coach framing.
+Deliberately last — genuinely low effort each, but also genuinely low
+retention value per ChatGPT's own framing, so there's no cost to leaving
+this until everything above has shipped.
+
+### Explicitly excluded
+
+Cut outright rather than phased, because they assume a product shape
+Warden isn't (multi-tenant SaaS, business tooling, or a trust model the
+bot deliberately doesn't have):
+
+- **Business/enterprise**: CRM integration, invoicing, proposal writing,
+  contract summarization, lead qualification, KPI dashboards, team
+  workspaces, white-label bots, agent marketplace, premium usage tiers —
+  Warden has one owner and an allowlist, not customers or seats.
+- **Social/dating**: dating profile help, icebreakers, compliment
+  generator — doesn't fit the bot's existing personality/use pattern.
+- **Deep health tracking**: symptom logging, step/sleep tracking,
+  meal/calorie logging — needs real device integrations (wearables, health
+  APIs) for the data to be worth anything; out of scope without one.
+- **Travel booking**: flight tracking, hotel suggestions — read-only trip
+  planning is already well served by `web_search`/`weather`; booking-shaped
+  features need commercial travel APIs this project has no reason to pay
+  for.
+- Already explicitly deferred in Phase 8 above and unchanged by this pass:
+  sandboxed code execution, spam/toxicity auto-moderation, voice cloning
+  (not in Phase 8 but same "no clear consenting use case" reasoning
+  applies).
