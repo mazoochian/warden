@@ -3391,9 +3391,24 @@ const ticker_interval_ms: i64 = 1200;
 /// task, so it's safe for this to be the same per-message arena the rest
 /// of that task uses — see `tickerLoop`'s doc comment for why the ticker
 /// itself must NOT share it.
+///
+/// Heap-allocated on `std.heap.page_allocator` by `replyWithAnswer`
+/// (**not** stack-local, unlike its pre-2026-08-01 shape) — `stop`/`done`
+/// let the ticker thread outlive `replyWithAnswer`'s own stack frame when
+/// it can't be joined promptly (see `tickerLoop`'s doc comment), so nothing
+/// referencing `state` may be on that frame.
 const TickerState = struct {
     io: Io,
     allocator: std.mem.Allocator,
+    /// Cooperative stop signal — `replyWithAnswer` sets this once it's done
+    /// with the model call; `tickerLoop` checks it instead of relying on
+    /// `Future.cancel()`/preemption (see `tickerLoop`'s doc comment for why).
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Set by `tickerLoop` right before it returns — `replyWithAnswer`
+    /// polls this (bounded) instead of blocking on `std.Thread.join()`,
+    /// since the ticker may be wedged inside an in-flight edit call for up
+    /// to its own 45s internal timeout.
+    done: std.atomic.Value(bool) = .init(false),
     /// This platform's hard cap on a single message's text (see
     /// `effectiveMaxMessageLength`) — a streamed `.text` status is
     /// truncated to this before being shown, since unlike the *final*
@@ -3471,7 +3486,8 @@ test "truncateUtf8 handles max_len landing exactly on a boundary" {
     try std.testing.expectEqualStrings("caf", truncateUtf8(text, 3));
 }
 
-/// Runs until canceled (see `replyWithAnswer`), editing `message_id` no
+/// Runs on its own real, detached `std.Thread` (see `replyWithAnswer` —
+/// deliberately NOT `Io.concurrent`, see below), editing `message_id` no
 /// more than once per `ticker_interval_ms` — the generic thinking
 /// animation, or whatever `state.status` currently says, whichever's
 /// current. Dedupes against the last text it actually sent so a run of
@@ -3480,20 +3496,37 @@ test "truncateUtf8 handles max_len landing exactly on a boundary" {
 /// ("message is not modified"), which `editMessage` can't distinguish from
 /// a real failure (see its doc comment).
 ///
+/// Stops cooperatively via `state.stop`, checked once per tick, rather than
+/// via `Future.cancel()` — confirmed live in production (VPS wedge,
+/// 2026-07-31/08-01) that when this loop's own `editMessage` call is
+/// in-flight at the exact moment its call to `http_util`'s 45s
+/// timeout-and-detach escape hatch fires, a caller blocked in
+/// `Future.cancel()` waiting for this task to stop can hang forever —
+/// permanently stranding whichever `WorkerPool` worker was running that
+/// caller. Same class of bug `xmpp.zig`'s `pollFn` hit and was fixed for
+/// (see `worker_pool.zig`'s module doc): `Future.cancel()` can't be trusted
+/// to unwind through that raw-detached-thread boundary. A plain
+/// `std.Thread` + atomic stop flag sidesteps the question entirely — no
+/// cancellation to trust, just a flag this loop checks on its own schedule,
+/// with `replyWithAnswer` bounding how long it waits rather than blocking
+/// unboundedly on a join.
+///
 /// Deliberately does NOT take the per-message arena `replyWithAnswer` and
 /// `qa.answer` use — this runs as a genuinely concurrent task (a real OS
-/// thread under `Io.Threaded`), and `std.heap.ArenaAllocator` has no
-/// internal locking, so two threads allocating from the same arena at once
-/// corrupts its bookkeeping. That was the actual cause of a reported hang:
-/// no timeout ever fired because the corruption happened inside allocator
-/// internals, nowhere near the network code the timeouts guard. Every
-/// allocation `editMessage`'s call chain makes is `defer`-freed by itself
-/// (no reliance on arena-wholesale-free), so a plain thread-safe allocator
-/// works fine here — no arena needed.
+/// thread), and `std.heap.ArenaAllocator` has no internal locking, so two
+/// threads allocating from the same arena at once corrupts its bookkeeping.
+/// That was the actual cause of an earlier reported hang: no timeout ever
+/// fired because the corruption happened inside allocator internals,
+/// nowhere near the network code the timeouts guard. Every allocation
+/// `editMessage`'s call chain makes is `defer`-freed by itself (no reliance
+/// on arena-wholesale-free), so a plain thread-safe allocator works fine
+/// here — no arena needed.
 fn tickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []const u8, state: *TickerState) void {
+    defer state.done.store(true, .release);
     var last_sent: []const u8 = thinking_text;
-    while (true) {
+    while (!state.stop.load(.acquire)) {
         Io.sleep(state.io, .fromMilliseconds(ticker_interval_ms), .awake) catch return;
+        if (state.stop.load(.acquire)) return;
 
         const status = state.getStatus();
         const text = status orelse thinking_text;
@@ -3653,26 +3686,61 @@ fn replyWithAnswer(
     };
     log.info("qa: placeholder for chat {s} = {?s}", .{ native_chat_id, placeholder_id });
 
-    var state = TickerState{ .io = io, .allocator = a, .max_len = max_message_len };
+    // Heap-allocated on `page_allocator`, not stack-local: `tickerLoop` runs
+    // on a real detached thread that this function may have to walk away
+    // from (still running) if it doesn't stop promptly — see the bounded
+    // stop/join below and `TickerState`'s doc comment. Never freed on that
+    // walk-away path (same accepted "detach and abandon" tradeoff
+    // `http_util.zig`'s `fetchWithTimeout` already makes for its own
+    // stalled-connection case) — a handful of leaked `TickerState`s over a
+    // long-running process is a fine trade for never stranding a
+    // `WorkerPool` worker again.
+    const state = std.heap.page_allocator.create(TickerState) catch |err| blk: {
+        log.warn("qa: couldn't allocate ticker state for chat {s}: {t}", .{ native_chat_id, err });
+        break :blk null;
+    };
+    if (state) |s| s.* = .{ .io = io, .allocator = a, .max_len = max_message_len };
     var progress: toolcall.Progress = .{};
-    var ticker_future: ?Io.Future(void) = null;
+    var ticker_thread: ?std.Thread = null;
     if (placeholder_id) |pid| {
-        progress = .{ .ptr = &state, .onEvent = onProgressEvent };
-        ticker_future = Io.concurrent(io, tickerLoop, .{ connector, native_chat_id, pid, &state }) catch |err| blk: {
-            log.warn("qa: couldn't start the thinking animation for chat {s}: {t}", .{ native_chat_id, err });
-            break :blk null;
-        };
+        if (state) |s| {
+            progress = .{ .ptr = s, .onEvent = onProgressEvent };
+            ticker_thread = std.Thread.spawn(.{}, tickerLoop, .{ connector, native_chat_id, pid, s }) catch |err| blk: {
+                log.warn("qa: couldn't start the thinking animation for chat {s}: {t}", .{ native_chat_id, err });
+                break :blk null;
+            };
+        }
     }
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tools);
     const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, enabled_tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, max_tokens_override, history_window);
 
-    // Stop the ticker before touching the placeholder ourselves — it's the
-    // sole owner of that Future until this point (see `Future.cancel`'s
-    // "not threadsafe" note), and cancel() blocks until it has actually
-    // stopped, so there's no risk of it clobbering the final edit below.
-    if (ticker_future) |*f| _ = f.cancel(io);
+    // Stop the ticker before touching the placeholder ourselves. Signaled
+    // cooperatively (`state.stop`) and joined with a bound, rather than
+    // trusted to `Future.cancel()`/`std.Thread.join()` unbounded — see
+    // `tickerLoop`'s doc comment for the production wedge this replaced.
+    // 5s comfortably covers a normal stop (next tick is at most
+    // `ticker_interval_ms` away) while still being far short of the ticker's
+    // own 45s internal HTTP timeout, so this only ever eats the bound on the
+    // rare tick that's genuinely wedged in that timeout's tail.
+    if (state) |s| {
+        s.stop.store(true, .release);
+        var waited_ms: i64 = 0;
+        while (!s.done.load(.acquire) and waited_ms < 5000) {
+            Io.sleep(io, .fromMilliseconds(50), .awake) catch break;
+            waited_ms += 50;
+        }
+        if (ticker_thread) |t| {
+            if (s.done.load(.acquire)) {
+                t.join();
+                std.heap.page_allocator.destroy(s);
+            } else {
+                log.warn("qa: ticker for chat {s} didn't stop within {d}ms, detaching it", .{ native_chat_id, waited_ms });
+                t.detach();
+            }
+        }
+    }
     log.info("qa: model call for chat {s} returned", .{native_chat_id});
 
     const raw_answer = raw_answer_or_err catch |err| {
