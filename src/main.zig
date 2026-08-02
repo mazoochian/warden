@@ -48,6 +48,7 @@ const user_settings = @import("store/user_settings.zig");
 const messages = @import("store/messages.zig");
 const stats = @import("store/stats.zig");
 const reminders = @import("store/reminders.zig");
+const notes = @import("store/notes.zig");
 const reminder_format = @import("features/reminder_format.zig");
 const alert_store = @import("store/alerts.zig");
 const alert_feature = @import("features/alerts.zig");
@@ -87,6 +88,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/hackernews.zig").tool,
     @import("tools/remind.zig").tool,
     @import("tools/set_alert.zig").tool,
+    @import("tools/set_note.zig").tool,
     @import("tools/begin_conversion.zig").tool,
     convert_file.tool,
     @import("tools/find_chat_member.zig").tool,
@@ -110,6 +112,8 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "digest", .description = "on | off | now -- enable, disable, or generate a recent-activity summary." },
     .{ .name = "remind", .description = "<time> <message> -- set a reminder. Also: every <interval> ..., cancel <id>." },
     .{ .name = "reminders", .description = "List your pending reminders in this chat." },
+    .{ .name = "note", .description = "add <text> | list | delete <id> -- a shared notes/lists space for this chat." },
+    .{ .name = "notes", .description = "List every note in this chat." },
     .{ .name = "alert", .description = "<crypto|weather|aqi> <subject> <above|below> <value> -- set an alert." },
     .{ .name = "alerts", .description = "List pending alerts in this chat." },
     .{ .name = "watch", .description = "<feed url> -- get notified when an RSS/Atom feed publishes." },
@@ -168,6 +172,8 @@ const help_text =
     \\/alerts -- list pending alerts
     \\/watch <feed url> / /unwatch <feed url> / /watches -- RSS/Atom feed
     \\  notifications. /watchcheck <feed url> forces an immediate check
+    \\/note add <text> | list | delete <id> -- notes/shopping lists for
+    \\  this chat. /notes lists them all
     \\
     \\Files
     \\/convert -- start a guided conversion (I'll ask you to send a file);
@@ -1085,6 +1091,13 @@ fn processMessageTask(
         .identity_id = identity_id,
         .is_owner = auth.isOwner(config, connector.platform(), msg.user_id),
     };
+    var note_adapter: NoteToolAdapter = .{
+        .pool = pool,
+        .chat_id = chat_id,
+        .identity_id = identity_id,
+        .is_owner = auth.isOwner(config, connector.platform(), msg.user_id),
+        .now = ts,
+    };
     var convert_flow_adapter: ConvertFlowToolAdapter = .{
         .pending = pending_conversions,
         .now = ts,
@@ -1109,6 +1122,7 @@ fn processMessageTask(
         .now = ts,
         .reminders = reminder_adapter.sink(),
         .alerts = alert_adapter.sink(),
+        .notes = note_adapter.sink(),
         .convert_flow = convert_flow_adapter.sink(),
         .member_directory = member_directory_adapter.sink(),
         .attachment_path = attachment_path,
@@ -1728,6 +1742,11 @@ fn handleMessage(
         handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/reminders")) {
         handleRemindersList(connector, a, pool, chat_id, now, msg.chat_id, msg.message_id);
+    } else if (std.mem.eql(u8, text, "/note") or std.mem.startsWith(u8, text, "/note ")) {
+        if (!feature_flags.isEnabled(pool, "notes")) return false;
+        handleNoteCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/notes")) {
+        handleNotesList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/convert")) {
         if (!feature_flags.isEnabled(pool, "convert")) return false;
         // Bare /convert, no attachment claimed above (either none present,
@@ -2963,6 +2982,101 @@ fn handleRemindersList(
     connector.sendMessage(a, native_chat_id, formatPendingReminders(a, pool, pending, now), reply_to);
 }
 
+const max_note_text_len = 1000;
+
+/// `/note add <text>` / `/note delete <id>` — see ROADMAP.md's Phase 11.
+/// A generic freeform-text knowledge base (notes, shopping lists,
+/// wishlists, ...), so unlike `/remind`'s implicit "first word is either
+/// `cancel` or a time expression" parsing, this requires an explicit
+/// `add`/`delete` keyword — a note's own text could otherwise legitimately
+/// start with a word like "list" or "delete" ("delete the old files"),
+/// which would be ambiguous under `/remind`'s shape.
+fn handleNoteCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /note add <text>, /note list, or /note delete <id>";
+    const arg = std.mem.trim(u8, text["/note".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        handleNotesList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "delete")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /note delete <id> (see /notes for ids).");
+            return;
+        };
+        const note = (notes.get(pool, a, id) catch |err| {
+            log.err("note: lookup failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that note, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No note with that id.");
+            return;
+        };
+        if (note.chat_id != chat_id) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No note with that id.");
+            return;
+        }
+        if (note.identity_id != identity_id and !auth.isOwner(config, connector.platform(), msg.user_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only whoever added that note (or the owner) can delete it.");
+            return;
+        }
+        notes.delete(pool, id) catch |err| {
+            log.err("note: delete failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't delete that note, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Note deleted.");
+        return;
+    }
+
+    if (!std.mem.eql(u8, sub, "add")) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    const note_text = std.mem.trim(u8, it.rest(), " ");
+    if (note_text.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    if (note_text.len > max_note_text_len) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That note is too long (max 1000 bytes).");
+        return;
+    }
+
+    const id = notes.create(pool, chat_id, identity_id, note_text, now) catch |err| {
+        log.err("note: failed to create note for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that note, try again.");
+        return;
+    };
+    const confirmation = std.fmt.allocPrint(a, "Note #{d} added.", .{id}) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+fn handleNotesList(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    native_chat_id: []const u8,
+    reply_to: ?[]const u8,
+) void {
+    const listed = notes.listForChat(pool, a, chat_id) catch |err| {
+        log.err("notes: list failed for chat {d}: {t}", .{ chat_id, err });
+        connector.sendMessage(a, native_chat_id, "Couldn't load notes, try again.", reply_to);
+        return;
+    };
+    connector.sendMessage(a, native_chat_id, formatAllNotes(a, listed), reply_to);
+}
+
 /// `/alert <crypto|weather|aqi> <subject> <above|below> <threshold>` sets a
 /// standing alert; `/alert cancel <id>` cancels one. Subject may contain
 /// spaces (city names) — everything between the kind and the trailing
@@ -3319,6 +3433,60 @@ const ReminderToolAdapter = struct {
         const self: *ReminderToolAdapter = @ptrCast(@alignCast(ptr));
         const pending = try reminders.listPending(self.pool, allocator, self.chat_id);
         return formatPendingReminders(allocator, self.pool, pending, self.now);
+    }
+};
+
+fn formatAllNotes(a: std.mem.Allocator, listed: []const notes.Note) []const u8 {
+    if (listed.len == 0) return "No notes yet. Add one with /note add <text> (or just ask).";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Notes:\n", .{}) catch return "";
+    for (listed) |n| w.print("  #{d} {s}\n", .{ n.id, n.text }) catch return "";
+    return buf.writer.buffered();
+}
+
+/// Wires the `set_note` LLM tool (see `tools/set_note.zig`) to real
+/// Postgres-backed notes for one specific message's chat/sender —
+/// constructed fresh per message in `processMessageTask` since `chat_id`/
+/// `identity_id`/`is_owner` all vary per sender, then handed to the tool
+/// loop as a `registry.NoteSink`. Same shape as `ReminderToolAdapter`.
+const NoteToolAdapter = struct {
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    is_owner: bool,
+    now: i64,
+
+    fn sink(self: *NoteToolAdapter) tool_registry.NoteSink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.NoteSink.VTable = .{
+        .create = createFn,
+        .delete = deleteFn,
+        .listAll = listAllFn,
+    };
+
+    fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror!i64 {
+        const self: *NoteToolAdapter = @ptrCast(@alignCast(ptr));
+        _ = allocator;
+        return notes.create(self.pool, self.chat_id, self.identity_id, text, self.now);
+    }
+
+    fn deleteFn(ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!tool_registry.NoteSink.DeleteResult {
+        const self: *NoteToolAdapter = @ptrCast(@alignCast(ptr));
+        const note = (try notes.get(self.pool, allocator, id)) orelse return .not_found;
+        if (note.chat_id != self.chat_id) return .not_found;
+        if (note.identity_id != self.identity_id and !self.is_owner) return .not_authorized;
+        try notes.delete(self.pool, id);
+        return .deleted;
+    }
+
+    fn listAllFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8 {
+        const self: *NoteToolAdapter = @ptrCast(@alignCast(ptr));
+        const listed = try notes.listForChat(self.pool, allocator, self.chat_id);
+        return formatAllNotes(allocator, listed);
     }
 };
 
@@ -3720,6 +3888,7 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
         .{ .name = "web_search", .key = "web_search" },
         .{ .name = "set_reminder", .key = "reminders" },
         .{ .name = "set_alert", .key = "alerts" },
+        .{ .name = "set_note", .key = "notes" },
         .{ .name = "begin_file_conversion", .key = "convert" },
         .{ .name = "convert_file", .key = "convert" },
     };
@@ -3759,6 +3928,7 @@ test "toolModuleKey maps tool names to their feature_flags module key" {
     try std.testing.expectEqualStrings("convert", toolModuleKey("convert_file").?);
     try std.testing.expectEqualStrings("convert", toolModuleKey("begin_file_conversion").?);
     try std.testing.expectEqualStrings("hackernews", toolModuleKey("hackernews_search").?);
+    try std.testing.expectEqualStrings("notes", toolModuleKey("set_note").?);
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("calculator"));
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("nonexistent_tool"));
 }
@@ -4520,6 +4690,7 @@ test {
     _ = @import("llm/dynamic_provider.zig");
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
+    _ = @import("store/notes.zig");
     _ = @import("features/qa.zig");
     _ = @import("features/reminder_format.zig");
     _ = @import("tools/remind.zig");
@@ -4528,6 +4699,7 @@ test {
     _ = @import("store/alerts.zig");
     _ = @import("features/alerts.zig");
     _ = @import("tools/set_alert.zig");
+    _ = @import("tools/set_note.zig");
     _ = @import("store/feed_watches.zig");
     _ = @import("features/feed_watcher.zig");
     _ = @import("features/feed_parse.zig");

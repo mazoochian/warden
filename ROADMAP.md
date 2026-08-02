@@ -751,7 +751,8 @@ rather than claimed, same standard held elsewhere (e.g. Phase 9's own
 note on this).
 
 ### Phase 11 — Personal knowledge base: notes & lists
-*Effort: S/M.*
+*Effort: S/M. Status: core done (2026-08-02) — see below for what shipped
+vs. what's deferred.*
 
 Cheapest phase on this list — a near-exact structural copy of
 `reminders.zig`/`alerts.zig` (per-identity or per-chat rows, a
@@ -761,6 +762,46 @@ packing lists, bucket list, meeting notes, voice notes (transcribe via
 Phase 7's existing whisper pipeline, then store as a note). Foundational
 for Phase 12 (something to actually index) and for "search notes" from
 ChatGPT's Search & Knowledge cluster.
+
+**Done:**
+- One flat, freeform `notes` table (migration `0024_notes.sql`) rather
+  than several typed structures — a shopping list, wishlist, packing
+  list, etc. are all just "a chat-scoped list of short text entries
+  someone added," not materially different shapes, so `store/notes.zig`
+  is a single generic primitive (`create`/`listForChat`/`get`/`delete`)
+  covering every use case in the phase's own list. Chat-scoped and
+  visible to the whole chat, deletable by creator-or-owner — same model
+  `reminders.zig`/`alerts.zig` already use.
+- `/note add <text>`, `/note list` (also `/notes`), `/note delete <id>` —
+  an explicit `add`/`delete` keyword, unlike `/remind`'s implicit
+  "first word is either `cancel` or a time expression" shape, since a
+  note's own text could otherwise legitimately start with a word like
+  "list" or "delete" ("delete the old files"), which `/remind`'s parsing
+  approach would have made ambiguous here.
+- `set_note` LLM tool (`tools/set_note.zig`, action=create/list/delete) —
+  the natural-language front end, wired into `filterEnabledTools`'s
+  module-key map like every other tool so the same `notes` feature flag
+  gates both the command and the tool.
+- Voice notes: **not built this pass** despite being explicitly listed in
+  scope above — `resolveQuestion`'s existing whisper transcription only
+  ever feeds a transcript into the *question* asked of the LLM, it has no
+  hook for "and also, save this as a note" as a side effect; wiring that
+  in is a small but real follow-up, not done here.
+
+**Deferred, not built this pass** — `/menu` entries. Every other module's
+menu entry (see `features/menu_tree.zig`) is either a simple view-only
+list or, for anything needing structured input like a date/time, a full
+custom wizard (`NodeKind.wizard`, built for the reminders module
+specifically). Notes don't need a wizard (the only field is free text),
+but wiring even a view/add/delete menu screen through `menu.zig`'s
+`ActionRunner` is nontrivial glue this pass didn't have room for — the
+feature is fully usable today via `/note`/`/notes` and natural language,
+just not yet reachable from the button menu. Flagged, not silently
+dropped, same convention this file already uses elsewhere (e.g. Phase
+9's deferred `/as` relay, Phase 5's menu-polish backlog entry in
+warden-ui's own ROADMAP).
+
+Verified: `zig build` and `zig build test` both green.
 
 ### Phase 12 — Long-term / semantic memory
 *Effort: L.*

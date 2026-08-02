@@ -89,6 +89,36 @@ pub const AlertSink = struct {
     }
 };
 
+/// Same ptr+vtable shape as `ReminderSink`/`AlertSink`, for the `set_note`
+/// tool — notes/lists (shopping lists, wishlists, packing lists, etc. are
+/// all just this one generic shape, see `store/notes.zig`'s doc comment).
+pub const NoteSink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const DeleteResult = enum { deleted, not_found, not_authorized };
+
+    pub const VTable = struct {
+        create: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror!i64,
+        delete: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!DeleteResult,
+        /// Same "sink formats its own listing" reasoning as
+        /// `ReminderSink.VTable.listPending`.
+        listAll: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8,
+    };
+
+    pub fn create(self: NoteSink, allocator: std.mem.Allocator, text: []const u8) !i64 {
+        return self.vtable.create(self.ptr, allocator, text);
+    }
+
+    pub fn delete(self: NoteSink, allocator: std.mem.Allocator, id: i64) !DeleteResult {
+        return self.vtable.delete(self.ptr, allocator, id);
+    }
+
+    pub fn listAll(self: NoteSink, allocator: std.mem.Allocator) ![]const u8 {
+        return self.vtable.listAll(self.ptr, allocator);
+    }
+};
+
 /// Callback surface the `begin_file_conversion` tool uses to kick off the
 /// interactive multi-stage `/convert` flow (see `features/convert_flow.zig`)
 /// when the user expresses intent in natural language rather than typing
@@ -166,6 +196,9 @@ pub const ToolContext = struct {
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `find_chat_member` tool.
     member_directory: ?MemberDirectorySink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `set_note` tool.
+    notes: ?NoteSink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the
