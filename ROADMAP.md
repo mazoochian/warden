@@ -676,7 +676,8 @@ against a live homeserver/Bot API. Noted honestly rather than claimed,
 same standard Phase 2's Matrix landing held itself to.
 
 ### Phase 10 — Vision & document understanding
-*Effort: M/L.*
+*Effort: M/L. Status: slice 1 done (images) — see below for what shipped
+vs. what's deferred.*
 
 The single biggest capability gap today: `qa.zig`'s Q&A path is text-only.
 Photos and PDFs already flow through the connector's attachment plumbing
@@ -688,6 +689,66 @@ image understanding, PDF understanding, OCR, handwriting recognition,
 document summarization, homework-helper/math-solver (photo of a problem),
 receipt OCR (feeds Phase 17's finance tracker). Highest priority because
 several later phases assume it exists.
+
+**Done (slice 1, images only):**
+- New `ContentBlock.image` variant (`llm/provider.zig`) — a base64
+  `{media_type, base64_data}` pair, alongside the existing `text`/
+  `tool_use`/`tool_result` blocks both provider adapters already switch
+  over exhaustively.
+- `llm/attachment_content.zig`'s `imageBlockForAttachment` classifies
+  `ToolContext`'s current attachment: a Telegram `.photo` is always an
+  image (Telegram never reports a `mime_type` for those — confirmed the
+  only reliable signal is `kind`, not mime/filename), a `.document` is an
+  image if its mime type starts with `image/` or (no mime) its filename
+  extension says so. Reads the file capped at 5MB (Anthropic's real
+  per-image limit) via the same `readFileAlloc(..., .limited(n))` shape
+  `transcribe.zig` already uses; any failure (missing file, over the cap)
+  falls back to `null` — text-only — rather than ever failing the whole
+  Q&A call over a picture the model just won't get to see that turn.
+- Hooked into `llm/toolcall.zig`'s `run()`, not `main.zig`'s
+  `resolveQuestion`: `resolveQuestion` only ever produces text and only
+  special-cases a *captionless* attachment, so a photo sent *with* a
+  caption would've been missed entirely. `ctx.attachment_path` is already
+  populated by the time `toolcall.run` builds its first message,
+  regardless of caption, so attaching the image there covers both cases
+  with one change — and is a no-op for `digest.zig`/`feed_watcher.zig`'s
+  own `toolcall.run` calls, whose synthetic `ToolContext`s never carry a
+  real attachment anyway.
+- `anthropic.zig`'s `writeContentBlocks` gained the native
+  `{"type":"image","source":{"type":"base64",...}}` shape;
+  `openai_compat.zig`'s `writeMessages` needed real restructuring (not
+  just a new arm) — `content` was always written as a bare JSON string
+  before this, and only switches to an array of `{"type":"text"}`/
+  `{"type":"image_url"}` parts for a message that actually carries an
+  image, so every existing text-only call through that file is
+  byte-for-byte unchanged.
+- New `WARDEN_LLM_VISION` toggle (`config.zig`'s `llm_vision_enabled`,
+  default on), following the exact same `LlmDynamicSettings`/
+  `dynamic_config.findBool` shape every other global LLM toggle
+  (`WARDEN_LLM_SHOW_THINKING`/`WARDEN_LLM_STREAMING`/...) already uses —
+  runtime-hot-swappable via warden-ui's admin config panel with no
+  redeploy, same as those. An owner whose configured OpenAI-compatible
+  model genuinely doesn't support vision can turn this off; there's no
+  per-provider/per-model capability metadata anywhere in this codebase to
+  gate it automatically instead.
+
+**Deferred, not built this pass** — native PDF-as-document support
+(Anthropic's `type: "document"` content block, real PDF understanding with
+no OCR/conversion round trip). It's an Anthropic-only API shape with no
+equivalent in the generic OpenAI-compatible surface warden's other
+provider slot targets, so it doesn't fit one shared code path as cleanly
+as images do (both providers' vision APIs handle those near-identically).
+Same "split off the provider-specific part" call this project made for
+Matrix E2EE (Phase 2→2b) and Phase 9's deferred `/as` relay.
+
+**Not live-verified** — no real Telegram photo sent to a live chat this
+pass, so this is implemented per spec and covered by unit tests
+(`attachment_content.zig`'s image/mime classification,
+`anthropic.zig`/`openai_compat.zig`'s exact JSON shapes,
+`toolcall.zig`'s vision-on/vision-off message-block-count check) but not
+confirmed against a real Anthropic/OpenAI vision response. Noted honestly
+rather than claimed, same standard held elsewhere (e.g. Phase 9's own
+note on this).
 
 ### Phase 11 — Personal knowledge base: notes & lists
 *Effort: S/M.*

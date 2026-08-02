@@ -193,6 +193,13 @@ fn writeContentBlocks(w: *Io.Writer, content: []const llm.ContentBlock) !void {
                 try json.Stringify.value(t, .{}, w);
                 try w.writeByte('}');
             },
+            .image => |img| {
+                try w.writeAll("{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
+                try json.Stringify.value(img.media_type, .{}, w);
+                try w.writeAll(",\"data\":");
+                try json.Stringify.value(img.base64_data, .{}, w);
+                try w.writeAll("}}");
+            },
             .tool_use => |tu| {
                 try w.writeAll("{\"type\":\"tool_use\",\"id\":");
                 try json.Stringify.value(tu.id, .{}, w);
@@ -471,6 +478,26 @@ test "writeContentBlocks/writeMessages/writeTools produce valid embedded JSON" {
     var parsed = try json.parseFromSlice(json.Value, testing.allocator, out.writer.buffered(), .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
+}
+
+test "writeContentBlocks: an image block writes Anthropic's base64 source shape" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try writeContentBlocks(&out.writer, &.{
+        .{ .text = "what's in this?" },
+        .{ .image = .{ .media_type = "image/jpeg", .base64_data = "Zm9v" } },
+    });
+
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const blocks = parsed.value.array.items;
+    try testing.expectEqual(@as(usize, 2), blocks.len);
+    try testing.expectEqualStrings("image", blocks[1].object.get("type").?.string);
+    const source = blocks[1].object.get("source").?.object;
+    try testing.expectEqualStrings("base64", source.get("type").?.string);
+    try testing.expectEqualStrings("image/jpeg", source.get("media_type").?.string);
+    try testing.expectEqualStrings("Zm9v", source.get("data").?.string);
 }
 
 // `StreamState.onLine` is fed canned SSE lines directly (one `sink.onLine`

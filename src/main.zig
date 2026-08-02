@@ -1114,6 +1114,7 @@ fn processMessageTask(
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
+        .attachment_kind = if (msg.attachment) |att| att.kind else null,
     };
     const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg);
     if (claimed) attachment_cleanup_path = null;
@@ -1435,6 +1436,7 @@ const LlmDynamicSettings = struct {
     max_tokens_override: ?u32,
     history_messages: i64,
     skip_trivial_messages: bool,
+    vision_enabled: bool,
 };
 
 /// One `dynamic_config.listAll` fetch instead of six separate
@@ -1469,6 +1471,7 @@ fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, con
         .max_tokens_override = if (max_tokens_raw > 0) @intCast(max_tokens_raw) else null,
         .history_messages = dynamic_config.findI64(rows, "WARDEN_LLM_HISTORY_MESSAGES", config.llm_history_messages),
         .skip_trivial_messages = dynamic_config.findBool(rows, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", config.skip_trivial_messages),
+        .vision_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_VISION", config.llm_vision_enabled),
     };
 }
 
@@ -1813,7 +1816,7 @@ fn handleMessage(
             .native_id = msg.user_id,
         };
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.max_tokens_override, dyn.history_messages);
+        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.max_tokens_override, dyn.history_messages);
     }
     return false;
 }
@@ -3818,6 +3821,7 @@ fn replyWithAnswer(
     existing_placeholder_id: ?[]const u8,
     stream: bool,
     show_thinking: bool,
+    vision_enabled: bool,
     max_tokens_override: ?u32,
     history_window: i64,
 ) void {
@@ -3866,7 +3870,7 @@ fn replyWithAnswer(
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tools);
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, enabled_tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, max_tokens_override, history_window);
+    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, enabled_tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, max_tokens_override, history_window);
 
     // Stop the ticker before touching the placeholder ourselves. Signaled
     // cooperatively (`state.stop`) and joined with a bound, rather than
@@ -4534,6 +4538,7 @@ test {
     _ = @import("llm/provider.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
+    _ = @import("llm/attachment_content.zig");
     _ = @import("tools/calculator.zig");
     _ = @import("llm/toolcall.zig");
     _ = @import("features/group_admin.zig");

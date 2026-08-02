@@ -163,6 +163,7 @@ fn testConfig(comptime owner_id: []const u8) Config {
         .llm_owner_only = true,
         .llm_show_thinking = false,
         .llm_streaming = false,
+        .llm_vision_enabled = true,
     };
 }
 

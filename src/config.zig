@@ -160,6 +160,16 @@ pub const Config = struct {
     /// spin a CPU core indefinitely, past even its own timeout — confirmed
     /// live, not theoretical. Flip on to test a fix; leave off otherwise.
     llm_streaming: bool,
+    /// Whether `toolcall.run` attaches an image attachment's actual bytes
+    /// to the model call (see `llm/attachment_content.zig`) instead of only
+    /// ever mechanically converting/transcribing it — ROADMAP.md's Phase 10.
+    /// Defaults on: current Anthropic models all support vision. An owner
+    /// pointed at an OpenAI-compatible backend whose configured model
+    /// genuinely doesn't (e.g. a local non-vision-tuned model) can turn
+    /// this off with one setting — there's no per-provider/per-model
+    /// capability metadata anywhere else in this codebase to gate on
+    /// automatically.
+    llm_vision_enabled: bool,
     /// Overrides `qa.zig`'s `answerMaxTokens` (which sizes the budget off
     /// the active platform's message-length cap plus a reasoning-model
     /// thinking reserve) with a flat ceiling instead — for keeping a
@@ -345,6 +355,7 @@ pub const Config = struct {
         const llm_owner_only = parseBoolEnv(env, "WARDEN_LLM_OWNER_ONLY", default_llm_owner_only);
         const llm_show_thinking = parseBoolEnv(env, "WARDEN_LLM_SHOW_THINKING", default_llm_show_thinking);
         const llm_streaming = parseBoolEnv(env, "WARDEN_LLM_STREAMING", default_llm_streaming);
+        const llm_vision_enabled = parseBoolEnv(env, "WARDEN_LLM_VISION", default_llm_vision_enabled);
         const llm_max_tokens_override: ?u32 = if (env.get("WARDEN_LLM_MAX_TOKENS")) |raw|
             std.fmt.parseInt(u32, raw, 10) catch null
         else
@@ -396,6 +407,7 @@ pub const Config = struct {
             .llm_owner_only = llm_owner_only,
             .llm_show_thinking = llm_show_thinking,
             .llm_streaming = llm_streaming,
+            .llm_vision_enabled = llm_vision_enabled,
             .llm_max_tokens_override = llm_max_tokens_override,
             .llm_history_messages = llm_history_messages,
             .skip_trivial_messages = skip_trivial_messages,
@@ -585,6 +597,7 @@ pub const Config = struct {
     pub const default_llm_owner_only: bool = true;
     pub const default_llm_show_thinking: bool = false;
     pub const default_llm_streaming: bool = false;
+    pub const default_llm_vision_enabled: bool = true;
     /// Unchanged from the hardcoded value `qa.zig` used before this was
     /// configurable — existing behavior by default, override via
     /// `WARDEN_LLM_HISTORY_MESSAGES` for a cheaper/smaller context window.

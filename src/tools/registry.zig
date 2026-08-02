@@ -176,6 +176,13 @@ pub const ToolContext = struct {
     /// needs when `attachment_mime` alone doesn't disambiguate.
     attachment_file_name: ?[]const u8 = null,
     attachment_mime: ?[]const u8 = null,
+    /// `iface.Attachment.kind` for this message's attachment, if any — see
+    /// `llm/attachment_content.zig`'s `imageBlockForAttachment`, which needs
+    /// this specifically because a Telegram photo never reports a
+    /// `mime_type` at all (see `platform/telegram.zig`'s
+    /// `attachmentFromMessage`), so `kind == .photo` is the only reliable
+    /// "this is an image" signal for that case.
+    attachment_kind: ?iface.AttachmentKind = null,
 };
 
 pub const ToolDef = struct {

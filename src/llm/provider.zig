@@ -19,8 +19,20 @@ pub const ToolResult = struct {
     is_error: bool = false,
 };
 
+/// A base64-encoded image, attached alongside a `.text` block in the same
+/// message's `content` — see `llm/attachment_content.zig`'s
+/// `imageBlockForAttachment` for the only place these currently get built,
+/// and `toolcall.zig`'s `run` for the only place one gets attached to a
+/// message. `media_type` is a real MIME type (`"image/jpeg"`, ...), never
+/// guessed at the provider-adapter layer.
+pub const ImageBlock = struct {
+    media_type: []const u8,
+    base64_data: []const u8,
+};
+
 pub const ContentBlock = union(enum) {
     text: []const u8,
+    image: ImageBlock,
     tool_use: ToolUse,
     tool_result: ToolResult,
 };
@@ -131,15 +143,16 @@ pub const Provider = struct {
     }
 };
 
-/// Concatenates all `text` blocks; tool_use/tool_result blocks contribute
-/// nothing (a response that's pure tool calls has no visible text yet).
+/// Concatenates all `text` blocks; image/tool_use/tool_result blocks
+/// contribute nothing (a response that's pure tool calls has no visible
+/// text yet, and a provider never sends an image block back in a response).
 pub fn textOf(allocator: std.mem.Allocator, content: []const ContentBlock) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     for (content) |block| {
         switch (block) {
             .text => |t| try buf.appendSlice(allocator, t),
-            .tool_use, .tool_result => {},
+            .image, .tool_use, .tool_result => {},
         }
     }
     return buf.toOwnedSlice(allocator);

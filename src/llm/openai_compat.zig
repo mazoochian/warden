@@ -535,6 +535,8 @@ fn writeMessages(
     for (messages) |m| {
         var text_parts: std.ArrayList(u8) = .empty;
         defer text_parts.deinit(allocator);
+        var images: std.ArrayList(llm.ImageBlock) = .empty;
+        defer images.deinit(allocator);
         var tool_calls: std.ArrayList(llm.ToolUse) = .empty;
         defer tool_calls.deinit(allocator);
         var tool_results: std.ArrayList(llm.ToolResult) = .empty;
@@ -543,6 +545,7 @@ fn writeMessages(
         for (m.content) |block| {
             switch (block) {
                 .text => |t| try text_parts.appendSlice(allocator, t),
+                .image => |img| try images.append(allocator, img),
                 .tool_use => |tu| try tool_calls.append(allocator, tu),
                 .tool_result => |tr| try tool_results.append(allocator, tr),
             }
@@ -558,14 +561,39 @@ fn writeMessages(
             try w.writeByte('}');
         }
 
-        if (text_parts.items.len == 0 and tool_calls.items.len == 0) continue;
+        if (text_parts.items.len == 0 and images.items.len == 0 and tool_calls.items.len == 0) continue;
 
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"role\":");
         try json.Stringify.value(@tagName(m.role), .{}, w);
         try w.writeAll(",\"content\":");
-        if (text_parts.items.len > 0) {
+        if (images.items.len > 0) {
+            // A message with an image can't use the plain-string `content`
+            // shape below -- OpenAI's vision API (and most OpenAI-compatible
+            // backends that mirror it) needs an array of typed parts here.
+            // Text-only messages never take this branch, so every existing
+            // non-vision call through this file stays byte-for-byte
+            // unchanged.
+            try w.writeByte('[');
+            var part_first = true;
+            if (text_parts.items.len > 0) {
+                try w.writeAll("{\"type\":\"text\",\"text\":");
+                try json.Stringify.value(text_parts.items, .{}, w);
+                try w.writeByte('}');
+                part_first = false;
+            }
+            for (images.items) |img| {
+                if (!part_first) try w.writeByte(',');
+                part_first = false;
+                const data_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ img.media_type, img.base64_data });
+                defer allocator.free(data_url);
+                try w.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
+                try json.Stringify.value(data_url, .{}, w);
+                try w.writeAll("}}");
+            }
+            try w.writeByte(']');
+        } else if (text_parts.items.len > 0) {
             try json.Stringify.value(text_parts.items, .{}, w);
         } else {
             try w.writeAll("null");
@@ -682,6 +710,37 @@ test "writeMessages expands tool_result blocks into standalone tool messages" {
     // system + user + assistant(tool_calls) + tool(result) = 4 messages.
     try testing.expectEqual(@as(usize, 4), parsed.value.array.items.len);
     try testing.expectEqualStrings("tool", parsed.value.array.items[3].object.get("role").?.string);
+}
+
+test "writeMessages: an image block switches content to an array of typed parts (a text-only message keeps the plain string)" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try writeMessages(testing.allocator, &out.writer, null, &.{
+        .{ .role = .user, .content = &.{
+            .{ .text = "what's in this?" },
+            .{ .image = .{ .media_type = "image/jpeg", .base64_data = "Zm9v" } },
+        } },
+        .{ .role = .assistant, .content = &.{.{ .text = "a cat" }} },
+    });
+
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.array.items;
+    try testing.expectEqual(@as(usize, 2), msgs.len);
+
+    const parts = msgs[0].object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), parts.len);
+    try testing.expectEqualStrings("text", parts[0].object.get("type").?.string);
+    try testing.expectEqualStrings("what's in this?", parts[0].object.get("text").?.string);
+    try testing.expectEqualStrings("image_url", parts[1].object.get("type").?.string);
+    try testing.expectEqualStrings(
+        "data:image/jpeg;base64,Zm9v",
+        parts[1].object.get("image_url").?.object.get("url").?.string,
+    );
+
+    // Plain text-only message is completely unaffected -- still a bare string.
+    try testing.expectEqualStrings("a cat", msgs[1].object.get("content").?.string);
 }
 
 test "stripThinkingBlock removes a single <think> span" {
