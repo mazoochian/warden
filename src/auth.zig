@@ -85,6 +85,19 @@ pub fn checkGroupAdminAccess(
     return true;
 }
 
+/// Gate for a management-room action (`/manage bind`/`/manage unbind`/
+/// `/notice`, see `main.zig`'s dispatch chain) — unlike
+/// `checkGroupAdminAccess`, which checks admin-of-the-*current*-chat via
+/// `msg.chat_id`, these actions target a chat other than the one the
+/// command was typed in, so `native_chat_id` here is the *target's*
+/// native id, not `msg.chat_id`. No `sudo`/token fallback tiers — a bot
+/// admin who isn't also the owner or a live admin of the target chat has
+/// no business binding/unbinding/notifying it.
+pub fn isOwnerOrLiveAdminOfChat(connector: iface.Connector, a: std.mem.Allocator, config: *const Config, native_chat_id: []const u8, user_id: []const u8) bool {
+    if (isOwner(config, connector.platform(), user_id)) return true;
+    return connector.isGroupAdmin(a, native_chat_id, user_id) catch false;
+}
+
 /// Gate for `/token`: owner, a bot admin (unconditionally — there's no
 /// platform check to override here, this is a direct grant, not an
 /// elevation past a failed check, so `/sudo` is never needed), or a live
@@ -350,6 +363,21 @@ test "checkTokenGrantAccess: owner, bot admin, or platform admin can grant token
     try testing.expect(checkTokenGrantAccess(plain_stub.connector(), a, &other_config, baseMsg(), true));
     try testing.expect(checkTokenGrantAccess(admin_stub.connector(), a, &other_config, baseMsg(), false));
     try testing.expect(!checkTokenGrantAccess(plain_stub.connector(), a, &other_config, baseMsg(), false));
+}
+
+test "isOwnerOrLiveAdminOfChat: owner or a live admin of the named chat passes, a plain user doesn't" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const owner_config = testConfig("42");
+    const other_config = testConfig("999");
+    var admin_stub = StubConnector{ .is_group_admin = true };
+    var plain_stub = StubConnector{};
+
+    try testing.expect(isOwnerOrLiveAdminOfChat(plain_stub.connector(), a, &owner_config, "target-chat", "42"));
+    try testing.expect(isOwnerOrLiveAdminOfChat(admin_stub.connector(), a, &other_config, "target-chat", "42"));
+    try testing.expect(!isOwnerOrLiveAdminOfChat(plain_stub.connector(), a, &other_config, "target-chat", "42"));
 }
 
 test "isOwnerOrBotAdmin and isOwnerOrSudoBotAdmin" {

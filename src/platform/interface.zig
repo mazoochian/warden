@@ -180,6 +180,19 @@ pub const Message = struct {
     /// was the actual cause of "duplicate" chats. Null on every other
     /// platform/message.
     migrated_to_native_chat_id: ?[]const u8 = null,
+    /// Synthetic signal meaning "upsert the chat row (`chat_id`/`chat_type`/
+    /// `chat_title` above) and stop — this isn't real conversational
+    /// content." Set for a Telegram channel post (channels have no `from`
+    /// user and never produce ordinary `message` updates, only these) and
+    /// for the bot being newly added to/promoted in a chat via
+    /// `my_chat_member` (see `platform/telegram.zig`'s
+    /// `chatJoinedMessageFromUpdate`) — the latter matters most for
+    /// channels, which otherwise wouldn't become a `chats` row until their
+    /// first post, which may never come if the channel is post-only for
+    /// other admins. `main.zig`'s `processMessageTask` checks this right
+    /// after its unconditional `upsertChat` call and returns early, same
+    /// shape as `chat_left`/`migrated_to_native_chat_id` above.
+    chat_ingest_only: bool = false,
 
     /// Deep-copies every string field into `allocator`. The poll loop
     /// spawns one concurrent task per message, each owning its own arena;
@@ -219,6 +232,7 @@ pub const Message = struct {
             },
             .chat_left = self.chat_left,
             .migrated_to_native_chat_id = if (self.migrated_to_native_chat_id) |s| try allocator.dupe(u8, s) else null,
+            .chat_ingest_only = self.chat_ingest_only,
         };
     }
 };

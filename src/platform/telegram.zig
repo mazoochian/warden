@@ -109,6 +109,48 @@ pub const TelegramConnector = struct {
         };
     }
 
+    /// Translates a `my_chat_member` update into a synthetic chat-ingest-only
+    /// `iface.Message` — `null` unless the bot's new status is one that means
+    /// "present in this chat" (`member`/`administrator`/`creator`). This is
+    /// the only reliable ingestion signal for a channel: channels never
+    /// produce ordinary `message` updates (see `channel_post`'s branch in
+    /// `pollFn`), so without this, a channel the bot is added to as an admin
+    /// but that never gets posted in again would simply never become a
+    /// `chats` row. Idempotent to call on every such status change (not just
+    /// the very first) — `store/chats.zig`'s `upsertChat` is itself an
+    /// upsert, so re-ingesting on e.g. a promotion from member to
+    /// administrator is harmless.
+    fn chatJoinedMessageFromUpdate(allocator: std.mem.Allocator, cmu: types.ChatMemberUpdated) !?iface.Message {
+        const status = cmu.new_chat_member.status;
+        const is_present = std.mem.eql(u8, status, "member") or
+            std.mem.eql(u8, status, "administrator") or
+            std.mem.eql(u8, status, "creator");
+        if (!is_present) return null;
+        return .{
+            .chat_id = try std.fmt.allocPrint(allocator, "{d}", .{cmu.chat.id}),
+            .user_id = "",
+            .chat_type = if (cmu.chat.type.len > 0) try allocator.dupe(u8, cmu.chat.type) else null,
+            .chat_title = if (cmu.chat.title) |t| try allocator.dupe(u8, t) else null,
+            .chat_ingest_only = true,
+        };
+    }
+
+    /// Translates a `channel_post`/`edited_channel_post` update into a
+    /// synthetic chat-ingest-only `iface.Message` — channel posts have no
+    /// `from` user (a channel post is anonymous-by-channel, not by a
+    /// member) and are never conversational content the LLM should answer,
+    /// so this deliberately only ever carries chat metadata. Same
+    /// testability reasoning as `chatLeftMessageFromUpdate`.
+    fn channelPostIngestMessage(allocator: std.mem.Allocator, cp: types.Message) !iface.Message {
+        return .{
+            .chat_id = try std.fmt.allocPrint(allocator, "{d}", .{cp.chat.id}),
+            .user_id = "",
+            .chat_type = if (cp.chat.type.len > 0) try allocator.dupe(u8, cp.chat.type) else null,
+            .chat_title = if (cp.chat.title) |t| try allocator.dupe(u8, t) else null,
+            .chat_ingest_only = true,
+        };
+    }
+
     /// Translates a service message carrying `migrate_to_chat_id` (basic
     /// group upgraded to a supergroup) into a synthetic
     /// `migrated_to_native_chat_id` `iface.Message` — `null` for any
@@ -305,7 +347,15 @@ pub const TelegramConnector = struct {
             self.offset = @max(self.offset, update.update_id + 1);
 
             if (update.my_chat_member) |cmu| {
-                if (try chatLeftMessageFromUpdate(allocator, cmu, self.self_id_str)) |m| try messages.append(allocator, m);
+                if (try chatLeftMessageFromUpdate(allocator, cmu, self.self_id_str)) |m|
+                    try messages.append(allocator, m)
+                else if (try chatJoinedMessageFromUpdate(allocator, cmu)) |m|
+                    try messages.append(allocator, m);
+                continue;
+            }
+
+            if (update.channel_post orelse update.edited_channel_post) |cp| {
+                try messages.append(allocator, try channelPostIngestMessage(allocator, cp));
                 continue;
             }
 
@@ -716,6 +766,55 @@ test "chatLeftMessageFromUpdate reports chat_left for left/kicked, null otherwis
         .new_chat_member = .{ .status = "administrator" },
     };
     try testing.expectEqual(@as(?iface.Message, null), try TelegramConnector.chatLeftMessageFromUpdate(a, promoted, "999"));
+}
+
+test "chatJoinedMessageFromUpdate reports chat_ingest_only for member/administrator/creator, null for left/kicked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const added = types.ChatMemberUpdated{
+        .chat = .{ .id = -100123, .type = "channel", .title = "News" },
+        .new_chat_member = .{ .status = "administrator" },
+    };
+    const m1 = (try TelegramConnector.chatJoinedMessageFromUpdate(a, added)).?;
+    try testing.expect(m1.chat_ingest_only);
+    try testing.expectEqualStrings("-100123", m1.chat_id);
+    try testing.expectEqualStrings("", m1.user_id);
+    try testing.expectEqualStrings("channel", m1.chat_type.?);
+    try testing.expectEqualStrings("News", m1.chat_title.?);
+
+    const member = types.ChatMemberUpdated{
+        .chat = .{ .id = -1, .type = "group" },
+        .new_chat_member = .{ .status = "member" },
+    };
+    try testing.expect((try TelegramConnector.chatJoinedMessageFromUpdate(a, member)).?.chat_ingest_only);
+
+    const left = types.ChatMemberUpdated{
+        .chat = .{ .id = -1 },
+        .new_chat_member = .{ .status = "left" },
+    };
+    try testing.expectEqual(@as(?iface.Message, null), try TelegramConnector.chatJoinedMessageFromUpdate(a, left));
+}
+
+test "channelPostIngestMessage carries only chat metadata, no sender" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cp = types.Message{
+        .message_id = 5,
+        .chat = .{ .id = -100777, .type = "channel", .title = "Announcements" },
+        .date = 1000,
+        .text = "hello subscribers",
+    };
+    const m = try TelegramConnector.channelPostIngestMessage(a, cp);
+    try testing.expect(m.chat_ingest_only);
+    try testing.expectEqualStrings("-100777", m.chat_id);
+    try testing.expectEqualStrings("", m.user_id);
+    try testing.expectEqualStrings("channel", m.chat_type.?);
+    try testing.expectEqualStrings("Announcements", m.chat_title.?);
+    try testing.expectEqual(@as(?[]const u8, null), m.text);
 }
 
 test "migrationMessageFromMessage reports the new native id, null for an ordinary message" {

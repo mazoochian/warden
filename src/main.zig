@@ -30,6 +30,7 @@ const bot_view = @import("api/bot_view.zig");
 const rate_limit = @import("api/rate_limit.zig");
 const migrate = @import("store/migrate.zig");
 const chats = @import("store/chats.zig");
+const management_rooms = @import("store/management_rooms.zig");
 const identities = @import("store/identities.zig");
 const chat_members = @import("store/chat_members.zig");
 const chat_settings = @import("store/chat_settings.zig");
@@ -132,6 +133,8 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "cancel", .description = "Cancel your pending file conversion, or a pending /kick or /ban." },
     .{ .name = "redact", .description = "<N> | reply [N] | text <substring> | regex <pattern> -- delete messages. Admins only." },
     .{ .name = "whois", .description = "Reply, or pass @username / user id, to look up who someone is. Bot admin/owner only." },
+    .{ .name = "manage", .description = "bind|unbind <chat id> | list -- manage this room's bound chats (see /manage list). Admins only." },
+    .{ .name = "notice", .description = "<chat id> <text> -- send a pinned notice to a chat this room is bound to. Admins only." },
 };
 
 /// `/help`'s reply — kept as a single static string (matches `reply()`'s
@@ -142,12 +145,11 @@ const public_commands = [_]iface.CommandSpec{
 const help_text =
     \\I'm Warden. Talk to me directly by mentioning me (@username), replying
     \\to one of my messages, or (in a group) saying a chat-specific magic
-    \\word if one's set — see /magicword. I'm not limited to chat commands:
-    \\ask me anything in plain language and I'll use whatever tool fits
-    \\(weather/air quality, currency/crypto prices, a calculator,
-    \\dictionaries, Hacker News, QR codes, diagrams, word clouds, web
-    \\search, fetching a URL) -- reminders, alerts, and file conversion
-    \\below all work as plain requests too, not just as slash commands.
+    \\word if one's set — see /magicword. Ask me anything in plain language
+    \\and I'll use whatever tool fits (weather/air quality, currency/crypto
+    \\prices, a calculator, dictionaries, Hacker News, QR codes, diagrams,
+    \\word clouds, web search, fetching a URL) -- reminders, alerts, and
+    \\file conversion below all work as plain requests too.
     \\
     \\General
     \\/ping -- check I'm responsive
@@ -165,22 +167,20 @@ const help_text =
     \\  /alert crypto btc above 100000. Also: /alert cancel <id>
     \\/alerts -- list pending alerts
     \\/watch <feed url> / /unwatch <feed url> / /watches -- RSS/Atom feed
-    \\  notifications for this chat. /watchcheck <feed url> forces an
-    \\  immediate check, for testing
+    \\  notifications. /watchcheck <feed url> forces an immediate check
     \\
     \\Files
     \\/convert -- start a guided conversion (I'll ask you to send a file);
     \\  or send a file with "/convert <format>" as its caption for one shot,
     \\  e.g. /convert pdf
     \\
-    \\Customization
+    \\Customization (owner only to change, anyone can view)
     \\/magicword <word> -- make me answer any message containing it, or
-    \\  /magicword off. Owner only to change, anyone can view.
+    \\  /magicword off
     \\/persona <text> -- set this chat's personality/system prompt, or
-    \\  /persona off to reset. Owner only to change, anyone can view.
-    \\/thinking on|off|default -- show or hide the model's reasoning for
-    \\  this chat, overriding the bot-wide default. Owner only to change,
-    \\  anyone can view.
+    \\  /persona off to reset
+    \\/thinking on|off|default -- show/hide the model's reasoning here,
+    \\  overriding the bot-wide default
     \\
     \\Group moderation (chat admins only, most by replying to a message)
     \\/mute, /unmute, /pin, /unpin, /delete -- reply to the target
@@ -193,9 +193,8 @@ const help_text =
     \\/cancel -- cancel your pending file conversion, or a pending
     \\  /kick/ban if you're an admin
     \\/redact <N> | (reply) [N] | text <substring> | regex <pattern> --
-    \\  delete messages, up to 100 at a time. Plain /redact <N> walks
-    \\  backward by id on Telegram, reaching messages this bot never
-    \\  logged. regex mode is bot admin/owner only
+    \\  delete up to 100 messages. Plain /redact <N> walks backward by id on
+    \\  Telegram, reaching messages I never logged. regex is admin/owner only
     \\
     \\Tokens and credits (reply to a user, or pass @username, to view/set)
     \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban per
@@ -208,14 +207,17 @@ const help_text =
     \\/addadmin, /removeadmin -- reply to a user, or pass @username or their
     \\  user id, to grant/revoke
     \\/adduser, /removeuser -- reply to a user, or pass @username or their
-    \\  user id, to let them use this bot at all (nobody but the owner/bot
-    \\  admins can by default)
+    \\  user id, to let them use this bot at all (owner/bot admins only by
+    \\  default)
     \\/allowchat, /disallowchat -- allow/disallow this whole chat
-    \\/whois [@username | user_id] -- reply to a user, or pass @username or
-    \\  their user id, to see their full name, username, platform id, and
-    \\  bot/bot-admin/superuser flags. Bot admin/owner only
+    \\/whois [@username | user_id] -- see their full name, username,
+    \\  platform id, and bot/bot-admin/superuser flags. Admin/owner only
     \\/sudo <command> -- a bot admin can run any moderation command above
     \\  even where they aren't a real chat admin, e.g. /sudo kick
+    \\
+    \\Management rooms (for channels/groups with no back-and-forth)
+    \\/manage bind|unbind|list <chat id> -- bind this chat as a control room
+    \\/notice <chat id> <text> -- pinned notice to a bound chat
     \\
     \\Owner only
     \\/scraper -- configure the web-scraping backend
@@ -1014,11 +1016,12 @@ fn processMessageTask(
     };
 
     // Housekeeping: synthetic lifecycle signals from a connector (see
-    // `iface.Message.chat_left`/`migrated_to_native_chat_id`'s doc
-    // comments), not real conversational content — handled and returned
-    // early, before identity resolution/recording/LLM dispatch, same as
-    // `choice_picked` being excluded from `recordMessage` a few lines
-    // below.
+    // `iface.Message.chat_left`/`migrated_to_native_chat_id`/
+    // `chat_ingest_only`'s doc comments), not real conversational content —
+    // handled and returned early, before identity resolution/recording/LLM
+    // dispatch, same as `choice_picked` being excluded from `recordMessage`
+    // a few lines below.
+    if (msg.chat_ingest_only) return;
     if (msg.migrated_to_native_chat_id) |new_id| {
         chats.renameNativeChatId(pool, chat_id, new_id) catch |err| {
             log.err("failed to rename chat {s} (supergroup migration) to {s}: {t}", .{ msg.chat_id, new_id, err });
@@ -1697,6 +1700,12 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/whois") or std.mem.startsWith(u8, text, "/whois ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleWhoisCommand(connector, a, config, pool, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/manage") or std.mem.startsWith(u8, text, "/manage ")) {
+        if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
+        handleManageCommand(connector, a, config, pool, chat_id, identity_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/notice") or std.mem.startsWith(u8, text, "/notice ")) {
+        if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
+        handleNoticeCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/redact") or std.mem.startsWith(u8, text, "/redact ")) {
         // Per-mode gating happens inside handleRedactCommand itself (regex
         // mode is stricter than the other modes) rather than here, since
@@ -2554,6 +2563,149 @@ fn handleWhoisCommand(connector: iface.Connector, a: std.mem.Allocator, config: 
         if (is_superuser) "yes" else "no",
     }) catch return;
     connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+}
+
+/// `/manage bind|unbind <chat id>` / `/manage list` — see ROADMAP.md's
+/// Phase 9. `<chat id>` is warden's own internal `chats.id` (see
+/// `/manage list`), not the platform-native chat id — no chat has a stable,
+/// always-present short handle a human could type otherwise (Telegram
+/// channels/private groups often have no public @username). bind/unbind are
+/// authorized against the *target* chat's admin status, not the current
+/// (control) room's — see `auth.isOwnerOrLiveAdminOfChat`'s doc comment.
+fn handleManageCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /manage bind <chat id> | /manage unbind <chat id> | /manage list";
+    const arg = std.mem.trim(u8, text["/manage".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        const targets = management_rooms.listTargets(pool, a, chat_id) catch |err| {
+            log.err("manage: listTargets failed for control room {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't list bound chats, try again.");
+            return;
+        };
+        if (targets.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No chats bound to this room yet. Use /manage bind <chat id>.");
+            return;
+        }
+        var buf: std.Io.Writer.Allocating = .init(a);
+        buf.writer.print("Chats bound to this room:\n", .{}) catch {};
+        for (targets) |t| buf.writer.print("  #{d} — {t} {s}\n", .{ t.id, t.platform, t.native_chat_id }) catch {};
+        connector.sendMessage(a, msg.chat_id, buf.writer.buffered(), msg.message_id);
+        return;
+    }
+
+    const want_bind = std.mem.eql(u8, sub, "bind");
+    if (!want_bind and !std.mem.eql(u8, sub, "unbind")) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    const rest = std.mem.trim(u8, it.rest(), " ");
+    const target_id = std.fmt.parseInt(i64, rest, 10) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /manage bind <chat id> (see /manage list for ids).");
+        return;
+    };
+    const target = (chats.getById(pool, a, target_id) catch |err| {
+        log.err("manage: getById failed for chat {d}: {t}", .{ target_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that chat, try again.");
+        return;
+    }) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "No chat with that id.");
+        return;
+    };
+    if (target.platform != connector.platform()) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That chat is on a different platform than this room — cross-platform management rooms aren't supported yet.");
+        return;
+    }
+    if (!auth.isOwnerOrLiveAdminOfChat(connector, a, config, target.native_chat_id, msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "You need to be the owner or a live admin of that chat to bind/unbind it.");
+        return;
+    }
+
+    if (want_bind) {
+        management_rooms.bind(pool, chat_id, target.id, identity_id) catch |err| {
+            log.err("manage: bind failed (control {d}, target {d}): {t}", .{ chat_id, target.id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't bind that chat, try again.");
+            return;
+        };
+        const confirmation = std.fmt.allocPrint(a, "This room is now a control room for chat #{d}.", .{target.id}) catch return;
+        connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+    } else {
+        const removed = management_rooms.unbind(pool, chat_id, target.id) catch |err| {
+            log.err("manage: unbind failed (control {d}, target {d}): {t}", .{ chat_id, target.id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't unbind that chat, try again.");
+            return;
+        };
+        const confirmation: []const u8 = if (removed) "Unbound." else "That chat wasn't bound to this room.";
+        connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+    }
+}
+
+/// `/notice <chat id> <text>` — sends `<text>` into a bound target chat as
+/// the bot and pins it, distinct from an ordinary relayed message (see
+/// ROADMAP.md's Phase 9, "Admin notices"). Two checks, in order: the room
+/// must actually be bound to that chat (`management_rooms.isBound` —
+/// binding is a separate, deliberate step from having send rights),
+/// then the sender must currently be the owner or a live admin of the
+/// *target* — checked fresh every time, not just at bind time, so a
+/// demotion after binding takes effect immediately.
+fn handleNoticeCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /notice <chat id> <text>";
+    const arg = std.mem.trim(u8, text["/notice".len..], " ");
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const id_str = it.first();
+    const target_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    };
+    const notice_text = std.mem.trim(u8, it.rest(), " ");
+    if (notice_text.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    const target = (chats.getById(pool, a, target_id) catch |err| {
+        log.err("notice: getById failed for chat {d}: {t}", .{ target_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that chat, try again.");
+        return;
+    }) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "No chat with that id.");
+        return;
+    };
+    if (target.platform != connector.platform()) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That chat is on a different platform than this room — cross-platform management rooms aren't supported yet.");
+        return;
+    }
+    const is_bound = management_rooms.isBound(pool, chat_id, target.id) catch |err| {
+        log.err("notice: isBound failed (control {d}, target {d}): {t}", .{ chat_id, target.id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't check this room's bindings, try again.");
+        return;
+    };
+    if (!is_bound) {
+        reply(connector, a, msg.chat_id, msg.message_id, "This room isn't bound to that chat — use /manage bind <chat id> first.");
+        return;
+    }
+    if (!auth.isOwnerOrLiveAdminOfChat(connector, a, config, target.native_chat_id, msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "You need to be the owner or a live admin of that chat to send a notice there.");
+        return;
+    }
+
+    const sent_id = connector.sendMessageReturningId(a, target.native_chat_id, notice_text, null) catch |err| {
+        log.err("notice: send failed for chat {d}: {t}", .{ target.id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't send that notice, try again.");
+        return;
+    };
+    if (sent_id) |sid| {
+        connector.pinMessage(a, target.native_chat_id, sid) catch |err| {
+            log.warn("notice: sent to chat {d} but pin failed: {t}", .{ target.id, err });
+        };
+    }
+    reply(connector, a, msg.chat_id, msg.message_id, "Notice sent.");
 }
 
 /// `/redact` — parses which of the five modes (see `features/redact.zig`'s
@@ -4331,6 +4483,7 @@ test {
     _ = @import("store/migrate.zig");
     _ = @import("store/identities.zig");
     _ = @import("store/chats.zig");
+    _ = @import("store/management_rooms.zig");
     _ = @import("store/chat_members.zig");
     _ = @import("store/chat_settings.zig");
     _ = @import("store/bot_config.zig");

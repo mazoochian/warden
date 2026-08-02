@@ -163,6 +163,12 @@ pub const Update = struct {
     edited_message: ?Message = null,
     callback_query: ?CallbackQuery = null,
     my_chat_member: ?ChatMemberUpdated = null,
+    /// A post in a channel the bot is in — channels have no `from` user
+    /// (posts are anonymous-by-channel, not by a member) and never produce
+    /// ordinary `message` updates, only these. See `platform/telegram.zig`'s
+    /// `pollFn` for how this becomes a chat-ingest-only `iface.Message`.
+    channel_post: ?Message = null,
+    edited_channel_post: ?Message = null,
 };
 
 pub fn GetUpdatesResponse(comptime T: type) type {

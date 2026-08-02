@@ -586,7 +586,9 @@ is a rough guess, not a commitment; real scoping happens when a phase
 actually starts.
 
 ### Phase 9 — Management rooms, channel support & delegated admin notices
-*Effort: M/L.*
+*Effort: M/L. Status: slice 1 done (channel ingestion, management-room
+binding, admin notices) — see the note below the bullet list for what
+shipped vs. what's deliberately deferred.*
 
 Ranked first, ahead of the ChatGPT-derived features below, because it
 closes a real zero-support gap rather than adding a new nice-to-have:
@@ -608,31 +610,70 @@ cover ordinary groups (so admin commands don't have to be typed in front
 of the whole group, even where that's optional rather than structurally
 required):
 
-- Subscribe to `channel_post`/`edited_channel_post` so a channel a bot
-  admin is added to gets ingested as a real `chats` row (via the same
-  `my_chat_member`-on-add flow groups already use), even though it will
-  never itself produce ordinary `message` updates.
-- A management-room binding: `/manage bind <chat ref>` issued in the room
-  that should act as control room for a target chat (channel or group),
-  authorized the same way `group_admin.zig`'s live checks already work —
-  the target chat's own Telegram admins (checked live via
-  `getChatMember`, not cached) or the bot owner. A management room isn't
-  exclusive to one target; commands inside it name which bound chat they
-  apply to (`/as <chat ref> <command>`), same shape as Mjolnir's
-  `!mjolnir <command> !room:server`.
-- **Admin notices**: extends Bot View's existing send-as-bot capability
-  (see `warden-bot-view-websocket.md` in memory — shipped 2026-07-28,
-  owner-only at the time) to a target chat's own admins, not just the
-  owner, scoped to chats they actually administer. A message sent this
-  way (from a management room or Bot View) is auto-pinned by the bot as a
-  notice, distinct from an ordinary relayed message — the parallel to
-  Mjolnir posting moderation notices into rooms it manages.
+**Done (slice 1):**
+- Channel ingestion: `platform/telegram.zig`'s `pollFn` now subscribes to
+  `channel_post`/`edited_channel_post` (new `Update` fields in
+  `telegram/types.zig`) and translates either into a chat-ingest-only
+  `iface.Message` (new `chat_ingest_only` synthetic signal, alongside
+  `chat_left`/`migrated_to_native_chat_id` — `processMessageTask` upserts
+  the chat row and stops, no identity resolution or LLM dispatch, since a
+  channel post is never conversational content). Also fixed a gap this
+  phase's own original text assumed already didn't exist: `my_chat_member`
+  previously only handled the *departure* case (`chatLeftMessageFromUpdate`);
+  a new `chatJoinedMessageFromUpdate` now ingests on `member`/
+  `administrator`/`creator` too, which is the *only* reliable ingestion
+  signal for a channel — one may go a long time between posts (or be
+  post-only for other admins) after the bot's added.
+- Management-room binding: new `management_room_bindings` table (migration
+  `0023`) + `store/management_rooms.zig` (`bind`/`unbind`/`isBound`/
+  `listTargets`), and `/manage bind|unbind <chat id>` / `/manage list` in
+  `main.zig`. `<chat ref>` is warden's own internal `chats.id` (surfaced via
+  `/manage list`), not a platform-native id or `@username` — no new
+  Telegram API surface needed, same convention `/alert cancel <id>`/
+  `/reminders` cancel already use. bind/unbind are authorized against the
+  *target* chat's live admin status (new `auth.isOwnerOrLiveAdminOfChat`),
+  not the room the command was typed in.
+- **Admin notices**: `/notice <chat id> <text>`, plus Bot View's
+  `POST /api/v1/bot-view/send` and its WS stream widened from strictly
+  owner-only to also admit a live admin of that specific target chat
+  (reusing `requireChatAccess`'s existing live-admin-check machinery,
+  factored into `isOwnerOrLiveAdminOfChatAccount` so both call sites share
+  it — `bot_admin` stays excluded either way, unchanged from the
+  2026-07-28 decision). The newly-admitted admin tier's send uses
+  `sendMessageReturningId` + `pinMessage` (auto-pinned, "distinct from an
+  ordinary relayed message"); the owner's own existing send is completely
+  unchanged (plain, unpinned).
 - **Explicit v1 scoping decision for this pass**: Bot View's owner-only
   visibility stays as the ceiling for the owner (sees/acts as the bot
-  everywhere, unchanged), but group admins get scoped access — they may
-  view/act only in a chat they are a live-checked admin of, never any
-  other chat, and never another admin's chat. No shared/team visibility
-  beyond that boundary in this first pass.
+  everywhere, unchanged), but a chat's own live admins get scoped access —
+  they may view/act only in a chat they're a live-checked admin of, never
+  any other chat. No shared/team visibility beyond that boundary.
+- Cross-platform management rooms aren't supported: binding/notices
+  require the target chat to be on the same platform as the room the
+  command was typed in (checked and rejected with a clear error
+  otherwise) — in practice a non-issue today, since channels (this
+  phase's actual motivating case) only exist on Telegram.
+
+**Deferred, not built this pass** — generic `/as <chat ref> <command>`,
+replaying arbitrary admin commands (kick/mute/pin/etc, not just a notice
+send) against a bound target chat from a management room, the way Mjolnir's
+`!mjolnir <command> !room:server` does. The blocker: every existing admin
+handler replies into whatever `chat_id` it's given, so a naive
+re-dispatch (swap `msg.chat_id` to the target's native id, reuse the
+existing per-command live-admin auth as-is) would post confirmations into
+the target chat, not back into the management room where the operator is
+sitting — a real UX gap, not just a missing feature, and untangling it
+(without touching every handler) is its own design problem. Same
+"split off the fuzzy part" call this project made for Matrix E2EE (Phase 2
+→ 2b); worth a dedicated pass once there's a real answer for reply
+routing.
+
+**Not live-verified** — unlike some earlier phases (e.g. Phase 7's
+whisper sidecar), this one had no real Telegram channel + a second admin
+account available to test cross-account authorization against, so this is
+implemented per spec and covered by unit/store tests only, not confirmed
+against a live homeserver/Bot API. Noted honestly rather than claimed,
+same standard Phase 2's Matrix landing held itself to.
 
 ### Phase 10 — Vision & document understanding
 *Effort: M/L.*

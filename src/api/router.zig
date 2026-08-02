@@ -944,6 +944,24 @@ fn isLiveAdminOfChat(ctx: *const ServerContext, identity_ids: []const i64, chat:
     return false;
 }
 
+/// `true` if `account_id` is the owner, or is currently a live admin of
+/// `chat` — deliberately narrower than `requireChatAccess`'s "owner or
+/// bot_admin or live admin" ladder (see its doc comment): `bot_admin`
+/// isn't accepted here. Factored out for Bot View's send/ws gates (Phase
+/// 9's "Admin notices" — see `handleBotViewSend`), which need the same
+/// live-admin-of-a-specific-chat check `requireChatAccess` already does,
+/// but with `bot_admin` staying excluded per Bot View's own 2026-07-28
+/// scoping decision.
+fn isOwnerOrLiveAdminOfChatAccount(ctx: *const ServerContext, account_id: i64, roles: Roles, chat: chats_store.ChatRef) bool {
+    if (roles.owner) return true;
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
+        log.err("bot-view-access: failed to list identities for account {d}: {t}", .{ account_id, err });
+        return false;
+    };
+    defer ctx.allocator.free(identity_ids);
+    return isLiveAdminOfChat(ctx, identity_ids, chat);
+}
+
 /// Every request handler below starts with this. `null` means a response
 /// was already sent (`401`/`404`/`403`) — the caller just returns.
 /// Ownership: on success, the caller owns `chat.native_chat_id` and must
@@ -970,17 +988,7 @@ fn requireChatAccess(ctx: *const ServerContext, request: *http.Server.Request, c
         try respondError(request, .internal_server_error, "internal", "failed to check access");
         return null;
     };
-    if (roles.owner or roles.bot_admin) return chat;
-
-    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
-        log.err("chat-access: failed to list identities for account {d}: {t}", .{ account_id, err });
-        ctx.allocator.free(chat.native_chat_id);
-        try respondError(request, .internal_server_error, "internal", "failed to check access");
-        return null;
-    };
-    defer ctx.allocator.free(identity_ids);
-
-    if (isLiveAdminOfChat(ctx, identity_ids, chat)) return chat;
+    if (roles.bot_admin or isOwnerOrLiveAdminOfChatAccount(ctx, account_id, roles, chat)) return chat;
 
     ctx.allocator.free(chat.native_chat_id);
     try respondError(request, .forbidden, "forbidden", "not a live admin of this chat");
@@ -1739,26 +1747,35 @@ fn handleConvert(ctx: *const ServerContext, request: *http.Server.Request) !void
 }
 
 // ---------------------------------------------------------------------------
-// "Bot View" (Phase 6) -- lets an owner watch a chat's live incoming
-// messages and reply in the bot's own voice. Owner-only, not extended to
-// bot_admins -- see ARCHITECTURE.md §7/§8, decided 2026-07-28 (Armin)
-// given how sensitive impersonating the bot's own voice is.
+// "Bot View" (Phase 6) -- lets the owner watch a chat's live incoming
+// messages and reply in the bot's own voice. Originally owner-only, not
+// extended to bot_admins -- see ARCHITECTURE.md §7/§8, decided 2026-07-28
+// (Armin) given how sensitive impersonating the bot's own voice is.
+//
+// Widened in Phase 9 ("Admin notices", see ROADMAP.md) to also admit a
+// chat's own live platform admins, scoped to only that chat -- `bot_admin`
+// stays excluded, same as before, since the 2026-07-28 reasoning about
+// impersonation sensitivity didn't change. The owner's own access/behavior
+// is completely unchanged: the newly-admitted admin tier is the one that
+// gets the "auto-pinned notice" treatment (see `handleBotViewSend` below)
+// to keep it visually distinct from the owner's plain sends.
 // ---------------------------------------------------------------------------
 
 const BotViewSendBody = struct { chat_id: i64, text: []const u8 };
 
 /// `POST /api/v1/bot-view/send` — calls the exact same `connector.sendMessage`
-/// any real automated reply already goes through (no parallel send path to
-/// keep in sync), and is always audit-logged: who, which chat, the text.
+/// (owner tier) or `sendMessageReturningId`+`pinMessage` (admin tier, an
+/// "admin notice" per Phase 9 — pin failures are logged and swallowed
+/// rather than failing the whole send, since not every chat grants the bot
+/// pin rights) any real automated reply already goes through (no parallel
+/// send path to keep in sync). Always audit-logged: who, which chat, the
+/// text.
 fn handleBotViewSend(ctx: *const ServerContext, request: *http.Server.Request) !void {
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    if (!ra.roles.owner) {
-        return respondError(request, .forbidden, "forbidden", "only the owner can send as the bot");
-    }
     var rate_key_buf: [32]u8 = undefined;
     const rate_key = std.fmt.bufPrint(&rate_key_buf, "{d}", .{ra.account_id}) catch "?";
     if (!try checkRateLimit(ctx, request, ctx.bot_view_send_limiter, rate_key)) return;
@@ -1775,11 +1792,32 @@ fn handleBotViewSend(ctx: *const ServerContext, request: *http.Server.Request) !
         return respondError(request, .not_found, "not_found", "no such chat");
     };
 
+    if (!ra.roles.owner and !isOwnerOrLiveAdminOfChatAccount(ctx, ra.account_id, ra.roles, chat)) {
+        return respondError(request, .forbidden, "forbidden", "only the owner, or a live admin of this chat, can send as the bot");
+    }
+
     const connector = findConnectorForPlatform(ctx.connectors, chat.platform) orelse {
         return respondError(request, .internal_server_error, "internal", "no active connector for this chat's platform");
     };
 
-    connector.sendMessage(arena, chat.native_chat_id, body.text, null);
+    if (ra.roles.owner) {
+        connector.sendMessage(arena, chat.native_chat_id, body.text, null);
+    } else {
+        const sent_id = connector.sendMessageReturningId(arena, chat.native_chat_id, body.text, null) catch |err| {
+            log.err("bot-view-send: admin-notice send failed for chat {d}: {t}", .{ body.chat_id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to send notice");
+        };
+        if (sent_id) |sid| {
+            connector.pinMessage(arena, chat.native_chat_id, sid) catch |err| {
+                log.warn("bot-view-send: admin notice sent to chat {d} but pin failed: {t}", .{ body.chat_id, err });
+            };
+        } else {
+            // This platform's connector doesn't implement
+            // `sendMessageReturningId` (no id to pin) -- still deliver the
+            // text via the plain path rather than silently dropping it.
+            connector.sendMessage(arena, chat.native_chat_id, body.text, null);
+        }
+    }
 
     var target_buf: [32]u8 = undefined;
     const target_str = std.fmt.bufPrint(&target_buf, "{d}", .{body.chat_id}) catch "?";
@@ -1828,9 +1866,6 @@ fn botViewWriterLoop(allocator: std.mem.Allocator, ws: *http.Server.WebSocket, s
 /// exactly this kind of long-lived per-connection work.
 fn handleBotViewWs(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    if (!ra.roles.owner) {
-        return respondError(request, .forbidden, "forbidden", "only the owner can use bot view");
-    }
 
     const chat_id_str = queryParam(target, "chat_id") orelse {
         return respondError(request, .bad_request, "bad_request", "chat_id is required");
@@ -1838,6 +1873,19 @@ fn handleBotViewWs(ctx: *const ServerContext, request: *http.Server.Request, tar
     const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat_id");
     };
+
+    if (!ra.roles.owner) {
+        const chat = (chats_store.getById(ctx.pool, ctx.allocator, chat_id) catch |err| {
+            log.err("bot-view-ws: failed to load chat {d}: {t}", .{ chat_id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to load chat");
+        }) orelse {
+            return respondError(request, .not_found, "not_found", "no such chat");
+        };
+        defer ctx.allocator.free(chat.native_chat_id);
+        if (!isOwnerOrLiveAdminOfChatAccount(ctx, ra.account_id, ra.roles, chat)) {
+            return respondError(request, .forbidden, "forbidden", "only the owner, or a live admin of this chat, can use bot view");
+        }
+    }
 
     const key = switch (request.upgradeRequested()) {
         .websocket => |maybe_key| maybe_key orelse {
