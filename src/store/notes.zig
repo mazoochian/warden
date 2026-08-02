@@ -79,6 +79,51 @@ pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Note {
     };
 }
 
+/// One row for the web API's `GET /api/v1/notes` -- identity-scoped (not
+/// chat-scoped like `Note`/`listForChat` above, which back the bot's own
+/// in-chat `/notes`), so each row carries its own chat context for a "my
+/// notes across every chat" view, same shape as
+/// `reminders.PendingReminderForIdentity`/`feed_watches.FeedWatchRowForIdentity`.
+pub const NoteForIdentity = struct {
+    id: i64,
+    chat_id: i64,
+    chat_title: ?[]const u8,
+    text: []const u8,
+    created_at: i64,
+};
+
+/// Notes added by one identity, optionally narrowed to one chat -- see
+/// `NoteForIdentity`'s doc comment for why this is a separate query from
+/// `listForChat` rather than a filter on top of it. Oldest first, same
+/// ordering (and same "reads naturally in the order items were added")
+/// `listForChat` already uses.
+pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]NoteForIdentity {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT n.id, n.chat_id, c.title, n.text, EXTRACT(EPOCH FROM n.created_at)::bigint
+        \\FROM notes n JOIN chats c ON c.id = n.chat_id
+        \\WHERE n.identity_id = $1 AND ($2::bigint IS NULL OR n.chat_id = $2)
+        \\ORDER BY n.created_at ASC;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
+
+    var out: std.ArrayList(NoteForIdentity) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .id = stmt.columnInt64(0),
+            .chat_id = stmt.columnInt64(1),
+            .chat_title = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+            .text = try allocator.dupe(u8, stmt.columnText(3)),
+            .created_at = stmt.columnInt64(4),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn delete(pool: *PgPool, id: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -133,6 +178,49 @@ test "create/listForChat/get/delete" {
 
     try delete(&pool, id2);
     try testing.expectEqual(@as(usize, 0), (try listForChat(&pool, a, chat_id)).len);
+}
+
+test "listForIdentity scopes by identity across chats, optionally narrowed to one" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, "Chat One");
+    const chat2 = try chats.upsertChat(&pool, .telegram, "2", null, "Chat Two");
+    const alice = try identities.upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "1",
+        .display_name = "Alice",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+    const bob = try identities.upsertIdentity(&pool, .{
+        .platform = .telegram,
+        .native_id = "2",
+        .display_name = "Bob",
+        .first_seen = 1000,
+        .last_seen = 1000,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    _ = try create(&pool, chat1, alice, "alice in chat1", 1000);
+    _ = try create(&pool, chat2, alice, "alice in chat2", 2000);
+    _ = try create(&pool, chat1, bob, "bob in chat1", 3000);
+
+    const alice_all = try listForIdentity(&pool, a, alice, null);
+    try testing.expectEqual(@as(usize, 2), alice_all.len);
+    try testing.expectEqualStrings("Chat One", alice_all[0].chat_title.?);
+
+    const alice_chat1 = try listForIdentity(&pool, a, alice, chat1);
+    try testing.expectEqual(@as(usize, 1), alice_chat1.len);
+    try testing.expectEqualStrings("alice in chat1", alice_chat1[0].text);
+
+    const bob_all = try listForIdentity(&pool, a, bob, null);
+    try testing.expectEqual(@as(usize, 1), bob_all.len);
 }
 
 test "listForChat scopes by chat" {

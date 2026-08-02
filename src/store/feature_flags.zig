@@ -68,6 +68,7 @@ pub const known_modules = [_]ModuleInfo{
     .{ .key = "reminders", .label = "Reminders", .category = .standalone },
     .{ .key = "alerts", .label = "Alerts", .category = .standalone },
     .{ .key = "watches", .label = "Watches", .category = .standalone },
+    .{ .key = "notes", .label = "Notes", .category = .standalone },
     .{ .key = "convert", .label = "Convert", .category = .standalone },
     .{ .key = "group_admin", .label = "Group Administration", .category = .standalone },
     .{ .key = "persona", .label = "Persona", .category = .standalone },

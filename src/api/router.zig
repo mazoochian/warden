@@ -27,6 +27,7 @@ const civil_time = @import("../text/civil_time.zig");
 const reminders = @import("../store/reminders.zig");
 const alert_store = @import("../store/alerts.zig");
 const feed_watches = @import("../store/feed_watches.zig");
+const notes_store = @import("../store/notes.zig");
 const group_admin = @import("../features/group_admin.zig");
 const redact_feature = @import("../features/redact.zig");
 const convert_feature = @import("../features/convert.zig");
@@ -57,12 +58,18 @@ const chat_actions_infix = "/actions/";
 const reminders_prefix = "/api/v1/reminders/";
 const alerts_prefix = "/api/v1/alerts/";
 const watches_prefix = "/api/v1/watches/";
+const notes_prefix = "/api/v1/notes/";
 
 /// Reminder-message length cap -- mirrors `main.zig`'s own
 /// `max_reminder_message_len` for `/remind` (kept as a separate constant
 /// since `main.zig` is the one that imports this file, not the other way
 /// around -- importing it back here would be circular).
 const max_reminder_message_len = 500;
+
+/// Note-text length cap -- mirrors `main.zig`'s own `max_note_text_len`
+/// for `/note add`, same "kept separate to avoid a circular import" reason
+/// as `max_reminder_message_len` above.
+const max_note_text_len = 1000;
 
 /// Default/max page size, matching `API.md`'s pagination convention.
 const default_page_limit: i64 = 50;
@@ -207,6 +214,15 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .DELETE and std.mem.startsWith(u8, path, watches_prefix)) {
         return handleDeleteWatch(ctx, request, path[watches_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/notes")) {
+        return handleListNotes(ctx, request, target);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/notes")) {
+        return handleCreateNote(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, notes_prefix)) {
+        return handleDeleteNote(ctx, request, path[notes_prefix.len..]);
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/convert")) {
         return handleConvert(ctx, request);
@@ -2567,6 +2583,118 @@ fn handleDeleteWatch(ctx: *const ServerContext, request: *http.Server.Request, i
     return respondJson(ctx, request, .ok, .{});
 }
 
+// --- Notes (Phase 11) -- same identity-scoped-by-default shape as
+// Reminders/Alerts/Watches above; deletion is creator-or-owner, same as
+// `/note delete` (`handleNoteCommand` in main.zig), not "anyone in the
+// chat" like Watches' removal is. ---
+
+const CreateNoteBody = struct {
+    chat_id: i64,
+    identity_id: ?i64 = null,
+    text: []const u8,
+};
+
+/// `GET /api/v1/notes?chat_id=&identity_id=` -- same scoping rules as
+/// `handleListReminders`. Unlike the bot's own in-chat `/notes` (chat-scoped,
+/// every contributor's notes together), this is "my notes across every
+/// chat" by default -- see `notes_store.NoteForIdentity`'s doc comment.
+fn handleListNotes(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
+        std.fmt.parseInt(i64, c, 10) catch {
+            return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+        }
+    else
+        null;
+
+    const items = notes_store.listForIdentity(ctx.pool, ctx.allocator, identity_id, chat_id) catch |err| {
+        log.err("list-notes: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load notes");
+    };
+    defer {
+        for (items) |it| {
+            if (it.chat_title) |t| ctx.allocator.free(t);
+            ctx.allocator.free(it.text);
+        }
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `POST /api/v1/notes` -- see API.md. Mirrors `/note add <text>`.
+fn handleCreateNote(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "notes")) {
+        return respondError(request, .forbidden, "forbidden", "the notes module is disabled");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [2 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(2 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateNoteBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    if (body.text.len == 0 or body.text.len > max_note_text_len) {
+        return respondError(request, .bad_request, "bad_request", "text must be 1-1000 bytes");
+    }
+
+    const identity_id = (try resolveCreateIdentity(ctx, request, ra, body.chat_id, body.identity_id)) orelse return;
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const id = notes_store.create(ctx.pool, body.chat_id, identity_id, body.text, now) catch |err| {
+        log.err("create-note: failed for chat {d}: {t}", .{ body.chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to create note");
+    };
+
+    audit_log.record(ctx.pool, ra.account_id, "note.create", null, null);
+
+    return respondJson(ctx, request, .ok, .{ .id = id });
+}
+
+/// `DELETE /api/v1/notes/:id` -- same authorization as `/note delete`:
+/// whoever added it, or the bot owner (not bot_admin -- mirrors
+/// `handleNoteCommand`'s `auth.isOwner` check exactly).
+fn handleDeleteNote(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid note id");
+    };
+
+    const note = (notes_store.get(ctx.pool, ctx.allocator, id) catch |err| {
+        log.err("delete-note: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up note");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such note");
+    };
+    defer ctx.allocator.free(note.text);
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+        log.err("delete-note: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to check access");
+    };
+    defer ctx.allocator.free(identity_ids);
+    const is_creator = std.mem.indexOfScalar(i64, identity_ids, note.identity_id) != null;
+    if (!is_creator and !ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only whoever added this note, or the owner, can delete it");
+    }
+
+    notes_store.delete(ctx.pool, id) catch |err| {
+        log.err("delete-note: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to delete note");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "note.delete", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
 /// `user_agent` must have been captured by the caller *before* it read the
 /// request body (if any) — `findHeader`/`iterateHeaders` requires the
 /// request reader to still be in its post-head, pre-body state; calling it
@@ -3112,6 +3240,9 @@ fn testConfigForDefaults() config_mod.Config {
         .system_prompt = null,
         .searxng_url = null,
         .whisper_url = null,
+        .embeddings_url = null,
+        .embeddings_api_key = "",
+        .embeddings_model = "text-embedding-3-small",
         .llm_owner_only = true,
         .llm_show_thinking = false,
         .llm_streaming = true,

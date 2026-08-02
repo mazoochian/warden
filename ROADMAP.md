@@ -751,8 +751,9 @@ rather than claimed, same standard held elsewhere (e.g. Phase 9's own
 note on this).
 
 ### Phase 11 — Personal knowledge base: notes & lists
-*Effort: S/M. Status: core done (2026-08-02) — see below for what shipped
-vs. what's deferred.*
+*Effort: S/M. Status: core done (2026-08-02); web API + warden-ui frontend
+added same day in a follow-up pass — see below for what shipped vs. what's
+deferred.*
 
 Cheapest phase on this list — a near-exact structural copy of
 `reminders.zig`/`alerts.zig` (per-identity or per-chat rows, a
