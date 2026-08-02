@@ -142,6 +142,27 @@ pub const Config = struct {
     /// then just gets `main.zig`'s generic attachment placeholder, same as
     /// today.
     whisper_url: ?[]const u8,
+    /// Base URL of an OpenAI-compatible embeddings endpoint (e.g.
+    /// "https://api.openai.com/v1" or a self-hosted server implementing
+    /// `POST {url}/embeddings`) for the long-term memory feature
+    /// (`llm/embeddings.zig`, `store/memories.zig`) — ROADMAP.md's Phase
+    /// 12. Unset disables the whole feature: `/memory`, the
+    /// `remember_memory` tool, and `qa.zig`'s retrieval step all become
+    /// no-ops. Deliberately separate from `llm_anthropic`/
+    /// `llm_openai_compat` (the chat providers) since an embeddings
+    /// backend is very likely a different service/model entirely.
+    embeddings_url: ?[]const u8,
+    /// Empty string means no Authorization header is sent, same
+    /// convention `OpenAiCompatProvider.api_key` uses.
+    embeddings_api_key: []const u8,
+    /// The embedding model to request. Its output dimension must be 1536
+    /// (matching OpenAI's text-embedding-3-small/ada-002) — the
+    /// `memories.embedding` column's vector width is fixed at migration
+    /// time (see `0025_memories.sql`), not derived from this at runtime.
+    /// A model with a different dimension fails loudly on the first
+    /// `remember` call (a Postgres dimension-mismatch error), not
+    /// silently.
+    embeddings_model: []const u8,
     /// Gates the bot's free-form LLM Q&A to the configured owner(s) only.
     /// Every other command keeps its own existing access control regardless
     /// of this setting. Meant to be flipped on before switching to an
@@ -352,6 +373,14 @@ pub const Config = struct {
             whisper_url = if (trimmed.len == 0) null else trimmed;
         }
 
+        var embeddings_url: ?[]const u8 = env.get("WARDEN_EMBEDDINGS_URL");
+        if (embeddings_url) |u| {
+            const trimmed = std.mem.trimEnd(u8, u, "/");
+            embeddings_url = if (trimmed.len == 0) null else trimmed;
+        }
+        const embeddings_api_key = env.get("WARDEN_EMBEDDINGS_API_KEY") orelse "";
+        const embeddings_model = env.get("WARDEN_EMBEDDINGS_MODEL") orelse "text-embedding-3-small";
+
         const llm_owner_only = parseBoolEnv(env, "WARDEN_LLM_OWNER_ONLY", default_llm_owner_only);
         const llm_show_thinking = parseBoolEnv(env, "WARDEN_LLM_SHOW_THINKING", default_llm_show_thinking);
         const llm_streaming = parseBoolEnv(env, "WARDEN_LLM_STREAMING", default_llm_streaming);
@@ -404,6 +433,9 @@ pub const Config = struct {
             .system_prompt = system_prompt,
             .searxng_url = searxng_url,
             .whisper_url = whisper_url,
+            .embeddings_url = embeddings_url,
+            .embeddings_api_key = embeddings_api_key,
+            .embeddings_model = embeddings_model,
             .llm_owner_only = llm_owner_only,
             .llm_show_thinking = llm_show_thinking,
             .llm_streaming = llm_streaming,

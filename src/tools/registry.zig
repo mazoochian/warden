@@ -119,6 +119,44 @@ pub const NoteSink = struct {
     }
 };
 
+/// Same ptr+vtable shape as `NoteSink`, for the `remember_memory` tool —
+/// see `store/memories.zig`'s doc comment for the "explicit remember/
+/// forget, per-identity, not per-chat" scope decision (ROADMAP.md's Phase
+/// 12). Unlike `NoteSink.delete` there's no "or the owner" escape hatch on
+/// `forget` — a memory is per-identity, never chat-visible, so there's
+/// nothing for a chat's/bot's owner to moderate; only the identity that
+/// owns a given memory can ever forget it (enforced by the `main.zig`
+/// adapter, not this type).
+pub const MemorySink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const ForgetResult = enum { forgotten, not_found, not_authorized };
+
+    pub const VTable = struct {
+        /// May itself make an embeddings API call before persisting — see
+        /// `main.zig`'s `MemoryToolAdapter`, the actual implementation
+        /// behind this vtable slot.
+        create: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror!i64,
+        forget: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!ForgetResult,
+        /// Same "sink formats its own listing" reasoning as
+        /// `ReminderSink.VTable.listPending`.
+        listAll: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8,
+    };
+
+    pub fn create(self: MemorySink, allocator: std.mem.Allocator, text: []const u8) !i64 {
+        return self.vtable.create(self.ptr, allocator, text);
+    }
+
+    pub fn forget(self: MemorySink, allocator: std.mem.Allocator, id: i64) !ForgetResult {
+        return self.vtable.forget(self.ptr, allocator, id);
+    }
+
+    pub fn listAll(self: MemorySink, allocator: std.mem.Allocator) ![]const u8 {
+        return self.vtable.listAll(self.ptr, allocator);
+    }
+};
+
 /// Callback surface the `begin_file_conversion` tool uses to kick off the
 /// interactive multi-stage `/convert` flow (see `features/convert_flow.zig`)
 /// when the user expresses intent in natural language rather than typing
@@ -199,6 +237,11 @@ pub const ToolContext = struct {
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `set_note` tool.
     notes: ?NoteSink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `remember_memory` tool — also null (regardless of a real message
+    /// being processed) whenever `WARDEN_EMBEDDINGS_URL` isn't configured,
+    /// see `config.zig`'s `embeddings_url` doc comment.
+    memory: ?MemorySink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the

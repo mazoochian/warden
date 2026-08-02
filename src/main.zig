@@ -49,6 +49,8 @@ const messages = @import("store/messages.zig");
 const stats = @import("store/stats.zig");
 const reminders = @import("store/reminders.zig");
 const notes = @import("store/notes.zig");
+const memories = @import("store/memories.zig");
+const embeddings = @import("llm/embeddings.zig");
 const reminder_format = @import("features/reminder_format.zig");
 const alert_store = @import("store/alerts.zig");
 const alert_feature = @import("features/alerts.zig");
@@ -89,6 +91,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/remind.zig").tool,
     @import("tools/set_alert.zig").tool,
     @import("tools/set_note.zig").tool,
+    @import("tools/remember_memory.zig").tool,
     @import("tools/begin_conversion.zig").tool,
     convert_file.tool,
     @import("tools/find_chat_member.zig").tool,
@@ -114,6 +117,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "reminders", .description = "List your pending reminders in this chat." },
     .{ .name = "note", .description = "add <text> | list | delete <id> -- a shared notes/lists space for this chat." },
     .{ .name = "notes", .description = "List every note in this chat." },
+    .{ .name = "memory", .description = "list | forget <id> -- what I remember about you, across every chat." },
     .{ .name = "alert", .description = "<crypto|weather|aqi> <subject> <above|below> <value> -- set an alert." },
     .{ .name = "alerts", .description = "List pending alerts in this chat." },
     .{ .name = "watch", .description = "<feed url> -- get notified when an RSS/Atom feed publishes." },
@@ -150,10 +154,9 @@ const help_text =
     \\I'm Warden. Talk to me directly by mentioning me (@username), replying
     \\to one of my messages, or (in a group) saying a chat-specific magic
     \\word if one's set — see /magicword. Ask me anything in plain language
-    \\and I'll use whatever tool fits (weather/air quality, currency/crypto
-    \\prices, a calculator, dictionaries, Hacker News, QR codes, diagrams,
-    \\word clouds, web search, fetching a URL) -- reminders, alerts, and
-    \\file conversion below all work as plain requests too.
+    \\and I'll use whatever tool fits (weather, crypto prices, a calculator,
+    \\QR codes, diagrams, word clouds, web search, fetching a URL) --
+    \\reminders, alerts, and file conversion below work as plain requests too.
     \\
     \\General
     \\/ping -- check I'm responsive
@@ -174,6 +177,8 @@ const help_text =
     \\  notifications. /watchcheck <feed url> forces an immediate check
     \\/note add <text> | list | delete <id> -- notes/shopping lists for
     \\  this chat. /notes lists them all
+    \\/memory list | forget <id> -- what I remember about you (I save
+    \\  things myself while we talk)
     \\
     \\Files
     \\/convert -- start a guided conversion (I'll ask you to send a file);
@@ -199,8 +204,8 @@ const help_text =
     \\/cancel -- cancel your pending file conversion, or a pending
     \\  /kick/ban if you're an admin
     \\/redact <N> | (reply) [N] | text <substring> | regex <pattern> --
-    \\  delete up to 100 messages. Plain /redact <N> walks backward by id on
-    \\  Telegram, reaching messages I never logged. regex is admin/owner only
+    \\  delete up to 100 messages, walking backward by id on Telegram if
+    \\  needed. regex is admin/owner only
     \\
     \\Tokens and credits (reply to a user, or pass @username, to view/set)
     \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban per
@@ -213,8 +218,7 @@ const help_text =
     \\/addadmin, /removeadmin -- reply to a user, or pass @username or their
     \\  user id, to grant/revoke
     \\/adduser, /removeuser -- reply to a user, or pass @username or their
-    \\  user id, to let them use this bot at all (owner/bot admins only by
-    \\  default)
+    \\  user id, to let them use this bot at all
     \\/allowchat, /disallowchat -- allow/disallow this whole chat
     \\/whois [@username | user_id] -- see their full name, username,
     \\  platform id, and bot/bot-admin/superuser flags. Admin/owner only
@@ -422,6 +426,18 @@ pub fn main(init: std.process.Init) !void {
     };
     const llm_provider: llm.Provider = dynamic_provider.provider();
 
+    // Same "heap-allocated, process-lifetime singleton" shape as the LLM
+    // providers above -- null when `WARDEN_EMBEDDINGS_URL` isn't set,
+    // which every downstream consumer (the `remember_memory` tool,
+    // `qa.zig`'s retrieval step) treats as "the memory feature is off"
+    // rather than an error.
+    var embeddings_client: ?*embeddings.EmbeddingsClient = null;
+    if (config.embeddings_url) |url| {
+        const ec = try gpa.create(embeddings.EmbeddingsClient);
+        ec.* = embeddings.EmbeddingsClient.init(gpa, io, url, config.embeddings_api_key, config.embeddings_model);
+        embeddings_client = ec;
+    }
+
     log.info("warden started, {d} connector(s), {d} owner(s) configured", .{ connectors.len, config.owners.len });
 
     // Best-effort: a platform without the concept (or a transient API
@@ -494,6 +510,7 @@ pub fn main(init: std.process.Init) !void {
             &config,
             &pool,
             llm_provider,
+            embeddings_client,
             active_tools,
             &pending_confirmations,
             &digest_scheduler,
@@ -771,6 +788,7 @@ fn connectorPollLoop(
     config: *const config_mod.Config,
     pool: *store_pool.PgPool,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
@@ -853,6 +871,7 @@ fn connectorPollLoop(
                 .config = config,
                 .pool = pool,
                 .llm_provider = llm_provider,
+                .embeddings_client = embeddings_client,
                 .tools = tools,
                 .pending = pending,
                 .digest_scheduler = digest_scheduler,
@@ -936,6 +955,7 @@ const MessageTask = struct {
     config: *const config_mod.Config,
     pool: *store_pool.PgPool,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
@@ -955,6 +975,7 @@ const MessageTask = struct {
             self.config,
             self.pool,
             self.llm_provider,
+            self.embeddings_client,
             self.tools,
             self.pending,
             self.digest_scheduler,
@@ -980,6 +1001,7 @@ fn processMessageTask(
     config: *const config_mod.Config,
     pool: *store_pool.PgPool,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
@@ -1111,6 +1133,12 @@ fn processMessageTask(
         .native_chat_id = msg.chat_id,
         .now = ts,
     };
+    var memory_adapter: MemoryToolAdapter = .{
+        .pool = pool,
+        .identity_id = identity_id,
+        .now = ts,
+        .embeddings_client = embeddings_client,
+    };
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
         .io = io,
@@ -1125,12 +1153,18 @@ fn processMessageTask(
         .notes = note_adapter.sink(),
         .convert_flow = convert_flow_adapter.sink(),
         .member_directory = member_directory_adapter.sink(),
+        // Null (not just a sink whose calls would fail) whenever the
+        // feature isn't configured at all -- matches every other
+        // `?Sink = null` field's own "absent means the tool can't run"
+        // convention, rather than surfacing a runtime error from inside
+        // the tool for something that's a deploy-time config choice.
+        .memory = if (embeddings_client != null) memory_adapter.sink() else null,
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, tool_ctx, tools, pending, digest_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, digest_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -1502,6 +1536,7 @@ fn handleMessage(
     chat_id: i64,
     identity_id: i64,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     tool_ctx: tool_registry.ToolContext,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
@@ -1747,6 +1782,9 @@ fn handleMessage(
         handleNoteCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/notes")) {
         handleNotesList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
+    } else if (std.mem.eql(u8, text, "/memory") or std.mem.startsWith(u8, text, "/memory ")) {
+        if (!feature_flags.isEnabled(pool, "memory")) return false;
+        handleMemoryCommand(connector, a, pool, identity_id, msg, text);
     } else if (std.mem.eql(u8, text, "/convert")) {
         if (!feature_flags.isEnabled(pool, "convert")) return false;
         // Bare /convert, no attachment claimed above (either none present,
@@ -1835,7 +1873,7 @@ fn handleMessage(
             .native_id = msg.user_id,
         };
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-        replyWithAnswer(connector, a, pool, chat_id, llm_provider, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.max_tokens_override, dyn.history_messages);
+        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.max_tokens_override, dyn.history_messages);
     }
     return false;
 }
@@ -3077,6 +3115,63 @@ fn handleNotesList(
     connector.sendMessage(a, native_chat_id, formatAllNotes(a, listed), reply_to);
 }
 
+/// `/memory list` / `/memory forget <id>` — see ROADMAP.md's Phase 12.
+/// Deliberately no `/memory remember <text>` counterpart: creation is
+/// meant to happen contextually through conversation (the model deciding
+/// what's worth keeping via the `remember_memory` tool), matching the
+/// ChatGPT-Memory framing this feature is modeled on, not a manually
+/// curated list a person edits directly.
+fn handleMemoryCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, identity_id: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /memory list, or /memory forget <id>";
+    const arg = std.mem.trim(u8, text["/memory".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        const listed = memories.listForIdentity(pool, a, identity_id) catch |err| {
+            log.err("memory: list failed for identity {d}: {t}", .{ identity_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't load memories, try again.");
+            return;
+        };
+        connector.sendMessage(a, msg.chat_id, formatMemories(a, listed), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "forget")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /memory forget <id> (see /memory list for ids).");
+            return;
+        };
+        const mem = (memories.get(pool, a, id) catch |err| {
+            log.err("memory: lookup failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that memory, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No memory with that id.");
+            return;
+        };
+        if (mem.identity_id != identity_id) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only the person that memory belongs to can forget it.");
+            return;
+        }
+        memories.forget(pool, id) catch |err| {
+            log.err("memory: forget failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't forget that memory, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Memory forgotten.");
+        return;
+    }
+
+    reply(connector, a, msg.chat_id, msg.message_id, usage);
+}
+
 /// `/alert <crypto|weather|aqi> <subject> <above|below> <threshold>` sets a
 /// standing alert; `/alert cancel <id>` cancels one. Subject may contain
 /// spaces (city names) — everything between the kind and the trailing
@@ -3612,6 +3707,68 @@ const MemberDirectoryToolAdapter = struct {
     }
 };
 
+const memory_search_limit = 5;
+
+fn formatMemories(a: std.mem.Allocator, listed: []const memories.Memory) []const u8 {
+    if (listed.len == 0) return "No memories yet. I'll remember things worth keeping as we talk.";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Memories:\n", .{}) catch return "";
+    for (listed) |m| w.print("  #{d} {s}\n", .{ m.id, m.text }) catch return "";
+    return buf.writer.buffered();
+}
+
+/// Wires the `remember_memory` LLM tool (see `tools/remember_memory.zig`)
+/// to real Postgres-backed memories for one specific message's sender —
+/// constructed fresh per message in `processMessageTask`, same shape as
+/// `NoteToolAdapter`, except scoped to `identity_id` alone (no `chat_id`/
+/// `is_owner` — see `registry.zig`'s `MemorySink` doc comment for why
+/// there's no "or the owner" escape hatch here). `embeddings_client` is
+/// `null` exactly when `config.embeddings_url` is unset; `tool_ctx.memory`
+/// itself is only ever set to this adapter's sink when it's non-null (see
+/// `processMessageTask`), so `createFn` finding it null here would only
+/// ever indicate a wiring bug, not a normal "feature disabled" path — it
+/// still fails safely rather than asserting, since a tool executing is
+/// never a place to crash the whole message-processing task over.
+const MemoryToolAdapter = struct {
+    pool: *store_pool.PgPool,
+    identity_id: i64,
+    now: i64,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
+
+    fn sink(self: *MemoryToolAdapter) tool_registry.MemorySink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.MemorySink.VTable = .{
+        .create = createFn,
+        .forget = forgetFn,
+        .listAll = listAllFn,
+    };
+
+    fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror!i64 {
+        const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
+        const client = self.embeddings_client orelse return error.EmbeddingsNotConfigured;
+        const vector = try client.embed(allocator, text);
+        return memories.remember(self.pool, allocator, self.identity_id, text, vector, self.now);
+    }
+
+    fn forgetFn(ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!tool_registry.MemorySink.ForgetResult {
+        const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
+        const mem = (try memories.get(self.pool, allocator, id)) orelse return .not_found;
+        if (mem.identity_id != self.identity_id) return .not_authorized;
+        try memories.forget(self.pool, id);
+        return .forgotten;
+    }
+
+    fn listAllFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8 {
+        const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
+        const listed = try memories.listForIdentity(self.pool, allocator, self.identity_id);
+        return formatMemories(allocator, listed);
+    }
+};
+
 /// Shared by `/alerts` and the `set_alert` LLM tool's `action=list`.
 fn formatPendingAlerts(a: std.mem.Allocator, pending: []const alert_store.PendingAlert) []const u8 {
     if (pending.len == 0) return "No alerts set. Set one with /alert <crypto|weather|aqi> <subject> <above|below> <threshold> (or just ask).";
@@ -3889,6 +4046,7 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
         .{ .name = "set_reminder", .key = "reminders" },
         .{ .name = "set_alert", .key = "alerts" },
         .{ .name = "set_note", .key = "notes" },
+        .{ .name = "remember_memory", .key = "memory" },
         .{ .name = "begin_file_conversion", .key = "convert" },
         .{ .name = "convert_file", .key = "convert" },
     };
@@ -3929,6 +4087,7 @@ test "toolModuleKey maps tool names to their feature_flags module key" {
     try std.testing.expectEqualStrings("convert", toolModuleKey("begin_file_conversion").?);
     try std.testing.expectEqualStrings("hackernews", toolModuleKey("hackernews_search").?);
     try std.testing.expectEqualStrings("notes", toolModuleKey("set_note").?);
+    try std.testing.expectEqualStrings("memory", toolModuleKey("remember_memory").?);
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("calculator"));
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("nonexistent_tool"));
 }
@@ -3975,7 +4134,9 @@ fn replyWithAnswer(
     a: std.mem.Allocator,
     pool: *store_pool.PgPool,
     chat_id: i64,
+    asker_identity_id: i64,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     tool_ctx: tool_registry.ToolContext,
     tools: []const tool_registry.ToolDef,
     system_prompt: ?[]const u8,
@@ -4040,7 +4201,7 @@ fn replyWithAnswer(
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tools);
-    const raw_answer_or_err = qa.answer(llm_provider, a, tool_ctx, enabled_tools, pool, chat_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, max_tokens_override, history_window);
+    const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, max_tokens_override, history_window);
 
     // Stop the ticker before touching the placeholder ourselves. Signaled
     // cooperatively (`state.stop`) and joined with a bound, rather than
@@ -4691,6 +4852,7 @@ test {
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
     _ = @import("store/notes.zig");
+    _ = @import("store/memories.zig");
     _ = @import("features/qa.zig");
     _ = @import("features/reminder_format.zig");
     _ = @import("tools/remind.zig");
@@ -4700,6 +4862,7 @@ test {
     _ = @import("features/alerts.zig");
     _ = @import("tools/set_alert.zig");
     _ = @import("tools/set_note.zig");
+    _ = @import("tools/remember_memory.zig");
     _ = @import("store/feed_watches.zig");
     _ = @import("features/feed_watcher.zig");
     _ = @import("features/feed_parse.zig");
@@ -4710,6 +4873,7 @@ test {
     _ = @import("llm/provider.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");
+    _ = @import("llm/embeddings.zig");
     _ = @import("llm/attachment_content.zig");
     _ = @import("tools/calculator.zig");
     _ = @import("llm/toolcall.zig");

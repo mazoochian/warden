@@ -801,10 +801,54 @@ dropped, same convention this file already uses elsewhere (e.g. Phase
 9's deferred `/as` relay, Phase 5's menu-polish backlog entry in
 warden-ui's own ROADMAP).
 
-Verified: `zig build` and `zig build test` both green.
+**Also done (2026-08-02), later same day** — a web API surface and
+warden-ui frontend page, closing the same "zero frontend story" gap Phase
+5a closed for reminders/alerts/watches; the initial Phase 11 landing above
+was bot-side only (`/note` commands + the `set_note` LLM tool), with no
+`API.md`/`router.zig` work in scope at the time.
+
+- `GET`/`POST`/`DELETE /api/v1/notes` in `src/api/router.zig` —
+  identity-scoped by default across every chat (`?chat_id=` narrows,
+  `identity_id` owner/bot_admin-only to act on behalf of someone else),
+  reusing the exact same `requireLoggedIn`/`resolveListIdentity`/
+  `resolveCreateIdentity` helpers Reminders/Alerts/Watches already built —
+  no parallel auth path. New `notes.NoteForIdentity`/
+  `notes.listForIdentity` in `store/notes.zig`: the original Phase 11 pass
+  only needed `listForChat` for the bot's own chat-scoped `/notes`, so the
+  identity-scoped "my notes across every chat" query the web API needs
+  (same shape as `reminders.listForIdentity`/`feed_watches.listForIdentity`)
+  didn't exist yet. Delete authorization mirrors `/note delete` exactly
+  (creator or the bot owner) — deliberately *not* Watches' looser "anyone
+  currently in the chat" model, since `/note delete` was never that open.
+- `notes` added to `feature_flags.known_modules` — the flag already gated
+  `/note`/`set_note` bot-side (`main.zig` was already calling
+  `feature_flags.isEnabled(pool, "notes")`), but the module was never
+  listed in `known_modules`, so it silently never appeared as a toggle on
+  `/admin/modules` even though the gate itself worked. Caught while
+  wiring the new `POST` handler's own feature-flag check.
+- warden-ui: `/notes` page (list/create/delete, a plain textarea for the
+  freeform text rather than a typed-list builder, matching
+  `store/notes.zig`'s own "one flat primitive, not several typed
+  structures" design), `useNotes.ts` hook, and an `AppShell` nav entry —
+  see warden-ui's own `ROADMAP.md`/`API.md` for that half in full.
+- Verified: `zig build` and `zig build test` both green — checked in an
+  isolated `git worktree` off this same commit rather than directly in
+  this checkout, since an unrelated, uncommitted, in-progress Phase 12
+  (long-term/semantic memory) pass was already sitting in this working
+  tree at the time and its new migration (`0025_memories.sql`) needs the
+  `pgvector` Postgres extension, which isn't installed on the local test
+  Postgres (`warden-test-pg`) — every DB-touching test crashes on that
+  migration otherwise, unrelated to anything in this pass. Left that
+  other work-in-progress completely untouched (not committed, not
+  reverted, not fixed) — it's a separate, unfinished piece of work this
+  pass didn't touch and isn't positioned to finish.
+
+Original core landing verified the same way at the time: `zig build` and
+`zig build test` both green.
 
 ### Phase 12 — Long-term / semantic memory
-*Effort: L.*
+*Effort: L. Status: done (2026-08-02) — explicit remember/forget, not a
+RAG index over notes/messages; see below for the exact scope.*
 
 Already flagged in Phase 8's backlog as "the most powerful idea
 considered" — this plan doesn't change that assessment, just re-confirms
@@ -815,6 +859,74 @@ construction. Sequenced after Phases 9-10 so there's real content worth
 indexing (notes, document text) beyond raw chat lines. Covers: remember
 preferences/names/projects/goals/writing style, search memories, forget
 memories, memory timeline, cross-chat reasoning.
+
+**Scope decision, confirmed before building**: explicit remember/forget,
+ChatGPT-Memory-style — the model calls a tool to save a short discrete
+fact when it learns something worth keeping, not a general RAG index over
+every note/message ever stored (notes/messages aren't automatically
+embedded). Scoped to **identity, not chat**, satisfying the "cross-chat
+reasoning" item directly: a memory follows a person across every chat
+they talk to the bot in, the same identity model `notes.zig`
+deliberately did *not* use (notes are chat-scoped/shared; memories are
+personal).
+
+**Done:**
+- `pgvector` + `memories` table (migration `0025_memories.sql`),
+  `embedding vector(1536)` — fixed at migration time (matches OpenAI's
+  `text-embedding-3-small`/`ada-002`; this codebase's static-SQL
+  migrations can't template a runtime-configured dimension). A
+  `WARDEN_EMBEDDINGS_MODEL` with a different output dimension fails
+  loudly (a real Postgres error) on the first `remember` call, not
+  silently — switching models later needs a manual column-type migration
+  plus re-embedding every row. No approximate (`ivfflat`) index — a
+  personal bot's memory table will never be large enough to need one.
+- New `WARDEN_EMBEDDINGS_URL`/`_API_KEY`/`_MODEL` config
+  (`src/llm/embeddings.zig`'s `EmbeddingsClient`, a small standalone
+  `POST {url}/embeddings` client — deliberately not an extension of
+  `OpenAiCompatProvider`, which is hardcoded to the chat-completions wire
+  shape) — separate from the chat `WARDEN_OPENAI_*` config since they may
+  point at different backends/models entirely. Unset disables the whole
+  feature (`/memory`, the `remember_memory` tool, and `qa.zig`'s
+  retrieval step all become no-ops) — same convention `WARDEN_WHISPER_URL`
+  already uses.
+- `src/store/memories.zig` (`remember`/`search`/`listForIdentity`/`get`/
+  `forget`/`hasAny`), a `MemorySink` (`tools/registry.zig`) and
+  `remember_memory` LLM tool (`action=create|list|forget`) — same
+  ptr+vtable sink shape `NoteSink`/`ReminderSink` already established.
+  `/memory list` / `/memory forget <id>` slash commands; deliberately
+  **no** `/memory remember <text>` — creation happens contextually
+  through conversation (the model deciding what's worth keeping), not a
+  manually curated list.
+- `qa.zig`'s `answer()` retrieval step: `hasAny` gates the embed-and-search
+  round trip so an identity that's never used the feature never pays its
+  latency/cost on every question; on a hit, the top 5 memories (by
+  pgvector cosine distance) get folded into the prompt as a "What you
+  remember about {name}" block. Any failure in this path (embeddings API
+  down, search error) just means no memory block gets added — never
+  blocks the answer, same soft-failure convention `resolveQuestion`'s
+  voice transcription already uses.
+- **Real bug caught during this pass, not just a design risk**:
+  `embeddings.zig`'s `formatVectorLiteral` originally returned
+  `Io.Writer.Allocating.buffered()` directly — a sub-slice into a
+  possibly-larger, doubling-growth internal buffer, not itself a
+  freeable allocation. `store/memories.zig`'s callers correctly
+  `allocator.free()`'d what they thought was an owned string, which
+  reliably aborted under `std.testing.allocator`'s strict validator
+  (silently "worked" under a looser allocator, which is exactly why this
+  kind of bug is dangerous). Fixed to `allocator.dupe()` the buffered
+  content before returning, matching the convention `anthropic.zig`'s
+  `buildPayload` already established for the identical `Writer.Allocating`
+  shape — this file just hadn't followed it.
+- **Not live-verified** — no real embeddings API key configured in this
+  environment, so this is implemented per spec and covered by unit/store
+  tests (including a `search` test confirming actual cosine-similarity
+  ordering, not just presence) but not confirmed against a real
+  embeddings backend. Noted honestly rather than claimed, same standard
+  held elsewhere this session.
+- `zig build` and `zig build test` both green (502/504; 1 skip expected,
+  the 1 crash is `store.crypto`'s pre-existing local-only ABRT, already
+  confirmed reproducible on unmodified master earlier this session,
+  unrelated to this change).
 
 ### Phase 13 — Proactive daily briefings
 *Effort: S/M.*

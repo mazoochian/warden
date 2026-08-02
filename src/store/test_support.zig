@@ -22,7 +22,7 @@ fn truncateAll(db: *Db) !void {
         \\  xmpp_profiles, chat_settings, chats, identities, bot_config,
         \\  crypto_account, crypto_sessions, crypto_megolm_outbound, crypto_megolm_inbound,
         \\  bot_admins, bot_allowed_users, bot_allowed_chats, bot_pending_grants,
-        \\  accounts, oauth_providers, management_room_bindings, notes
+        \\  accounts, oauth_providers, management_room_bindings, notes, memories
         \\  RESTART IDENTITY CASCADE;
     );
 }
