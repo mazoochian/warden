@@ -68,6 +68,7 @@ const tool_registry = @import("tools/registry.zig");
 const group_admin = @import("features/group_admin.zig");
 const wordcloud = @import("features/wordcloud.zig");
 const digest = @import("features/digest.zig");
+const briefing = @import("features/briefing.zig");
 const scheduler = @import("features/scheduler.zig");
 const convert_file = @import("tools/convert_file.zig");
 const worker_pool = @import("worker_pool.zig");
@@ -113,6 +114,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "stats", .description = "Show message stats for this chat." },
     .{ .name = "wordcloud", .description = "Generate a word cloud from recent chat activity." },
     .{ .name = "digest", .description = "on | off | now -- enable, disable, or generate a recent-activity summary." },
+    .{ .name = "briefing", .description = "on | off | now -- enable, disable, or generate a briefing of pending reminders/alerts." },
     .{ .name = "remind", .description = "<time> <message> -- set a reminder. Also: every <interval> ..., cancel <id>." },
     .{ .name = "reminders", .description = "List your pending reminders in this chat." },
     .{ .name = "note", .description = "add <text> | list | delete <id> -- a shared notes/lists space for this chat." },
@@ -164,6 +166,7 @@ const help_text =
     \\/stats -- message stats for this chat
     \\/wordcloud -- word cloud from recent activity
     \\/digest on|off|now -- enable/disable/generate a recent-activity summary
+    \\/briefing on|off|now -- like /digest
     \\
     \\Reminders, alerts, feeds
     \\/remind <time> <message> -- e.g. /remind 30m take the bread out, or
@@ -368,6 +371,10 @@ pub fn main(init: std.process.Init) !void {
     defer digest_scheduler.deinit();
     loadDigestScheduleFromDisk(gpa, &pool, &digest_scheduler);
 
+    var briefing_scheduler = scheduler.BriefingScheduler.init(gpa, io, config.briefing_interval_seconds);
+    defer briefing_scheduler.deinit();
+    loadBriefingScheduleFromDisk(gpa, &pool, &briefing_scheduler);
+
     var pending_conversions = convert_flow.PendingConversions.init(gpa, io, config.convert_timeout_seconds);
     defer pending_conversions.deinit();
 
@@ -514,6 +521,7 @@ pub fn main(init: std.process.Init) !void {
             active_tools,
             &pending_confirmations,
             &digest_scheduler,
+            &briefing_scheduler,
             &pending_conversions,
             &menu_sessions,
             io,
@@ -581,6 +589,7 @@ pub fn main(init: std.process.Init) !void {
         const tick_started = Io.Timestamp.now(io, .real);
         const now = tick_started.toSeconds();
         checkAndSendDueDigests(connectors, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
+        checkAndSendDueBriefings(connectors, gpa, &config, &pool, &briefing_scheduler, max_message_len, now);
         checkAndSendDueReminders(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
@@ -792,6 +801,7 @@ fn connectorPollLoop(
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
+    briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     menu_sessions: *menu.Sessions,
     io: Io,
@@ -875,6 +885,7 @@ fn connectorPollLoop(
                 .tools = tools,
                 .pending = pending,
                 .digest_scheduler = digest_scheduler,
+                .briefing_scheduler = briefing_scheduler,
                 .pending_conversions = pending_conversions,
                 .menu_sessions = menu_sessions,
                 .io = io,
@@ -959,6 +970,7 @@ const MessageTask = struct {
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
+    briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     menu_sessions: *menu.Sessions,
     io: Io,
@@ -979,6 +991,7 @@ const MessageTask = struct {
             self.tools,
             self.pending,
             self.digest_scheduler,
+            self.briefing_scheduler,
             self.pending_conversions,
             self.menu_sessions,
             self.io,
@@ -1005,6 +1018,7 @@ fn processMessageTask(
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
+    briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     menu_sessions: *menu.Sessions,
     io: Io,
@@ -1164,7 +1178,7 @@ fn processMessageTask(
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, digest_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -1477,6 +1491,79 @@ fn checkAndSendDueDigests(
     }
 }
 
+/// Same restore-on-restart shape as `loadDigestScheduleFromDisk` above --
+/// see its own doc comment.
+fn loadBriefingScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, briefing_scheduler: *scheduler.BriefingScheduler) void {
+    const refs = chats.listAll(pool, gpa) catch |err| {
+        log.err("briefing: failed to scan existing chats: {t}", .{err});
+        return;
+    };
+    defer {
+        for (refs) |r| gpa.free(r.native_chat_id);
+        gpa.free(refs);
+    }
+
+    for (refs) |ref| {
+        if (chat_settings.getBriefingEnabled(pool, ref.id)) {
+            briefing_scheduler.enable(ref.platform, ref.native_chat_id) catch |err| {
+                log.err("briefing: failed to restore schedule for chat {s}: {t}", .{ ref.native_chat_id, err });
+            };
+        }
+    }
+}
+
+/// Same shape as `checkAndSendDueDigests` above, minus the `io`/
+/// `llm_provider` params that one needs -- `briefing.generate` is pure
+/// composition over already-stored data, no tool-call loop involved.
+fn checkAndSendDueBriefings(
+    connectors: []const iface.Connector,
+    gpa: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    briefing_scheduler: *scheduler.BriefingScheduler,
+    max_message_len: usize,
+    now: i64,
+) void {
+    const enabled_chats = briefing_scheduler.snapshotEnabledChatIds(gpa) catch |err| {
+        log.err("briefing: failed to snapshot enabled chats: {t}", .{err});
+        return;
+    };
+    defer {
+        for (enabled_chats) |k| gpa.free(k.native_chat_id);
+        gpa.free(enabled_chats);
+    }
+
+    for (enabled_chats) |key| {
+        const native_chat_id = key.native_chat_id;
+        const connector = findConnector(connectors, key.platform) orelse {
+            log.warn("briefing: no active connector for platform {s}, skipping chat {s}", .{ @tagName(key.platform), native_chat_id });
+            continue;
+        };
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const chat_id = chats.upsertChat(pool, connector.platform(), native_chat_id, null, null) catch |err| {
+            log.err("briefing: failed to resolve chat {s}: {t}", .{ native_chat_id, err });
+            continue;
+        };
+
+        const last_sent = chat_settings.getLastBriefingTs(pool, chat_id);
+        const briefing_interval_seconds = dynamic_config.getI64(pool, a, "WARDEN_BRIEFING_INTERVAL_SECONDS", config.briefing_interval_seconds);
+        if (now - last_sent < briefing_interval_seconds) continue;
+
+        const briefing_text = briefing.generate(a, pool, chat_id, now) catch |err| {
+            log.err("briefing: generate failed for chat {s}: {t}", .{ native_chat_id, err });
+            continue;
+        };
+        sendTextOrFile(connector, a, native_chat_id, briefing_text, null, max_message_len, "briefing.txt");
+        chat_settings.setLastBriefingTs(pool, chat_id, now) catch |err| {
+            log.err("briefing: failed to persist last_briefing_ts for chat {s}: {t}", .{ native_chat_id, err });
+        };
+    }
+}
+
 const LlmDynamicSettings = struct {
     owner_only: bool,
     show_thinking: bool,
@@ -1541,6 +1628,7 @@ fn handleMessage(
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
     digest_scheduler: *scheduler.DigestScheduler,
+    briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     menu_sessions: *menu.Sessions,
     io: Io,
@@ -1662,6 +1750,9 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/digest") or std.mem.startsWith(u8, text, "/digest ")) {
         if (!feature_flags.isEnabled(pool, "digest")) return false;
         handleDigestCommand(connector, a, pool, chat_id, digest_scheduler, llm_provider, tool_ctx, now, max_message_len, msg.chat_id, msg.message_id, text);
+    } else if (std.mem.eql(u8, text, "/briefing") or std.mem.startsWith(u8, text, "/briefing ")) {
+        if (!feature_flags.isEnabled(pool, "briefings")) return false;
+        handleBriefingCommand(connector, a, pool, chat_id, briefing_scheduler, now, max_message_len, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
@@ -2882,6 +2973,70 @@ fn handleDigestCommand(
             std.fmt.allocPrint(
                 a,
                 "Digest is {s}. Last sent {d}s ago. Use /digest on, /digest off, or /digest now.",
+                .{ if (enabled) "on" else "off", now - last },
+            ) catch return;
+        connector.sendMessage(a, native_chat_id, msg_text, reply_to);
+    }
+}
+
+/// Same on/off/now shape as `handleDigestCommand` above, minus the
+/// `llm_provider`/`tool_ctx` params that one needs -- `briefing.generate`
+/// is pure composition over already-stored data, no LLM call involved.
+fn handleBriefingCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    briefing_scheduler: *scheduler.BriefingScheduler,
+    now: i64,
+    max_message_len: usize,
+    native_chat_id: []const u8,
+    reply_to: ?[]const u8,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/briefing".len..], " ");
+
+    if (std.mem.eql(u8, arg, "on")) {
+        briefing_scheduler.enable(connector.platform(), native_chat_id) catch |err| {
+            log.err("briefing: failed to enable for chat {s}: {t}", .{ native_chat_id, err });
+            connector.sendMessage(a, native_chat_id, "Couldn't enable briefings, try again.", reply_to);
+            return;
+        };
+        chat_settings.setBriefingEnabled(pool, chat_id, true) catch |err| {
+            log.err("briefing: failed to persist enabled flag for chat {s}: {t}", .{ native_chat_id, err });
+        };
+        const hours = @divTrunc(briefing_scheduler.interval_seconds, 3600);
+        const msg_text = std.fmt.allocPrint(a, "Briefing enabled — I'll post one roughly every {d}h.", .{hours}) catch return;
+        connector.sendMessage(a, native_chat_id, msg_text, reply_to);
+    } else if (std.mem.eql(u8, arg, "off")) {
+        briefing_scheduler.disable(a, connector.platform(), native_chat_id);
+        chat_settings.setBriefingEnabled(pool, chat_id, false) catch |err| {
+            log.err("briefing: failed to persist disabled flag for chat {s}: {t}", .{ native_chat_id, err });
+        };
+        connector.sendMessage(a, native_chat_id, "Briefing disabled.", reply_to);
+    } else if (std.mem.eql(u8, arg, "now")) {
+        const briefing_text = briefing.generate(a, pool, chat_id, now) catch |err| {
+            log.err("briefing: generate failed for chat {s}: {t}", .{ native_chat_id, err });
+            connector.sendMessage(a, native_chat_id, "Couldn't generate a briefing just now.", reply_to);
+            return;
+        };
+        sendTextOrFile(connector, a, native_chat_id, briefing_text, reply_to, max_message_len, "briefing.txt");
+        chat_settings.setLastBriefingTs(pool, chat_id, now) catch |err| {
+            log.err("briefing: failed to persist last_briefing_ts for chat {s}: {t}", .{ native_chat_id, err });
+        };
+    } else {
+        const enabled = briefing_scheduler.isEnabled(a, connector.platform(), native_chat_id);
+        const last = chat_settings.getLastBriefingTs(pool, chat_id);
+        const msg_text = if (last == 0)
+            std.fmt.allocPrint(
+                a,
+                "Briefing is {s}. Never sent yet. Use /briefing on, /briefing off, or /briefing now.",
+                .{if (enabled) "on" else "off"},
+            ) catch return
+        else
+            std.fmt.allocPrint(
+                a,
+                "Briefing is {s}. Last sent {d}s ago. Use /briefing on, /briefing off, or /briefing now.",
                 .{ if (enabled) "on" else "off", now - last },
             ) catch return;
         connector.sendMessage(a, native_chat_id, msg_text, reply_to);
@@ -4897,6 +5052,7 @@ test {
     _ = @import("http_util.zig");
     _ = @import("features/scheduler.zig");
     _ = @import("features/digest.zig");
+    _ = @import("features/briefing.zig");
     _ = @import("tools/html_extract.zig");
     _ = @import("tools/scrape_site.zig");
     _ = @import("platform/interface.zig");

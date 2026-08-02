@@ -159,6 +159,7 @@ pub const KnownKey = struct {
 pub const known_keys = [_]KnownKey{
     .{ .key = "WARDEN_RETENTION_MESSAGES", .label = "Message retention (per chat)", .kind = .i64 },
     .{ .key = "WARDEN_DIGEST_INTERVAL_SECONDS", .label = "Digest interval (seconds)", .kind = .i64 },
+    .{ .key = "WARDEN_BRIEFING_INTERVAL_SECONDS", .label = "Briefing interval (seconds)", .kind = .i64 },
     .{ .key = "WARDEN_LLM_OWNER_ONLY", .label = "LLM Q&A owner-only", .kind = .bool },
     .{ .key = "WARDEN_LLM_SHOW_THINKING", .label = "Show LLM thinking by default", .kind = .bool },
     .{ .key = "WARDEN_LLM_STREAMING", .label = "Stream LLM responses", .kind = .bool },

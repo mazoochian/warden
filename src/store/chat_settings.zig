@@ -60,6 +60,62 @@ pub fn setLastDigestTs(pool: *PgPool, chat_id: i64, ts: i64) !void {
     _ = try stmt.step();
 }
 
+/// Same shape as `getDigestEnabled`/`setDigestEnabled` above -- a separate
+/// pair rather than reusing the digest ones since a chat can opt into
+/// digests, briefings, both, or neither independently (see
+/// `0026_briefings.sql`).
+pub fn getBriefingEnabled(pool: *PgPool, chat_id: i64) bool {
+    const db = pool.acquire() catch return false;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT briefing_enabled FROM chat_settings WHERE chat_id = $1;") catch return false;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return false;
+    if (!has_row) return false;
+    return stmt.columnBool(0);
+}
+
+pub fn setBriefingEnabled(pool: *PgPool, chat_id: i64, value: bool) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, briefing_enabled) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET briefing_enabled = excluded.briefing_enabled;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindBool(2, value);
+    _ = try stmt.step();
+}
+
+pub fn getLastBriefingTs(pool: *PgPool, chat_id: i64) i64 {
+    const db = pool.acquire() catch return 0;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT EXTRACT(EPOCH FROM last_briefing_ts)::bigint FROM chat_settings WHERE chat_id = $1;") catch return 0;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return 0;
+    if (!has_row or stmt.columnIsNull(0)) return 0;
+    return stmt.columnInt64(0);
+}
+
+pub fn setLastBriefingTs(pool: *PgPool, chat_id: i64, ts: i64) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, last_briefing_ts) VALUES ($1, to_timestamp($2))
+        \\ON CONFLICT (chat_id) DO UPDATE SET last_briefing_ts = excluded.last_briefing_ts;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, ts);
+    _ = try stmt.step();
+}
+
 /// Returns the magic word duped into `allocator`, or `null` if unset.
 pub fn getMagicWord(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ?[]const u8 {
     const db = pool.acquire() catch return null;
@@ -176,6 +232,23 @@ test "digest_enabled/last_digest_ts/magic_word round trip with defaults when uns
 
     try setMagicWord(&pool, chat_id, null);
     try testing.expectEqual(@as(?[]const u8, null), getMagicWord(&pool, testing.allocator, chat_id));
+}
+
+test "briefing_enabled/last_briefing_ts round trip with defaults when unset" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    try testing.expect(!getBriefingEnabled(&pool, chat_id));
+    try setBriefingEnabled(&pool, chat_id, true);
+    try testing.expect(getBriefingEnabled(&pool, chat_id));
+
+    try testing.expectEqual(@as(i64, 0), getLastBriefingTs(&pool, chat_id));
+    try setLastBriefingTs(&pool, chat_id, 54321);
+    try testing.expectEqual(@as(i64, 54321), getLastBriefingTs(&pool, chat_id));
 }
 
 test "system_prompt override round trips and clears back to null" {

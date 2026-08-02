@@ -813,6 +813,7 @@ fn handleAdminListConfig(ctx: *const ServerContext, request: *http.Server.Reques
 fn defaultForKnownKey(a: std.mem.Allocator, config: *const config_mod.Config, key: []const u8) ![]const u8 {
     if (std.mem.eql(u8, key, "WARDEN_RETENTION_MESSAGES")) return std.fmt.allocPrint(a, "{d}", .{config.retention_messages});
     if (std.mem.eql(u8, key, "WARDEN_DIGEST_INTERVAL_SECONDS")) return std.fmt.allocPrint(a, "{d}", .{config.digest_interval_seconds});
+    if (std.mem.eql(u8, key, "WARDEN_BRIEFING_INTERVAL_SECONDS")) return std.fmt.allocPrint(a, "{d}", .{config.briefing_interval_seconds});
     if (std.mem.eql(u8, key, "WARDEN_LLM_OWNER_ONLY")) return std.fmt.allocPrint(a, "{}", .{config.llm_owner_only});
     if (std.mem.eql(u8, key, "WARDEN_LLM_SHOW_THINKING")) return std.fmt.allocPrint(a, "{}", .{config.llm_show_thinking});
     if (std.mem.eql(u8, key, "WARDEN_LLM_STREAMING")) return std.fmt.allocPrint(a, "{}", .{config.llm_streaming});
@@ -3237,6 +3238,7 @@ fn testConfigForDefaults() config_mod.Config {
         .menu_timeout_seconds = 180,
         .tmp_dir = "data/tmp",
         .digest_interval_seconds = 86_400,
+        .briefing_interval_seconds = 86_400,
         .system_prompt = null,
         .searxng_url = null,
         .whisper_url = null,

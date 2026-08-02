@@ -73,6 +73,7 @@ pub const known_modules = [_]ModuleInfo{
     .{ .key = "group_admin", .label = "Group Administration", .category = .standalone },
     .{ .key = "persona", .label = "Persona", .category = .standalone },
     .{ .key = "digest", .label = "Digest", .category = .standalone },
+    .{ .key = "briefings", .label = "Briefings", .category = .standalone },
     .{ .key = "voice_transcription", .label = "Voice Transcription", .category = .standalone },
     .{ .key = "menu", .label = "Menu", .category = .standalone },
     .{ .key = "weather", .label = "Weather", .category = .llm_tool },

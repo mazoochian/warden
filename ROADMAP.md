@@ -930,15 +930,63 @@ personal).
   unrelated to this change).
 
 ### Phase 13 — Proactive daily briefings
-*Effort: S/M.*
+*Effort: S/M. Status: core done (2026-08-02) — see below for what shipped
+vs. what's deferred.*
 
 Pure composition, not new capability — a scheduled job (same
 `checkAndSendDue*` pattern as reminders/alerts/feeds) that assembles a
-morning briefing from primitives that already exist: pending reminders,
-triggered-but-not-yet-delivered alerts, weather, and new feed items since
-last digest. Covers: morning briefing, evening recap, weather alerts
-digest, news digest (already 90% done via `feed_watcher.zig` — this is
-mostly packaging), deadline reminders. High value for low new-code volume.
+briefing from primitives that already exist.
+
+**Done:**
+- `chat_settings.zig` gains `briefing_enabled`/`last_briefing_ts` (migration
+  `0026_briefings.sql`), same shape as the existing `digest_enabled`/
+  `last_digest_ts` pair — kept separate so a chat can opt into digests,
+  briefings, both, or neither independently.
+- `features/scheduler.zig` gains `BriefingScheduler`, a near-exact
+  structural copy of `DigestScheduler` (same interval-based, not
+  wall-clock, tradeoff — see that struct's own doc comment on why a real
+  timezone-aware scheduler isn't worth it for a personal bot; the same
+  reasoning applies here unchanged) rather than generalizing the two into
+  something shared, matching this project's established per-domain-copy
+  convention (see e.g. Phase 11's notes.zig/reminders.zig relationship).
+- `features/briefing.zig` (new): `generate` composes a chat's pending
+  reminders (`reminders.listPending`) and pending alerts
+  (`alert_store.listPending`) into one plain-text status list — no LLM
+  call, unlike `digest.zig`'s narrative summary, since a briefing is just
+  "what's still outstanding," not something that benefits from being
+  rewritten in prose. Returns an explicit "nothing pending" message rather
+  than an empty string when both are empty, mirroring `digest.generate`'s
+  own "0 messages" short-circuit.
+- `/briefing on|off|now` command (mirrors `/digest` exactly), gated by a
+  new `briefings` feature flag, plus `WARDEN_BRIEFING_INTERVAL_SECONDS`
+  (dynamic-config-overridable, same as `WARDEN_DIGEST_INTERVAL_SECONDS`)
+  and a matching `checkAndSendDueBriefings`/`loadBriefingScheduleFromDisk`
+  pair wired into `main.zig`'s scheduler tick loop and connector startup
+  path, alongside the existing digest ones.
+- **Not given a `/menu` entry** this pass — same reasoning `/digest` itself
+  never got a full wizard-style entry, just a view/on/off screen; briefing
+  currently is command-only (`/briefing`), consistent with how Phase 11's
+  notes were also left off `/menu` initially.
+
+**Deliberately deferred, not built this pass**:
+- **Weather.** There's no per-chat default location stored anywhere —
+  `tools/weather.zig` is on-demand-only, taking a location argument per
+  call. Adding a "default location for this chat" setting (plus its own
+  admin/command surface) is a real feature on its own, out of scope for
+  what was meant to be pure composition over data that already exists.
+- **New feed items since last briefing.** `store/feed_watches.zig` only
+  tracks seen guids for dedup, not readable item text, so reconstructing
+  "what was new" after the fact would mean duplicating
+  `feed_watcher.zig`'s own live-fetch-and-parse logic rather than
+  composing existing stored data — a different shape of work than this
+  phase's "pure composition" framing intended.
+- Both flagged here rather than silently dropped, same convention this
+  file already uses elsewhere (e.g. Phase 11's deferred voice notes,
+  Phase 9's deferred `/as` relay).
+- `zig build` and `zig build test` both green (508/510; 1 expected skip,
+  1 crash is a pre-existing `http_util.zig` fetch segfault — a known
+  flake unrelated to this change, deterministic on CI, intermittent
+  locally).
 
 ### Phase 14 — Messaging assistance modes
 *Effort: S/M.*

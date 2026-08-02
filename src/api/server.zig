@@ -168,6 +168,7 @@ fn testConfig() config_mod.Config {
         .menu_timeout_seconds = 180,
         .tmp_dir = "data/tmp",
         .digest_interval_seconds = 86_400,
+        .briefing_interval_seconds = 86_400,
         .system_prompt = null,
         .searxng_url = null,
         .whisper_url = null,

@@ -128,6 +128,10 @@ pub const Config = struct {
     /// How often an opted-in chat gets a digest (interval-based, not
     /// wall-clock time-of-day — see `features/scheduler.zig`).
     digest_interval_seconds: i64,
+    /// How often an opted-in chat gets a proactive briefing (same
+    /// interval-based tradeoff as `digest_interval_seconds` above — see
+    /// `features/scheduler.zig`'s `BriefingScheduler`).
+    briefing_interval_seconds: i64,
     /// Overrides the built-in Q&A system prompt when set — either inline
     /// via WARDEN_SYSTEM_PROMPT or from a file via
     /// WARDEN_SYSTEM_PROMPT_FILE (the file wins if both are set, since a
@@ -346,6 +350,11 @@ pub const Config = struct {
         else
             default_digest_interval_seconds;
 
+        const briefing_interval_seconds: i64 = if (env.get("WARDEN_BRIEFING_INTERVAL_SECONDS")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_briefing_interval_seconds
+        else
+            default_briefing_interval_seconds;
+
         var system_prompt: ?[]const u8 = env.get("WARDEN_SYSTEM_PROMPT");
         if (env.get("WARDEN_SYSTEM_PROMPT_FILE")) |path| {
             // A configured-but-unreadable prompt file is a hard error: the
@@ -430,6 +439,7 @@ pub const Config = struct {
             .menu_timeout_seconds = menu_timeout_seconds,
             .tmp_dir = tmp_dir,
             .digest_interval_seconds = digest_interval_seconds,
+            .briefing_interval_seconds = briefing_interval_seconds,
             .system_prompt = system_prompt,
             .searxng_url = searxng_url,
             .whisper_url = whisper_url,
@@ -626,6 +636,7 @@ pub const Config = struct {
     /// platform message workers do.
     pub const default_api_workers: usize = 4;
     pub const default_digest_interval_seconds: i64 = 86_400;
+    pub const default_briefing_interval_seconds: i64 = 86_400;
     pub const default_llm_owner_only: bool = true;
     pub const default_llm_show_thinking: bool = false;
     pub const default_llm_streaming: bool = false;
