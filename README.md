@@ -387,6 +387,23 @@ export WARDEN_ANTHROPIC_MODEL=claude-sonnet-5
 # Database (required): a Postgres instance warden owns the schema of.
 # Provision one yourself (a managed cloud instance, or your own
 # self-hosted server) — compose.yaml does not bundle a Postgres service.
+#
+# The instance MUST have the pgvector extension available: migration
+# 0025_memories.sql (Phase 12, long-term/semantic memory) runs
+# `CREATE EXTENSION IF NOT EXISTS vector` and creates a `vector(1536)`
+# column. `CREATE EXTENSION` can only enable an extension whose files are
+# already installed on the server, so a stock image without pgvector —
+# `postgres:16-alpine`, for instance — fails the migration and warden exits
+# at startup. The official `pgvector/pgvector:pg16` image (or your
+# platform's pgvector package) satisfies this.
+#
+# Adding pgvector to an instance that already holds data is not just an
+# image swap: `pgvector/pgvector:*` is Debian/glibc while `*-alpine` is
+# musl, and reusing a data directory across that change alters the
+# collation provider, which can silently corrupt text btree index ordering.
+# Migrate with pg_dump + restore into a fresh data directory (a logical
+# restore rebuilds every index under the new collation), not by pointing
+# the new image at the old PGDATA.
 export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
 
 # Optional knobs (defaults shown):
