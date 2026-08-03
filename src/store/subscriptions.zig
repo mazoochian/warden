@@ -70,6 +70,58 @@ pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![
     return out.toOwnedSlice(allocator);
 }
 
+/// One row for the web API's `GET /api/v1/subscriptions` -- identity-
+/// scoped (not chat-scoped like `Subscription`/`listForChat` above, which
+/// back the bot's own in-chat `/subscription list`), so each row carries
+/// its own chat context for a "everything I'm paying for, across every
+/// chat" view, same shape as `expenses.ExpenseForIdentity`/
+/// `notes.NoteForIdentity`.
+pub const SubscriptionForIdentity = struct {
+    id: i64,
+    chat_id: i64,
+    chat_title: ?[]const u8,
+    name: []const u8,
+    amount_cents: i64,
+    currency: []const u8,
+    interval_days: i64,
+    created_at: i64,
+};
+
+/// Subscriptions added by one identity, optionally narrowed to one chat
+/// -- see `SubscriptionForIdentity`'s doc comment for why this is a
+/// separate query from `listForChat`. Oldest first, same ordering
+/// `listForChat` already uses.
+pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]SubscriptionForIdentity {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT s.id, s.chat_id, c.title, s.name, s.amount_cents, s.currency, s.interval_days,
+        \\       EXTRACT(EPOCH FROM s.created_at)::bigint
+        \\FROM subscriptions s JOIN chats c ON c.id = s.chat_id
+        \\WHERE s.identity_id = $1 AND ($2::bigint IS NULL OR s.chat_id = $2)
+        \\ORDER BY s.created_at ASC;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
+
+    var out: std.ArrayList(SubscriptionForIdentity) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .id = stmt.columnInt64(0),
+            .chat_id = stmt.columnInt64(1),
+            .chat_title = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+            .name = try allocator.dupe(u8, stmt.columnText(3)),
+            .amount_cents = stmt.columnInt64(4),
+            .currency = try allocator.dupe(u8, stmt.columnText(5)),
+            .interval_days = stmt.columnInt64(6),
+            .created_at = stmt.columnInt64(7),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// `null` if no such subscription exists -- used by `/subscription
 /// remove` to check chat/creator before deleting, same pattern as
 /// `notes.get`.
@@ -153,4 +205,37 @@ test "monthlyEquivalentCents normalizes weekly/monthly/yearly intervals to a 30-
     try testing.expectEqual(@as(i64, 1599), monthlyEquivalentCents(1599, 30)); // already monthly
     try testing.expectEqual(@as(i64, 690), monthlyEquivalentCents(8400, 365)); // ~$84/yr -> ~$6.90/mo
     try testing.expectEqual(@as(i64, 3000), monthlyEquivalentCents(700, 7)); // $7/wk -> $30/mo
+}
+
+test "listForIdentity scopes by identity across chats, optionally narrowed to one" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, "Chat One");
+    const chat2 = try chats.upsertChat(&pool, .telegram, "2", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    const bob = try identities.getOrCreateMinimal(&pool, .telegram, "2", "bob", null, false, 1000);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    _ = try create(&pool, chat1, alice, "Netflix", 1599, "USD", 30, 1000);
+    _ = try create(&pool, chat2, alice, "Spotify", 999, "USD", 30, 2000);
+    _ = try create(&pool, chat1, bob, "Hulu", 799, "USD", 30, 3000);
+
+    const alice_all = try listForIdentity(&pool, a, alice, null);
+    try testing.expectEqual(@as(usize, 2), alice_all.len);
+    try testing.expectEqualStrings("Netflix", alice_all[0].name); // oldest first
+    try testing.expectEqualStrings("Chat One", alice_all[0].chat_title.?);
+    try testing.expectEqual(@as(?[]const u8, null), alice_all[1].chat_title); // chat2 has no title
+
+    const alice_chat2 = try listForIdentity(&pool, a, alice, chat2);
+    try testing.expectEqual(@as(usize, 1), alice_chat2.len);
+    try testing.expectEqualStrings("Spotify", alice_chat2[0].name);
+
+    const bob_all = try listForIdentity(&pool, a, bob, null);
+    try testing.expectEqual(@as(usize, 1), bob_all.len); // never sees alice's
 }

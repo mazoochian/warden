@@ -77,6 +77,73 @@ pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, ca
     return out.toOwnedSlice(allocator);
 }
 
+/// One row for the web API's `GET /api/v1/expenses` -- identity-scoped
+/// (not chat-scoped like `Expense`/`listForChat` above, which back the
+/// bot's own in-chat `/expense list`), so each row carries its own chat
+/// context for a "my spending across every chat" view, same shape as
+/// `notes.NoteForIdentity`/`reminders.PendingReminderForIdentity`.
+pub const ExpenseForIdentity = struct {
+    id: i64,
+    chat_id: i64,
+    chat_title: ?[]const u8,
+    amount_cents: i64,
+    currency: []const u8,
+    category: []const u8,
+    description: ?[]const u8,
+    created_at: i64,
+};
+
+/// Expenses recorded by one identity, optionally narrowed to one chat
+/// and/or `category` and/or a `since_ts` floor -- see
+/// `ExpenseForIdentity`'s doc comment for why this is a separate query
+/// from `listForChat` rather than a filter on top of it. Newest first,
+/// same ordering `listForChat` already uses (most recent spending is what
+/// you actually want to see first).
+pub fn listForIdentity(
+    pool: *PgPool,
+    allocator: std.mem.Allocator,
+    identity_id: i64,
+    chat_id: ?i64,
+    category: ?[]const u8,
+    since_ts: ?i64,
+    limit: i64,
+) ![]ExpenseForIdentity {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT e.id, e.chat_id, c.title, e.amount_cents, e.currency, e.category, e.description,
+        \\       EXTRACT(EPOCH FROM e.created_at)::bigint
+        \\FROM expenses e JOIN chats c ON c.id = e.chat_id
+        \\WHERE e.identity_id = $1
+        \\  AND ($2::bigint IS NULL OR e.chat_id = $2)
+        \\  AND ($3::text IS NULL OR e.category = $3)
+        \\  AND ($4::bigint IS NULL OR e.created_at >= to_timestamp($4))
+        \\ORDER BY e.created_at DESC LIMIT $5;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
+    if (category) |c| stmt.bindText(3, c) else stmt.bindNull(3);
+    if (since_ts) |s| stmt.bindInt64(4, s) else stmt.bindNull(4);
+    stmt.bindInt64(5, limit);
+
+    var out: std.ArrayList(ExpenseForIdentity) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .id = stmt.columnInt64(0),
+            .chat_id = stmt.columnInt64(1),
+            .chat_title = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+            .amount_cents = stmt.columnInt64(3),
+            .currency = try allocator.dupe(u8, stmt.columnText(4)),
+            .category = try allocator.dupe(u8, stmt.columnText(5)),
+            .description = if (stmt.columnIsNull(6)) null else try allocator.dupe(u8, stmt.columnText(6)),
+            .created_at = stmt.columnInt64(7),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// `null` if no such expense exists -- used by `/expense delete` to check
 /// chat/creator before deleting, same pattern as `notes.get`.
 pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Expense {
@@ -223,6 +290,47 @@ test "listForChat filters by category and since_ts" {
     const since_recent = try listForChat(&pool, a, chat1, null, 2500, 100);
     try testing.expectEqual(@as(usize, 1), since_recent.len);
     try testing.expectEqual(@as(i64, 3000), since_recent[0].amount_cents);
+}
+
+test "listForIdentity scopes by identity across chats, narrowed by chat/category/since" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, "Chat One");
+    const chat2 = try chats.upsertChat(&pool, .telegram, "2", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    const bob = try identities.getOrCreateMinimal(&pool, .telegram, "2", "bob", null, false, 1000);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    _ = try create(&pool, chat1, alice, 1000, "USD", "food", null, 1000);
+    _ = try create(&pool, chat2, alice, 2000, "USD", "transport", null, 2000);
+    _ = try create(&pool, chat1, bob, 9999, "USD", "food", null, 3000);
+
+    // Alice's own spending, across every chat -- bob's row never appears.
+    const alice_all = try listForIdentity(&pool, a, alice, null, null, null, 100);
+    try testing.expectEqual(@as(usize, 2), alice_all.len);
+    try testing.expectEqual(@as(i64, 2000), alice_all[0].amount_cents); // newest first
+    try testing.expectEqualStrings("Chat One", alice_all[1].chat_title.?);
+    try testing.expectEqual(@as(?[]const u8, null), alice_all[0].chat_title); // chat2 has no title
+
+    const alice_chat1 = try listForIdentity(&pool, a, alice, chat1, null, null, 100);
+    try testing.expectEqual(@as(usize, 1), alice_chat1.len);
+
+    const alice_food = try listForIdentity(&pool, a, alice, null, "food", null, 100);
+    try testing.expectEqual(@as(usize, 1), alice_food.len);
+    try testing.expectEqualStrings("food", alice_food[0].category);
+
+    const alice_recent = try listForIdentity(&pool, a, alice, null, null, 1500, 100);
+    try testing.expectEqual(@as(usize, 1), alice_recent.len);
+    try testing.expectEqual(@as(i64, 2000), alice_recent[0].amount_cents);
+
+    const bob_all = try listForIdentity(&pool, a, bob, null, null, null, 100);
+    try testing.expectEqual(@as(usize, 1), bob_all.len);
 }
 
 test "totalsByCategory and totalForChat sum correctly and totalForChat is 0 with no matching rows" {

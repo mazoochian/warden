@@ -60,6 +60,42 @@ pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![
     return out.toOwnedSlice(allocator);
 }
 
+/// `null` if no such budget exists. Exists for the web API's
+/// `DELETE /api/v1/budgets/:id`, which addresses a budget by its integer
+/// id rather than by category the way `/budget remove <category>` does --
+/// a category is free text that can contain spaces and `&`, and this
+/// file's own `remove` below would need it percent-decoded out of a URL
+/// path/query to match; an integer id sidesteps that encoding question
+/// entirely and matches every other `DELETE /api/v1/...:id` in the API.
+pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Budget {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT chat_id, category, amount_cents, currency FROM budgets WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, id);
+    if (!try stmt.step()) return null;
+    return .{
+        .id = id,
+        .chat_id = stmt.columnInt64(0),
+        .category = try allocator.dupe(u8, stmt.columnText(1)),
+        .amount_cents = stmt.columnInt64(2),
+        .currency = try allocator.dupe(u8, stmt.columnText(3)),
+    };
+}
+
+/// Companion to `getById` above -- see its doc comment for why the web
+/// API deletes by id while the bot's `/budget remove` deletes by category.
+pub fn removeById(pool: *PgPool, id: i64) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("DELETE FROM budgets WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, id);
+    _ = try stmt.step();
+}
+
 pub fn remove(pool: *PgPool, chat_id: i64, category: []const u8) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -108,4 +144,31 @@ test "set is an upsert keyed by (chat_id, category), listForChat is alphabetical
     const listed3 = try listForChat(&pool, a, chat1);
     try testing.expectEqual(@as(usize, 1), listed3.len);
     try testing.expectEqualStrings("transport", listed3[0].category);
+}
+
+test "getById/removeById address a budget by integer id, independent of its category text" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A category whose text would need percent-decoding to survive a URL --
+    // exactly the case `getById`'s doc comment exists for.
+    const id = try set(&pool, chat1, "eating out & drinks", 25000, "USD");
+
+    const fetched = (try getById(&pool, a, id)).?;
+    try testing.expectEqual(chat1, fetched.chat_id);
+    try testing.expectEqualStrings("eating out & drinks", fetched.category);
+    try testing.expectEqual(@as(i64, 25000), fetched.amount_cents);
+
+    try testing.expectEqual(@as(?Budget, null), try getById(&pool, a, id + 999));
+
+    try removeById(&pool, id);
+    try testing.expectEqual(@as(?Budget, null), try getById(&pool, a, id));
 }

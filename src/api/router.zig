@@ -28,6 +28,9 @@ const reminders = @import("../store/reminders.zig");
 const alert_store = @import("../store/alerts.zig");
 const feed_watches = @import("../store/feed_watches.zig");
 const notes_store = @import("../store/notes.zig");
+const expenses_store = @import("../store/expenses.zig");
+const budgets_store = @import("../store/budgets.zig");
+const subscriptions_store = @import("../store/subscriptions.zig");
 const group_admin = @import("../features/group_admin.zig");
 const redact_feature = @import("../features/redact.zig");
 const convert_feature = @import("../features/convert.zig");
@@ -59,6 +62,9 @@ const reminders_prefix = "/api/v1/reminders/";
 const alerts_prefix = "/api/v1/alerts/";
 const watches_prefix = "/api/v1/watches/";
 const notes_prefix = "/api/v1/notes/";
+const expenses_prefix = "/api/v1/expenses/";
+const budgets_prefix = "/api/v1/budgets/";
+const subscriptions_prefix = "/api/v1/subscriptions/";
 
 /// Reminder-message length cap -- mirrors `main.zig`'s own
 /// `max_reminder_message_len` for `/remind` (kept as a separate constant
@@ -70,6 +76,31 @@ const max_reminder_message_len = 500;
 /// for `/note add`, same "kept separate to avoid a circular import" reason
 /// as `max_reminder_message_len` above.
 const max_note_text_len = 1000;
+
+/// Currency every finance row defaults to when a request omits one --
+/// mirrors `main.zig`'s own `default_currency` for `/expense`/`/budget`/
+/// `/subscription`, same "kept separate to avoid a circular import" reason
+/// as the two caps above. Also matches the `DEFAULT 'USD'` in migrations
+/// `0029`/`0030`/`0031`.
+const default_currency = "USD";
+
+/// API-level caps on the finance free-text fields. The `expenses`/
+/// `budgets`/`subscriptions` tables all declare these columns as bare
+/// `TEXT` with no length constraint (the bot's own command parsers bound
+/// them implicitly, by taking a single line of chat input), so without
+/// these an authenticated `POST` could store an arbitrarily large blob.
+const max_expense_category_len = 64;
+const max_expense_description_len = 500;
+const max_subscription_name_len = 128;
+const max_currency_len = 8;
+
+/// A hard ceiling on any single stored amount, in cents -- ~$1 trillion,
+/// far above any plausible real entry while still leaving `i64` arithmetic
+/// (`subscriptions.monthlyEquivalentCents` multiplies by 30, and
+/// `expenses.totalsByCategory` sums across rows) nowhere near overflow.
+/// The DB's own `CHECK (amount_cents > 0)` covers the lower bound; this is
+/// the upper one it has no opinion about.
+const max_amount_cents: i64 = 100_000_000_000_000;
 
 /// Default/max page size, matching `API.md`'s pagination convention.
 const default_page_limit: i64 = 50;
@@ -223,6 +254,39 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .DELETE and std.mem.startsWith(u8, path, notes_prefix)) {
         return handleDeleteNote(ctx, request, path[notes_prefix.len..]);
+    }
+    // Finance (ROADMAP.md Phase 17). `/expenses/summary` is matched before
+    // the `expenses_prefix` catch-all below only incidentally -- that one
+    // is `DELETE`-only, so the two can't collide regardless of order.
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/expenses")) {
+        return handleListExpenses(ctx, request, target);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/expenses/summary")) {
+        return handleExpenseSummary(ctx, request, target);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/expenses")) {
+        return handleCreateExpense(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, expenses_prefix)) {
+        return handleDeleteExpense(ctx, request, path[expenses_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/budgets")) {
+        return handleListBudgets(ctx, request, target);
+    }
+    if (method == .PUT and std.mem.eql(u8, path, "/api/v1/budgets")) {
+        return handleSetBudget(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, budgets_prefix)) {
+        return handleDeleteBudget(ctx, request, path[budgets_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/subscriptions")) {
+        return handleListSubscriptions(ctx, request, target);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/subscriptions")) {
+        return handleCreateSubscription(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, subscriptions_prefix)) {
+        return handleDeleteSubscription(ctx, request, path[subscriptions_prefix.len..]);
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/convert")) {
         return handleConvert(ctx, request);
@@ -2694,6 +2758,656 @@ fn handleDeleteNote(ctx: *const ServerContext, request: *http.Server.Request, id
     audit_log.record(ctx.pool, ra.account_id, "note.delete", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
+}
+
+// --- Finance: expenses, budgets, subscriptions (ROADMAP.md Phase 17) ---
+
+/// Percent-decodes a query-parameter value into `arena`. `queryParam`
+/// returns the raw, still-encoded slice; every caller written before this
+/// one only ever parsed integers out of it, where encoding can't matter,
+/// but the expense `category` filter is free text -- "eating out & drinks"
+/// arrives as `eating%20out%20%26%20drinks` and would match no row at all
+/// without this. `+` decodes to a space too, since form-encoded query
+/// strings still use it. Malformed escapes (a trailing `%`, non-hex
+/// digits) are passed through as literal characters rather than raising --
+/// a filter value is not worth failing a whole request over, and a
+/// nonsense category simply matches nothing.
+fn percentDecode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '+') {
+            try out.append(arena, ' ');
+            i += 1;
+            continue;
+        }
+        if (s[i] == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
+                try out.append(arena, s[i]);
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
+                try out.append(arena, s[i]);
+                i += 1;
+                continue;
+            };
+            try out.append(arena, @as(u8, hi) * 16 + @as(u8, lo));
+            i += 3;
+            continue;
+        }
+        try out.append(arena, s[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Chat-scoped *read* access for the finance endpoints: true if the caller
+/// is a member of `chat_id` through any of their linked identities, or is
+/// owner/bot_admin. `false` means a response was already sent.
+///
+/// Deliberately **not** `requireChatAccess` -- that one means "live
+/// platform admin of this chat," the right bar for changing a chat's
+/// settings but the wrong one for reading a shared ledger every member can
+/// already see in-chat via `/expense summary`/`/budget list` (both of
+/// which are open to the whole chat; only *changing* a budget is
+/// owner-gated). Reuses the same `chat_members.isMember` primitive
+/// `resolveCreateIdentity` already authorizes finance *writes* with, so
+/// this is that existing check reused for reads, not a second
+/// authorization path.
+fn requireChatMember(ctx: *const ServerContext, request: *http.Server.Request, ra: RequesterAuth, chat_id: i64) !bool {
+    const chat = (chats_store.getById(ctx.pool, ctx.allocator, chat_id) catch |err| {
+        log.err("chat-member: failed to load chat {d}: {t}", .{ chat_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to load chat");
+        return false;
+    }) orelse {
+        try respondError(request, .not_found, "not_found", "no such chat");
+        return false;
+    };
+    ctx.allocator.free(chat.native_chat_id);
+
+    if (ra.roles.owner or ra.roles.bot_admin) return true;
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+        log.err("chat-member: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to check access");
+        return false;
+    };
+    defer ctx.allocator.free(identity_ids);
+    for (identity_ids) |id| {
+        if (chat_members.isMember(ctx.pool, chat_id, id)) return true;
+    }
+    try respondError(request, .forbidden, "forbidden", "not a member of this chat");
+    return false;
+}
+
+/// Validates a client-supplied amount. Every finance amount crosses this
+/// API as an **integer cent count**, never a decimal string or float --
+/// the client does its own string -> cents conversion (see warden-ui's
+/// `parseAmountCents` in `src/lib/money.ts`) so that no float ever touches
+/// a money value on either side of the wire, which is the same standard
+/// ROADMAP.md Phase 17 held the bot-side code to.
+fn validAmountCents(cents: i64) bool {
+    return cents > 0 and cents <= max_amount_cents;
+}
+
+/// `null` (with a response already sent) if the body's currency is present
+/// but unusable; otherwise the currency to store.
+fn resolveCurrency(request: *http.Server.Request, supplied: ?[]const u8) !?[]const u8 {
+    const cur = supplied orelse return default_currency;
+    if (cur.len == 0 or cur.len > max_currency_len) {
+        try respondError(request, .bad_request, "bad_request", "currency must be 1-8 characters");
+        return null;
+    }
+    return cur;
+}
+
+const CreateExpenseBody = struct {
+    chat_id: i64,
+    identity_id: ?i64 = null,
+    amount_cents: i64,
+    category: []const u8,
+    description: ?[]const u8 = null,
+    currency: ?[]const u8 = null,
+};
+
+const SetBudgetBody = struct {
+    chat_id: i64,
+    category: []const u8,
+    amount_cents: i64,
+    currency: ?[]const u8 = null,
+};
+
+const CreateSubscriptionBody = struct {
+    chat_id: i64,
+    identity_id: ?i64 = null,
+    name: []const u8,
+    amount_cents: i64,
+    interval_days: i64,
+    currency: ?[]const u8 = null,
+};
+
+/// `GET /api/v1/expenses?chat_id=&identity_id=&category=&since=&limit=` --
+/// same identity scoping as `handleListNotes` ("my spending across every
+/// chat" by default). Unlike the bot's own `/expense list`, which is
+/// chat-scoped and shows every contributor's entries together.
+fn handleListExpenses(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
+        std.fmt.parseInt(i64, c, 10) catch {
+            return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+        }
+    else
+        null;
+    const since: ?i64 = if (queryParam(target, "since")) |s|
+        std.fmt.parseInt(i64, s, 10) catch {
+            return respondError(request, .bad_request, "bad_request", "invalid since");
+        }
+    else
+        null;
+    const category: ?[]const u8 = if (queryParam(target, "category")) |c|
+        try percentDecode(arena, c)
+    else
+        null;
+
+    const items = expenses_store.listForIdentity(
+        ctx.pool,
+        arena,
+        identity_id,
+        chat_id,
+        category,
+        since,
+        paginationParams(target).limit,
+    ) catch |err| {
+        log.err("list-expenses: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load expenses");
+    };
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `GET /api/v1/expenses/summary?chat_id=&since=` -- chat-scoped totals by
+/// category cross-referenced against that chat's budgets, the web version
+/// of `/expense summary`. Chat-scoped (not identity-scoped like the list
+/// above) because a budget is chat-wide policy: "am I over budget" is only
+/// a meaningful question against the whole chat's spending, which is
+/// exactly what the bot's own summary reports.
+///
+/// `since` is required from the caller rather than defaulted to "this
+/// calendar month" server-side the way `/expense summary` does -- the
+/// month boundary depends on the viewer's UTC offset, which the frontend
+/// already knows from `GET /api/v1/me/settings`; guessing it here would
+/// silently report the wrong window for anyone not on UTC. Omitting it
+/// means all time.
+fn handleExpenseSummary(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+
+    const chat_id = std.fmt.parseInt(i64, queryParam(target, "chat_id") orelse {
+        return respondError(request, .bad_request, "bad_request", "chat_id is required");
+    }, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+    };
+    if (!try requireChatMember(ctx, request, ra, chat_id)) return;
+
+    const since: ?i64 = if (queryParam(target, "since")) |s|
+        std.fmt.parseInt(i64, s, 10) catch {
+            return respondError(request, .bad_request, "bad_request", "invalid since");
+        }
+    else
+        null;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const totals = expenses_store.totalsByCategory(ctx.pool, arena, chat_id, since) catch |err| {
+        log.err("expense-summary: totals failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load summary");
+    };
+    const budget_rows = budgets_store.listForChat(ctx.pool, arena, chat_id) catch |err| {
+        log.err("expense-summary: budgets failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load summary");
+    };
+
+    const Row = struct {
+        category: []const u8,
+        total_cents: i64,
+        budget_cents: ?i64,
+        over: bool,
+    };
+    var rows: std.ArrayList(Row) = .empty;
+
+    // Spending first (already highest-total-first from the query), each
+    // matched against a budget for the same category if one exists.
+    for (totals) |t| {
+        var budget_cents: ?i64 = null;
+        for (budget_rows) |b| {
+            if (std.mem.eql(u8, b.category, t.category)) {
+                budget_cents = b.amount_cents;
+                break;
+            }
+        }
+        try rows.append(arena, .{
+            .category = t.category,
+            .total_cents = t.total_cents,
+            .budget_cents = budget_cents,
+            .over = if (budget_cents) |b| t.total_cents > b else false,
+        });
+    }
+    // Then any budget with no spending at all in this window -- `/budget
+    // list` shows these too, and dropping them would make a configured
+    // budget silently vanish from the panel until someone spends against
+    // it.
+    for (budget_rows) |b| {
+        var already = false;
+        for (totals) |t| {
+            if (std.mem.eql(u8, b.category, t.category)) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
+        try rows.append(arena, .{
+            .category = b.category,
+            .total_cents = 0,
+            .budget_cents = b.amount_cents,
+            .over = false,
+        });
+    }
+
+    const total_cents = expenses_store.totalForChat(ctx.pool, chat_id, since) catch |err| {
+        log.err("expense-summary: total failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load summary");
+    };
+
+    return respondJson(ctx, request, .ok, .{
+        .chat_id = chat_id,
+        .total_cents = total_cents,
+        .categories = rows.items,
+    });
+}
+
+/// `POST /api/v1/expenses` -- mirrors `/expense add <amount> <category>
+/// [description]`, open to anyone in the chat (same
+/// `resolveCreateIdentity` authorization as reminders/alerts/notes).
+fn handleCreateExpense(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "finance")) {
+        return respondError(request, .forbidden, "forbidden", "the finance module is disabled");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [2 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(2 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateExpenseBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    if (!validAmountCents(body.amount_cents)) {
+        return respondError(request, .bad_request, "bad_request", "amount_cents must be a positive integer number of cents");
+    }
+    if (body.category.len == 0 or body.category.len > max_expense_category_len) {
+        return respondError(request, .bad_request, "bad_request", "category must be 1-64 bytes");
+    }
+    if (body.description) |d| {
+        if (d.len > max_expense_description_len) {
+            return respondError(request, .bad_request, "bad_request", "description must be at most 500 bytes");
+        }
+    }
+    const currency = (try resolveCurrency(request, body.currency)) orelse return;
+
+    const identity_id = (try resolveCreateIdentity(ctx, request, ra, body.chat_id, body.identity_id)) orelse return;
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const id = expenses_store.create(
+        ctx.pool,
+        body.chat_id,
+        identity_id,
+        body.amount_cents,
+        currency,
+        body.category,
+        body.description,
+        now,
+    ) catch |err| {
+        log.err("create-expense: failed for chat {d}: {t}", .{ body.chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to create expense");
+    };
+
+    audit_log.record(ctx.pool, ra.account_id, "expense.create", null, null);
+
+    return respondJson(ctx, request, .ok, .{ .id = id });
+}
+
+/// `DELETE /api/v1/expenses/:id` -- same authorization as `/expense
+/// delete`: whoever recorded it, or the bot owner (not bot_admin --
+/// mirrors `handleExpenseCommand`'s `auth.isOwner` check exactly, same as
+/// `handleDeleteNote`).
+fn handleDeleteExpense(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid expense id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const expense = (expenses_store.get(ctx.pool, arena, id) catch |err| {
+        log.err("delete-expense: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up expense");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such expense");
+    };
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, arena, ra.account_id) catch |err| {
+        log.err("delete-expense: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to check access");
+    };
+    const is_creator = std.mem.indexOfScalar(i64, identity_ids, expense.identity_id) != null;
+    if (!is_creator and !ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only whoever recorded this expense, or the owner, can delete it");
+    }
+
+    expenses_store.delete(ctx.pool, id) catch |err| {
+        log.err("delete-expense: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to delete expense");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "expense.delete", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/budgets?chat_id=` -- chat-scoped, readable by any member,
+/// exactly like the bot's own `/budget list`. No identity scoping at all:
+/// a budget is chat-wide policy, not a personal record.
+fn handleListBudgets(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+
+    const chat_id = std.fmt.parseInt(i64, queryParam(target, "chat_id") orelse {
+        return respondError(request, .bad_request, "bad_request", "chat_id is required");
+    }, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+    };
+    if (!try requireChatMember(ctx, request, ra, chat_id)) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const items = budgets_store.listForChat(ctx.pool, arena, chat_id) catch |err| {
+        log.err("list-budgets: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load budgets");
+    };
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `PUT /api/v1/budgets` -- upsert keyed by `(chat_id, category)`, mirroring
+/// `/budget set <category> <amount>`. `PUT`, not `POST`, because
+/// `budgets.set` is an upsert rather than a create: sending the same
+/// category twice replaces the amount instead of adding a second row.
+///
+/// **Owner only** -- `handleBudgetCommand` gates set/remove behind
+/// `auth.isOwner` (not bot_admin), since a budget is chat-wide policy in
+/// the same tier as a system-prompt override. Viewing stays open, above.
+fn handleSetBudget(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "finance")) {
+        return respondError(request, .forbidden, "forbidden", "the finance module is disabled");
+    }
+    if (!ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only the bot owner can change a chat's budgets");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(SetBudgetBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    if (!validAmountCents(body.amount_cents)) {
+        return respondError(request, .bad_request, "bad_request", "amount_cents must be a positive integer number of cents");
+    }
+    if (body.category.len == 0 or body.category.len > max_expense_category_len) {
+        return respondError(request, .bad_request, "bad_request", "category must be 1-64 bytes");
+    }
+    const currency = (try resolveCurrency(request, body.currency)) orelse return;
+
+    // Owner-only above, so there's no membership question left to answer --
+    // but the chat still has to exist, or this would create a budget
+    // dangling off a nonexistent chat id.
+    if (!try requireChatMember(ctx, request, ra, body.chat_id)) return;
+
+    const id = budgets_store.set(ctx.pool, body.chat_id, body.category, body.amount_cents, currency) catch |err| {
+        log.err("set-budget: failed for chat {d}: {t}", .{ body.chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to set budget");
+    };
+
+    audit_log.record(ctx.pool, ra.account_id, "budget.set", body.category, null);
+
+    return respondJson(ctx, request, .ok, .{ .id = id });
+}
+
+/// `DELETE /api/v1/budgets/:id` -- owner only, same as `handleSetBudget`.
+/// Addressed by integer id rather than by category the way `/budget remove
+/// <category>` is; see `budgets.getById`'s doc comment for why.
+fn handleDeleteBudget(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only the bot owner can change a chat's budgets");
+    }
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid budget id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = (budgets_store.getById(ctx.pool, arena, id) catch |err| {
+        log.err("delete-budget: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up budget");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such budget");
+    };
+
+    budgets_store.removeById(ctx.pool, id) catch |err| {
+        log.err("delete-budget: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to delete budget");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "budget.remove", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/subscriptions?chat_id=&identity_id=` -- same identity
+/// scoping as `handleListNotes`. Each row carries `monthly_equivalent_cents`
+/// so the panel doesn't have to reimplement
+/// `subscriptions.monthlyEquivalentCents`'s 30-day-month normalization and
+/// risk drifting from what `/subscription list` reports in chat.
+fn handleListSubscriptions(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+
+    const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
+        std.fmt.parseInt(i64, c, 10) catch {
+            return respondError(request, .bad_request, "bad_request", "invalid chat_id");
+        }
+    else
+        null;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = subscriptions_store.listForIdentity(ctx.pool, arena, identity_id, chat_id) catch |err| {
+        log.err("list-subscriptions: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load subscriptions");
+    };
+
+    const Row = struct {
+        id: i64,
+        chat_id: i64,
+        chat_title: ?[]const u8,
+        name: []const u8,
+        amount_cents: i64,
+        currency: []const u8,
+        interval_days: i64,
+        monthly_equivalent_cents: i64,
+        created_at: i64,
+    };
+    var items: std.ArrayList(Row) = .empty;
+    var monthly_total: i64 = 0;
+    for (rows) |s| {
+        const monthly = subscriptions_store.monthlyEquivalentCents(s.amount_cents, s.interval_days);
+        monthly_total += monthly;
+        try items.append(arena, .{
+            .id = s.id,
+            .chat_id = s.chat_id,
+            .chat_title = s.chat_title,
+            .name = s.name,
+            .amount_cents = s.amount_cents,
+            .currency = s.currency,
+            .interval_days = s.interval_days,
+            .monthly_equivalent_cents = monthly,
+            .created_at = s.created_at,
+        });
+    }
+
+    return respondJson(ctx, request, .ok, .{
+        .items = items.items,
+        .monthly_total_cents = monthly_total,
+    });
+}
+
+/// `POST /api/v1/subscriptions` -- mirrors `/subscription add <name>
+/// <amount> every <interval>`. Takes `interval_days` as an integer rather
+/// than the bot's `1mo`/`2w` shorthand: `parseIntervalDays` lives in
+/// `main.zig` (which imports this file, so importing it back would be
+/// circular), and a picker in the panel is a better fit for the web than
+/// re-parsing a shorthand string here.
+fn handleCreateSubscription(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "finance")) {
+        return respondError(request, .forbidden, "forbidden", "the finance module is disabled");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateSubscriptionBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    if (!validAmountCents(body.amount_cents)) {
+        return respondError(request, .bad_request, "bad_request", "amount_cents must be a positive integer number of cents");
+    }
+    if (body.name.len == 0 or body.name.len > max_subscription_name_len) {
+        return respondError(request, .bad_request, "bad_request", "name must be 1-128 bytes");
+    }
+    // Upper bound mirrors `parseIntervalDays`'s own reachable maximum
+    // (`/subscription add ... every 100y`-scale input) while keeping
+    // `monthlyEquivalentCents`'s `amount_cents * 30` division safe.
+    if (body.interval_days <= 0 or body.interval_days > 36_500) {
+        return respondError(request, .bad_request, "bad_request", "interval_days must be between 1 and 36500");
+    }
+    const currency = (try resolveCurrency(request, body.currency)) orelse return;
+
+    const identity_id = (try resolveCreateIdentity(ctx, request, ra, body.chat_id, body.identity_id)) orelse return;
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const id = subscriptions_store.create(
+        ctx.pool,
+        body.chat_id,
+        identity_id,
+        body.name,
+        body.amount_cents,
+        currency,
+        body.interval_days,
+        now,
+    ) catch |err| {
+        log.err("create-subscription: failed for chat {d}: {t}", .{ body.chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to create subscription");
+    };
+
+    audit_log.record(ctx.pool, ra.account_id, "subscription.create", null, null);
+
+    return respondJson(ctx, request, .ok, .{ .id = id });
+}
+
+/// `DELETE /api/v1/subscriptions/:id` -- same authorization as
+/// `/subscription remove`: whoever added it, or the bot owner.
+fn handleDeleteSubscription(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid subscription id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const sub = (subscriptions_store.get(ctx.pool, arena, id) catch |err| {
+        log.err("delete-subscription: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up subscription");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such subscription");
+    };
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, arena, ra.account_id) catch |err| {
+        log.err("delete-subscription: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to check access");
+    };
+    const is_creator = std.mem.indexOfScalar(i64, identity_ids, sub.identity_id) != null;
+    if (!is_creator and !ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only whoever added this subscription, or the owner, can remove it");
+    }
+
+    subscriptions_store.remove(ctx.pool, id) catch |err| {
+        log.err("delete-subscription: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to remove subscription");
+    };
+    audit_log.record(ctx.pool, ra.account_id, "subscription.delete", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+test "percentDecode handles escapes, plus-as-space, and passes malformed escapes through" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("food", try percentDecode(a, "food"));
+    try std.testing.expectEqualStrings("eating out & drinks", try percentDecode(a, "eating%20out%20%26%20drinks"));
+    try std.testing.expectEqualStrings("eating out", try percentDecode(a, "eating+out"));
+    try std.testing.expectEqualStrings("caf\u{00e9}", try percentDecode(a, "caf%C3%A9")); // multi-byte UTF-8
+    // Malformed: a trailing '%' and a non-hex escape both survive as literals
+    // rather than failing the request.
+    try std.testing.expectEqualStrings("100%", try percentDecode(a, "100%"));
+    try std.testing.expectEqualStrings("%zz", try percentDecode(a, "%zz"));
 }
 
 /// `user_agent` must have been captured by the caller *before* it read the
