@@ -971,8 +971,8 @@ personal).
   unrelated to this change).
 
 ### Phase 13 — Proactive daily briefings
-*Effort: S/M. Status: core done (2026-08-02) — see below for what shipped
-vs. what's deferred.*
+*Effort: S/M. Status: core done (2026-08-02); weather section added in a
+follow-up pass (2026-08-03). One item still deferred — see below.*
 
 Pure composition, not new capability — a scheduled job (same
 `checkAndSendDue*` pattern as reminders/alerts/feeds) that assembles a
@@ -1009,21 +1009,51 @@ briefing from primitives that already exist.
   currently is command-only (`/briefing`), consistent with how Phase 11's
   notes were also left off `/menu` initially.
 
-**Deliberately deferred, not built this pass**:
-- **Weather.** There's no per-chat default location stored anywhere —
-  `tools/weather.zig` is on-demand-only, taking a location argument per
-  call. Adding a "default location for this chat" setting (plus its own
-  admin/command surface) is a real feature on its own, out of scope for
-  what was meant to be pure composition over data that already exists.
+**Done (weather follow-up, 2026-08-03)** — the blocker was never the
+weather lookup itself but the missing per-chat location, so that's what
+this pass added:
+- `0034_default_location.sql` adds `chat_settings.default_location`
+  (nullable; NULL means "no default location", the same null-means-unset
+  convention as `magic_word`/`system_prompt`/`welcome_message`). Stores the
+  **raw place name the user typed**, not resolved coordinates: Open-Meteo's
+  geocoder turns it into a lat/lon on every call anyway, so caching
+  coordinates would add a staleness problem for no gain, and keeping the
+  text means `/location` can echo back exactly what was set.
+- New `/location <place>` / `/location off` / `/location` (view) command.
+  Viewing is open to the chat, changing is owner-only — the same split
+  `/magicword` and `/persona` already use. Unlike the magic word it
+  deliberately allows spaces (almost every real place name has one), capped
+  at 100 bytes.
+- **The place name is deliberately not validated on set.** Doing so would
+  mean a geocoder round trip on every `/location` call, and a geocoder
+  outage would then block setting a location at all. A name that never
+  resolves simply yields briefings with no weather section — the same
+  degradation as a transient lookup failure.
+- `briefing.generate` takes a `weather_line: ?[]const u8` **passed in by
+  the caller** rather than fetching it itself. That keeps the function pure
+  composition (the framing this phase chose) and keeps `zig build test`
+  fully offline, matching the policy already used for the word cloud,
+  diagrams, and every live-API test in this project. `main.zig`'s
+  `briefingWeatherLine` does the fetching and returns `null` on *any*
+  failure, so an unreachable Open-Meteo degrades to a briefing without
+  weather instead of failing the whole briefing.
+- Weather alone now justifies a briefing: a chat with a location set but
+  nothing pending gets the forecast rather than "nothing pending". Covered
+  by its own test.
+- `weather.describeWeatherCode` was made `pub` and reused rather than
+  duplicated, so a briefing and the `weather` tool describe identical
+  conditions identically.
+
+**Still deferred, not built:**
 - **New feed items since last briefing.** `store/feed_watches.zig` only
   tracks seen guids for dedup, not readable item text, so reconstructing
   "what was new" after the fact would mean duplicating
   `feed_watcher.zig`'s own live-fetch-and-parse logic rather than
   composing existing stored data — a different shape of work than this
   phase's "pure composition" framing intended.
-- Both flagged here rather than silently dropped, same convention this
-  file already uses elsewhere (e.g. Phase 11's deferred voice notes,
-  Phase 9's deferred `/as` relay).
+- Flagged here rather than silently dropped, same convention this file
+  already uses elsewhere (e.g. Phase 11's deferred voice notes, Phase 9's
+  deferred `/as` relay).
 - `zig build` and `zig build test` both green (508/510; 1 expected skip,
   1 crash is a pre-existing `http_util.zig` fetch segfault — a known
   flake unrelated to this change, deterministic on CI, intermittent
@@ -1206,10 +1236,18 @@ reasoning doesn't change here.
 - **Not live-verified** — no real Telegram join event exercised this pass.
 
 **Deferred, not built this pass:**
-- **Scheduled announcements** needs its own storage + scheduler (a
-  genuinely separate sub-feature, not "extends the existing moderation
-  surface" the way the rest of this phase does) — bigger than this slice's
-  scope, revisit as its own pass.
+- **Scheduled announcements** — **re-examined 2026-08-03 and now judged
+  largely redundant, not merely deferred.** The original note assumed this
+  needed its own storage + scheduler. It doesn't: `reminders` already
+  stores a message against a `chat_id` with an absolute `due_at` *and* a
+  `recur_interval_seconds` (Phase 3 added recurrence), and reminders are
+  delivered into the chat they were set in, not DM'd. A "scheduled
+  announcement" is therefore a recurring reminder posted to a group — the
+  storage and the scheduler both already exist and already work. Building
+  a parallel subsystem would be the same redundancy this list already
+  rejects for "group summaries" below. If a real gap shows up (e.g.
+  announcements wanting different framing or an admin-only surface), that's
+  a thin presentation layer over `reminders`, not a new sub-feature.
 - **Auto-pin important messages** — deferred as genuinely ambiguous
   without a real definition of "important" (message length? reply count?
   an LLM judgment call per message, which would mean an LLM call on every

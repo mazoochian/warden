@@ -1,0 +1,14 @@
+-- Phase 13 follow-up: a per-chat default location, so weather can appear in
+-- proactive briefings. Phase 13 deferred weather for exactly this reason --
+-- `tools/weather.zig` is on-demand-only, taking a location argument per
+-- call, and there was nowhere to record "where this chat is" between calls.
+--
+-- NULL means "no default location" (the default -- a chat opts in
+-- explicitly), the same null-means-unset convention as
+-- chat_settings.magic_word/system_prompt/welcome_message. Stored as the
+-- raw user-typed place name rather than resolved coordinates: Open-Meteo's
+-- geocoder is what turns it into a lat/lon anyway (see
+-- `weather.fetchWeather`), so caching coordinates here would add a
+-- staleness problem for no gain, and keeping the original text means
+-- /location can echo back exactly what the user set.
+ALTER TABLE chat_settings ADD COLUMN default_location TEXT;

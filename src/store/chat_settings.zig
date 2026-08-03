@@ -340,3 +340,54 @@ test "show_thinking override round trips through true, false, and clears back to
     try setShowThinkingOverride(&pool, chat_id, null);
     try testing.expectEqual(@as(?bool, null), getShowThinkingOverride(&pool, chat_id));
 }
+
+/// Returns this chat's default location (the raw place name the user set,
+/// e.g. "Berlin") duped into `allocator`, or `null` if unset — see the
+/// `0034_default_location.sql` migration comment for why the text is stored
+/// rather than resolved coordinates.
+pub fn getDefaultLocation(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ?[]const u8 {
+    const db = pool.acquire() catch return null;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT default_location FROM chat_settings WHERE chat_id = $1;") catch return null;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return null;
+    if (!has_row or stmt.columnIsNull(0)) return null;
+    return allocator.dupe(u8, stmt.columnText(0)) catch null;
+}
+
+/// `null` clears it.
+pub fn setDefaultLocation(pool: *PgPool, chat_id: i64, location: ?[]const u8) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, default_location) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET default_location = excluded.default_location;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    if (location) |l| stmt.bindText(2, l) else stmt.bindNull(2);
+    _ = try stmt.step();
+}
+
+test "default location round-trips, is null by default, and clears back to null" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    try testing.expectEqual(@as(?[]const u8, null), getDefaultLocation(&pool, testing.allocator, chat_id));
+
+    try setDefaultLocation(&pool, chat_id, "San Francisco, California");
+    const got = getDefaultLocation(&pool, testing.allocator, chat_id) orelse return error.TestExpectedValue;
+    defer testing.allocator.free(got);
+    // Spaces and commas survive verbatim -- unlike the magic word, a place
+    // name is expected to contain them.
+    try testing.expectEqualStrings("San Francisco, California", got);
+
+    try setDefaultLocation(&pool, chat_id, null);
+    try testing.expectEqual(@as(?[]const u8, null), getDefaultLocation(&pool, testing.allocator, chat_id));
+}

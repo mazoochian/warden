@@ -132,7 +132,9 @@ pub fn fetchWeather(allocator: std.mem.Allocator, io: std.Io, location: []const 
 
 /// WMO weather codes (https://open-meteo.com/en/docs), condensed to the
 /// common cases.
-fn describeWeatherCode(code: i64) []const u8 {
+/// Also used by `main.zig`'s briefing weather line, so a briefing and the
+/// weather tool describe the same conditions identically.
+pub fn describeWeatherCode(code: i64) []const u8 {
     return switch (code) {
         0 => "clear sky",
         1, 2, 3 => "partly cloudy",

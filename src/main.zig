@@ -143,6 +143,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "brainstorm", .description = "<topic> -- brainstorm ideas/options, or reply to a message." },
     .{ .name = "convert", .description = "Convert an attached photo/document/voice/audio/video to another format." },
     .{ .name = "magicword", .description = "<word> -- make Warden answer any message containing this word." },
+    .{ .name = "location", .description = "<place> | off -- set this chat's default location, used for briefing weather." },
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
     .{ .name = "welcome", .description = "<text> -- greet new members ({name} = their name), or off to disable." },
     .{ .name = "expense", .description = "add <amt> <category> [desc] | list | summary | delete <id> -- expense tracker." },
@@ -247,6 +248,7 @@ const help_text =
     \\
     \\Customization (owner only to change, anyone can view)
     \\/magicword <word> | off -- answer any message containing this word
+    \\/location <place> | off -- default location for briefing weather
     \\/persona <text> | off -- set/reset this chat's personality
     \\/thinking on|off|default -- show/hide the model's reasoning here,
     \\  overriding the bot-wide default
@@ -644,7 +646,7 @@ pub fn main(init: std.process.Init) !void {
         const tick_started = Io.Timestamp.now(io, .real);
         const now = tick_started.toSeconds();
         checkAndSendDueDigests(connectors, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
-        checkAndSendDueBriefings(connectors, gpa, &config, &pool, &briefing_scheduler, max_message_len, now);
+        checkAndSendDueBriefings(connectors, gpa, io, &config, &pool, &briefing_scheduler, max_message_len, now);
         checkAndSendDueReminders(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
@@ -1596,12 +1598,41 @@ fn loadBriefingScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool
     }
 }
 
-/// Same shape as `checkAndSendDueDigests` above, minus the `io`/
-/// `llm_provider` params that one needs -- `briefing.generate` is pure
-/// composition over already-stored data, no tool-call loop involved.
+/// One formatted weather line for a chat's default location, or `null` if
+/// the chat has none set, the lookup failed, or the place didn't geocode.
+///
+/// Every failure path returns `null` rather than propagating: a briefing
+/// that can't reach Open-Meteo should still deliver its reminders and
+/// alerts, not fail wholesale over the one section that needs the network.
+/// Kept here rather than inside `briefing.generate` so that function stays
+/// pure composition and its tests stay offline -- see its doc comment.
+fn briefingWeatherLine(a: std.mem.Allocator, io: Io, pool: *store_pool.PgPool, chat_id: i64) ?[]const u8 {
+    const location = chat_settings.getDefaultLocation(pool, a, chat_id) orelse return null;
+    const weather = @import("tools/weather.zig");
+    const reading = (weather.fetchWeather(a, io, location) catch |err| {
+        log.warn("briefing: weather lookup failed for \"{s}\": {t}", .{ location, err });
+        return null;
+    }) orelse {
+        log.warn("briefing: default location \"{s}\" didn't geocode", .{location});
+        return null;
+    };
+    return std.fmt.allocPrint(a, "{s}, {s}: {s}, {d:.1}°C, wind {d:.1} km/h", .{
+        reading.name,
+        reading.country,
+        weather.describeWeatherCode(reading.weather_code),
+        reading.temperature_2m,
+        reading.wind_speed_10m,
+    }) catch null;
+}
+
+/// Same shape as `checkAndSendDueDigests` above, minus the `llm_provider`
+/// param that one needs -- `briefing.generate` is pure composition over
+/// already-stored data, no tool-call loop involved. `io` is needed only for
+/// the optional weather section (see `briefingWeatherLine`).
 fn checkAndSendDueBriefings(
     connectors: []const iface.Connector,
     gpa: std.mem.Allocator,
+    io: Io,
     config: *const config_mod.Config,
     pool: *store_pool.PgPool,
     briefing_scheduler: *scheduler.BriefingScheduler,
@@ -1637,7 +1668,7 @@ fn checkAndSendDueBriefings(
         const briefing_interval_seconds = dynamic_config.getI64(pool, a, "WARDEN_BRIEFING_INTERVAL_SECONDS", config.briefing_interval_seconds);
         if (now - last_sent < briefing_interval_seconds) continue;
 
-        const briefing_text = briefing.generate(a, pool, chat_id, now) catch |err| {
+        const briefing_text = briefing.generate(a, pool, chat_id, now, briefingWeatherLine(a, io, pool, chat_id)) catch |err| {
             log.err("briefing: generate failed for chat {s}: {t}", .{ native_chat_id, err });
             continue;
         };
@@ -2049,7 +2080,7 @@ fn handleMessage(
         handleDigestCommand(connector, a, pool, chat_id, digest_scheduler, llm_provider, tool_ctx, now, max_message_len, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/briefing") or std.mem.startsWith(u8, text, "/briefing ")) {
         if (!feature_flags.isEnabled(pool, "briefings")) return false;
-        handleBriefingCommand(connector, a, pool, chat_id, briefing_scheduler, now, max_message_len, msg.chat_id, msg.message_id, text);
+        handleBriefingCommand(connector, a, io, pool, chat_id, briefing_scheduler, now, max_message_len, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
@@ -2153,6 +2184,8 @@ fn handleMessage(
         handleRedactCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text, sudo_active);
     } else if (std.mem.eql(u8, text, "/magicword") or std.mem.startsWith(u8, text, "/magicword ")) {
         handleMagicWord(connector, a, config, pool, chat_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/location") or std.mem.startsWith(u8, text, "/location ")) {
+        handleLocationCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/persona") or std.mem.startsWith(u8, text, "/persona ")) {
         handlePersonaCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/welcome") or std.mem.startsWith(u8, text, "/welcome ")) {
@@ -2480,6 +2513,71 @@ fn isAddressedToBot(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64
 }
 
 const magic_word_key = "magic_word";
+/// Generous enough for "San Francisco, California, United States" while
+/// still bounding what gets sent to the geocoder. Unlike the magic word
+/// this deliberately allows spaces -- almost every real place name has one.
+const max_location_len = 100;
+
+/// `/location` (view) / `/location <place>` (set) / `/location off`
+/// (clear). Viewing is open to anyone in the chat, changing is owner-only,
+/// the same split `/magicword` and `/persona` already use.
+///
+/// The place name is stored verbatim and only resolved at briefing time by
+/// Open-Meteo's geocoder, so this deliberately does *not* validate that the
+/// place exists: that would mean a network round trip on every `/location`
+/// call, and a geocoder outage would then block setting a location at all.
+/// A place that never resolves simply produces briefings with no weather
+/// section (see `briefingWeatherLine`), which is the same degradation as a
+/// transient lookup failure.
+fn handleLocationCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/location".len..], " ");
+
+    if (arg.len == 0) {
+        const reply_text = if (chat_settings.getDefaultLocation(pool, a, chat_id)) |loc|
+            std.fmt.allocPrint(a, "Default location: {s} — used for weather in briefings. Change it with /location <place>, clear it with /location off.", .{loc}) catch return
+        else
+            "No default location set — briefings won't include weather. Set one with /location <place>, e.g. /location Berlin.";
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can change the default location.");
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "off")) {
+        chat_settings.setDefaultLocation(pool, chat_id, null) catch |err| {
+            log.err("location: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't clear the location, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Default location cleared — briefings won't include weather.");
+        return;
+    }
+
+    if (arg.len > max_location_len) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That location name is too long (max 100 bytes).");
+        return;
+    }
+
+    chat_settings.setDefaultLocation(pool, chat_id, arg) catch |err| {
+        log.err("location: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that location, try again.");
+        return;
+    };
+    const confirm = std.fmt.allocPrint(a, "Default location set to {s} — briefings will include its weather.", .{arg}) catch return;
+    connector.sendMessage(a, msg.chat_id, confirm, msg.message_id);
+}
+
 const max_magic_word_len = 64;
 
 fn handleMagicWord(
@@ -4256,6 +4354,7 @@ fn handleDigestCommand(
 fn handleBriefingCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
+    io: Io,
     pool: *store_pool.PgPool,
     chat_id: i64,
     briefing_scheduler: *scheduler.BriefingScheduler,
@@ -4286,7 +4385,7 @@ fn handleBriefingCommand(
         };
         connector.sendMessage(a, native_chat_id, "Briefing disabled.", reply_to);
     } else if (std.mem.eql(u8, arg, "now")) {
-        const briefing_text = briefing.generate(a, pool, chat_id, now) catch |err| {
+        const briefing_text = briefing.generate(a, pool, chat_id, now, briefingWeatherLine(a, io, pool, chat_id)) catch |err| {
             log.err("briefing: generate failed for chat {s}: {t}", .{ native_chat_id, err });
             connector.sendMessage(a, native_chat_id, "Couldn't generate a briefing just now.", reply_to);
             return;
