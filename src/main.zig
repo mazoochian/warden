@@ -50,6 +50,9 @@ const stats = @import("store/stats.zig");
 const reminders = @import("store/reminders.zig");
 const notes = @import("store/notes.zig");
 const keyword_alerts = @import("store/keyword_alerts.zig");
+const expenses = @import("store/expenses.zig");
+const budgets = @import("store/budgets.zig");
+const subscriptions = @import("store/subscriptions.zig");
 const memories = @import("store/memories.zig");
 const embeddings = @import("llm/embeddings.zig");
 const reminder_format = @import("features/reminder_format.zig");
@@ -99,6 +102,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/find_chat_member.zig").tool,
     @import("tools/catch_me_up.zig").tool,
     @import("tools/create_poll.zig").tool,
+    @import("tools/set_expense.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
@@ -139,6 +143,9 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "magicword", .description = "<word> -- make Warden answer any message containing this word." },
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
     .{ .name = "welcome", .description = "<text> -- greet new members ({name} = their name), or off to disable." },
+    .{ .name = "expense", .description = "add <amt> <category> [desc] | list | summary | delete <id> -- expense tracker." },
+    .{ .name = "budget", .description = "set <category> <amt> | list | remove <category> -- monthly budgets. Owner to set." },
+    .{ .name = "subscription", .description = "add <name> <amt> every <interval> | list | remove <id> -- recurring costs." },
     .{ .name = "thinking", .description = "on|off|default -- show or hide the model's reasoning for this chat." },
     .{ .name = "mute", .description = "Reply to a user's message to mute them. Admins only." },
     .{ .name = "unmute", .description = "Reply to a user's message to unmute them. Admins only." },
@@ -179,18 +186,15 @@ const help_text =
     \\/poll <question> | <opt1> | <opt2> | ... -- create a poll (2-10 opts)
     \\
     \\Reminders, alerts, feeds
-    \\/remind <time> <message> -- e.g. /remind 30m take the bread out, or
-    \\  /remind 14:30 stand-up. Also: /remind every <interval> ... to
-    \\  repeat, /remind cancel <id>
+    \\/remind <time> <message> -- e.g. 30m/14:30/5-22. every <interval>
+    \\  to repeat, cancel <id> to cancel
     \\/reminders -- list your pending reminders
     \\/alert <crypto|weather|aqi> <subject> <above|below> <value> -- e.g.
-    \\  /alert crypto btc above 100000. Also: /alert cancel <id>
+    \\  /alert crypto btc above 100000. cancel <id> to cancel
     \\/alerts -- list pending alerts
     \\/watch, /unwatch <feed url>; /watches -- RSS/Atom feed notifications
-    \\/note add <text> | list | delete <id> -- notes/shopping lists for
-    \\  this chat. /notes lists them all
-    \\/memory list | forget <id> -- what I remember about you (I save
-    \\  things myself as we talk)
+    \\/note add <text> | list | delete <id> -- notes/shopping lists
+    \\/memory list | forget <id> -- what I remember (I save this myself)
     \\/keyword add <word> | list | remove <id> -- flag it here when said
     \\
     \\Messaging modes
@@ -208,34 +212,29 @@ const help_text =
     \\  overriding the bot-wide default
     \\/welcome <text> | off -- greet new members ({name} = their name)
     \\
+    \\Finance (manual entry only -- no bank/price-tracking integration)
+    \\/expense, /budget, /subscription -- type any of these alone for
+    \\  usage (or just ask, e.g. "log $12 for lunch")
+    \\
     \\Group moderation (chat admins only, most by replying to a message)
     \\/mute, /unmute, /pin, /unpin, /delete -- reply to the target
-    \\  message/user (unpin doesn't need a reply)
-    \\/kick, /ban [@username | user_id] -- reply to the target, or pass
-    \\  @username or their raw user id
-    \\/promote, /demote -- reply to a user's message to grant/revoke real
-    \\  admin rights. Bot owner only, not open to other chat admins
-    \\/confirm -- confirm a pending /kick or /ban
-    \\/cancel -- cancel your pending file conversion, or a pending
-    \\  /kick/ban if you're an admin
-    \\/redact <N> | (reply) [N] | text <substring> | regex <pattern> --
-    \\  delete up to 100 messages. regex is admin/owner only
+    \\/kick, /ban [@user|id] -- reply to the target, or pass @user/id
+    \\/promote, /demote -- reply to grant/revoke real admin. Owner only
+    \\/confirm, /cancel -- confirm/cancel a pending /kick or /ban
+    \\/redact <N> | (reply) [N] | text <sub> | regex <pat> -- delete up
+    \\  to 100 messages. regex is admin/owner only
     \\
     \\Tokens and credits (reply to a user, or pass @username, to view/set)
-    \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban per
-    \\  token spent. This chat's admins or any bot admin can grant these
-    \\/credit [balance] [@user] -- lets someone talk to the LLM, 1 credit per
-    \\  question. Bot admin/owner only (spends real API cost)
+    \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban
+    \\  per token. Chat admins/bot admins can grant these
+    \\/credit [balance] [@user] -- 1 credit per LLM question. Bot
+    \\  admin/owner only (spends real API cost)
     \\
-    \\Bot admins (trusted bot-wide, not scoped to one chat -- owner only to
-    \\grant/revoke; the owner counts as one automatically, everywhere)
-    \\/addadmin, /removeadmin -- reply to a user, or pass @username or their
-    \\  user id, to grant/revoke
-    \\/adduser, /removeuser -- reply to a user, or pass @username or their
-    \\  user id, to let them use this bot at all
+    \\Bot admins (trusted bot-wide -- owner only to grant/revoke)
+    \\/addadmin, /removeadmin, /adduser, /removeuser -- reply to a user,
+    \\  or pass @username/id, to grant/revoke that role
     \\/allowchat, /disallowchat -- allow/disallow this whole chat
-    \\/whois [@username | user_id] -- see their full name, username,
-    \\  platform id, and bot/bot-admin/superuser flags. Admin/owner only
+    \\/whois [@user|id] -- their name/username/id/flags. Admin/owner only
     \\/sudo <command> -- a bot admin can run any moderation command above
     \\  even where they aren't a real chat admin, e.g. /sudo kick
     \\
@@ -1160,6 +1159,13 @@ fn processMessageTask(
         .is_owner = auth.isOwner(config, connector.platform(), msg.user_id),
         .now = ts,
     };
+    var expense_adapter: ExpenseToolAdapter = .{
+        .pool = pool,
+        .chat_id = chat_id,
+        .identity_id = identity_id,
+        .is_owner = auth.isOwner(config, connector.platform(), msg.user_id),
+        .now = ts,
+    };
     var convert_flow_adapter: ConvertFlowToolAdapter = .{
         .pending = pending_conversions,
         .now = ts,
@@ -1205,6 +1211,7 @@ fn processMessageTask(
         // the tool for something that's a deploy-time config choice.
         .memory = if (embeddings_client != null) memory_adapter.sink() else null,
         .chat_history = chat_history_adapter.sink(),
+        .expenses = expense_adapter.sink(),
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -2099,6 +2106,15 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/keyword") or std.mem.startsWith(u8, text, "/keyword ")) {
         if (!feature_flags.isEnabled(pool, "keyword_alerts")) return false;
         handleKeywordCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/expense") or std.mem.startsWith(u8, text, "/expense ")) {
+        if (!feature_flags.isEnabled(pool, "finance")) return false;
+        handleExpenseCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/budget") or std.mem.startsWith(u8, text, "/budget ")) {
+        if (!feature_flags.isEnabled(pool, "finance")) return false;
+        handleBudgetCommand(connector, a, config, pool, chat_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/subscription") or std.mem.startsWith(u8, text, "/subscription ")) {
+        if (!feature_flags.isEnabled(pool, "finance")) return false;
+        handleSubscriptionCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/memory") or std.mem.startsWith(u8, text, "/memory ")) {
         if (!feature_flags.isEnabled(pool, "memory")) return false;
         handleMemoryCommand(connector, a, pool, identity_id, msg, text);
@@ -2595,6 +2611,516 @@ test "sendWelcomeMessages substitutes {name} per joined member, no-ops without a
     const no_join_msg = iface.Message{ .chat_id = "1", .user_id = "0" };
     sendWelcomeMessages(connector, a, &pool, chat_id, no_join_msg);
     try std.testing.expectEqual(@as(usize, 2), state.sent.items.len);
+}
+
+// ---------------------------------------------------------------------
+// Phase 17 (ROADMAP.md): finance trackers -- expenses, budgets,
+// subscriptions. Shared parsing/formatting helpers for all three below;
+// command handlers follow after `handleThinkingCommand`.
+// ---------------------------------------------------------------------
+
+const default_currency = "USD";
+
+/// Parses a plain decimal amount ("12", "12.5", "12.50") into integer
+/// cents -- real money, so this is a hand-rolled parser rather than
+/// `std.fmt.parseFloat` + rounding, which would reintroduce exactly the
+/// float-precision risk `0029_expenses.sql`'s doc comment explicitly
+/// rejects. Rejects negative/zero, more than 2 fractional digits, and
+/// anything that isn't plain digits and at most one `.`.
+fn parseAmountCents(s: []const u8) ?i64 {
+    if (s.len == 0) return null;
+    const dot = std.mem.indexOfScalar(u8, s, '.');
+    const whole_str = if (dot) |d| s[0..d] else s;
+    const frac_str = if (dot) |d| s[d + 1 ..] else "";
+    if (dot != null and (frac_str.len == 0 or frac_str.len > 2)) return null;
+    if (whole_str.len == 0) return null;
+
+    const whole = std.fmt.parseInt(i64, whole_str, 10) catch return null;
+    var frac: i64 = 0;
+    if (frac_str.len == 1) {
+        frac = (std.fmt.parseInt(i64, frac_str, 10) catch return null) * 10;
+    } else if (frac_str.len == 2) {
+        frac = std.fmt.parseInt(i64, frac_str, 10) catch return null;
+    }
+    const cents = whole * 100 + frac;
+    if (cents <= 0) return null;
+    return cents;
+}
+
+test "parseAmountCents handles whole numbers, one and two decimal digits, and rejects garbage" {
+    try std.testing.expectEqual(@as(?i64, 1200), parseAmountCents("12"));
+    try std.testing.expectEqual(@as(?i64, 1250), parseAmountCents("12.50"));
+    try std.testing.expectEqual(@as(?i64, 1250), parseAmountCents("12.5"));
+    try std.testing.expectEqual(@as(?i64, 5), parseAmountCents("0.05"));
+    try std.testing.expectEqual(@as(?i64, null), parseAmountCents(""));
+    try std.testing.expectEqual(@as(?i64, null), parseAmountCents("0"));
+    try std.testing.expectEqual(@as(?i64, null), parseAmountCents("-5"));
+    try std.testing.expectEqual(@as(?i64, null), parseAmountCents("12.500"));
+    try std.testing.expectEqual(@as(?i64, null), parseAmountCents(".50"));
+    try std.testing.expectEqual(@as(?i64, null), parseAmountCents("abc"));
+}
+
+/// "1250 USD" -> "12.50 USD" -- always shows the ISO currency code rather
+/// than guessing a symbol, matching how `tools/currency.zig`/`weather.zig`
+/// already handle units elsewhere in this codebase (explicit codes, no
+/// locale guessing).
+///
+/// The fractional part is cast to `u8` before formatting -- zero-padding a
+/// *signed* integer via `{d:0>2}` makes Zig 0.16's formatter print an
+/// explicit `+` for non-negative values (to stay unambiguous with a
+/// zero-padded negative), which every other zero-padded `{d:0>2}` call
+/// elsewhere in this codebase (`civil_time.zig`, `menu.zig`, `log.zig`)
+/// never hit because they all format already-unsigned `u8` clock fields.
+/// Found by this file's own test, not by inspection.
+fn formatMoney(a: std.mem.Allocator, cents: i64, currency: []const u8) ![]const u8 {
+    const frac: u8 = @intCast(@mod(cents, 100));
+    return std.fmt.allocPrint(a, "{d}.{d:0>2} {s}", .{ @divTrunc(cents, 100), frac, currency });
+}
+
+test "formatMoney pads single-digit cents and always includes the currency code" {
+    const a = std.testing.allocator;
+    const x = try formatMoney(a, 1250, "USD");
+    defer a.free(x);
+    try std.testing.expectEqualStrings("12.50 USD", x);
+
+    const y = try formatMoney(a, 5, "USD");
+    defer a.free(y);
+    try std.testing.expectEqualStrings("0.05 USD", y);
+}
+
+/// Parses a subscription's recurrence shorthand -- "30d", "1w", "1mo",
+/// "1y" -- into a plain day count. Longest-suffix-first ("mo" checked
+/// before a bare unit) so "1mo" doesn't parse as "1m" + trailing "o".
+/// Deliberately a different, smaller unit set than
+/// `reminder_format.zig`'s own duration parser (seconds/minutes/hours),
+/// since a subscription's cadence is always day-or-longer.
+fn parseIntervalDays(s: []const u8) ?i64 {
+    const suffixes = [_]struct { suffix: []const u8, days: i64 }{
+        .{ .suffix = "mo", .days = 30 },
+        .{ .suffix = "d", .days = 1 },
+        .{ .suffix = "w", .days = 7 },
+        .{ .suffix = "y", .days = 365 },
+    };
+    for (suffixes) |s_unit| {
+        if (std.mem.endsWith(u8, s, s_unit.suffix)) {
+            const num_str = s[0 .. s.len - s_unit.suffix.len];
+            const n = std.fmt.parseInt(i64, num_str, 10) catch continue;
+            if (n <= 0) return null;
+            return n * s_unit.days;
+        }
+    }
+    return null;
+}
+
+test "parseIntervalDays handles d/w/mo/y suffixes and rejects unknown units or non-positive counts" {
+    try std.testing.expectEqual(@as(?i64, 1), parseIntervalDays("1d"));
+    try std.testing.expectEqual(@as(?i64, 14), parseIntervalDays("2w"));
+    try std.testing.expectEqual(@as(?i64, 30), parseIntervalDays("1mo"));
+    try std.testing.expectEqual(@as(?i64, 730), parseIntervalDays("2y"));
+    try std.testing.expectEqual(@as(?i64, null), parseIntervalDays("1x"));
+    try std.testing.expectEqual(@as(?i64, null), parseIntervalDays("0d"));
+    try std.testing.expectEqual(@as(?i64, null), parseIntervalDays("-1d"));
+}
+
+/// Unix timestamp for the first moment of the current UTC calendar month
+/// containing `now` -- backs `/expense summary`'s and `/budget list`'s
+/// "this month" window. Naive UTC, same tradeoff `ctx.now`'s other
+/// consumers (digests, scheduler) already make.
+fn startOfMonthUnix(now: i64) i64 {
+    const c = civil_time.localFromUnix(now, 0);
+    return civil_time.unixFromLocal(.{ .year = c.year, .month = c.month, .day = 1 }, 0);
+}
+
+test "startOfMonthUnix returns midnight UTC on the 1st of the month containing now" {
+    // 2026-08-03 00:46:00 UTC (this session's own timestamp, arbitrary).
+    const now = civil_time.unixFromLocal(.{ .year = 2026, .month = 8, .day = 3, .hour = 0, .minute = 46 }, 0);
+    const start = startOfMonthUnix(now);
+    const c = civil_time.localFromUnix(start, 0);
+    try std.testing.expectEqual(@as(i32, 2026), c.year);
+    try std.testing.expectEqual(@as(u8, 8), c.month);
+    try std.testing.expectEqual(@as(u8, 1), c.day);
+    try std.testing.expectEqual(@as(u8, 0), c.hour);
+}
+
+/// Per-chat finance authorization: creator or the bot owner, same
+/// "shared, but only whoever added it (or the owner) may remove" model
+/// `/note delete`/`/keyword remove` already use.
+fn isFinanceOwnerOrCreator(config: *const config_mod.Config, connector: iface.Connector, msg: iface.Message, identity_id: i64, record_identity_id: i64) bool {
+    return record_identity_id == identity_id or auth.isOwner(config, connector.platform(), msg.user_id);
+}
+
+/// Per-chat expense tracker (ROADMAP.md's Phase 17) -- `/expense add
+/// <amount> <category> [description...]`, `/expense list [category]`,
+/// `/expense summary [all]` (defaults to this calendar month), `/expense
+/// delete <id>`. No currency conversion or per-chat currency setting in
+/// v1 -- every amount is recorded in `default_currency` (USD) and sums
+/// add across whatever's actually recorded, same documented limitation
+/// `store/expenses.zig`'s own doc comment flags. Receipt logging ("log
+/// this receipt" with a photo attached) needs no separate OCR plumbing
+/// here -- Phase 10's vision support already lets the model read the
+/// photo during normal Q&A; it just calls `set_expense` (see
+/// `tools/set_expense.zig`) with what it read, the same as if the user
+/// had typed the amount themselves.
+fn handleExpenseCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /expense add <amount> <category> [description], /expense list [category], /expense summary [all], or /expense delete <id>";
+    const arg = std.mem.trim(u8, text["/expense".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        const category = std.mem.trim(u8, it.rest(), " ");
+        const listed = expenses.listForChat(pool, a, chat_id, if (category.len > 0) category else null, null, 20) catch |err| {
+            log.err("expense: list failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't load expenses, try again.");
+            return;
+        };
+        connector.sendMessage(a, msg.chat_id, formatExpenseList(a, listed), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "summary")) {
+        const scope = std.mem.trim(u8, it.rest(), " ");
+        const since_ts: ?i64 = if (std.mem.eql(u8, scope, "all")) null else startOfMonthUnix(now);
+        connector.sendMessage(a, msg.chat_id, formatExpenseSummary(a, pool, chat_id, since_ts), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "delete")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /expense delete <id> (see /expense list for ids).");
+            return;
+        };
+        const expense = (expenses.get(pool, a, id) catch |err| {
+            log.err("expense: lookup failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that up, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No expense with that id.");
+            return;
+        };
+        if (expense.chat_id != chat_id) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No expense with that id.");
+            return;
+        }
+        if (!isFinanceOwnerOrCreator(config, connector, msg, identity_id, expense.identity_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only whoever logged that expense (or the owner) can delete it.");
+            return;
+        }
+        expenses.delete(pool, id) catch |err| {
+            log.err("expense: delete failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't delete that, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Expense deleted.");
+        return;
+    }
+
+    if (!std.mem.eql(u8, sub, "add")) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    const amount_str = it.next() orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    };
+    const cents = parseAmountCents(amount_str) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "That doesn't look like a valid amount -- try e.g. 12.50.");
+        return;
+    };
+    const category = it.next() orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    };
+    const description_raw = std.mem.trim(u8, it.rest(), " ");
+    const description: ?[]const u8 = if (description_raw.len > 0) description_raw else null;
+
+    const id = expenses.create(pool, chat_id, identity_id, cents, default_currency, category, description, now) catch |err| {
+        log.err("expense: failed to create for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that, try again.");
+        return;
+    };
+    const money = formatMoney(a, cents, default_currency) catch return;
+    const confirmation = std.fmt.allocPrint(a, "Expense #{d} logged: {s} ({s}).", .{ id, money, category }) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+fn formatExpenseList(a: std.mem.Allocator, listed: []const expenses.Expense) []const u8 {
+    if (listed.len == 0) return "No expenses logged yet. Add one with /expense add <amount> <category> [description].";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Recent expenses:\n", .{}) catch return "";
+    for (listed) |e| {
+        const money = formatMoney(a, e.amount_cents, e.currency) catch continue;
+        if (e.description) |d| {
+            w.print("  #{d} {s} ({s}) -- {s}\n", .{ e.id, money, e.category, d }) catch return "";
+        } else {
+            w.print("  #{d} {s} ({s})\n", .{ e.id, money, e.category }) catch return "";
+        }
+    }
+    return buf.writer.buffered();
+}
+
+/// Per-category breakdown + grand total since `since_ts` (null = all
+/// time), each category's line also showing its budget (if one's set)
+/// and whether it's over -- reuses `expenses.totalsByCategory`/
+/// `budgets.listForChat` rather than a joined SQL query, since both
+/// lists are already small (a personal chat's category count) and this
+/// keeps `store/expenses.zig`/`store/budgets.zig` independent of each
+/// other.
+fn formatExpenseSummary(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, since_ts: ?i64) []const u8 {
+    const totals = expenses.totalsByCategory(pool, a, chat_id, since_ts) catch |err| {
+        log.err("expense: summary failed for chat {d}: {t}", .{ chat_id, err });
+        return "Couldn't load the expense summary, try again.";
+    };
+    if (totals.len == 0) return "No expenses in that window.";
+
+    const budget_list = budgets.listForChat(pool, a, chat_id) catch &.{};
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Expense summary:\n", .{}) catch return "";
+    var grand_total: i64 = 0;
+    for (totals) |t| {
+        grand_total += t.total_cents;
+        const money = formatMoney(a, t.total_cents, default_currency) catch continue;
+        var budget_note: []const u8 = "";
+        for (budget_list) |b| {
+            if (!std.mem.eql(u8, b.category, t.category)) continue;
+            const budget_money = formatMoney(a, b.amount_cents, b.currency) catch break;
+            budget_note = if (t.total_cents > b.amount_cents)
+                std.fmt.allocPrint(a, " -- OVER budget of {s}", .{budget_money}) catch ""
+            else
+                std.fmt.allocPrint(a, " (budget {s})", .{budget_money}) catch "";
+            break;
+        }
+        w.print("  {s}: {s}{s}\n", .{ t.category, money, budget_note }) catch return "";
+    }
+    const grand_money = formatMoney(a, grand_total, default_currency) catch return buf.writer.buffered();
+    w.print("Total: {s}\n", .{grand_money}) catch return "";
+    return buf.writer.buffered();
+}
+
+/// Per-chat monthly budgets (ROADMAP.md's Phase 17) -- `/budget set
+/// <category> <amount>`, `/budget list`, `/budget remove <category>`.
+/// Same view-open-to-anyone/change-owner-only access model as `/persona`/
+/// `/welcome`: a budget is a shared chat-wide policy, not a personal
+/// item, so letting any member rewrite it is a bigger lever than logging
+/// their own expense.
+fn handleBudgetCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /budget set <category> <amount>, /budget list, or /budget remove <category>";
+    const arg = std.mem.trim(u8, text["/budget".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        connector.sendMessage(a, msg.chat_id, formatBudgetList(a, pool, chat_id, now), msg.message_id);
+        return;
+    }
+
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can change this chat's budgets.");
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "remove")) {
+        const category = std.mem.trim(u8, it.rest(), " ");
+        if (category.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /budget remove <category>");
+            return;
+        }
+        budgets.remove(pool, chat_id, category) catch |err| {
+            log.err("budget: remove failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't remove that, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Budget removed.");
+        return;
+    }
+
+    if (!std.mem.eql(u8, sub, "set")) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    const category = it.next() orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    };
+    const amount_str = std.mem.trim(u8, it.rest(), " ");
+    const cents = parseAmountCents(amount_str) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "That doesn't look like a valid amount -- try e.g. 300.");
+        return;
+    };
+
+    _ = budgets.set(pool, chat_id, category, cents, default_currency) catch |err| {
+        log.err("budget: set failed for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that, try again.");
+        return;
+    };
+    const money = formatMoney(a, cents, default_currency) catch return;
+    const confirmation = std.fmt.allocPrint(a, "Budget for {s} set to {s}/month.", .{ category, money }) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+fn formatBudgetList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, now: i64) []const u8 {
+    const listed = budgets.listForChat(pool, a, chat_id) catch |err| {
+        log.err("budget: list failed for chat {d}: {t}", .{ chat_id, err });
+        return "Couldn't load budgets, try again.";
+    };
+    if (listed.len == 0) return "No budgets set yet. Set one with /budget set <category> <amount>.";
+
+    const spent = expenses.totalsByCategory(pool, a, chat_id, startOfMonthUnix(now)) catch &.{};
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Budgets (this month):\n", .{}) catch return "";
+    for (listed) |b| {
+        var spent_cents: i64 = 0;
+        for (spent) |s| {
+            if (std.mem.eql(u8, s.category, b.category)) {
+                spent_cents = s.total_cents;
+                break;
+            }
+        }
+        const spent_money = formatMoney(a, spent_cents, b.currency) catch continue;
+        const budget_money = formatMoney(a, b.amount_cents, b.currency) catch continue;
+        const flag = if (spent_cents > b.amount_cents) " OVER" else "";
+        w.print("  {s}: {s} / {s}{s}\n", .{ b.category, spent_money, budget_money, flag }) catch return "";
+    }
+    return buf.writer.buffered();
+}
+
+/// Per-chat subscription/recurring-cost ledger (ROADMAP.md's Phase 17) --
+/// `/subscription add <name> <amount> every <interval>`, `/subscription
+/// list` (each entry's monthly-equivalent cost plus a running total),
+/// `/subscription remove <id>`. See `store/subscriptions.zig`'s doc
+/// comment for why this deliberately doesn't also fire its own reminders.
+fn handleSubscriptionCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /subscription add <name> <amount> every <interval e.g. 1mo>, /subscription list, or /subscription remove <id>";
+    const arg = std.mem.trim(u8, text["/subscription".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        connector.sendMessage(a, msg.chat_id, formatSubscriptionList(a, pool, chat_id), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "remove")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /subscription remove <id> (see /subscription list for ids).");
+            return;
+        };
+        const s = (subscriptions.get(pool, a, id) catch |err| {
+            log.err("subscription: lookup failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that up, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No subscription with that id.");
+            return;
+        };
+        if (s.chat_id != chat_id) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No subscription with that id.");
+            return;
+        }
+        if (!isFinanceOwnerOrCreator(config, connector, msg, identity_id, s.identity_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only whoever added that subscription (or the owner) can remove it.");
+            return;
+        }
+        subscriptions.remove(pool, id) catch |err| {
+            log.err("subscription: remove failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't remove that, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Subscription removed.");
+        return;
+    }
+
+    if (!std.mem.eql(u8, sub, "add")) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    // "<name...> <amount> every <interval>" -- name may be multiple words
+    // (e.g. "Amazon Prime"), so this parses from the *end*: the last two
+    // tokens must be "every <interval>", the token before that the
+    // amount, and everything before that the name. Same "join everything
+    // between fixed anchors" shape `/alert`'s own multi-word-subject
+    // parsing already uses.
+    const rest = std.mem.trim(u8, it.rest(), " ");
+    const every_idx = std.mem.lastIndexOf(u8, rest, " every ") orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    };
+    const before_every = std.mem.trim(u8, rest[0..every_idx], " ");
+    const interval_str = std.mem.trim(u8, rest[every_idx + " every ".len ..], " ");
+    const interval_days = parseIntervalDays(interval_str) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Bad interval -- try e.g. 30d, 1w, 1mo, or 1y.");
+        return;
+    };
+    const amount_idx = std.mem.lastIndexOfScalar(u8, before_every, ' ') orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    };
+    const name = std.mem.trim(u8, before_every[0..amount_idx], " ");
+    const amount_str = before_every[amount_idx + 1 ..];
+    if (name.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    const cents = parseAmountCents(amount_str) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "That doesn't look like a valid amount -- try e.g. 15.99.");
+        return;
+    };
+
+    const id = subscriptions.create(pool, chat_id, identity_id, name, cents, default_currency, interval_days, now) catch |err| {
+        log.err("subscription: failed to create for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that, try again.");
+        return;
+    };
+    const money = formatMoney(a, cents, default_currency) catch return;
+    const confirmation = std.fmt.allocPrint(a, "Subscription #{d} added: {s}, {s} every {s}.", .{ id, name, money, interval_str }) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+fn formatSubscriptionList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64) []const u8 {
+    const listed = subscriptions.listForChat(pool, a, chat_id) catch |err| {
+        log.err("subscription: list failed for chat {d}: {t}", .{ chat_id, err });
+        return "Couldn't load subscriptions, try again.";
+    };
+    if (listed.len == 0) return "No subscriptions tracked yet. Add one with /subscription add <name> <amount> every <interval>.";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Subscriptions:\n", .{}) catch return "";
+    var monthly_total: i64 = 0;
+    for (listed) |s| {
+        const money = formatMoney(a, s.amount_cents, s.currency) catch continue;
+        const monthly_eq = subscriptions.monthlyEquivalentCents(s.amount_cents, s.interval_days);
+        monthly_total += monthly_eq;
+        const monthly_money = formatMoney(a, monthly_eq, s.currency) catch continue;
+        w.print("  #{d} {s}: {s} every {d}d (~{s}/mo)\n", .{ s.id, s.name, money, s.interval_days, monthly_money }) catch return "";
+    }
+    const total_money = formatMoney(a, monthly_total, default_currency) catch return buf.writer.buffered();
+    w.print("Total: ~{s}/mo\n", .{total_money}) catch return "";
+    return buf.writer.buffered();
 }
 
 /// Per-chat override for whether a reasoning model's chain-of-thought is
@@ -4275,6 +4801,50 @@ const NoteToolAdapter = struct {
     }
 };
 
+/// Wires the `set_expense` LLM tool (see `tools/set_expense.zig`) to real
+/// Postgres-backed expenses — same shape/reasoning as `NoteToolAdapter`
+/// (ROADMAP.md's Phase 17). `amount_cents` arrives already converted from
+/// the tool's own dollar-amount input, so this adapter, like `formatAllNotes`'
+/// counterpart below, only ever handles the integer-cents unit.
+const ExpenseToolAdapter = struct {
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    is_owner: bool,
+    now: i64,
+
+    fn sink(self: *ExpenseToolAdapter) tool_registry.ExpenseSink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.ExpenseSink.VTable = .{
+        .create = createFn,
+        .delete = deleteFn,
+        .listAll = listAllFn,
+    };
+
+    fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, amount_cents: i64, category: []const u8, description: ?[]const u8) anyerror!i64 {
+        const self: *ExpenseToolAdapter = @ptrCast(@alignCast(ptr));
+        _ = allocator;
+        return expenses.create(self.pool, self.chat_id, self.identity_id, amount_cents, default_currency, category, description, self.now);
+    }
+
+    fn deleteFn(ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!tool_registry.ExpenseSink.DeleteResult {
+        const self: *ExpenseToolAdapter = @ptrCast(@alignCast(ptr));
+        const expense = (try expenses.get(self.pool, allocator, id)) orelse return .not_found;
+        if (expense.chat_id != self.chat_id) return .not_found;
+        if (expense.identity_id != self.identity_id and !self.is_owner) return .not_authorized;
+        try expenses.delete(self.pool, id);
+        return .deleted;
+    }
+
+    fn listAllFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8 {
+        const self: *ExpenseToolAdapter = @ptrCast(@alignCast(ptr));
+        const listed = try expenses.listForChat(self.pool, allocator, self.chat_id, null, null, 20);
+        return formatExpenseList(allocator, listed);
+    }
+};
+
 /// Wires the `set_alert` LLM tool (see `tools/set_alert.zig`) to real
 /// Postgres-backed alerts — same shape/reasoning as `ReminderToolAdapter`.
 const AlertToolAdapter = struct {
@@ -4770,6 +5340,7 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
         .{ .name = "convert_file", .key = "convert" },
         .{ .name = "catch_me_up", .key = "messaging_modes" },
         .{ .name = "create_poll", .key = "polls" },
+        .{ .name = "set_expense", .key = "finance" },
     };
     for (pairs) |p| {
         if (std.mem.eql(u8, p.name, name)) return p.key;
@@ -4811,6 +5382,7 @@ test "toolModuleKey maps tool names to their feature_flags module key" {
     try std.testing.expectEqualStrings("memory", toolModuleKey("remember_memory").?);
     try std.testing.expectEqualStrings("messaging_modes", toolModuleKey("catch_me_up").?);
     try std.testing.expectEqualStrings("polls", toolModuleKey("create_poll").?);
+    try std.testing.expectEqualStrings("finance", toolModuleKey("set_expense").?);
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("calculator"));
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("nonexistent_tool"));
 }
@@ -5576,6 +6148,9 @@ test {
     _ = @import("store/reminders.zig");
     _ = @import("store/notes.zig");
     _ = @import("store/keyword_alerts.zig");
+    _ = @import("store/expenses.zig");
+    _ = @import("store/budgets.zig");
+    _ = @import("store/subscriptions.zig");
     _ = @import("store/memories.zig");
     _ = @import("features/qa.zig");
     _ = @import("features/reminder_format.zig");
@@ -5596,6 +6171,7 @@ test {
     _ = @import("tools/find_chat_member.zig");
     _ = @import("tools/catch_me_up.zig");
     _ = @import("tools/create_poll.zig");
+    _ = @import("tools/set_expense.zig");
     _ = @import("llm/provider.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");

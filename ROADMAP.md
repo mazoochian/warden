@@ -1182,7 +1182,9 @@ reasoning doesn't change here.
   shows up in practice.
 
 ### Phase 17 — Finance trackers
-*Effort: M.*
+*Effort: M. Status: core done (2026-08-03) — expense tracker, budget
+planner, subscription tracker. Price/deal alerts deliberately held, not
+guessed at — see below.*
 
 Extends `alerts.zig` with a new alert kind (product/subscription price)
 rather than a parallel system, plus simple ledger tables for manual entry.
@@ -1191,6 +1193,101 @@ reminders, price/deal alerts. Receipt OCR line item depends on Phase 10.
 Explicitly not building: investment/portfolio tracking, tax tools, KPI
 dashboards — real-money-adjacent features where "close enough" is the
 wrong tradeoff for a spare-time personal project.
+
+**A note on rigor for this phase specifically**: even scoped to manual-
+entry ledgers rather than real payment handling, this phase touches real
+money in a way nothing else in this codebase does, so it got the same
+"close enough is the wrong tradeoff" scrutiny the intro paragraph above
+already calls for. Concretely: every amount is stored as an integer cents
+column (`amount_cents BIGINT`, `CHECK (amount_cents > 0)`), never a float,
+end to end — the parsing helpers (`parseAmountCents` for typed input,
+`centsFromAmount` for the LLM tool's dollar-amount float input) are the
+*only* place a float or decimal string is ever handled, and both convert
+to integer cents immediately rather than carrying a float through any
+storage or arithmetic. Two real bugs were caught by this pass's own tests
+before they shipped (see "Done" below) — both are exactly the kind of
+subtle-but-real bug that "close enough" would have let through.
+
+**Done:**
+- `store/expenses.zig` + migration `0029_expenses.sql` (`create`/
+  `listForChat`/`get`/`delete`/`totalsByCategory`/`totalForChat`) — chat-
+  scoped, creator-or-owner to delete, same model `notes.zig` established.
+  `/expense add <amount> <category> [description]`, `/expense list
+  [category]`, `/expense summary [all]` (defaults to the current calendar
+  month), `/expense delete <id>`.
+- `store/budgets.zig` + migration `0030_budgets.sql` (`set`/`listForChat`/
+  `remove`) — one budget per `(chat_id, category)`, hardcoded monthly
+  (not a selectable period, see the migration's own comment). `/budget
+  set <category> <amount>` / `/budget list` / `/budget remove <category>`
+  — chat-wide *policy*, so (unlike expenses) only the bot owner may
+  set/remove; viewing stays open, same access model `/persona`/`/welcome`
+  already use. `/expense summary` and `/budget list` both cross-reference
+  `expenses.totalsByCategory` against configured budgets and flag
+  anything over.
+- `store/subscriptions.zig` + migration `0031_subscriptions.sql`
+  (`create`/`listForChat`/`get`/`remove`/`monthlyEquivalentCents`) — a
+  read-only recurring-cost ledger ("what am I paying for, how much per
+  month total"), deliberately *not* a second reminder-firing scheduler:
+  "remind me when it's due" is already well served by the existing
+  `/remind every <interval> <message>` (Phase 3), so this doesn't
+  duplicate that — see the migration's own comment. `/subscription add
+  <name> <amount> every <interval e.g. 1mo>` / `/subscription list`
+  (each entry's 30-day-month-equivalent cost, plus a running total) /
+  `/subscription remove <id>`.
+- **"Bill reminders" from this phase's own original scope note is already
+  covered by the existing `/remind every <interval> <message>`** — no new
+  code needed, just documented here so it isn't mistaken for an oversight.
+- **Receipt OCR needed no new plumbing** — Phase 10's vision support
+  already lets the model read a photo during normal Q&A; sending a
+  receipt and asking to log it just means the model extracts the
+  amount/category itself and calls the same `set_expense` tool it would
+  from typed text (see below). No dedicated OCR feature was built.
+- `set_expense` LLM tool (`tools/set_expense.zig`, action=create/list/
+  delete) — the natural-language front end for expenses (reminders/
+  alerts/notes/memory all have one; budgets/subscriptions don't, see
+  below). Takes a plain dollar amount (not cents) and converts it via
+  `centsFromAmount` (rounds to the nearest cent, rejects non-positive/
+  non-finite input) before it ever reaches the store layer.
+- **Scope decision: no `set_budget`/`set_subscription` tools this pass**
+  — both are less naturally something a user just mentions in passing
+  the way an expense or a reminder is; `/budget`/`/subscription` cover
+  the real use case for now. Revisit if natural-language budget/
+  subscription requests turn out to be common.
+- New `finance` feature flag gates `/expense`, `/budget`,
+  `/subscription`, and `set_expense` together.
+- **Two real bugs caught by this pass's own tests, not by inspection**:
+  (1) `formatMoney`'s cents-formatting used `{d:0>2}` (zero-padded width)
+  directly on the *signed* `i64` result of `@mod(cents, 100)` — Zig
+  0.16's formatter prints an explicit `+` for a non-negative value under
+  zero-padding on a signed type (to stay unambiguous with a zero-padded
+  negative), which every pre-existing `{d:0>2}` call elsewhere in this
+  codebase (`civil_time.zig`/`menu.zig`/`log.zig`) never hit because they
+  all format already-unsigned `u8` clock fields — this file's own
+  `formatMoney` test caught "12.+50 USD" instead of "12.50 USD"
+  immediately. Fixed by casting the fractional part to `u8` before
+  formatting. (2) A test-data bug (not a code bug) in
+  `expenses.totalsByCategory`'s own test — the test's hand-computed
+  "expected" category order didn't actually match the totals it set up
+  (transport's single $20 entry outweighs food's two entries summing to
+  $15), caught by the same "run it, don't just read it" discipline.
+- `zig build` and `zig build test` both green (542/544; 1 expected skip,
+  1 crash is the same pre-existing `http_util.zig` fetch segfault flagged
+  in every other pass this session, unrelated to this change).
+- **Not live-verified** — no real Telegram chat exercised this pass;
+  covered by unit/store tests (integer-cents round trips, category/date
+  filtering, budget-vs-spend cross-referencing, the two bugs above).
+
+**Deliberately held, not guessed at (per explicit instruction this
+pass)**: **price/deal alerts** for arbitrary products. Unlike the
+existing `crypto`/`weather`/`aqi` alert kinds, there's no free, reliable,
+structured API for an arbitrary product's current price — building this
+would mean scraping shopping-site pages (reusing `scrape_site`'s on-device
+extraction) and/or an LLM call to extract a price from what's scraped,
+neither of which is a small wiring job the way the existing alert kinds
+were: it's a real product decision (which sites to support, how often to
+check against likely anti-scraping measures, whether the LLM-extraction
+cost per check is worth it) rather than something to guess into
+existence. Flagged here for a real design pass, not silently dropped.
 
 ### Phase 18 — Media generation
 *Effort: M/L.*

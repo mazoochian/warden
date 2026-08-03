@@ -119,6 +119,43 @@ pub const NoteSink = struct {
     }
 };
 
+/// Same ptr+vtable shape as `NoteSink`, for the `set_expense` tool
+/// (ROADMAP.md's Phase 17) -- lets the model log an expense from natural
+/// language ("I spent $12 on lunch") or a receipt photo it can already
+/// see via Phase 10's vision support, with no separate OCR plumbing
+/// needed: the model reads the amount/items off the image itself and
+/// calls this like any other expense. `amount_cents` is already
+/// converted from the model's dollar-amount input by the tool itself
+/// (see `tools/set_expense.zig`), so this sink -- like every store-layer
+/// boundary in this file -- only ever deals in the exact integer unit
+/// real money is stored as.
+pub const ExpenseSink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const DeleteResult = enum { deleted, not_found, not_authorized };
+
+    pub const VTable = struct {
+        create: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, amount_cents: i64, category: []const u8, description: ?[]const u8) anyerror!i64,
+        delete: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!DeleteResult,
+        /// Same "sink formats its own listing" reasoning as
+        /// `ReminderSink.VTable.listPending`.
+        listAll: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8,
+    };
+
+    pub fn create(self: ExpenseSink, allocator: std.mem.Allocator, amount_cents: i64, category: []const u8, description: ?[]const u8) !i64 {
+        return self.vtable.create(self.ptr, allocator, amount_cents, category, description);
+    }
+
+    pub fn delete(self: ExpenseSink, allocator: std.mem.Allocator, id: i64) !DeleteResult {
+        return self.vtable.delete(self.ptr, allocator, id);
+    }
+
+    pub fn listAll(self: ExpenseSink, allocator: std.mem.Allocator) ![]const u8 {
+        return self.vtable.listAll(self.ptr, allocator);
+    }
+};
+
 /// Same ptr+vtable shape as `NoteSink`, for the `remember_memory` tool —
 /// see `store/memories.zig`'s doc comment for the "explicit remember/
 /// forget, per-identity, not per-chat" scope decision (ROADMAP.md's Phase
@@ -268,6 +305,9 @@ pub const ToolContext = struct {
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `catch_me_up` tool.
     chat_history: ?ChatHistorySink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `set_expense` tool.
+    expenses: ?ExpenseSink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the

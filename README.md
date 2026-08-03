@@ -25,6 +25,7 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Polls: `/poll <question> | <option 1> | <option 2> | ...` (2-10 options) sends a real native poll, or just ask in natural language ("make a poll asking pizza or sushi")
 - Keyword Alerts: `/keyword add <word>` tracks a word for this chat — whenever anyone's message mentions it, the bot flags it right there (whole-word, case-insensitive, no LLM call). `/keyword list` / `/keyword remove <id>` manage the list, creator-or-owner to remove
 - Welcome Messages: `/welcome <text>` (owner only to set; `{name}` is replaced with the new member's name) greets anyone who joins the chat automatically; `/welcome off` disables it. Off by default — opt in per chat
+- Finance: `/expense add <amount> <category> [description]` (or just say it, or send a receipt photo) logs a manual expense — amounts are always stored as integer cents, never a float. `/expense summary` shows a category breakdown against any `/budget set <category> <amount>` (owner-only, monthly). `/subscription add <name> <amount> every <interval>` tracks recurring costs and their monthly-equivalent total — for reminders when they're due, use the existing `/remind every <interval> <message>`. No price/deal-alert or bank-integration features — manual entry only
 
 # Talking to the bot
 Nobody but the owner (and any bot admins — see "Access control" below) can
