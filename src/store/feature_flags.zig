@@ -77,6 +77,7 @@ pub const known_modules = [_]ModuleInfo{
     .{ .key = "voice_transcription", .label = "Voice Transcription", .category = .standalone },
     .{ .key = "menu", .label = "Menu", .category = .standalone },
     .{ .key = "messaging_modes", .label = "Messaging Modes", .category = .standalone },
+    .{ .key = "polls", .label = "Polls", .category = .standalone },
     .{ .key = "weather", .label = "Weather", .category = .llm_tool },
     .{ .key = "crypto_price", .label = "Crypto Prices", .category = .llm_tool },
     .{ .key = "air_quality", .label = "Air Quality", .category = .llm_tool },

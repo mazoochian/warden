@@ -97,6 +97,7 @@ const base_tools = [_]tool_registry.ToolDef{
     convert_file.tool,
     @import("tools/find_chat_member.zig").tool,
     @import("tools/catch_me_up.zig").tool,
+    @import("tools/create_poll.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
@@ -127,6 +128,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "unwatch", .description = "<feed url> -- stop watching a feed." },
     .{ .name = "watches", .description = "List feeds this chat is watching." },
     .{ .name = "watchcheck", .description = "<feed url> -- force an immediate check of a watch, for testing." },
+    .{ .name = "poll", .description = "<question> | <opt1> | <opt2> | ... -- create a poll (2-10 options)." },
     .{ .name = "translate", .description = "<language> <text> -- translate text, or reply to a message with just the language." },
     .{ .name = "rewrite", .description = "<tone> <text> -- rewrite text in a given tone, or reply to a message with just the tone." },
     .{ .name = "eli5", .description = "<text> -- explain like I'm five, or reply to a message." },
@@ -171,17 +173,17 @@ const help_text =
     \\/wordcloud -- word cloud from recent activity
     \\/digest on|off|now -- enable/disable/generate a recent-activity summary
     \\/briefing on|off|now -- like /digest
+    \\/poll <question> | <opt1> | <opt2> | ... -- create a poll (2-10 opts)
     \\
     \\Reminders, alerts, feeds
     \\/remind <time> <message> -- e.g. /remind 30m take the bread out, or
-    \\  /remind 14:30 stand-up. Also: /remind every <interval> <message> to
+    \\  /remind 14:30 stand-up. Also: /remind every <interval> ... to
     \\  repeat, /remind cancel <id>
     \\/reminders -- list your pending reminders
     \\/alert <crypto|weather|aqi> <subject> <above|below> <value> -- e.g.
     \\  /alert crypto btc above 100000. Also: /alert cancel <id>
     \\/alerts -- list pending alerts
-    \\/watch, /unwatch <feed url>; /watches -- RSS/Atom feed notifications.
-    \\  /watchcheck <feed url> forces an immediate check
+    \\/watch, /unwatch <feed url>; /watches -- RSS/Atom feed notifications
     \\/note add <text> | list | delete <id> -- notes/shopping lists for
     \\  this chat. /notes lists them all
     \\/memory list | forget <id> -- what I remember about you (I save
@@ -192,9 +194,8 @@ const help_text =
     \\  give text, or reply with just the first arg
     \\
     \\Files
-    \\/convert -- start a guided conversion (I'll ask you to send a file);
-    \\  or send a file with "/convert <format>" as its caption for one shot,
-    \\  e.g. /convert pdf
+    \\/convert -- guided conversion (asks you to send a file); or send a
+    \\  file with "/convert <format>" as its caption for one shot
     \\
     \\Customization (owner only to change, anyone can view)
     \\/magicword <word> -- make me answer any message containing it, or
@@ -1738,6 +1739,80 @@ test "modeArgOrReplyText prefers explicit text, falls back to reply_to_text, els
     try std.testing.expectEqual(@as(?[]const u8, null), modeArgOrReplyText("", null));
 }
 
+const create_poll_max_options = 10;
+
+/// One `|`-delimited part parsed by `parsePollCommand`, still owning the
+/// whole allocation (`parts`) that `question`/`options` are views into --
+/// callers that need to free it (tests using `testing.allocator` directly;
+/// production call sites pass a per-message arena and never bother) must
+/// free `parts` as a whole, not `options` alone, since `options` is a
+/// sub-slice starting at index 1, not its own allocation.
+const ParsedPoll = struct {
+    question: []const u8,
+    options: [][]const u8,
+    parts: [][]const u8,
+};
+
+/// Parses `/poll <question> | <option1> | <option2> | ...` (ROADMAP.md's
+/// Phase 16) into a question and 2-10 trimmed options, or an error string
+/// to reply with. `|`-delimited rather than `/remind`-style keyword
+/// parsing since a poll question or option could legitimately contain
+/// almost any word.
+fn parsePollCommand(a: std.mem.Allocator, arg: []const u8) union(enum) { ok: ParsedPoll, err: []const u8 } {
+    var parts: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, arg, '|');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) parts.append(a, trimmed) catch return .{ .err = "Couldn't parse that poll, try again." };
+    }
+    const owned = parts.toOwnedSlice(a) catch return .{ .err = "Couldn't parse that poll, try again." };
+    if (owned.len < 3) {
+        a.free(owned);
+        return .{ .err = "Usage: /poll <question> | <option 1> | <option 2> | ... (2-10 options)." };
+    }
+    if (owned.len - 1 > create_poll_max_options) {
+        a.free(owned);
+        return .{ .err = "A poll can have at most 10 options." };
+    }
+    return .{ .ok = .{ .question = owned[0], .options = owned[1..], .parts = owned } };
+}
+
+fn handlePollCommand(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/poll".len..], " \t");
+    switch (parsePollCommand(a, arg)) {
+        .err => |e| connector.sendMessage(a, msg.chat_id, e, msg.message_id),
+        .ok => |parsed| connector.sendPoll(a, msg.chat_id, parsed.question, parsed.options, msg.message_id),
+    }
+}
+
+test "parsePollCommand splits on | and trims whitespace, requiring at least 2 options" {
+    const a = std.testing.allocator;
+
+    const ok = parsePollCommand(a, "pizza or sushi? | pizza | sushi");
+    defer switch (ok) {
+        .ok => |v| a.free(v.parts),
+        .err => {},
+    };
+    try std.testing.expect(ok == .ok);
+    try std.testing.expectEqualStrings("pizza or sushi?", ok.ok.question);
+    try std.testing.expectEqual(@as(usize, 2), ok.ok.options.len);
+    try std.testing.expectEqualStrings("pizza", ok.ok.options[0]);
+    try std.testing.expectEqualStrings("sushi", ok.ok.options[1]);
+
+    const too_few = parsePollCommand(a, "just a question");
+    try std.testing.expect(too_few == .err);
+}
+
+test "parsePollCommand rejects more than 10 options" {
+    const a = std.testing.allocator;
+    const many = parsePollCommand(a, "q | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11");
+    defer switch (many) {
+        .ok => |v| a.free(v.parts),
+        .err => {},
+    };
+    try std.testing.expect(many == .err);
+}
+
 /// Returns whether this message's attachment (if any) was claimed by the
 /// interactive `/convert` flow — `processMessageTask` must not delete a
 /// claimed file via its own attachment-cleanup `defer` (see
@@ -2065,6 +2140,14 @@ fn handleMessage(
         };
         const question = std.fmt.allocPrint(a, "Brainstorm this: give a short list of concrete ideas or options. If it reads like a decision between choices, briefly weigh the trade-offs too:\n\n{s}", .{source}) catch return false;
         handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+    } else if (std.mem.eql(u8, text, "/poll") or std.mem.startsWith(u8, text, "/poll ")) {
+        // ROADMAP.md's Phase 16: group/Telegram quality-of-life. No LLM call
+        // involved (plain string splitting + a native API call), so unlike
+        // the messaging-mode commands above this needs no owner/credits
+        // gate -- same "open to anyone allowed in the chat" tier as
+        // /wordcloud//stats.
+        if (!feature_flags.isEnabled(pool, "polls")) return false;
+        handlePollCommand(connector, a, msg, text);
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
@@ -4398,6 +4481,7 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
         .{ .name = "begin_file_conversion", .key = "convert" },
         .{ .name = "convert_file", .key = "convert" },
         .{ .name = "catch_me_up", .key = "messaging_modes" },
+        .{ .name = "create_poll", .key = "polls" },
     };
     for (pairs) |p| {
         if (std.mem.eql(u8, p.name, name)) return p.key;
@@ -4438,6 +4522,7 @@ test "toolModuleKey maps tool names to their feature_flags module key" {
     try std.testing.expectEqualStrings("notes", toolModuleKey("set_note").?);
     try std.testing.expectEqualStrings("memory", toolModuleKey("remember_memory").?);
     try std.testing.expectEqualStrings("messaging_modes", toolModuleKey("catch_me_up").?);
+    try std.testing.expectEqualStrings("polls", toolModuleKey("create_poll").?);
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("calculator"));
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("nonexistent_tool"));
 }
@@ -5221,6 +5306,7 @@ test {
     _ = @import("tools/begin_conversion.zig");
     _ = @import("tools/find_chat_member.zig");
     _ = @import("tools/catch_me_up.zig");
+    _ = @import("tools/create_poll.zig");
     _ = @import("llm/provider.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");

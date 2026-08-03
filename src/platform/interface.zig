@@ -270,6 +270,11 @@ pub const Connector = struct {
         /// how `convert_file` delivers a converted file. Optional like
         /// `sendPhoto`, with the same "unsupported platform" fallback.
         sendDocument: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, file_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void = null,
+        /// Sends a native poll (ROADMAP.md's Phase 16), if this platform has
+        /// the concept. Fire-and-forget like `sendPhoto`/`sendDocument` --
+        /// the wrapper method below falls back to a plain text listing of
+        /// the question/options when unsupported.
+        sendPoll: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, question: []const u8, options: []const []const u8, reply_to_message_id: ?[]const u8) void = null,
         /// This platform's hard limit on a single text message's length, in
         /// bytes, if it enforces one. Optional/null when a platform has no
         /// small fixed limit (e.g. Matrix/XMPP cap on total event/stanza
@@ -390,6 +395,21 @@ pub const Connector = struct {
             return;
         };
         f(self.ptr, allocator, chat_id, file_bytes, file_name, caption);
+    }
+
+    /// Renders `question`/`options` as plain numbered text when this
+    /// platform has no native poll concept -- same "degrade to text rather
+    /// than silently drop it" convention `sendPhoto`/`sendDocument` already
+    /// use for their own unsupported case.
+    pub fn sendPoll(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, question: []const u8, options: []const []const u8, reply_to_message_id: ?[]const u8) void {
+        const f = self.vtable.sendPoll orelse {
+            var buf: std.Io.Writer.Allocating = .init(allocator);
+            buf.writer.print("{s}\n", .{question}) catch return;
+            for (options, 0..) |opt, i| buf.writer.print("{d}. {s}\n", .{ i + 1, opt }) catch return;
+            self.sendMessage(allocator, chat_id, buf.writer.buffered(), reply_to_message_id);
+            return;
+        };
+        f(self.ptr, allocator, chat_id, question, options, reply_to_message_id);
     }
 
     /// `null` when this connector doesn't declare a limit — see

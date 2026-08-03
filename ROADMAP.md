@@ -1060,7 +1060,8 @@ write-capable API (draft/send email) rather than a read-only public one
 (weather, crypto, RSS).
 
 ### Phase 16 — Group/Telegram quality-of-life
-*Effort: S/M.*
+*Effort: S/M. Status: slice 1 done (poll generation) — see below for what
+shipped vs. what's deferred.*
 
 Extends `group_admin.zig`'s existing moderation surface rather than adding
 a new subsystem. Covers: welcome messages, scheduled announcements,
@@ -1069,6 +1070,58 @@ summaries (composes `digest.zig`, already exists in spirit). Spam
 detection/auto-moderation stays explicitly out of scope — already
 deferred in Phase 8's backlog over trust-model concerns, and that
 reasoning doesn't change here.
+
+**Done (slice 1, 2026-08-03):**
+- New `Connector.sendPoll` (optional vtable slot, `platform/interface.zig`)
+  — same "optional, degrades to plain text when a platform doesn't
+  support it" convention as `sendPhoto`/`sendDocument`. Telegram's
+  implementation (`telegram/client.zig`) sends a real native poll via Bot
+  API 7's `InputPollOption` shape (`{"text": "..."}` objects, not bare
+  strings); fire-and-forget like `sendPhoto`, logging rather than
+  propagating a failure.
+- `/poll <question> | <option 1> | <option 2> | ...` (`main.zig`'s
+  `parsePollCommand`/`handlePollCommand`) — `|`-delimited rather than
+  `/remind`-style keyword parsing, since a question or option could
+  legitimately contain almost any word. 2-10 options, same range Telegram
+  itself enforces. No LLM call involved, so unlike the Phase 14 messaging-
+  mode commands this needs no owner/credits gate — same "open to anyone
+  allowed in the chat" tier as `/wordcloud`/`/stats`.
+- `create_poll` LLM tool (`tools/create_poll.zig`) — natural-language front
+  end ("make a poll asking pizza or sushi") landing on the same
+  `Connector.sendPoll`, same "command + tool, one implementation" shape
+  Phase 14's `catch_me_up` established.
+- New `polls` feature flag gates both.
+- `zig build` and `zig build test` both green (520/522; 1 expected skip, 1
+  crash is the same pre-existing `http_util.zig` fetch segfault flagged in
+  Phase 13/14's own status notes, unrelated to this change).
+- **Not live-verified** — no real Telegram chat exercised this pass;
+  covered by unit tests (`parsePollCommand`'s parsing/limits,
+  `create_poll`'s option-count validation against a fake connector) but
+  not confirmed against a real Bot API `sendPoll` call. Noted honestly
+  rather than claimed, same standard held elsewhere in this file.
+
+**Deferred, not built this pass:**
+- **Keyword alerts** and **welcome messages** are next in line for a
+  follow-up slice — both need real new plumbing (a per-chat keyword list
+  + a message-scan hook for the former; a new "someone just joined" signal
+  distinct from the existing `observed_users` bag, which today conflates
+  joins with replies/mentions/`new_chat_members` for identity-registration
+  purposes only, for the latter), not done in this pass for time.
+- **Scheduled announcements** needs its own storage + scheduler (a
+  genuinely separate sub-feature, not "extends the existing moderation
+  surface" the way the rest of this phase does) — bigger than this slice's
+  scope, revisit as its own pass.
+- **Auto-pin important messages** — deferred as genuinely ambiguous
+  without a real definition of "important" (message length? reply count?
+  an LLM judgment call per message, which would mean an LLM call on every
+  single message — expensive and a scope change from every other
+  passive/mechanical feature in this phase). Needs a real design decision
+  before it's buildable, not a quick follow-up.
+- **Group summaries** — already covered by the existing `/digest` and
+  Phase 14's `catch_me_up`; building a third, subtly-different "summarize
+  this group" surface would be redundant rather than additive. Not
+  planned unless a real gap between those two and what this item wants
+  shows up in practice.
 
 ### Phase 17 — Finance trackers
 *Effort: M.*

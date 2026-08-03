@@ -279,6 +279,7 @@ pub const TelegramConnector = struct {
         .sendMessage = sendMessageFn,
         .sendPhoto = sendPhotoFn,
         .sendDocument = sendDocumentFn,
+        .sendPoll = sendPollFn,
         .maxMessageLength = maxMessageLengthFn,
         .downloadFile = downloadFileFn,
         .sendMessageReturningId = sendMessageReturningIdFn,
@@ -540,6 +541,13 @@ pub const TelegramConnector = struct {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         const id = parseChatId(chat_id) orelse return;
         self.client.sendDocument(allocator, id, file_bytes, file_name, caption);
+    }
+
+    fn sendPollFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, question: []const u8, options: []const []const u8, reply_to_message_id: ?[]const u8) void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        const id = parseChatId(chat_id) orelse return;
+        const reply_id: ?i64 = if (reply_to_message_id) |r| parseId(r) catch null else null;
+        self.client.sendPoll(allocator, id, question, options, reply_id);
     }
 
     fn downloadFileFn(ptr: *anyopaque, allocator: std.mem.Allocator, file_id: []const u8) anyerror![]u8 {

@@ -409,6 +409,34 @@ pub const Client = struct {
         }
     }
 
+    /// Sends a native Telegram poll (ROADMAP.md's Phase 16). Fire-and-
+    /// forget like `sendMessage`/`sendPhoto` -- a failed poll (bad
+    /// question/options, bot lacking permission, etc.) is logged, not
+    /// propagated, so a caller's own reply flow never has to special-case
+    /// it. `options` up to Bot API 7's `InputPollOption` shape (an object
+    /// with a `text` field, not a bare string).
+    pub fn sendPoll(self: *Client, allocator: std.mem.Allocator, chat_id: i64, question: []const u8, options: []const []const u8, reply_to_message_id: ?i64) void {
+        self.sendPollErr(allocator, chat_id, question, options, reply_to_message_id) catch |err| {
+            std.log.err("sendPoll failed: {t}", .{err});
+        };
+    }
+
+    fn sendPollErr(self: *Client, allocator: std.mem.Allocator, chat_id: i64, question: []const u8, options: []const []const u8, reply_to_message_id: ?i64) !void {
+        const PollOption = struct { text: []const u8 };
+        const opts = try allocator.alloc(PollOption, options.len);
+        defer allocator.free(opts);
+        for (options, 0..) |o, i| opts[i] = .{ .text = o };
+
+        const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
+
+        return self.callMethod(allocator, "sendPoll", .{
+            .chat_id = chat_id,
+            .question = question,
+            .options = opts,
+            .reply_parameters = reply_parameters,
+        });
+    }
+
     /// Sends an arbitrary file as a document (e.g. a converted file from
     /// `convert_file`, or the text-too-long fallback). Fire-and-forget like
     /// `sendMessage`/`sendPhoto`.
