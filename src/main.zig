@@ -126,7 +126,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "briefing", .description = "on | off | now -- enable, disable, or generate a briefing of pending reminders/alerts." },
     .{ .name = "remind", .description = "<time> <message> -- set a reminder. Also: every <interval> ..., cancel <id>." },
     .{ .name = "reminders", .description = "List your pending reminders in this chat." },
-    .{ .name = "note", .description = "add <text> | list | delete <id> -- a shared notes/lists space for this chat." },
+    .{ .name = "note", .description = "add <text> | list | delete <id> -- a shared notes/lists space; caption a voice message with /note to save its transcript." },
     .{ .name = "notes", .description = "List every note in this chat." },
     .{ .name = "memory", .description = "list | forget <id> -- what I remember about you, across every chat." },
     .{ .name = "keyword", .description = "add <word> | list | remove <id> -- get flagged here when a word comes up." },
@@ -235,6 +235,7 @@ const help_text =
     \\/alerts -- list pending alerts
     \\/watch, /unwatch <feed url>; /watches -- RSS/Atom feed notifications
     \\/note add <text> | list | delete <id> -- notes/shopping lists
+    \\  (caption a voice message with /note to save its transcript)
     \\/memory list | forget <id> -- what I remember (I save this myself)
     \\/keyword add <word> | list | remove <id> -- flag it here when said
     \\
@@ -2202,7 +2203,7 @@ fn handleMessage(
         handleRemindersList(connector, a, pool, chat_id, now, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/note") or std.mem.startsWith(u8, text, "/note ")) {
         if (!feature_flags.isEnabled(pool, "notes")) return false;
-        handleNoteCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
+        handleNoteCommand(connector, a, io, config, pool, tool_ctx, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/notes")) {
         handleNotesList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/keyword") or std.mem.startsWith(u8, text, "/keyword ")) {
@@ -4545,6 +4546,129 @@ fn handleRemindersList(
     connector.sendMessage(a, native_chat_id, formatPendingReminders(a, pool, pending, now), reply_to);
 }
 
+/// True when this `/note` is really "save my voice message as a note":
+/// the message carries a voice attachment and the command was given with no
+/// text of its own (bare `/note`, or `/note add` with nothing after it).
+///
+/// Split out as a pure function purely so it can be tested without a
+/// connector, a pool, or a whisper server -- the transcription itself needs
+/// all three, so the decision logic is the part worth covering offline.
+fn isVoiceNoteRequest(kind: ?iface.AttachmentKind, arg: []const u8) bool {
+    const k = kind orelse return false;
+    if (k != .voice) return false;
+    return arg.len == 0 or std.mem.eql(u8, arg, "add");
+}
+
+test "isVoiceNoteRequest: a voice attachment with a bare /note (or /note add) is a voice note" {
+    try std.testing.expect(isVoiceNoteRequest(.voice, ""));
+    try std.testing.expect(isVoiceNoteRequest(.voice, "add"));
+}
+
+test "isVoiceNoteRequest: /note with real text is a normal note even on a voice message" {
+    // Someone who captions a voice message "/note add buy milk" meant the
+    // text, not the audio -- the explicit words win over the attachment.
+    try std.testing.expect(!isVoiceNoteRequest(.voice, "add buy milk"));
+    try std.testing.expect(!isVoiceNoteRequest(.voice, "list"));
+    try std.testing.expect(!isVoiceNoteRequest(.voice, "delete 3"));
+}
+
+test "isVoiceNoteRequest: only voice attachments qualify" {
+    // A photo or PDF has no audio to transcribe; those keep the old
+    // usage-string behaviour rather than silently doing nothing.
+    try std.testing.expect(!isVoiceNoteRequest(.photo, ""));
+    try std.testing.expect(!isVoiceNoteRequest(.document, ""));
+    try std.testing.expect(!isVoiceNoteRequest(.audio, ""));
+    try std.testing.expect(!isVoiceNoteRequest(.video, ""));
+    try std.testing.expect(!isVoiceNoteRequest(null, ""));
+}
+
+/// Transcribes a voice message and stores the transcript as a note.
+///
+/// Every failure replies with something specific rather than the generic
+/// usage string -- "whisper isn't configured" and "I couldn't make out any
+/// speech" are very different problems for the person holding the phone,
+/// and a voice note that silently does nothing is the worst outcome here.
+fn handleVoiceNote(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    io: Io,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    tool_ctx: tool_registry.ToolContext,
+    chat_id: i64,
+    identity_id: i64,
+    now: i64,
+    msg: iface.Message,
+) void {
+    if (!feature_flags.isEnabled(pool, "voice_transcription")) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Voice transcription is turned off, so I can't turn that into a note.");
+        return;
+    }
+    const whisper_url = config.whisper_url orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "No transcription server is configured, so I can't turn a voice message into a note. Send /note add <text> instead.");
+        return;
+    };
+    const path = tool_ctx.attachment_path orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "I couldn't get hold of that audio, try sending it again.");
+        return;
+    };
+
+    // Sent only once the checks above have passed, so a misconfiguration
+    // never leaves a "Transcribing…" message stranded. Everything after
+    // this point reports through `settleVoiceNote`, which edits this
+    // message rather than adding a second one.
+    const placeholder_id = connector.sendMessageReturningId(a, msg.chat_id, "🎙️ Transcribing your voice note…", msg.message_id) catch |err| blk: {
+        log.warn("voice note: couldn't send a placeholder for chat {s}: {t}", .{ msg.chat_id, err });
+        break :blk null;
+    };
+
+    const transcript = transcribe.transcribe(a, io, whisper_url, config.tmp_dir, path) catch |err| {
+        log.warn("voice note: transcription failed for chat {s}: {t}", .{ msg.chat_id, err });
+        settleVoiceNote(connector, a, msg, placeholder_id, "Transcription failed, so I didn't save a note. Try again, or use /note add <text>.");
+        return;
+    };
+    if (transcript.len == 0) {
+        settleVoiceNote(connector, a, msg, placeholder_id, "I couldn't make out any speech in that, so I didn't save a note.");
+        return;
+    }
+
+    // A typed `/note` rejects over-long text so the sender can shorten it.
+    // A transcript can't be edited before sending, and re-recording to fit
+    // a byte budget is a miserable ask -- so this truncates instead, on a
+    // codepoint boundary (transcripts are routinely non-ASCII), and says so.
+    const stored = truncateUtf8(transcript, max_note_text_len);
+    const was_truncated = stored.len < transcript.len;
+
+    const id = notes.create(pool, chat_id, identity_id, stored, now) catch |err| {
+        log.err("voice note: failed to create note for chat {d}: {t}", .{ chat_id, err });
+        settleVoiceNote(connector, a, msg, placeholder_id, "I transcribed that but couldn't save the note, try again.");
+        return;
+    };
+
+    const confirm = std.fmt.allocPrint(a, "{s}Note #{d} saved: {s}", .{
+        if (was_truncated) "(transcript was long, so I trimmed it) " else "",
+        id,
+        stored,
+    }) catch return;
+    settleVoiceNote(connector, a, msg, placeholder_id, confirm);
+}
+
+/// Replaces the "Transcribing…" placeholder with the final outcome, or
+/// sends it as a new message when there's no placeholder to edit (a
+/// platform without `editMessage`, or a placeholder send that failed).
+/// Falls back to sending if the edit itself fails, so the user always gets
+/// the result even if the placeholder is somehow gone.
+fn settleVoiceNote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, placeholder_id: ?[]const u8, text: []const u8) void {
+    if (placeholder_id) |pid| {
+        if (connector.editMessage(a, msg.chat_id, pid, text)) |_| {
+            return;
+        } else |err| {
+            log.warn("voice note: couldn't edit placeholder in chat {s}: {t}", .{ msg.chat_id, err });
+        }
+    }
+    connector.sendMessage(a, msg.chat_id, text, msg.message_id);
+}
+
 const max_note_text_len = 1000;
 
 /// `/note add <text>` / `/note delete <id>` — see ROADMAP.md's Phase 11.
@@ -4554,9 +4678,23 @@ const max_note_text_len = 1000;
 /// `add`/`delete` keyword — a note's own text could otherwise legitimately
 /// start with a word like "list" or "delete" ("delete the old files"),
 /// which would be ambiguous under `/remind`'s shape.
-fn handleNoteCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+fn handleNoteCommand(connector: iface.Connector, a: std.mem.Allocator, io: Io, config: *const config_mod.Config, pool: *store_pool.PgPool, tool_ctx: tool_registry.ToolContext, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /note add <text>, /note list, or /note delete <id>";
     const arg = std.mem.trim(u8, text["/note".len..], " ");
+
+    // Phase 11's deferred voice notes: `/note` sent as the *caption* of a
+    // voice message means "transcribe this and save it". Checked before the
+    // empty-arg usage reply below, which is what a bare `/note` would
+    // otherwise hit. Telegram delivers a caption in `msg.caption`, which
+    // `platform/telegram.zig` maps onto `text` -- so a captioned voice
+    // message never reaches `resolveQuestion`'s transcription path (that
+    // one only fires for *captionless* attachments), which is exactly why
+    // this needed its own hook rather than falling out of the existing one.
+    if (isVoiceNoteRequest(if (msg.attachment) |att| att.kind else null, arg)) {
+        handleVoiceNote(connector, a, io, config, pool, tool_ctx, chat_id, identity_id, now, msg);
+        return;
+    }
+
     if (arg.len == 0) {
         reply(connector, a, msg.chat_id, msg.message_id, usage);
         return;

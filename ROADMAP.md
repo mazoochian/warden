@@ -824,11 +824,26 @@ ChatGPT's Search & Knowledge cluster.
   the natural-language front end, wired into `filterEnabledTools`'s
   module-key map like every other tool so the same `notes` feature flag
   gates both the command and the tool.
-- Voice notes: **not built this pass** despite being explicitly listed in
-  scope above — `resolveQuestion`'s existing whisper transcription only
-  ever feeds a transcript into the *question* asked of the LLM, it has no
-  hook for "and also, save this as a note" as a side effect; wiring that
-  in is a small but real follow-up, not done here.
+- Voice notes: **done in a follow-up pass (2026-08-03).** Caption a voice
+  message with `/note` (or `/note add`) and the transcript is saved as a
+  note. The hook had to be its own path rather than falling out of
+  `resolveQuestion`: that one only transcribes *captionless* attachments
+  (`if (text.len > 0) return .{ .text = text }`), and Telegram delivers a
+  caption in `msg.caption`, which `platform/telegram.zig` maps onto `text`
+  — so a captioned voice message never reaches it at all.
+  - `isVoiceNoteRequest` is split out as a pure predicate so the decision
+    logic is testable offline; the transcription itself needs a connector,
+    a pool and a whisper server, so only the decision is unit-tested (3
+    tests). Explicit text wins over the attachment: `/note add buy milk`
+    on a voice message saves the words, not the audio.
+  - Unlike a typed `/note`, an over-long transcript is **truncated rather
+    than rejected** (codepoint-safe, via the existing `truncateUtf8`) and
+    the reply says so — a transcript can't be edited before sending, and
+    re-recording to fit a byte budget is a miserable ask.
+  - The "🎙️ Transcribing…" placeholder is sent only *after* the config
+    checks pass, and every outcome (success, failure, no speech, save
+    error) edits that same message via `settleVoiceNote` rather than
+    leaving it stranded and adding a second one.
 
 **Deferred, not built this pass** — `/menu` entries. Every other module's
 menu entry (see `features/menu_tree.zig`) is either a simple view-only
@@ -1261,9 +1276,10 @@ reasoning doesn't change here.
   shows up in practice.
 
 ### Phase 17 — Finance trackers
-*Effort: M. Status: core done (2026-08-03) — expense tracker, budget
-planner, subscription tracker. Price/deal alerts deliberately held, not
-guessed at — see below.*
+*Effort: M. Status: core done (2026-08-03); web API + warden-ui frontend
+also done (2026-08-03, later same day — see the end of this section) —
+expense tracker, budget planner, subscription tracker. Price/deal alerts
+deliberately held, not guessed at — see below.*
 
 Extends `alerts.zig` with a new alert kind (product/subscription price)
 rather than a parallel system, plus simple ledger tables for manual entry.
@@ -1367,6 +1383,66 @@ were: it's a real product decision (which sites to support, how often to
 check against likely anti-scraping measures, whether the LLM-extraction
 cost per check is worth it) rather than something to guess into
 existence. Flagged here for a real design pass, not silently dropped.
+
+**Also done (2026-08-03), later same day** — a web API surface and
+warden-ui frontend page, closing the same "zero frontend story" gap Phase
+11's notes work closed: this phase's core landed with no `API.md`/
+`router.zig` work in scope at the time, so `/expense`, `/budget` and
+`/subscription` had no web equivalent at all despite `finance` already
+showing up as a toggle on the panel's `/admin/modules`.
+
+- Ten new endpoints in `src/api/router.zig`: `GET`/`POST`/`DELETE
+  /api/v1/expenses`, `GET /api/v1/expenses/summary`, `GET`/`PUT`/`DELETE
+  /api/v1/budgets`, `GET`/`POST`/`DELETE /api/v1/subscriptions`. All
+  gated behind the existing `finance` flag on mutation (reads stay open
+  with the module off, same as notes — turning a module off stops new
+  entries, it doesn't strand what's already recorded), and each mutation
+  writes an `audit_log` row.
+- Store-layer additions for the identity-scoped "across every chat" queries
+  the web API needs and the bot's own chat-scoped commands never did:
+  `expenses.ExpenseForIdentity`/`listForIdentity`,
+  `subscriptions.SubscriptionForIdentity`/`listForIdentity` (both modeled
+  exactly on `notes.NoteForIdentity`), plus `budgets.getById`/`removeById`
+  so the web layer can address a budget by integer id — a category is free
+  text that can contain spaces and `&`, and deleting by category over HTTP
+  would have needed it percent-decoded out of the URL to match.
+- Authorization mirrors the commands rather than being uniformly
+  simplified: expenses/subscriptions are creatable by anyone in the chat
+  and deletable by their creator or the owner; **budget mutations are
+  owner-only** (matching `handleBudgetCommand`'s `auth.isOwner`, *not*
+  bot_admin), while budget/summary reads are open to any chat **member**.
+  That last one needed a new `requireChatMember` helper — the pre-existing
+  `requireChatAccess` means "live platform admin of this chat," too strict
+  for a ledger the whole chat already sees in-chat. It reuses the same
+  `chat_members.isMember` primitive `resolveCreateIdentity` authorizes
+  writes with, so it's an existing check reused, not a parallel path.
+- New `percentDecode` helper in `router.zig`, for the expense `category`
+  filter: the pre-existing `queryParam` returns raw, still-encoded slices,
+  which never mattered because every caller before this one parsed only
+  integers out of it — a category like `eating out & drinks` would have
+  matched nothing.
+- **Integer cents on both sides of the wire**, holding the web half to
+  this phase's own stated standard: amounts cross the API as
+  `amount_cents`, and warden-ui's new `src/lib/money.ts` converts a typed
+  decimal via string splitting rather than `parseFloat(x) * 100` (whose
+  `1.005 -> 100.49999999999999` is a silent off-by-one-cent). This also
+  kept `main.zig` — where `parseAmountCents`/`parseIntervalDays` live —
+  entirely out of the change, which mattered because another agent was
+  editing that file concurrently; all of this was built and tested in an
+  isolated `git worktree`, same as Phase 11's web work needed.
+- No new migration: `0029`/`0030`/`0031` already define every table, and
+  `finance` was already in `feature_flags.known_modules`.
+- warden-ui: a `/finance` page with Expenses/Budgets/Subscriptions tabs
+  (one nav entry with tabs, not three pages, matching how the bot gates
+  all three commands behind the one flag) — see warden-ui's own
+  `ROADMAP.md` Phase 9 / `API.md` for that half in full.
+- `zig build` and `zig build test` green (558/560; 1 expected skip, and the
+  1 crash is the same pre-existing `http_util.zig` fetch segfault flagged
+  in every other pass, unrelated to this change). Store-layer tests cover
+  the new identity-scoped queries and `budgets.getById`/`removeById`
+  (including a category containing a space and `&`), plus a unit test for
+  `percentDecode`. **Not live-verified** — no expense was recorded through
+  the panel against production data this pass.
 
 ### Phase 19 — Power-user tools & light/fun features
 *Effort: S, batchable. Status: done (2026-08-03).*

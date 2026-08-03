@@ -40,8 +40,8 @@ WorkingDirectory=/home/armin/warden
 # compose up` would try to start those too. `traefik`/`warden-ui` are
 # defined in compose.override.yaml (VPS-only, not shipped in this repo —
 # see ARCHITECTURE.md §2 in the warden-ui repo for the reverse-proxy plan).
-ExecStart=/usr/bin/docker compose up --no-color --remove-orphans warden warden-ui searxng postgres traefik
-ExecStop=/usr/bin/docker compose stop warden warden-ui searxng postgres traefik
+ExecStart=/usr/bin/docker compose up --no-color --remove-orphans warden warden-ui searxng postgres traefik whisper-server
+ExecStop=/usr/bin/docker compose stop warden warden-ui searxng postgres traefik whisper-server
 Restart=always
 RestartSec=10
 TimeoutStartSec=180
