@@ -989,7 +989,7 @@ briefing from primitives that already exist.
   locally).
 
 ### Phase 14 — Messaging assistance modes
-*Effort: S/M.*
+*Effort: S/M. Status: done (2026-08-03).*
 
 New prompt-modes layered onto the existing Q&A path plus one new tool that
 reads `store/messages.zig`'s existing log. Covers: summarize long chats
@@ -998,6 +998,53 @@ this as low-novelty since the model already translates zero-shot, so
 mainly a documented command rather than new capability), rewrite/tone
 adjustment, explain-like-I'm-5, brainstorming/decision-helper framings.
 No new storage.
+
+**Done:**
+- `store/messages.zig` gained `recentSinceFormatted` (time-windowed, not
+  row-count-windowed like the existing `recentFormatted`) — the one new
+  read added over the existing `messages` table per this phase's own "no
+  new storage" framing; no migration.
+- `catch_me_up` (`tools/catch_me_up.zig`): an LLM-invocable tool, not a
+  slash command, following `fetch_url`'s established "return raw content,
+  the model summarizes it itself" shape rather than `features/digest.zig`'s
+  own internal LLM call — cheaper (one model round trip, not two) and lets
+  the model itself decide how much of the returned window is actually
+  relevant to "what did I miss." Takes an optional `hours` argument
+  (default 24, clamped to a max of 336/2 weeks) plus a fixed 2000-row
+  ceiling underneath that, mirroring `recentDeletable`'s own two-bound
+  shape. Wired to real data via a new `registry.ChatHistorySink` +
+  `main.zig`'s `ChatHistoryToolAdapter`, same per-message-construction
+  pattern every other tool sink already uses. This is deliberately
+  *distinct* from `/digest`: digest is a scheduled, always-summarized
+  fixed-window feature; this is on-demand, user-controlled, and triggered
+  by natural language ("catch me up", "what did I miss") the same way any
+  other tool call is, not its own slash command.
+- `/translate <language> <text>`, `/rewrite <tone> <text>`, `/eli5 <text>`,
+  `/brainstorm <topic>` — new slash commands, each replying to a message
+  with just the command and its first argument (e.g. `/translate spanish`
+  as a reply) translates/rewrites/explains/brainstorms *that* message
+  instead of needing the text repeated (`splitModeArgs`/
+  `modeArgOrReplyText` in `main.zig`). All four route through a shared
+  `handleModeCommand`, which just builds a mode-specific instruction string
+  and calls the exact same `replyWithAnswer` pipeline plain addressed Q&A
+  uses (owner-only/credits gates, `/persona`/`/thinking` overrides, the
+  placeholder+ticker flow, tool-calling, streaming) — no parallel LLM-
+  calling path, no new capability, just a documented, reliable command
+  shape over what the model already does zero-shot, consistent with
+  ChatGPT's own "low novelty" framing for translate specifically.
+- New `messaging_modes` feature flag (`store/feature_flags.zig`'s
+  `known_modules`), gating all four commands plus the `catch_me_up` tool —
+  same "one flag covers both a standalone command and an LLM-tool-shaped
+  feature" precedent Phase 11's `notes` flag already established.
+- `zig build` and `zig build test` both green (517/519; 1 expected skip, 1
+  crash is the same pre-existing `http_util.zig` fetch segfault flagged in
+  Phase 13's own status note, unrelated to this change).
+- **Not live-verified** — no real Telegram chat exercised this pass;
+  implemented per spec and covered by unit tests (`splitModeArgs`/
+  `modeArgOrReplyText`'s argument parsing, `catch_me_up`'s hour-clamping
+  and empty-window messaging, `messages.recentSinceFormatted`'s time-window
+  behavior against a real test Postgres). Noted honestly rather than
+  claimed, same standard held elsewhere in this file.
 
 ### Phase 15 — Calendar & email integration
 *Effort: L.*

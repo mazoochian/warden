@@ -96,6 +96,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/begin_conversion.zig").tool,
     convert_file.tool,
     @import("tools/find_chat_member.zig").tool,
+    @import("tools/catch_me_up.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
@@ -126,6 +127,10 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "unwatch", .description = "<feed url> -- stop watching a feed." },
     .{ .name = "watches", .description = "List feeds this chat is watching." },
     .{ .name = "watchcheck", .description = "<feed url> -- force an immediate check of a watch, for testing." },
+    .{ .name = "translate", .description = "<language> <text> -- translate text, or reply to a message with just the language." },
+    .{ .name = "rewrite", .description = "<tone> <text> -- rewrite text in a given tone, or reply to a message with just the tone." },
+    .{ .name = "eli5", .description = "<text> -- explain like I'm five, or reply to a message." },
+    .{ .name = "brainstorm", .description = "<topic> -- brainstorm ideas/options, or reply to a message." },
     .{ .name = "convert", .description = "Convert an attached photo/document/voice/audio/video to another format." },
     .{ .name = "magicword", .description = "<word> -- make Warden answer any message containing this word." },
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
@@ -153,12 +158,11 @@ const public_commands = [_]iface.CommandSpec{
 /// public menu, group-chat-only commands, and the free-form LLM path, none
 /// of which fit `CommandSpec`'s flat name/description shape.
 const help_text =
-    \\I'm Warden. Talk to me directly by mentioning me (@username), replying
-    \\to one of my messages, or (in a group) saying a chat-specific magic
-    \\word if one's set — see /magicword. Ask me anything in plain language
-    \\and I'll use whatever tool fits (weather, crypto prices, a calculator,
-    \\QR codes, diagrams, word clouds, web search, fetching a URL) --
-    \\reminders, alerts, and file conversion below work as plain requests too.
+    \\I'm Warden. Talk to me by mentioning me, replying to my messages, or
+    \\(in a group) saying this chat's magic word -- see /magicword. Ask
+    \\anything in plain language and I'll reach for the right tool (weather,
+    \\crypto, calculator, diagrams, word clouds, web search, URLs) --
+    \\reminders/alerts/conversion/translation below also work as plain asks.
     \\
     \\General
     \\/ping -- check I'm responsive
@@ -176,12 +180,16 @@ const help_text =
     \\/alert <crypto|weather|aqi> <subject> <above|below> <value> -- e.g.
     \\  /alert crypto btc above 100000. Also: /alert cancel <id>
     \\/alerts -- list pending alerts
-    \\/watch <feed url> / /unwatch <feed url> / /watches -- RSS/Atom feed
-    \\  notifications. /watchcheck <feed url> forces an immediate check
+    \\/watch, /unwatch <feed url>; /watches -- RSS/Atom feed notifications.
+    \\  /watchcheck <feed url> forces an immediate check
     \\/note add <text> | list | delete <id> -- notes/shopping lists for
     \\  this chat. /notes lists them all
     \\/memory list | forget <id> -- what I remember about you (I save
     \\  things myself while we talk)
+    \\
+    \\Messaging modes
+    \\/translate <lang>, /rewrite <tone>, /eli5, /brainstorm <topic> --
+    \\  give text, or reply with just the first arg
     \\
     \\Files
     \\/convert -- start a guided conversion (I'll ask you to send a file);
@@ -207,8 +215,7 @@ const help_text =
     \\/cancel -- cancel your pending file conversion, or a pending
     \\  /kick/ban if you're an admin
     \\/redact <N> | (reply) [N] | text <substring> | regex <pattern> --
-    \\  delete up to 100 messages, walking backward by id on Telegram if
-    \\  needed. regex is admin/owner only
+    \\  delete up to 100 messages. regex is admin/owner only
     \\
     \\Tokens and credits (reply to a user, or pass @username, to view/set)
     \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban per
@@ -1153,6 +1160,11 @@ fn processMessageTask(
         .now = ts,
         .embeddings_client = embeddings_client,
     };
+    var chat_history_adapter: ChatHistoryToolAdapter = .{
+        .pool = pool,
+        .chat_id = chat_id,
+        .now = ts,
+    };
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
         .io = io,
@@ -1173,6 +1185,7 @@ fn processMessageTask(
         // convention, rather than surfacing a runtime error from inside
         // the tool for something that's a deploy-time config choice.
         .memory = if (embeddings_client != null) memory_adapter.sink() else null,
+        .chat_history = chat_history_adapter.sink(),
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -1610,6 +1623,121 @@ fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, con
     };
 }
 
+/// One argument, one piece of text — e.g. `/translate spanish hola` splits
+/// into `modifier="spanish"`, `text="hola"`.
+const ModeArgSplit = struct {
+    modifier: []const u8,
+    text: []const u8,
+};
+
+/// Parses a "messaging mode" command's argument shape (ROADMAP.md's Phase
+/// 14: /translate, /rewrite) — `<modifier> [text...]`, where `modifier` is
+/// the first whitespace-delimited token (a target language, a tone) and
+/// everything after it is the text to operate on. When no text follows the
+/// modifier, falls back to `reply_to_text` — so `/translate spanish` as a
+/// reply to someone else's message translates *that* message without
+/// needing to repeat it. Returns null when there's neither a modifier, nor
+/// any text to fall back to (caller replies with its own usage message).
+fn splitModeArgs(arg: []const u8, reply_to_text: ?[]const u8) ?ModeArgSplit {
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len == 0) return null;
+
+    const space_idx = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+    const modifier = trimmed[0..space_idx];
+    const rest = if (space_idx < trimmed.len) std.mem.trim(u8, trimmed[space_idx..], " \t") else "";
+    const text = if (rest.len > 0) rest else (reply_to_text orelse return null);
+    return .{ .modifier = modifier, .text = text };
+}
+
+/// Same "explicit text, or fall back to the replied-to message" shape as
+/// `splitModeArgs`, minus the leading modifier token — for /eli5 and
+/// /brainstorm, which take just a body of text/topic. Returns null when
+/// there's neither.
+fn modeArgOrReplyText(arg: []const u8, reply_to_text: ?[]const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len > 0) return trimmed;
+    return reply_to_text;
+}
+
+/// Shared entry point for the Phase 14 "messaging mode" commands
+/// (/translate, /rewrite, /eli5, /brainstorm) — each one just builds a
+/// mode-specific instruction as `question` (see the dispatch table in
+/// `handleMessage`) and routes it through the exact same LLM-answering
+/// pipeline plain addressed Q&A uses: dynamic owner-only/credits gates,
+/// /persona and /thinking overrides, the placeholder+ticker flow, tool-
+/// calling, streaming — all via `replyWithAnswer`, same as
+/// `isAddressedToBot`'s own branch. Deliberately skips that branch's
+/// mention-detection and trivial-message short circuit: typing an explicit
+/// `/translate ...` is already unambiguous address, and is never itself a
+/// trivial greeting. `replied_to` (the "user is replying to your earlier
+/// message" framing `qa.answer` adds) is left null here since any relevant
+/// replied-to text is already folded straight into `question` by the
+/// caller, not carried as separate context.
+fn handleModeCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
+    tool_ctx: tool_registry.ToolContext,
+    tools: []const tool_registry.ToolDef,
+    io: Io,
+    now: i64,
+    max_message_len: usize,
+    is_owner: bool,
+    is_bot_admin: bool,
+    msg: iface.Message,
+    question: []const u8,
+) void {
+    const dyn = resolveLlmDynamicSettings(pool, a, config);
+    const is_privileged = is_owner or is_bot_admin;
+    if (dyn.owner_only and !is_privileged) return;
+
+    if (!is_privileged and !(identities.spendCredit(pool, identity_id) catch |err| blk: {
+        log.err("qa: credit spend check failed for identity {d}: {t}", .{ identity_id, err });
+        break :blk false;
+    })) {
+        connector.sendMessage(a, msg.chat_id, "You're out of LLM credits — ask the bot owner for more.", msg.message_id);
+        return;
+    }
+
+    const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
+    const show_thinking = chat_settings.getShowThinkingOverride(pool, chat_id) orelse dyn.show_thinking;
+    const asker: qa.Asker = if (msg.identity) |identity| .{
+        .display_name = identity.display_name,
+        .username = identity.username,
+        .native_id = identity.native_id,
+    } else .{
+        .display_name = msg.username orelse msg.user_id,
+        .username = msg.username,
+        .native_id = msg.user_id,
+    };
+    const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
+    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.max_tokens_override, dyn.history_messages);
+}
+
+test "splitModeArgs splits a leading modifier token from the rest, falling back to reply_to_text" {
+    const with_text = splitModeArgs("spanish hola amigo", null).?;
+    try std.testing.expectEqualStrings("spanish", with_text.modifier);
+    try std.testing.expectEqualStrings("hola amigo", with_text.text);
+
+    const modifier_only = splitModeArgs("spanish", "earlier message").?;
+    try std.testing.expectEqualStrings("spanish", modifier_only.modifier);
+    try std.testing.expectEqualStrings("earlier message", modifier_only.text);
+
+    try std.testing.expectEqual(@as(?ModeArgSplit, null), splitModeArgs("spanish", null));
+    try std.testing.expectEqual(@as(?ModeArgSplit, null), splitModeArgs("", "earlier message"));
+}
+
+test "modeArgOrReplyText prefers explicit text, falls back to reply_to_text, else null" {
+    try std.testing.expectEqualStrings("hi there", modeArgOrReplyText("  hi there  ", null).?);
+    try std.testing.expectEqualStrings("earlier", modeArgOrReplyText("   ", "earlier").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), modeArgOrReplyText("", null));
+}
+
 /// Returns whether this message's attachment (if any) was claimed by the
 /// interactive `/convert` flow — `processMessageTask` must not delete a
 /// claimed file via its own attachment-cleanup `defer` (see
@@ -1901,6 +2029,42 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/watchcheck") or std.mem.startsWith(u8, text, "/watchcheck ")) {
         if (!feature_flags.isEnabled(pool, "watches")) return false;
         handleWatchCheckCommand(connector, a, pool, io, llm_provider, chat_id, msg, text, now);
+    } else if (std.mem.eql(u8, text, "/translate") or std.mem.startsWith(u8, text, "/translate ")) {
+        // Phase 14 (ROADMAP.md): messaging assistance modes -- thin,
+        // reliable command surfaces over the existing Q&A path (the model
+        // already translates zero-shot; this just makes it a documented,
+        // predictable command rather than relying on natural language).
+        if (!feature_flags.isEnabled(pool, "messaging_modes")) return false;
+        const split = splitModeArgs(text["/translate".len..], msg.reply_to_text) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /translate <language> <text>, or reply to a message with /translate <language>.");
+            return false;
+        };
+        const question = std.fmt.allocPrint(a, "Translate the following into {s}. Reply with only the translation, no commentary or notes:\n\n{s}", .{ split.modifier, split.text }) catch return false;
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+    } else if (std.mem.eql(u8, text, "/rewrite") or std.mem.startsWith(u8, text, "/rewrite ")) {
+        if (!feature_flags.isEnabled(pool, "messaging_modes")) return false;
+        const split = splitModeArgs(text["/rewrite".len..], msg.reply_to_text) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /rewrite <tone> <text>, or reply to a message with /rewrite <tone>.");
+            return false;
+        };
+        const question = std.fmt.allocPrint(a, "Rewrite the following in a {s} tone. Reply with only the rewritten text, no commentary or notes:\n\n{s}", .{ split.modifier, split.text }) catch return false;
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+    } else if (std.mem.eql(u8, text, "/eli5") or std.mem.startsWith(u8, text, "/eli5 ")) {
+        if (!feature_flags.isEnabled(pool, "messaging_modes")) return false;
+        const source = modeArgOrReplyText(text["/eli5".len..], msg.reply_to_text) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /eli5 <text>, or reply to a message with /eli5.");
+            return false;
+        };
+        const question = std.fmt.allocPrint(a, "Explain the following like I'm five years old -- simple everyday language, short sentences, no jargon:\n\n{s}", .{source}) catch return false;
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+    } else if (std.mem.eql(u8, text, "/brainstorm") or std.mem.startsWith(u8, text, "/brainstorm ")) {
+        if (!feature_flags.isEnabled(pool, "messaging_modes")) return false;
+        const source = modeArgOrReplyText(text["/brainstorm".len..], msg.reply_to_text) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /brainstorm <topic>, or reply to a message with /brainstorm.");
+            return false;
+        };
+        const question = std.fmt.allocPrint(a, "Brainstorm this: give a short list of concrete ideas or options. If it reads like a decision between choices, briefly weigh the trade-offs too:\n\n{s}", .{source}) catch return false;
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
@@ -3862,6 +4026,35 @@ const MemberDirectoryToolAdapter = struct {
     }
 };
 
+/// Wires the `catch_me_up` LLM tool (see `tools/catch_me_up.zig`) to this
+/// chat's own logged history — same per-message construction as the other
+/// tool adapters above (ROADMAP.md's Phase 14).
+const ChatHistoryToolAdapter = struct {
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    now: i64,
+
+    fn sink(self: *ChatHistoryToolAdapter) tool_registry.ChatHistorySink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.ChatHistorySink.VTable = .{
+        .recentSince = recentSinceFn,
+    };
+
+    fn recentSinceFn(ptr: *anyopaque, allocator: std.mem.Allocator, hours_ago: i64) anyerror![]const u8 {
+        const self: *ChatHistoryToolAdapter = @ptrCast(@alignCast(ptr));
+        const since_ts = self.now - hours_ago * 3600;
+        return messages.recentSinceFormatted(self.pool, allocator, self.chat_id, since_ts, catch_me_up_row_limit);
+    }
+};
+
+/// Hard row ceiling for `catch_me_up`, independent of its own hour-window
+/// cap — a very chatty chat over even a modest window could otherwise
+/// return an unbounded amount of text (see `messages.recentSinceFormatted`'s
+/// own doc comment for why both bounds exist together).
+const catch_me_up_row_limit = 2000;
+
 const memory_search_limit = 5;
 
 fn formatMemories(a: std.mem.Allocator, listed: []const memories.Memory) []const u8 {
@@ -4204,6 +4397,7 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
         .{ .name = "remember_memory", .key = "memory" },
         .{ .name = "begin_file_conversion", .key = "convert" },
         .{ .name = "convert_file", .key = "convert" },
+        .{ .name = "catch_me_up", .key = "messaging_modes" },
     };
     for (pairs) |p| {
         if (std.mem.eql(u8, p.name, name)) return p.key;
@@ -4243,6 +4437,7 @@ test "toolModuleKey maps tool names to their feature_flags module key" {
     try std.testing.expectEqualStrings("hackernews", toolModuleKey("hackernews_search").?);
     try std.testing.expectEqualStrings("notes", toolModuleKey("set_note").?);
     try std.testing.expectEqualStrings("memory", toolModuleKey("remember_memory").?);
+    try std.testing.expectEqualStrings("messaging_modes", toolModuleKey("catch_me_up").?);
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("calculator"));
     try std.testing.expectEqual(@as(?[]const u8, null), toolModuleKey("nonexistent_tool"));
 }
@@ -5025,6 +5220,7 @@ test {
     _ = @import("features/convert_flow.zig");
     _ = @import("tools/begin_conversion.zig");
     _ = @import("tools/find_chat_member.zig");
+    _ = @import("tools/catch_me_up.zig");
     _ = @import("llm/provider.zig");
     _ = @import("llm/anthropic.zig");
     _ = @import("llm/openai_compat.zig");

@@ -70,6 +70,39 @@ pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
     return std.mem.join(allocator, "\n", lines.items);
 }
 
+/// Same "who: text" formatting as `recentFormatted`, but windowed by wall-
+/// clock time (`since_ts`, unix seconds) rather than a flat row count —
+/// backs the `catch_me_up` LLM tool (ROADMAP.md's Phase 14), which needs
+/// "everything since N hours ago" rather than "the last N messages" so a
+/// quiet chat's catch-up isn't padded with days-old context and a noisy
+/// one isn't truncated mid-conversation. Still capped by `limit` as a hard
+/// ceiling (a very chatty chat over a long window could otherwise return
+/// an unbounded amount of text) — same belt-and-suspenders shape
+/// `recentDeletable`'s `scan_limit`/`match_limit` pair already uses for a
+/// different combination of bounds.
+pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, since_ts: i64, limit: i64) ![]const u8 {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text
+        \\FROM messages m JOIN identities i ON i.id = m.identity_id
+        \\WHERE m.chat_id = $1 AND m.text IS NOT NULL AND m.ts >= to_timestamp($2)
+        \\ORDER BY m.id DESC LIMIT $3;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, since_ts);
+    stmt.bindInt64(3, limit);
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    while (try stmt.step()) {
+        try lines.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ stmt.columnText(0), stmt.columnText(1) }));
+    }
+    std.mem.reverse([]const u8, lines.items); // rows came back newest-first
+    return std.mem.join(allocator, "\n", lines.items);
+}
+
 pub const MessageRef = struct {
     id: i64,
     native_message_id: []const u8,
@@ -236,6 +269,33 @@ test "insert/recentFormatted/pruneKeepLast scoped correctly per chat" {
     try pruneKeepLast(&pool, chat1, 1);
     const pruned = try recentFormatted(&pool, a, chat1, 10);
     try testing.expectEqualStrings("alice: again", pruned);
+}
+
+test "recentSinceFormatted windows by timestamp, respects the row limit, and returns newest-first input in oldest-first output" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try insert(&pool, chat1, alice, "1", "too old", 500);
+    try insert(&pool, chat1, alice, "2", "in window one", 1500);
+    try insert(&pool, chat1, alice, "3", "in window two", 2000);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const windowed = try recentSinceFormatted(&pool, a, chat1, 1000, 100);
+    try testing.expectEqualStrings("alice: in window one\nalice: in window two", windowed);
+
+    const capped = try recentSinceFormatted(&pool, a, chat1, 1000, 1);
+    try testing.expectEqualStrings("alice: in window two", capped);
+
+    const nothing_before_anything = try recentSinceFormatted(&pool, a, chat1, 9999, 100);
+    try testing.expectEqualStrings("", nothing_before_anything);
 }
 
 test "recentDeletable excludes messages with no native_message_id, newest first" {

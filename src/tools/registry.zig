@@ -205,6 +205,29 @@ pub const MemberDirectorySink = struct {
     }
 };
 
+/// Callback surface the `catch_me_up` tool uses to pull this chat's own
+/// logged history windowed by time rather than the fixed row count
+/// `qa.zig`'s own conversational context uses — same ptr+vtable boundary
+/// reasoning as `ReminderSink`/`MemberDirectorySink` (`registry.zig` must
+/// never depend on the store layer directly, see `ScraperConfig`'s doc
+/// comment). Read-only, so unlike `ReminderSink`/`NoteSink` there's just
+/// the one method.
+pub const ChatHistorySink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Already formatted as "who: text" lines, oldest-first, empty
+        /// string when nothing falls in the window — same "sink formats its
+        /// own listing" reasoning as `ReminderSink.VTable.listPending`.
+        recentSince: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, hours_ago: i64) anyerror![]const u8,
+    };
+
+    pub fn recentSince(self: ChatHistorySink, allocator: std.mem.Allocator, hours_ago: i64) ![]const u8 {
+        return self.vtable.recentSince(self.ptr, allocator, hours_ago);
+    }
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -242,6 +265,9 @@ pub const ToolContext = struct {
     /// being processed) whenever `WARDEN_EMBEDDINGS_URL` isn't configured,
     /// see `config.zig`'s `embeddings_url` doc comment.
     memory: ?MemorySink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `catch_me_up` tool.
+    chat_history: ?ChatHistorySink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the
