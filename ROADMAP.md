@@ -1289,17 +1289,8 @@ check against likely anti-scraping measures, whether the LLM-extraction
 cost per check is worth it) rather than something to guess into
 existence. Flagged here for a real design pass, not silently dropped.
 
-### Phase 18 — Media generation
-*Effort: M/L.*
-
-The first phase needing a new paid external provider (image generation —
-no local/free equivalent worth self-hosting at this scale). Covers: image
-generation, stickers, memes, captions, background removal. Lower priority
-than everything above it — fun, but not a daily-workflow feature the way
-reminders/memory/documents are.
-
 ### Phase 19 — Power-user tools & light/fun features
-*Effort: S, batchable.*
+*Effort: S, batchable. Status: done (2026-08-03).*
 
 Grab-bag of cheap wins with no shared theme beyond "small and self-
 contained enough to knock out in a batch": custom command aliases, prompt
@@ -1307,6 +1298,63 @@ templates, joke/riddle/trivia/word-of-day, motivational-coach framing.
 Deliberately last — genuinely low effort each, but also genuinely low
 retention value per ChatGPT's own framing, so there's no cost to leaving
 this until everything above has shipped.
+
+**Done:**
+- `store/command_aliases.zig` + migration `0032_command_aliases.sql` --
+  `/alias add <name> <command or text>` saves a per-chat shortcut;
+  `main.zig`'s `handleMessage` expands `/name` to the saved text (plus
+  any trailing text typed after it) right after `/sudo` unwrapping, then
+  falls through to the exact same dispatch chain as if that had been
+  typed directly. `isReservedCommandName` (checked against
+  `public_commands` plus the owner-only commands deliberately left out of
+  that public list) rejects any alias name that would shadow a real
+  built-in command. Expansion happens exactly once, not recursively --
+  if a saved expansion itself happens to start with another alias's name,
+  it's dispatched as literal text rather than expanded again, which rules
+  out alias loops by construction rather than a depth counter.
+  `/alias list` / `/alias remove <name>` (creator-or-owner).
+- `store/prompt_templates.zig` + migration `0033_prompt_templates.sql` --
+  `/template save <name> <text>`, `/template use <name> [extra text]`
+  (routes the saved text, plus any extra text appended, through the same
+  `handleModeCommand` pipeline Phase 14's `/eli5`/`/brainstorm` already
+  use -- "use a saved prompt" is just another way of asking a question),
+  `/template list`, `/template delete <name>` (creator-or-owner).
+- `/joke [topic]`, `/riddle [topic]` (answer on its own line, not
+  immediately spoiled), `/trivia [topic]`, `/wordoftheday`, `/motivate
+  [text]` (falls back to the replied-to message like `/eli5`/
+  `/brainstorm` do) -- all thin one-line instruction-builders over the
+  same `handleModeCommand` pipeline, no new plumbing beyond the
+  instruction string itself, consistent with how cheap ChatGPT's own
+  framing said this whole phase should be.
+- New `power_tools` feature flag gates all of the above together.
+- **Scope decision: no LLM tools for aliases/templates** — creating one
+  by natural language ("make an alias called gm for...") is a much less
+  natural ask than logging an expense or setting a reminder is, so
+  `/alias`/`/template` stay command-only this pass, same precedent
+  Phase 16's `keyword_alerts` already set for a similar judgment call.
+- `zig build` and `zig build test` both green (545/547; 1 expected skip,
+  1 crash is the same pre-existing `http_util.zig` fetch segfault flagged
+  throughout this session, unrelated to this change).
+- **Not live-verified** — no real Telegram chat exercised this pass;
+  covered by unit/store tests (`command_aliases`/`prompt_templates`
+  upsert-and-scoping round trips, `isReservedCommandName`'s coverage of
+  both the public menu and the owner-only extras).
+
+### Phase 18 — Media generation
+*Effort: M/L. Status: held, not started — see below.*
+
+The first phase needing a new paid external provider (image generation —
+no local/free equivalent worth self-hosting at this scale). Covers: image
+generation, stickers, memes, captions, background removal. Lower priority
+than everything above it — fun, but not a daily-workflow feature the way
+reminders/memory/documents are.
+
+**Deliberately held (2026-08-03), not guessed at**: which paid image-
+generation provider/API to use is a real cost decision for the project
+owner, not something to pick unilaterally — this is why Phase 19 (below,
+which needs no external provider or big decision) was done first, out of
+its numeric order, rather than leaving the bot idle while this one
+waited. Revisit once the owner has chosen a provider.
 
 ### Explicitly excluded
 

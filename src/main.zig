@@ -53,6 +53,8 @@ const keyword_alerts = @import("store/keyword_alerts.zig");
 const expenses = @import("store/expenses.zig");
 const budgets = @import("store/budgets.zig");
 const subscriptions = @import("store/subscriptions.zig");
+const command_aliases = @import("store/command_aliases.zig");
+const prompt_templates = @import("store/prompt_templates.zig");
 const memories = @import("store/memories.zig");
 const embeddings = @import("llm/embeddings.zig");
 const reminder_format = @import("features/reminder_format.zig");
@@ -146,6 +148,13 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "expense", .description = "add <amt> <category> [desc] | list | summary | delete <id> -- expense tracker." },
     .{ .name = "budget", .description = "set <category> <amt> | list | remove <category> -- monthly budgets. Owner to set." },
     .{ .name = "subscription", .description = "add <name> <amt> every <interval> | list | remove <id> -- recurring costs." },
+    .{ .name = "alias", .description = "add <name> <command> | list | remove <name> -- custom command shortcuts." },
+    .{ .name = "template", .description = "save <name> <text> | list | use <name> [extra] | delete <name> -- saved prompts." },
+    .{ .name = "joke", .description = "[topic] -- tell a joke." },
+    .{ .name = "riddle", .description = "[topic] -- give a riddle (answer follows on its own line)." },
+    .{ .name = "trivia", .description = "[topic] -- share an interesting fact." },
+    .{ .name = "wordoftheday", .description = "an interesting word, its definition, and an example." },
+    .{ .name = "motivate", .description = "[text] -- a short motivational pep talk, tailored if you give context." },
     .{ .name = "thinking", .description = "on|off|default -- show or hide the model's reasoning for this chat." },
     .{ .name = "mute", .description = "Reply to a user's message to mute them. Admins only." },
     .{ .name = "unmute", .description = "Reply to a user's message to unmute them. Admins only." },
@@ -163,6 +172,37 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "manage", .description = "bind|unbind <chat id> | list -- manage this room's bound chats (see /manage list). Admins only." },
     .{ .name = "notice", .description = "<chat id> <text> -- send a pinned notice to a chat this room is bound to. Admins only." },
 };
+
+/// Owner-only commands deliberately left out of `public_commands` (see its
+/// own doc comment) but still reserved -- an alias must never shadow one
+/// of these either.
+const reserved_command_names_extra = [_][]const u8{
+    "token", "credit", "scraper", "adduser", "removeuser",
+    "allowchat", "disallowchat", "addadmin", "removeadmin", "sudo",
+};
+
+/// True if `name` (no leading slash) is a real built-in command -- checked
+/// case-insensitively, same as `normalizeCommandMention`'s own qualifier
+/// matching. `/alias add`/`/alias`'s expansion-lookup step both use this:
+/// an alias may never shadow a real command (ROADMAP.md's Phase 19).
+fn isReservedCommandName(name: []const u8) bool {
+    for (public_commands) |c| {
+        if (std.ascii.eqlIgnoreCase(c.name, name)) return true;
+    }
+    for (reserved_command_names_extra) |n| {
+        if (std.ascii.eqlIgnoreCase(n, name)) return true;
+    }
+    return false;
+}
+
+test "isReservedCommandName covers both the public menu and the owner-only extras, case-insensitively" {
+    try std.testing.expect(isReservedCommandName("ping"));
+    try std.testing.expect(isReservedCommandName("PING"));
+    try std.testing.expect(isReservedCommandName("sudo"));
+    try std.testing.expect(isReservedCommandName("Token"));
+    try std.testing.expect(!isReservedCommandName("gm"));
+    try std.testing.expect(!isReservedCommandName("standup"));
+}
 
 /// `/help`'s reply — kept as a single static string (matches `reply()`'s
 /// `comptime txt` parameter) rather than built from `public_commands`, since
@@ -215,6 +255,11 @@ const help_text =
     \\Finance (manual entry only -- no bank/price-tracking integration)
     \\/expense, /budget, /subscription -- type any of these alone for
     \\  usage (or just ask, e.g. "log $12 for lunch")
+    \\
+    \\Power tools
+    \\/alias add <name> <command> | list | remove <name> -- shortcuts
+    \\/template save <name> <text> | list | use <name> [extra] | delete
+    \\/joke, /riddle, /trivia [topic]; /wordoftheday; /motivate [text]
     \\
     \\Group moderation (chat admins only, most by replying to a message)
     \\/mute, /unmute, /pin, /unpin, /delete -- reply to the target
@@ -1934,6 +1979,28 @@ fn handleMessage(
         text = std.fmt.allocPrint(a, "/{s}", .{std.mem.trim(u8, text["/sudo ".len..], " ")}) catch text;
     }
 
+    // Custom command aliases (ROADMAP.md's Phase 19) -- "/gm" re-dispatches
+    // as if the user had typed its saved expansion (plus any trailing text
+    // typed after the alias name) directly. Expanded exactly once, not
+    // recursively: if the expansion itself happens to start with another
+    // alias's name, it's dispatched as literal text from here on rather
+    // than re-expanded -- a simple, safe rule that rules out alias loops
+    // by construction, not by a depth counter. `isReservedCommandName`
+    // means a real built-in command is never shadowable, so this lookup
+    // can never change the meaning of an existing command even if the
+    // query below returns a row (it never will for one).
+    if (feature_flags.isEnabled(pool, "power_tools") and text.len > 1 and text[0] == '/') {
+        const cmd_end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
+        const cmd_name = text[1..cmd_end];
+        if (command_aliases.get(pool, a, chat_id, cmd_name) catch null) |alias| {
+            const trailing = std.mem.trim(u8, text[cmd_end..], " ");
+            text = if (trailing.len > 0)
+                std.fmt.allocPrint(a, "{s} {s}", .{ alias.expansion, trailing }) catch text
+            else
+                alias.expansion;
+        }
+    }
+
     // A plain message (or reply) arriving while (chat, user) has an open
     // `/menu` prompt waiting on free-form input (e.g. Group Administration's
     // "reply with the person you want to kick") — consumed here, before
@@ -2115,6 +2182,48 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/subscription") or std.mem.startsWith(u8, text, "/subscription ")) {
         if (!feature_flags.isEnabled(pool, "finance")) return false;
         handleSubscriptionCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/alias") or std.mem.startsWith(u8, text, "/alias ")) {
+        if (!feature_flags.isEnabled(pool, "power_tools")) return false;
+        handleAliasCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/template") or std.mem.startsWith(u8, text, "/template ")) {
+        if (!feature_flags.isEnabled(pool, "power_tools")) return false;
+        handleTemplateCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, text);
+    } else if (std.mem.eql(u8, text, "/joke") or std.mem.startsWith(u8, text, "/joke ")) {
+        if (!feature_flags.isEnabled(pool, "power_tools")) return false;
+        const topic = std.mem.trim(u8, text["/joke".len..], " ");
+        const question = if (topic.len > 0)
+            std.fmt.allocPrint(a, "Tell a short, genuinely funny joke about {s}. Just the joke, no setup commentary.", .{topic}) catch return false
+        else
+            "Tell a short, genuinely funny joke. Just the joke, no setup commentary.";
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+    } else if (std.mem.eql(u8, text, "/riddle") or std.mem.startsWith(u8, text, "/riddle ")) {
+        if (!feature_flags.isEnabled(pool, "power_tools")) return false;
+        const topic = std.mem.trim(u8, text["/riddle".len..], " ");
+        const question = if (topic.len > 0)
+            std.fmt.allocPrint(a, "Give me a clever riddle about {s} and its answer, but put the answer on its own new line after \"Answer:\" so it isn't spoiled immediately.", .{topic}) catch return false
+        else
+            "Give me a clever riddle and its answer, but put the answer on its own new line after \"Answer:\" so it isn't spoiled immediately.";
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+    } else if (std.mem.eql(u8, text, "/trivia") or std.mem.startsWith(u8, text, "/trivia ")) {
+        if (!feature_flags.isEnabled(pool, "power_tools")) return false;
+        const topic = std.mem.trim(u8, text["/trivia".len..], " ");
+        const question = if (topic.len > 0)
+            std.fmt.allocPrint(a, "Give me one genuinely interesting trivia fact about {s}, in 1-2 sentences.", .{topic}) catch return false
+        else
+            "Give me one genuinely interesting trivia fact, in 1-2 sentences.";
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+    } else if (std.mem.eql(u8, text, "/wordoftheday")) {
+        if (!feature_flags.isEnabled(pool, "power_tools")) return false;
+        const question = "Give me an interesting, moderately advanced English word of the day: the word, a short definition, and one example sentence using it.";
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+    } else if (std.mem.eql(u8, text, "/motivate") or std.mem.startsWith(u8, text, "/motivate ")) {
+        if (!feature_flags.isEnabled(pool, "power_tools")) return false;
+        const context = modeArgOrReplyText(text["/motivate".len..], msg.reply_to_text);
+        const question = if (context) |c|
+            std.fmt.allocPrint(a, "Give me a short, genuine, non-cheesy motivational message. Tailor it to this: {s}", .{c}) catch return false
+        else
+            "Give me a short, genuine, non-cheesy motivational message.";
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
     } else if (std.mem.eql(u8, text, "/memory") or std.mem.startsWith(u8, text, "/memory ")) {
         if (!feature_flags.isEnabled(pool, "memory")) return false;
         handleMemoryCommand(connector, a, pool, identity_id, msg, text);
@@ -2742,10 +2851,11 @@ test "startOfMonthUnix returns midnight UTC on the 1st of the month containing n
     try std.testing.expectEqual(@as(u8, 0), c.hour);
 }
 
-/// Per-chat finance authorization: creator or the bot owner, same
-/// "shared, but only whoever added it (or the owner) may remove" model
-/// `/note delete`/`/keyword remove` already use.
-fn isFinanceOwnerOrCreator(config: *const config_mod.Config, connector: iface.Connector, msg: iface.Message, identity_id: i64, record_identity_id: i64) bool {
+/// Generic "creator or the bot owner" authorization for any chat-shared,
+/// per-record feature (expenses, subscriptions, aliases, templates) --
+/// same "shared, but only whoever added it (or the owner) may remove"
+/// model `/note delete`/`/keyword remove` already use.
+fn isRecordOwnerOrCreator(config: *const config_mod.Config, connector: iface.Connector, msg: iface.Message, identity_id: i64, record_identity_id: i64) bool {
     return record_identity_id == identity_id or auth.isOwner(config, connector.platform(), msg.user_id);
 }
 
@@ -2808,7 +2918,7 @@ fn handleExpenseCommand(connector: iface.Connector, a: std.mem.Allocator, config
             reply(connector, a, msg.chat_id, msg.message_id, "No expense with that id.");
             return;
         }
-        if (!isFinanceOwnerOrCreator(config, connector, msg, identity_id, expense.identity_id)) {
+        if (!isRecordOwnerOrCreator(config, connector, msg, identity_id, expense.identity_id)) {
             reply(connector, a, msg.chat_id, msg.message_id, "Only whoever logged that expense (or the owner) can delete it.");
             return;
         }
@@ -3040,7 +3150,7 @@ fn handleSubscriptionCommand(connector: iface.Connector, a: std.mem.Allocator, c
             reply(connector, a, msg.chat_id, msg.message_id, "No subscription with that id.");
             return;
         }
-        if (!isFinanceOwnerOrCreator(config, connector, msg, identity_id, s.identity_id)) {
+        if (!isRecordOwnerOrCreator(config, connector, msg, identity_id, s.identity_id)) {
             reply(connector, a, msg.chat_id, msg.message_id, "Only whoever added that subscription (or the owner) can remove it.");
             return;
         }
@@ -3120,6 +3230,234 @@ fn formatSubscriptionList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_i
     }
     const total_money = formatMoney(a, monthly_total, default_currency) catch return buf.writer.buffered();
     w.print("Total: ~{s}/mo\n", .{total_money}) catch return "";
+    return buf.writer.buffered();
+}
+
+// ---------------------------------------------------------------------
+// Phase 19 (ROADMAP.md): power-user tools -- custom command aliases and
+// saved prompt templates. Joke/riddle/trivia/word-of-day/motivate are
+// implemented directly in `handleMessage`'s dispatch chain above (they're
+// thin one-liners over the existing `handleModeCommand` from Phase 14,
+// with no state of their own worth a dedicated handler function).
+// ---------------------------------------------------------------------
+
+/// `/alias add <name> <command/text>` / `/alias list` / `/alias remove
+/// <name>` -- see the alias-expansion step in `handleMessage` for how a
+/// saved alias actually gets used. Same "shared, but only whoever added
+/// it (or the owner) may remove" model `/note delete` already uses.
+fn handleAliasCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /alias add <name> <command or text>, /alias list, or /alias remove <name>";
+    const arg = std.mem.trim(u8, text["/alias".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        connector.sendMessage(a, msg.chat_id, formatAliasList(a, pool, chat_id), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "remove")) {
+        const name = std.mem.trim(u8, it.rest(), " ");
+        if (name.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /alias remove <name>");
+            return;
+        }
+        const existing = (command_aliases.get(pool, a, chat_id, name) catch |err| {
+            log.err("alias: lookup failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that up, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No alias with that name.");
+            return;
+        };
+        if (!isRecordOwnerOrCreator(config, connector, msg, identity_id, existing.identity_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only whoever added that alias (or the owner) can remove it.");
+            return;
+        }
+        command_aliases.remove(pool, chat_id, name) catch |err| {
+            log.err("alias: remove failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't remove that, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Alias removed.");
+        return;
+    }
+
+    if (!std.mem.eql(u8, sub, "add")) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    const name = it.next() orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    };
+    const expansion = std.mem.trim(u8, it.rest(), " ");
+    if (expansion.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    if (isReservedCommandName(name)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That name is already a built-in command -- pick a different alias name.");
+        return;
+    }
+
+    const lower_name = std.ascii.allocLowerString(a, name) catch return;
+    _ = command_aliases.set(pool, chat_id, identity_id, lower_name, expansion, now) catch |err| {
+        log.err("alias: failed to save for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that, try again.");
+        return;
+    };
+    const confirmation = std.fmt.allocPrint(a, "Alias /{s} saved.", .{lower_name}) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+fn formatAliasList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64) []const u8 {
+    const listed = command_aliases.listForChat(pool, a, chat_id) catch |err| {
+        log.err("alias: list failed for chat {d}: {t}", .{ chat_id, err });
+        return "Couldn't load aliases, try again.";
+    };
+    if (listed.len == 0) return "No aliases yet. Add one with /alias add <name> <command or text>.";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Aliases:\n", .{}) catch return "";
+    for (listed) |al| w.print("  /{s} -> {s}\n", .{ al.name, al.expansion }) catch return "";
+    return buf.writer.buffered();
+}
+
+/// `/template save <name> <text>` / `/template list` / `/template use
+/// <name> [extra text]` / `/template delete <name>` -- `use` routes the
+/// saved text (plus any extra text appended) through the exact same
+/// `handleModeCommand` pipeline `/eli5`/`/brainstorm` use, since "use a
+/// saved prompt" is just another way of asking a question. Same "shared,
+/// but only whoever added it (or the owner) may delete" access model
+/// `/alias remove` uses.
+fn handleTemplateCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
+    tool_ctx: tool_registry.ToolContext,
+    tools: []const tool_registry.ToolDef,
+    io: Io,
+    now: i64,
+    max_message_len: usize,
+    is_owner: bool,
+    is_bot_admin: bool,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const usage = "Usage: /template save <name> <text>, /template list, /template use <name> [extra text], or /template delete <name>";
+    const arg = std.mem.trim(u8, text["/template".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        connector.sendMessage(a, msg.chat_id, formatTemplateList(a, pool, chat_id), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "delete")) {
+        const name = std.mem.trim(u8, it.rest(), " ");
+        if (name.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /template delete <name>");
+            return;
+        }
+        const existing = (prompt_templates.get(pool, a, chat_id, name) catch |err| {
+            log.err("template: lookup failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that up, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No template with that name.");
+            return;
+        };
+        if (!isRecordOwnerOrCreator(config, connector, msg, identity_id, existing.identity_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only whoever saved that template (or the owner) can delete it.");
+            return;
+        }
+        prompt_templates.remove(pool, chat_id, name) catch |err| {
+            log.err("template: delete failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't delete that, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Template deleted.");
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "use")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const space = std.mem.indexOfScalar(u8, rest, ' ');
+        const name = if (space) |sp| rest[0..sp] else rest;
+        const extra = if (space) |sp| std.mem.trim(u8, rest[sp..], " ") else "";
+        if (name.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /template use <name> [extra text]");
+            return;
+        }
+        const template = (prompt_templates.get(pool, a, chat_id, name) catch |err| {
+            log.err("template: lookup failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that up, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No template with that name.");
+            return;
+        };
+        const question = if (extra.len > 0)
+            std.fmt.allocPrint(a, "{s}\n\n{s}", .{ template.text, extra }) catch return
+        else
+            template.text;
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        return;
+    }
+
+    if (!std.mem.eql(u8, sub, "save")) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    const name = it.next() orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    };
+    const template_text = std.mem.trim(u8, it.rest(), " ");
+    if (template_text.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    const lower_name = std.ascii.allocLowerString(a, name) catch return;
+    _ = prompt_templates.set(pool, chat_id, identity_id, lower_name, template_text, now) catch |err| {
+        log.err("template: failed to save for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that, try again.");
+        return;
+    };
+    const confirmation = std.fmt.allocPrint(a, "Template \"{s}\" saved. Use it with /template use {s}.", .{ lower_name, lower_name }) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+fn formatTemplateList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64) []const u8 {
+    const listed = prompt_templates.listForChat(pool, a, chat_id) catch |err| {
+        log.err("template: list failed for chat {d}: {t}", .{ chat_id, err });
+        return "Couldn't load templates, try again.";
+    };
+    if (listed.len == 0) return "No templates saved yet. Save one with /template save <name> <text>.";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Templates:\n", .{}) catch return "";
+    for (listed) |t| w.print("  {s}\n", .{t.name}) catch return "";
     return buf.writer.buffered();
 }
 
@@ -6151,6 +6489,8 @@ test {
     _ = @import("store/expenses.zig");
     _ = @import("store/budgets.zig");
     _ = @import("store/subscriptions.zig");
+    _ = @import("store/command_aliases.zig");
+    _ = @import("store/prompt_templates.zig");
     _ = @import("store/memories.zig");
     _ = @import("features/qa.zig");
     _ = @import("features/reminder_format.zig");

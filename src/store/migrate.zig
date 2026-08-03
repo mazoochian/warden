@@ -43,6 +43,8 @@ const migrations = [_]Migration{
     .{ .version = 29, .name = "0029_expenses", .sql = @embedFile("migrations/0029_expenses.sql") },
     .{ .version = 30, .name = "0030_budgets", .sql = @embedFile("migrations/0030_budgets.sql") },
     .{ .version = 31, .name = "0031_subscriptions", .sql = @embedFile("migrations/0031_subscriptions.sql") },
+    .{ .version = 32, .name = "0032_command_aliases", .sql = @embedFile("migrations/0032_command_aliases.sql") },
+    .{ .version = 33, .name = "0033_prompt_templates", .sql = @embedFile("migrations/0033_prompt_templates.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each
