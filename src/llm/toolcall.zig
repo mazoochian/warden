@@ -47,12 +47,16 @@ pub const Progress = struct {
 /// `show_thinking`/`max_tokens` are forwarded straight into every
 /// `ChatRequest` — see `provider.zig`'s `ChatRequest.show_thinking` doc
 /// comment and `qa.zig`'s `answerMaxTokens` for how callers compute them.
-/// `vision_enabled` gates whether `ctx`'s attachment (if it's an image —
-/// see `llm/attachment_content.zig`) gets attached as real bytes to the
-/// first turn below; `imageBlockForAttachment` itself doesn't know about
-/// this config, callers are expected to check it first, same division of
+/// `vision_enabled`/`documents_enabled` gate whether `ctx`'s attachment
+/// gets attached as real bytes to the first turn below — the former for
+/// images, the latter for PDFs (see `llm/attachment_content.zig`). Neither
+/// `imageBlockForAttachment` nor `documentBlockForAttachment` knows about
+/// this config; callers are expected to check it first, same division of
 /// responsibility as everywhere else config-gating happens above this
-/// layer rather than inside it.
+/// layer rather than inside it. They're separate flags because they're
+/// separate capabilities: a model can support vision and still have no way
+/// to read a PDF, which is exactly the case for the OpenAI-compatible
+/// surface (see `llm/openai_compat.zig`'s `writeMessages`).
 pub fn run(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -64,16 +68,29 @@ pub fn run(
     stream: bool,
     show_thinking: bool,
     vision_enabled: bool,
+    documents_enabled: bool,
     max_tokens: u32,
 ) ![]const u8 {
     const llm_tools = try toLlmTools(allocator, tool_defs);
 
     var messages: std.ArrayList(llm.ChatMessage) = .empty;
-    const image_block = if (vision_enabled) attachment_content.imageBlockForAttachment(ctx) else null;
+    // At most one attachment block: a given message carries a single
+    // attachment, and the two builders are mutually exclusive by
+    // construction (an image's media type is never `application/pdf`).
+    // Image is tried first only because it's the cheaper check.
+    const attachment_block: ?llm.ContentBlock = blk: {
+        if (vision_enabled) {
+            if (attachment_content.imageBlockForAttachment(ctx)) |img| break :blk img;
+        }
+        if (documents_enabled) {
+            if (attachment_content.documentBlockForAttachment(ctx)) |doc| break :blk doc;
+        }
+        break :blk null;
+    };
     try messages.append(allocator, .{
         .role = .user,
-        .content = if (image_block) |img|
-            try allocator.dupe(llm.ContentBlock, &.{ .{ .text = user_message }, img })
+        .content = if (attachment_block) |att|
+            try allocator.dupe(llm.ContentBlock, &.{ .{ .text = user_message }, att })
         else
             try allocator.dupe(llm.ContentBlock, &.{.{ .text = user_message }}),
     });
@@ -111,7 +128,7 @@ pub fn run(
         for (response.content) |block| {
             switch (block) {
                 .tool_use => |tu| try tool_uses.append(allocator, tu),
-                .text, .image, .tool_result => {},
+                .text, .image, .document, .tool_result => {},
             }
         }
 
@@ -285,7 +302,7 @@ test "run executes a tool call and threads its result back to the model" {
     var fake = FakeProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false, false, false, 1024);
+    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false, false, false, false, 1024);
     try testing.expectEqualStrings("The answer is 4.", result);
     try testing.expectEqual(@as(u32, 2), fake.call_count);
 }
@@ -344,7 +361,7 @@ test "run(..., true) uses chatStream, reporting .text progress events" {
     defer reports.deinit(testing.allocator);
     const progress = Progress{ .ptr = &reports, .onEvent = Recorder.onEvent };
 
-    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, progress, true, false, false, 1024);
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, progress, true, false, false, false, 1024);
     try testing.expectEqualStrings("Hello", result);
     try testing.expectEqual(@as(u32, 1), fake.call_count);
     try testing.expectEqual(@as(usize, 2), reports.items.len);
@@ -396,7 +413,7 @@ test "run salvages a final answer when the tool-call cap is hit" {
     var fake = InsatiableProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{}, false, false, false, 1024);
+    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{}, false, false, false, false, 1024);
     try testing.expectEqualStrings("best effort answer", result);
     // max_iterations tool turns plus the final wrap-up call.
     try testing.expectEqual(@as(u32, 7), fake.call_count);
@@ -424,7 +441,7 @@ test "run returns the model's answer directly when it never calls a tool" {
     var fake = NoToolProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, false, 1024);
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, false, false, 1024);
     try testing.expectEqualStrings("no tools needed", result);
 }
 
@@ -464,11 +481,11 @@ test "run attaches an image block to the first message when vision_enabled and t
     };
 
     var vision_on = BlockCountingProvider{};
-    _ = try run(vision_on.provider(), a, ctx, null, "what's this?", &.{}, .{}, false, false, true, 1024);
+    _ = try run(vision_on.provider(), a, ctx, null, "what's this?", &.{}, .{}, false, false, true, false, 1024);
     try testing.expectEqual(@as(usize, 2), vision_on.seen_block_count);
 
     var vision_off = BlockCountingProvider{};
-    _ = try run(vision_off.provider(), a, ctx, null, "what's this?", &.{}, .{}, false, false, false, 1024);
+    _ = try run(vision_off.provider(), a, ctx, null, "what's this?", &.{}, .{}, false, false, false, false, 1024);
     try testing.expectEqual(@as(usize, 1), vision_off.seen_block_count);
 }
 
@@ -486,4 +503,69 @@ test "sanitizeUtf8 replaces invalid bytes with U+FFFD instead of corrupting the 
     try testing.expect(std.unicode.utf8ValidateSlice(out));
     try testing.expect(std.mem.indexOf(u8, out, "\u{FFFD}") != null);
     try testing.expect(std.mem.indexOf(u8, out, "broken") != null);
+}
+
+test "run attaches a document block only when documents_enabled -- vision_enabled alone never pulls in a PDF" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+
+    const path = "data/tmp/toolcall_test_doc.pdf";
+    try Io.Dir.cwd().createDirPath(io, "data/tmp");
+    {
+        var file = try Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        var w = file.writer(io, &.{});
+        try w.interface.writeAll("%PDF-1.7 fake");
+        try w.interface.flush();
+    }
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ctx = registry.ToolContext{
+        .allocator = a,
+        .io = io,
+        .attachment_path = path,
+        .attachment_kind = .document,
+        .attachment_mime = "application/pdf",
+    };
+
+    const BlockProbe = struct {
+        seen_block_count: usize = 0,
+        saw_document: bool = false,
+        fn provider(self: *@This()) llm.Provider {
+            return .{ .ptr = self, .vtable = &vt };
+        }
+        const vt: llm.Provider.VTable = .{ .chat = chat };
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen_block_count = request.messages[0].content.len;
+            for (request.messages[0].content) |b| {
+                if (b == .document) self.saw_document = true;
+            }
+            return .{
+                .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = "ok" }}),
+                .stop_reason = .end_turn,
+            };
+        }
+    };
+
+    // documents on -> the PDF rides along as a real document block.
+    var docs_on = BlockProbe{};
+    _ = try run(docs_on.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, false, true, 1024);
+    try testing.expectEqual(@as(usize, 2), docs_on.seen_block_count);
+    try testing.expect(docs_on.saw_document);
+
+    // documents off -> text only.
+    var docs_off = BlockProbe{};
+    _ = try run(docs_off.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, false, false, 1024);
+    try testing.expectEqual(@as(usize, 1), docs_off.seen_block_count);
+    try testing.expect(!docs_off.saw_document);
+
+    // The two flags are genuinely independent: an owner who enabled vision
+    // for a model that can't read PDFs must not get one attached anyway.
+    var vision_only = BlockProbe{};
+    _ = try run(vision_only.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, true, false, 1024);
+    try testing.expectEqual(@as(usize, 1), vision_only.seen_block_count);
+    try testing.expect(!vision_only.saw_document);
 }

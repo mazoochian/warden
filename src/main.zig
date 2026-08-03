@@ -1656,6 +1656,7 @@ const LlmDynamicSettings = struct {
     history_messages: i64,
     skip_trivial_messages: bool,
     vision_enabled: bool,
+    documents_enabled: bool,
 };
 
 /// One `dynamic_config.listAll` fetch instead of six separate
@@ -1691,6 +1692,7 @@ fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, con
         .history_messages = dynamic_config.findI64(rows, "WARDEN_LLM_HISTORY_MESSAGES", config.llm_history_messages),
         .skip_trivial_messages = dynamic_config.findBool(rows, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", config.skip_trivial_messages),
         .vision_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_VISION", config.llm_vision_enabled),
+        .documents_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_DOCUMENTS", config.llm_documents_enabled),
     };
 }
 
@@ -1787,7 +1789,7 @@ fn handleModeCommand(
         .native_id = msg.user_id,
     };
     const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.max_tokens_override, dyn.history_messages);
+    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages);
 }
 
 test "splitModeArgs splits a leading modifier token from the rest, falling back to reply_to_text" {
@@ -2359,7 +2361,7 @@ fn handleMessage(
             .native_id = msg.user_id,
         };
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.max_tokens_override, dyn.history_messages);
+        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages);
     }
     return false;
 }
@@ -5786,6 +5788,7 @@ fn replyWithAnswer(
     stream: bool,
     show_thinking: bool,
     vision_enabled: bool,
+    documents_enabled: bool,
     max_tokens_override: ?u32,
     history_window: i64,
 ) void {
@@ -5834,7 +5837,7 @@ fn replyWithAnswer(
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tools);
-    const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, max_tokens_override, history_window);
+    const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window);
 
     // Stop the ticker before touching the placeholder ourselves. Signaled
     // cooperatively (`state.stop`) and joined with a bound, rather than

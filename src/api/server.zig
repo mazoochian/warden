@@ -179,6 +179,7 @@ fn testConfig() config_mod.Config {
         .llm_show_thinking = false,
         .llm_streaming = false,
         .llm_vision_enabled = true,
+        .llm_documents_enabled = true,
         .api_session_secret = "test-secret-for-server-zig-tests",
         .api_dev_login = true,
     };

@@ -45,7 +45,7 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
     // of chain-of-thought has no place in a summary digest. max_tokens
     // matches ChatRequest's own pre-existing default (unset before this
     // became an explicit `toolcall.run` parameter).
-    const summary = toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false, false, false, 1024) catch |err| blk: {
+    const summary = toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, 1024) catch |err| blk: {
         std.log.err("digest: llm summary failed: {t}", .{err});
         break :blk "";
     };

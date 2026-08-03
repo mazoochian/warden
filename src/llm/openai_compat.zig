@@ -542,13 +542,28 @@ fn writeMessages(
         var tool_results: std.ArrayList(llm.ToolResult) = .empty;
         defer tool_results.deinit(allocator);
 
+        var documents: usize = 0;
+
         for (m.content) |block| {
             switch (block) {
                 .text => |t| try text_parts.appendSlice(allocator, t),
                 .image => |img| try images.append(allocator, img),
+                // No equivalent on this surface: a native document block is
+                // an Anthropic-specific shape (see `anthropic.zig`), and
+                // OpenAI's `image_url` part won't accept a PDF. Rather than
+                // drop the attachment silently -- which would leave the
+                // model confidently answering "about" a file it never
+                // received -- say so in the text, so it can tell the user
+                // it can't read the document instead of inventing content.
+                .document => documents += 1,
                 .tool_use => |tu| try tool_calls.append(allocator, tu),
                 .tool_result => |tr| try tool_results.append(allocator, tr),
             }
+        }
+
+        if (documents > 0) {
+            if (text_parts.items.len > 0) try text_parts.appendSlice(allocator, "\n\n");
+            try text_parts.appendSlice(allocator, "[A document was attached to this message, but the configured model does not support reading documents, so its contents are not available to you. Say so rather than guessing what it contains.]");
         }
 
         for (tool_results.items) |tr| {
@@ -941,4 +956,51 @@ test "StreamState captures a mid-stream error event" {
     try testing.expect(state.err != null);
     try testing.expectEqualStrings("invalid_request_error", state.err.?.type);
     try testing.expectEqualStrings("bad request", state.err.?.message);
+}
+
+test "writeMessages: a document block has no wire equivalent, so it degrades to a note in the text" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try writeMessages(testing.allocator, &out.writer, null, &.{
+        .{ .role = .user, .content = &.{
+            .{ .text = "summarise this" },
+            .{ .document = .{ .media_type = "application/pdf", .base64_data = "JVBERg==" } },
+        } },
+    });
+
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.array.items;
+    try testing.expectEqual(@as(usize, 1), msgs.len);
+
+    // No image parts were added, so this stays the plain-string `content`
+    // shape rather than switching to an array of typed parts.
+    const content = msgs[0].object.get("content").?.string;
+    try testing.expect(std.mem.startsWith(u8, content, "summarise this"));
+    try testing.expect(std.mem.indexOf(u8, content, "does not support reading documents") != null);
+    // The base64 payload must never be smuggled into the text -- that would
+    // burn the whole context window on bytes the model can't decode.
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, content, "JVBERg=="));
+}
+
+test "writeMessages: a document alongside an image keeps the image part and still notes the document" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try writeMessages(testing.allocator, &out.writer, null, &.{
+        .{ .role = .user, .content = &.{
+            .{ .text = "look" },
+            .{ .image = .{ .media_type = "image/png", .base64_data = "aW1n" } },
+            .{ .document = .{ .media_type = "application/pdf", .base64_data = "JVBERg==" } },
+        } },
+    });
+
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const parts = parsed.value.array.items[0].object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), parts.len);
+    try testing.expectEqualStrings("text", parts[0].object.get("type").?.string);
+    try testing.expect(std.mem.indexOf(u8, parts[0].object.get("text").?.string, "does not support reading documents") != null);
+    try testing.expectEqualStrings("image_url", parts[1].object.get("type").?.string);
 }

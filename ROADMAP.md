@@ -676,8 +676,8 @@ against a live homeserver/Bot API. Noted honestly rather than claimed,
 same standard Phase 2's Matrix landing held itself to.
 
 ### Phase 10 — Vision & document understanding
-*Effort: M/L. Status: slice 1 done (images) — see below for what shipped
-vs. what's deferred.*
+*Effort: M/L. Status: slice 1 (images) and slice 2 (native PDF documents)
+both done — see below for what shipped in each.*
 
 The single biggest capability gap today: `qa.zig`'s Q&A path is text-only.
 Photos and PDFs already flow through the connector's attachment plumbing
@@ -732,23 +732,64 @@ several later phases assume it exists.
   per-provider/per-model capability metadata anywhere in this codebase to
   gate it automatically instead.
 
-**Deferred, not built this pass** — native PDF-as-document support
-(Anthropic's `type: "document"` content block, real PDF understanding with
-no OCR/conversion round trip). It's an Anthropic-only API shape with no
-equivalent in the generic OpenAI-compatible surface warden's other
-provider slot targets, so it doesn't fit one shared code path as cleanly
-as images do (both providers' vision APIs handle those near-identically).
-Same "split off the provider-specific part" call this project made for
-Matrix E2EE (Phase 2→2b) and Phase 9's deferred `/as` relay.
+**Done (slice 2, native PDF documents, 2026-08-03):**
+- New `ContentBlock.document` variant (`llm/provider.zig`) carrying the
+  same `{media_type, base64_data}` pair as `ImageBlock`. Deliberately a
+  *separate* variant rather than a reused `ImageBlock`, even though the
+  two are structurally identical: they serialize to different wire shapes,
+  and only one has an OpenAI-compatible equivalent. Keeping them distinct
+  means the compiler forces every adapter to decide what to do — which it
+  immediately did, flagging the two exhaustive switches (`provider.zig`'s
+  `textOf`, `toolcall.zig`'s tool-use scan) that had to be updated.
+- `llm/attachment_content.zig` gains `documentBlockForAttachment`, the
+  direct counterpart to `imageBlockForAttachment`, plus a shared
+  `readBase64` helper the two now split (they differ only in size cap and
+  which block they wrap the result in). PDF-only, and only for
+  `.document`-kind attachments: a Telegram `.photo` is never a PDF, and a
+  `.docx`/`.zip` stays on the existing `/convert` path rather than being
+  handed to the model as bytes it can't decode. Mime-first with a
+  filename-extension fallback, the same precedence the image path already
+  used.
+- **Size cap is deliberately not Anthropic's own 32MB number**: that limit
+  is per *request*, while the cap here is on one attachment's raw bytes
+  *before* base64 inflates them by 4/3 — a 24MB PDF is already ~32MB
+  encoded, before the system prompt, tool schemas, and history sharing the
+  same request. 16MB raw (~21.3MB encoded) leaves real headroom and still
+  sits above Telegram's own 20MB `getFile` ceiling, so it rejects
+  essentially nothing that could have been downloaded in the first place.
+- `anthropic.zig`'s `writeContentBlocks` gained the native
+  `{"type":"document","source":{"type":"base64",...}}` arm (no beta header
+  needed). `openai_compat.zig` has no equivalent and **degrades loudly**:
+  it appends a short note to the message text saying a document was
+  attached but can't be read, rather than dropping it silently — a silent
+  drop would leave the model confidently answering "about" a file it never
+  received. The base64 payload is explicitly never smuggled into that text
+  (there's a test asserting so); it would burn the context window on bytes
+  the model can't decode.
+- New `WARDEN_LLM_DOCUMENTS` toggle (`config.zig`'s
+  `llm_documents_enabled`, default on), following the same
+  `LlmDynamicSettings`/`dynamic_config.findBool` shape as
+  `WARDEN_LLM_VISION`. Kept **separate** from the vision flag rather than
+  folded into it: they're genuinely different capabilities, and a model
+  that does vision but can't read PDFs is exactly the OpenAI-compatible
+  case. `toolcall.zig`'s `run` takes both flags and attaches at most one
+  block (an image's media type is never `application/pdf`, so the two are
+  mutually exclusive by construction).
 
-**Not live-verified** — no real Telegram photo sent to a live chat this
-pass, so this is implemented per spec and covered by unit tests
-(`attachment_content.zig`'s image/mime classification,
-`anthropic.zig`/`openai_compat.zig`'s exact JSON shapes,
-`toolcall.zig`'s vision-on/vision-off message-block-count check) but not
-confirmed against a real Anthropic/OpenAI vision response. Noted honestly
-rather than claimed, same standard held elsewhere (e.g. Phase 9's own
-note on this).
+This is the "split off the provider-specific part" call this project made
+for Matrix E2EE (Phase 2→2b) and Phase 9's deferred `/as` relay — the
+shared path stays shared, the Anthropic-only shape lives in the Anthropic
+adapter, and the other adapter says plainly what it can't do.
+
+**Not live-verified (both slices)** — no real Telegram photo or PDF sent
+to a live chat, so both slices are implemented per spec and covered by
+unit tests (`attachment_content.zig`'s image/mime and PDF classification
+including the mime-beats-filename and oversized cases,
+`anthropic.zig`/`openai_compat.zig`'s exact JSON shapes and the
+degrade-note behaviour, `toolcall.zig`'s on/off message-block-count checks
+for vision and documents independently) but not confirmed against a real
+Anthropic/OpenAI response. Noted honestly rather than claimed, same
+standard held elsewhere (e.g. Phase 9's own note on this).
 
 ### Phase 11 — Personal knowledge base: notes & lists
 *Effort: S/M. Status: core done (2026-08-02); web API + warden-ui frontend

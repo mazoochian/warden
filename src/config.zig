@@ -195,6 +195,17 @@ pub const Config = struct {
     /// capability metadata anywhere else in this codebase to gate on
     /// automatically.
     llm_vision_enabled: bool,
+    /// Whether `toolcall.run` attaches a PDF attachment's actual bytes to
+    /// the model call (see `llm/attachment_content.zig`) so the model reads
+    /// the real document instead of only ever converting it — ROADMAP.md's
+    /// Phase 10 slice 2. Separate from `llm_vision_enabled` because it's a
+    /// separate capability with a much narrower provider story: native
+    /// document blocks are Anthropic-only, and the OpenAI-compatible
+    /// adapter has to tell the model the document is unreadable instead
+    /// (see `llm/openai_compat.zig`'s `writeMessages`). Defaults on, like
+    /// vision; an owner on a backend without document support can turn it
+    /// off to drop that note rather than have it appear on every PDF.
+    llm_documents_enabled: bool,
     /// Overrides `qa.zig`'s `answerMaxTokens` (which sizes the budget off
     /// the active platform's message-length cap plus a reasoning-model
     /// thinking reserve) with a flat ceiling instead — for keeping a
@@ -394,6 +405,7 @@ pub const Config = struct {
         const llm_show_thinking = parseBoolEnv(env, "WARDEN_LLM_SHOW_THINKING", default_llm_show_thinking);
         const llm_streaming = parseBoolEnv(env, "WARDEN_LLM_STREAMING", default_llm_streaming);
         const llm_vision_enabled = parseBoolEnv(env, "WARDEN_LLM_VISION", default_llm_vision_enabled);
+        const llm_documents_enabled = parseBoolEnv(env, "WARDEN_LLM_DOCUMENTS", default_llm_documents_enabled);
         const llm_max_tokens_override: ?u32 = if (env.get("WARDEN_LLM_MAX_TOKENS")) |raw|
             std.fmt.parseInt(u32, raw, 10) catch null
         else
@@ -450,6 +462,7 @@ pub const Config = struct {
             .llm_show_thinking = llm_show_thinking,
             .llm_streaming = llm_streaming,
             .llm_vision_enabled = llm_vision_enabled,
+            .llm_documents_enabled = llm_documents_enabled,
             .llm_max_tokens_override = llm_max_tokens_override,
             .llm_history_messages = llm_history_messages,
             .skip_trivial_messages = skip_trivial_messages,
@@ -641,6 +654,7 @@ pub const Config = struct {
     pub const default_llm_show_thinking: bool = false;
     pub const default_llm_streaming: bool = false;
     pub const default_llm_vision_enabled: bool = true;
+    pub const default_llm_documents_enabled: bool = true;
     /// Unchanged from the hardcoded value `qa.zig` used before this was
     /// configurable — existing behavior by default, override via
     /// `WARDEN_LLM_HISTORY_MESSAGES` for a cheaper/smaller context window.

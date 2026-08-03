@@ -200,6 +200,19 @@ fn writeContentBlocks(w: *Io.Writer, content: []const llm.ContentBlock) !void {
                 try json.Stringify.value(img.base64_data, .{}, w);
                 try w.writeAll("}}");
             },
+            // Same `source`-wrapped shape as `.image` above, differing only
+            // in the block type -- Anthropic's native PDF support, which
+            // reads the document's real layout/pages rather than treating
+            // it as text extracted elsewhere. Needs no beta header. The
+            // generic OpenAI-compatible surface has no equivalent; see
+            // `openai_compat.zig`'s `writeMessages`.
+            .document => |doc| {
+                try w.writeAll("{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":");
+                try json.Stringify.value(doc.media_type, .{}, w);
+                try w.writeAll(",\"data\":");
+                try json.Stringify.value(doc.base64_data, .{}, w);
+                try w.writeAll("}}");
+            },
             .tool_use => |tu| {
                 try w.writeAll("{\"type\":\"tool_use\",\"id\":");
                 try json.Stringify.value(tu.id, .{}, w);
@@ -498,6 +511,27 @@ test "writeContentBlocks: an image block writes Anthropic's base64 source shape"
     try testing.expectEqualStrings("base64", source.get("type").?.string);
     try testing.expectEqualStrings("image/jpeg", source.get("media_type").?.string);
     try testing.expectEqualStrings("Zm9v", source.get("data").?.string);
+}
+
+test "writeContentBlocks: a document block writes Anthropic's native PDF document shape" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try writeContentBlocks(&out.writer, &.{
+        .{ .text = "summarise this" },
+        .{ .document = .{ .media_type = "application/pdf", .base64_data = "JVBERg==" } },
+    });
+
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const blocks = parsed.value.array.items;
+    try testing.expectEqual(@as(usize, 2), blocks.len);
+    // "document", NOT "image" -- the whole point of the separate variant.
+    try testing.expectEqualStrings("document", blocks[1].object.get("type").?.string);
+    const source = blocks[1].object.get("source").?.object;
+    try testing.expectEqualStrings("base64", source.get("type").?.string);
+    try testing.expectEqualStrings("application/pdf", source.get("media_type").?.string);
+    try testing.expectEqualStrings("JVBERg==", source.get("data").?.string);
 }
 
 // `StreamState.onLine` is fed canned SSE lines directly (one `sink.onLine`

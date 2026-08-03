@@ -162,6 +162,7 @@ pub fn answer(
     stream: bool,
     show_thinking: bool,
     vision_enabled: bool,
+    documents_enabled: bool,
     max_tokens_override: ?u32,
     history_window: i64,
 ) ![]const u8 {
@@ -254,7 +255,7 @@ pub fn answer(
         .{ system_prompt orelse default_system_prompt, length_hint_chars },
     );
 
-    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, vision_enabled, effective_max_tokens);
+    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, vision_enabled, documents_enabled, effective_max_tokens);
 }
 
 test "answerMaxTokens reserves a thinking budget on top of the answer's own character-derived budget" {

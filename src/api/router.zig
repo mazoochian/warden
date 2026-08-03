@@ -3249,6 +3249,7 @@ fn testConfigForDefaults() config_mod.Config {
         .llm_show_thinking = false,
         .llm_streaming = true,
         .llm_vision_enabled = true,
+        .llm_documents_enabled = true,
         .llm_max_tokens_override = null,
         .llm_history_messages = 20,
         .skip_trivial_messages = true,

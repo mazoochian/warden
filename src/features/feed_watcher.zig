@@ -190,7 +190,7 @@ fn checkOne(connectors: []const iface.Connector, gpa: std.mem.Allocator, io: Io,
     // would have zero visible effect (same reasoning as digest.zig).
     // show_thinking=false and max_tokens=1024 for the same reasons
     // documented in digest.zig's own toolcall.run call.
-    const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}, false, false, false, 1024) catch |err| blk: {
+    const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, 1024) catch |err| blk: {
         std.log.err("feed_watcher: llm summary failed for {s}: {t}", .{ fw.feed_url, err });
         break :blk "";
     };

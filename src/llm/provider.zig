@@ -30,9 +30,28 @@ pub const ImageBlock = struct {
     base64_data: []const u8,
 };
 
+/// A base64-encoded document (currently only PDF), attached alongside a
+/// `.text` block the same way `ImageBlock` is — see
+/// `llm/attachment_content.zig`'s `documentBlockForAttachment`.
+///
+/// Structurally identical to `ImageBlock` but deliberately a separate
+/// variant rather than a reused one: the two serialize to *different* wire
+/// shapes (Anthropic's `{"type":"document",...}` vs `{"type":"image",...}`),
+/// and only one of them has an equivalent on the generic
+/// OpenAI-compatible surface — see `llm/openai_compat.zig`'s
+/// `writeMessages` for how a document degrades there. Collapsing them into
+/// one variant with a media-type check would push that provider-specific
+/// divergence into every switch arm instead of letting the compiler force
+/// each adapter to handle the two cases explicitly.
+pub const DocumentBlock = struct {
+    media_type: []const u8,
+    base64_data: []const u8,
+};
+
 pub const ContentBlock = union(enum) {
     text: []const u8,
     image: ImageBlock,
+    document: DocumentBlock,
     tool_use: ToolUse,
     tool_result: ToolResult,
 };
@@ -143,16 +162,17 @@ pub const Provider = struct {
     }
 };
 
-/// Concatenates all `text` blocks; image/tool_use/tool_result blocks
-/// contribute nothing (a response that's pure tool calls has no visible
-/// text yet, and a provider never sends an image block back in a response).
+/// Concatenates all `text` blocks; every other block type contributes
+/// nothing (a response that's pure tool calls has no visible text yet, and
+/// a provider never sends an image or document block back in a response —
+/// those are request-only, built by `llm/attachment_content.zig`).
 pub fn textOf(allocator: std.mem.Allocator, content: []const ContentBlock) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     for (content) |block| {
         switch (block) {
             .text => |t| try buf.appendSlice(allocator, t),
-            .image, .tool_use, .tool_result => {},
+            .image, .document, .tool_use, .tool_result => {},
         }
     }
     return buf.toOwnedSlice(allocator);
