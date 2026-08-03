@@ -163,6 +163,15 @@ pub const Message = struct {
     /// `find_chat_member` tool) grows from more than just who's actually
     /// spoken. Empty for platforms/messages that reveal nothing extra.
     observed_users: []const Identity = &.{},
+    /// Subset of a join service message's subjects that should trigger a
+    /// welcome message (ROADMAP.md's Phase 16) — distinct from
+    /// `observed_users` above, which already includes the same identities
+    /// for roster-registration purposes but conflates joins with replies/
+    /// mentions/leaves, giving `main.zig` no reliable way to tell "someone
+    /// just joined" apart from those. Excludes the bot's own account
+    /// joining/being added (not a "welcome a new member" event). Empty for
+    /// platforms/messages that aren't a join.
+    joined_users: []const Identity = &.{},
     /// Synthetic signal (not a real chat message) meaning the bot's own
     /// membership in `chat_id` just ended — left, kicked/banned, or the
     /// chat itself was deleted; every case is handled identically since
@@ -228,6 +237,12 @@ pub const Message = struct {
                 if (self.observed_users.len == 0) break :blk &.{};
                 const out = try allocator.alloc(Identity, self.observed_users.len);
                 for (self.observed_users, 0..) |id, i| out[i] = try id.dupe(allocator);
+                break :blk out;
+            },
+            .joined_users = blk: {
+                if (self.joined_users.len == 0) break :blk &.{};
+                const out = try allocator.alloc(Identity, self.joined_users.len);
+                for (self.joined_users, 0..) |id, i| out[i] = try id.dupe(allocator);
                 break :blk out;
             },
             .chat_left = self.chat_left,
@@ -719,6 +734,41 @@ test "Message.dupe passes through an empty observed_users without allocating" {
         testing.allocator.free(dst.user_id);
     }
     try testing.expectEqual(@as(usize, 0), dst.observed_users.len);
+    try testing.expectEqual(@as(usize, 0), dst.joined_users.len);
+}
+
+test "Message.dupe deep-copies joined_users independently of observed_users" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const src_a = arena.allocator();
+
+    const src = Message{
+        .chat_id = try src_a.dupe(u8, "1"),
+        .user_id = try src_a.dupe(u8, "2"),
+        .joined_users = &.{
+            .{
+                .platform = .telegram,
+                .native_id = try src_a.dupe(u8, "99"),
+                .display_name = try src_a.dupe(u8, "Bob"),
+                .first_seen = 1000,
+                .last_seen = 1000,
+            },
+        },
+    };
+
+    const dst = try src.dupe(testing.allocator);
+    defer {
+        testing.allocator.free(dst.chat_id);
+        testing.allocator.free(dst.user_id);
+        testing.allocator.free(dst.joined_users[0].native_id);
+        testing.allocator.free(dst.joined_users[0].display_name);
+        testing.allocator.free(dst.joined_users);
+    }
+
+    arena.deinit();
+
+    try testing.expectEqual(@as(usize, 0), dst.observed_users.len);
+    try testing.expectEqual(@as(usize, 1), dst.joined_users.len);
+    try testing.expectEqualStrings("Bob", dst.joined_users[0].display_name);
 }
 
 test "Message.dupe carries chat_left and deep-copies migrated_to_native_chat_id" {

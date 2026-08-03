@@ -204,6 +204,24 @@ pub const TelegramConnector = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    /// Just this message's `new_chat_members`, if any -- see
+    /// `iface.Message.joined_users`'s doc comment for why this is a
+    /// separate signal from `observedUsersFromMessage` above (which
+    /// includes the same identities for roster-registration purposes, but
+    /// mixed in with replies/mentions/leaves). Skips the bot's own account
+    /// being added -- same "not a participant worth surfacing" reasoning
+    /// `observedUsersFromMessage` already uses, and specifically not a
+    /// "welcome a new member" event either.
+    fn joinedUsersFromMessage(self: *TelegramConnector, allocator: std.mem.Allocator, msg: types.Message, now: i64) ![]Identity {
+        const joined = msg.new_chat_members orelse return &.{};
+        var out: std.ArrayList(Identity) = .empty;
+        for (joined) |user| {
+            if (self.self_id) |me| if (user.id == me) continue;
+            try out.append(allocator, try identityFromUser(allocator, user, now));
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     /// Telegram sends at most one of photo/document/voice/audio/video per
     /// message; checked in this order since only `photo` is ever a list
     /// (multiple resolutions) rather than a single object. Duped into
@@ -453,6 +471,7 @@ pub const TelegramConnector = struct {
 
             const attachment = try attachmentFromMessage(allocator, msg);
             const observed_users = try self.observedUsersFromMessage(allocator, msg, msg.date);
+            const joined_users = try self.joinedUsersFromMessage(allocator, msg, msg.date);
 
             try messages.append(allocator, .{
                 .chat_id = chat_id,
@@ -473,6 +492,7 @@ pub const TelegramConnector = struct {
                 .telegram_profile = telegram_profile,
                 .attachment = attachment,
                 .observed_users = observed_users,
+                .joined_users = joined_users,
             });
         }
         return messages.toOwnedSlice(allocator);
@@ -747,6 +767,39 @@ test "observedUsersFromMessage is empty for a plain message with nothing extra t
     const msg = types.Message{ .message_id = 1, .chat = .{ .id = 1 } };
     const observed = try conn.observedUsersFromMessage(a, msg, 1000);
     try testing.expectEqual(@as(usize, 0), observed.len);
+}
+
+test "joinedUsersFromMessage reports real joiners but excludes the bot's own account" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var conn = TelegramConnector.init(testing.allocator, testing.io, "test-token");
+    defer conn.deinit();
+    conn.self_id = 999;
+
+    const bob = types.User{ .id = 42, .first_name = "Bob" };
+    const the_bot = types.User{ .id = 999, .first_name = "Warden", .is_bot = true };
+    var joined = [_]types.User{ bob, the_bot };
+
+    const msg = types.Message{ .message_id = 1, .chat = .{ .id = 1 }, .new_chat_members = joined[0..] };
+    const result = try conn.joinedUsersFromMessage(a, msg, 1000);
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualStrings("42", result[0].native_id);
+    try testing.expectEqualStrings("Bob", result[0].display_name);
+}
+
+test "joinedUsersFromMessage is empty for a plain message with no new_chat_members" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var conn = TelegramConnector.init(testing.allocator, testing.io, "test-token");
+    defer conn.deinit();
+
+    const msg = types.Message{ .message_id = 1, .chat = .{ .id = 1 } };
+    const result = try conn.joinedUsersFromMessage(a, msg, 1000);
+    try testing.expectEqual(@as(usize, 0), result.len);
 }
 
 test "chatLeftMessageFromUpdate reports chat_left for left/kicked, null otherwise" {

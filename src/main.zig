@@ -138,6 +138,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "convert", .description = "Convert an attached photo/document/voice/audio/video to another format." },
     .{ .name = "magicword", .description = "<word> -- make Warden answer any message containing this word." },
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
+    .{ .name = "welcome", .description = "<text> -- greet new members ({name} = their name), or off to disable." },
     .{ .name = "thinking", .description = "on|off|default -- show or hide the model's reasoning for this chat." },
     .{ .name = "mute", .description = "Reply to a user's message to mute them. Admins only." },
     .{ .name = "unmute", .description = "Reply to a user's message to unmute them. Admins only." },
@@ -201,12 +202,11 @@ const help_text =
     \\  file with "/convert <format>" as its caption for one shot
     \\
     \\Customization (owner only to change, anyone can view)
-    \\/magicword <word> -- make me answer any message containing it, or
-    \\  /magicword off
-    \\/persona <text> -- set this chat's personality/system prompt, or
-    \\  /persona off to reset
+    \\/magicword <word> | off -- answer any message containing this word
+    \\/persona <text> | off -- set/reset this chat's personality
     \\/thinking on|off|default -- show/hide the model's reasoning here,
     \\  overriding the bot-wide default
+    \\/welcome <text> | off -- greet new members ({name} = their name)
     \\
     \\Group moderation (chat admins only, most by replying to a message)
     \\/mute, /unmute, /pin, /unpin, /delete -- reply to the target
@@ -1087,6 +1087,12 @@ fn processMessageTask(
         };
         return;
     }
+
+    // ROADMAP.md's Phase 16: welcome messages. A join service message has
+    // no `text`, so it would never reach `handleMessage`'s command
+    // dispatch below -- checked here instead, alongside the other
+    // housekeeping signals above, before normal message handling.
+    sendWelcomeMessages(connector, a, pool, chat_id, msg);
 
     // Every group member's message counts toward this chat's local record
     // (stats/content recall), regardless of who sent it — only
@@ -2073,6 +2079,8 @@ fn handleMessage(
         handleMagicWord(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/persona") or std.mem.startsWith(u8, text, "/persona ")) {
         handlePersonaCommand(connector, a, config, pool, chat_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/welcome") or std.mem.startsWith(u8, text, "/welcome ")) {
+        handleWelcomeCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/thinking") or std.mem.startsWith(u8, text, "/thinking ")) {
         handleThinkingCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/scraper") or std.mem.startsWith(u8, text, "/scraper ")) {
@@ -2452,6 +2460,141 @@ fn handlePersonaCommand(
         return;
     };
     reply(connector, a, msg.chat_id, msg.message_id, "Persona updated for this chat.");
+}
+
+const max_welcome_len = 1000;
+
+/// `/welcome <text>` / `/welcome off` — see ROADMAP.md's Phase 16. Same
+/// view-open-to-anyone/change-owner-only access model as `/persona`: a
+/// welcome message posts automatically whenever someone new joins, so
+/// letting any chat member rewrite it is a bigger lever than a magic word.
+/// `{name}` in `text` is a literal placeholder, substituted per new member
+/// at send time by `sendWelcomeMessages` below -- not expanded here.
+fn handleWelcomeCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/welcome".len..], " ");
+
+    if (arg.len == 0) {
+        const reply_text = if (chat_settings.getWelcomeMessage(pool, a, chat_id)) |welcome|
+            std.fmt.allocPrint(a, "This chat's welcome message:\n{s}\n\nChange it with /welcome <text> ({{name}} is replaced with the new member's name), turn it off with /welcome off.", .{welcome}) catch return
+        else
+            "No welcome message set. Set one with /welcome <text> -- {name} is replaced with the new member's name.";
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    // Viewing (above) stays available even when disabled -- same policy
+    // `/persona`'s own gate uses. Only the set/clear path below is gated.
+    if (!feature_flags.isEnabled(pool, "welcome_messages")) return;
+
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can change this chat's welcome message.");
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "off")) {
+        chat_settings.setWelcomeMessage(pool, chat_id, null) catch |err| {
+            log.err("welcome: failed to clear for chat {s}: {t}", .{ msg.chat_id, err });
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Welcome message turned off.");
+        return;
+    }
+
+    if (arg.len > max_welcome_len) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That welcome message is too long (max 1000 bytes).");
+        return;
+    }
+
+    chat_settings.setWelcomeMessage(pool, chat_id, arg) catch |err| {
+        log.err("welcome: failed to set for chat {s}: {t}", .{ msg.chat_id, err });
+        return;
+    };
+    reply(connector, a, msg.chat_id, msg.message_id, "Welcome message set for this chat.");
+}
+
+/// Sends this chat's configured welcome message (if any) once per newly-
+/// joined member in `msg.joined_users` -- called from `processMessageTask`
+/// right after the housekeeping checks, before normal dispatch (a join
+/// service message has no `text`, so it would never reach `handleMessage`'s
+/// command chain anyway). A no-op, not an error, when no welcome message is
+/// configured or the chat's `welcome_messages` module is disabled -- most
+/// chats never opt in, and this runs on every join regardless.
+fn sendWelcomeMessages(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message) void {
+    if (msg.joined_users.len == 0) return;
+    if (!feature_flags.isEnabled(pool, "welcome_messages")) return;
+    const template = chat_settings.getWelcomeMessage(pool, a, chat_id) orelse return;
+
+    for (msg.joined_users) |member| {
+        const text = std.mem.replaceOwned(u8, a, template, "{name}", member.display_name) catch continue;
+        connector.sendMessage(a, msg.chat_id, text, null);
+    }
+}
+
+test "sendWelcomeMessages substitutes {name} per joined member, no-ops without a configured template or with no joiners" {
+    const test_support = @import("store/test_support.zig");
+    var db = try test_support.openTestDb(std.testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try store_pool.PgPool.wrapForTest(std.testing.allocator, std.testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    const RecordingState = struct { sent: std.ArrayList([]const u8) = .empty };
+    var state = RecordingState{};
+    const vt = struct {
+        const vtable: iface.Connector.VTable = .{
+            .platform = platformFn,
+            .poll = pollFn,
+            .sendMessage = sendMessageFn,
+        };
+        fn platformFn(ptr: *anyopaque) iface.Platform {
+            _ = ptr;
+            return .telegram;
+        }
+        fn pollFn(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]iface.Message {
+            _ = ptr;
+            _ = alloc;
+            return &.{};
+        }
+        fn sendMessageFn(ptr: *anyopaque, alloc: std.mem.Allocator, cid: []const u8, text: []const u8, reply_to: ?[]const u8) void {
+            _ = cid;
+            _ = reply_to;
+            const s: *RecordingState = @ptrCast(@alignCast(ptr));
+            s.sent.append(alloc, text) catch {};
+        }
+    };
+    const connector: iface.Connector = .{ .ptr = &state, .vtable = &vt.vtable };
+
+    const alice: Identity = .{ .platform = .telegram, .native_id = "10", .display_name = "Alice", .first_seen = 1000, .last_seen = 1000 };
+    const bob: Identity = .{ .platform = .telegram, .native_id = "11", .display_name = "Bob", .first_seen = 1000, .last_seen = 1000 };
+    const join_msg = iface.Message{ .chat_id = "1", .user_id = "0", .joined_users = &.{ alice, bob } };
+
+    // No template configured yet -- no-op.
+    sendWelcomeMessages(connector, a, &pool, chat_id, join_msg);
+    try std.testing.expectEqual(@as(usize, 0), state.sent.items.len);
+
+    try chat_settings.setWelcomeMessage(&pool, chat_id, "Welcome, {name}!");
+    sendWelcomeMessages(connector, a, &pool, chat_id, join_msg);
+    try std.testing.expectEqual(@as(usize, 2), state.sent.items.len);
+    try std.testing.expectEqualStrings("Welcome, Alice!", state.sent.items[0]);
+    try std.testing.expectEqualStrings("Welcome, Bob!", state.sent.items[1]);
+
+    // No joiners on this message -- no-op even with a template configured.
+    const no_join_msg = iface.Message{ .chat_id = "1", .user_id = "0" };
+    sendWelcomeMessages(connector, a, &pool, chat_id, no_join_msg);
+    try std.testing.expectEqual(@as(usize, 2), state.sent.items.len);
 }
 
 /// Per-chat override for whether a reasoning model's chain-of-thought is

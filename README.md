@@ -24,6 +24,7 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Messaging Modes: `/translate <language> <text>`, `/rewrite <tone> <text>`, `/eli5 <text>`, and `/brainstorm <topic>` are reliable, documented commands over capabilities the model already has zero-shot — each also works by replying to a message with just the command and its first argument (e.g. `/translate spanish` as a reply translates that message). Ask "catch me up" or "what did I miss" (or use these commands) and the bot pulls its own logged history for the last 24h (configurable) and summarizes it itself — different from the scheduled `/digest`, this is on-demand and model-controlled
 - Polls: `/poll <question> | <option 1> | <option 2> | ...` (2-10 options) sends a real native poll, or just ask in natural language ("make a poll asking pizza or sushi")
 - Keyword Alerts: `/keyword add <word>` tracks a word for this chat — whenever anyone's message mentions it, the bot flags it right there (whole-word, case-insensitive, no LLM call). `/keyword list` / `/keyword remove <id>` manage the list, creator-or-owner to remove
+- Welcome Messages: `/welcome <text>` (owner only to set; `{name}` is replaced with the new member's name) greets anyone who joins the chat automatically; `/welcome off` disables it. Off by default — opt in per chat
 
 # Talking to the bot
 Nobody but the owner (and any bot admins — see "Access control" below) can

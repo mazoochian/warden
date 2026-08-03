@@ -39,6 +39,7 @@ const migrations = [_]Migration{
     .{ .version = 25, .name = "0025_memories", .sql = @embedFile("migrations/0025_memories.sql") },
     .{ .version = 26, .name = "0026_briefings", .sql = @embedFile("migrations/0026_briefings.sql") },
     .{ .version = 27, .name = "0027_keyword_alerts", .sql = @embedFile("migrations/0027_keyword_alerts.sql") },
+    .{ .version = 28, .name = "0028_welcome_message", .sql = @embedFile("migrations/0028_welcome_message.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each

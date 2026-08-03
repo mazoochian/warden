@@ -1060,8 +1060,9 @@ write-capable API (draft/send email) rather than a read-only public one
 (weather, crypto, RSS).
 
 ### Phase 16 — Group/Telegram quality-of-life
-*Effort: S/M. Status: slice 1 (poll generation) and slice 2 (keyword
-alerts) done — see below for what shipped vs. what's deferred.*
+*Effort: S/M. Status: slice 1 (poll generation), slice 2 (keyword alerts),
+and slice 3 (welcome messages) done — see below for what shipped vs.
+what's deferred.*
 
 Extends `group_admin.zig`'s existing moderation surface rather than adding
 a new subsystem. Covers: welcome messages, scheduled announcements,
@@ -1134,11 +1135,36 @@ reasoning doesn't change here.
   per-chat scoping, case-insensitive dedup) but no real Telegram message
   exercised this pass.
 
+**Done (slice 3, welcome messages, 2026-08-03):**
+- New `iface.Message.joined_users` — a distinct signal from the pre-
+  existing `observed_users` bag, which already carried join-event subjects
+  but conflated them with reply targets/text-mentions/leaves for identity-
+  registration purposes only, giving `main.zig` no reliable way to tell
+  "someone just joined" apart from those. `platform/telegram.zig`'s new
+  `joinedUsersFromMessage` populates it from `new_chat_members` alone,
+  excluding the bot's own account being added (not a "welcome a new
+  member" event).
+- `chat_settings.welcome_message` (migration `0028_welcome_message.sql`,
+  `getWelcomeMessage`/`setWelcomeMessage`) — nullable, unset means no
+  welcome configured (opt-in, not on by default). `{name}` is a literal
+  placeholder in the stored text, substituted per new member at send time.
+- `/welcome <text>` / `/welcome off` (`main.zig`'s `handleWelcomeCommand`)
+  — same view-open-to-anyone/change-owner-only access model as `/persona`.
+  `sendWelcomeMessages` is called from `processMessageTask` alongside the
+  other housekeeping signals (`chat_left`/`migrated_to_native_chat_id`),
+  since a join service message has no `text` and would never reach
+  `handleMessage`'s normal command dispatch otherwise.
+- New `welcome_messages` feature flag gates the set/clear path (viewing
+  stays open, matching `/persona`'s own policy) and the actual send.
+- `zig build` and `zig build test` both green; covered by unit tests
+  (`joinedUsersFromMessage`'s bot-exclusion, `Message.dupe`'s deep copy,
+  the `welcome_message` store round trip, and a `sendWelcomeMessages`
+  integration test against a real test-Postgres chat and a fake connector
+  confirming per-member `{name}` substitution and the no-template/no-
+  joiners no-op cases).
+- **Not live-verified** — no real Telegram join event exercised this pass.
+
 **Deferred, not built this pass:**
-- **Welcome messages** needs a new "someone just joined" signal distinct
-  from the existing `observed_users` bag, which today conflates joins with
-  replies/mentions/`new_chat_members` for identity-registration purposes
-  only — real new plumbing, not done in this pass for time.
 - **Scheduled announcements** needs its own storage + scheduler (a
   genuinely separate sub-feature, not "extends the existing moderation
   surface" the way the rest of this phase does) — bigger than this slice's

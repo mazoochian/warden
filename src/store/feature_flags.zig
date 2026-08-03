@@ -79,6 +79,7 @@ pub const known_modules = [_]ModuleInfo{
     .{ .key = "messaging_modes", .label = "Messaging Modes", .category = .standalone },
     .{ .key = "polls", .label = "Polls", .category = .standalone },
     .{ .key = "keyword_alerts", .label = "Keyword Alerts", .category = .standalone },
+    .{ .key = "welcome_messages", .label = "Welcome Messages", .category = .standalone },
     .{ .key = "weather", .label = "Weather", .category = .llm_tool },
     .{ .key = "crypto_price", .label = "Crypto Prices", .category = .llm_tool },
     .{ .key = "air_quality", .label = "Air Quality", .category = .llm_tool },
