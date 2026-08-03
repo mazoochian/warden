@@ -6801,11 +6801,64 @@ test {
     _ = @import("store/db.zig");
 }
 
-/// ASCII whitespace/punctuation counts as a boundary; bytes >= 0x80 do NOT,
-/// so a UTF-8 word (e.g. Persian) embedded inside a longer word isn't a
-/// false match, while the same word delimited by spaces/punctuation is.
-fn isWordBoundary(c: u8) bool {
-    return c < 0x80 and !std.ascii.isAlphanumeric(c);
+/// Codepoints that delimit a word for magic-word / keyword matching.
+///
+/// ASCII is easy: anything non-alphanumeric. Beyond ASCII there's no full
+/// Unicode table to consult, so this enumerates the punctuation, symbol and
+/// separator blocks that actually turn up in chat -- above all the Persian
+/// comma (U+060C) and question mark (U+061F), which is what "وردن،" and
+/// "وردن؟" end with. Everything else >= 0x80 stays a word character, so a
+/// name embedded in a longer word ("محسن" vs "حسن") still isn't a match.
+///
+/// ZWNJ/ZWJ (U+200C/U+200D) are deliberately word characters: Persian uses
+/// them *inside* words, so treating them as boundaries would match a name
+/// glued to a suffix.
+fn isWordBoundaryCodepoint(cp: u21) bool {
+    if (cp < 0x80) return !std.ascii.isAlphanumeric(@intCast(cp));
+    return switch (cp) {
+        0x00A0, 0x00A1, 0x00AB, 0x00B7, 0x00BB, 0x00BF => true, // Latin-1 punctuation
+        0x0589, 0x058A, 0x05BE, 0x05C0, 0x05C3, 0x05C6, 0x05F3, 0x05F4 => true, // Armenian/Hebrew
+        0x060C, 0x060D, 0x061B, 0x061E, 0x061F => true, // Arabic comma/semicolon/question mark
+        0x066A...0x066D => true, // Arabic percent / decimal separators / star
+        0x06D4 => true, // Arabic full stop
+        0x0964, 0x0965 => true, // Devanagari danda
+        0x200B, 0x200E, 0x200F => true, // zero-width space + bidi marks (not ZWNJ/ZWJ)
+        0x2010...0x2027 => true, // dashes, quotes, bullet, ellipsis
+        0x2028...0x205F => true, // separators, bidi controls, exotic spaces
+        0x2190...0x2BFF => true, // arrows, math operators, symbols, dingbats
+        0x2E00...0x2E7F => true, // supplemental punctuation
+        0x3000...0x303F => true, // CJK punctuation
+        0xFE0F, 0xFE10...0xFE19, 0xFE30...0xFE6F => true, // variation selector, vertical/small forms
+        0xFF01...0xFF20, 0xFF3B...0xFF40, 0xFF5B...0xFF65 => true, // fullwidth punctuation
+        0x1F000...0x1FAFF => true, // emoji and pictographs
+        else => false,
+    };
+}
+
+/// Boundary test for the byte *before* `idx`: walks back to the start of the
+/// UTF-8 sequence and decodes it. Malformed or misaligned input counts as a
+/// boundary -- erring toward answering beats silently ignoring the owner.
+fn isWordBoundaryBefore(haystack: []const u8, idx: usize) bool {
+    if (idx == 0) return true;
+    var i = idx;
+    while (i > 0 and idx - i < 4) {
+        i -= 1;
+        if (haystack[i] & 0xC0 == 0x80) continue; // continuation byte
+        const len = std.unicode.utf8ByteSequenceLength(haystack[i]) catch return true;
+        if (i + len != idx) return true;
+        const cp = std.unicode.utf8Decode(haystack[i..idx]) catch return true;
+        return isWordBoundaryCodepoint(cp);
+    }
+    return true;
+}
+
+/// Boundary test for the codepoint starting at `idx` (end of the match).
+fn isWordBoundaryAt(haystack: []const u8, idx: usize) bool {
+    if (idx >= haystack.len) return true;
+    const len = std.unicode.utf8ByteSequenceLength(haystack[idx]) catch return true;
+    if (idx + len > haystack.len) return true;
+    const cp = std.unicode.utf8Decode(haystack[idx..][0..len]) catch return true;
+    return isWordBoundaryCodepoint(cp);
 }
 
 /// Whole-word, ASCII-case-insensitive search — used for magic-word
@@ -6818,8 +6871,8 @@ fn containsWordIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     while (std.ascii.indexOfIgnoreCasePos(haystack, start, needle)) |abs_idx| {
         const end_idx = abs_idx + needle.len;
 
-        const left_ok = (abs_idx == 0) or isWordBoundary(haystack[abs_idx - 1]);
-        const right_ok = (end_idx == haystack.len) or isWordBoundary(haystack[end_idx]);
+        const left_ok = isWordBoundaryBefore(haystack, abs_idx);
+        const right_ok = isWordBoundaryAt(haystack, end_idx);
 
         if (left_ok and right_ok) {
             return true;
@@ -6847,6 +6900,38 @@ test "containsWordIgnoreCase handles UTF-8 magic words" {
     try std.testing.expect(containsWordIgnoreCase("حسن!", "حسن"));
     // ...but the same bytes inside a longer word ("محسن") do not.
     try std.testing.expect(!containsWordIgnoreCase("محسن اومد", "حسن"));
+}
+
+// Regression: Persian punctuation is multi-byte UTF-8, so the old
+// ASCII-only boundary test saw "وردن،" as one long word and the bot stayed
+// silent when it was called by name with normal Persian punctuation.
+test "containsWordIgnoreCase treats Persian punctuation as a word boundary" {
+    const magic = "وردن";
+    try std.testing.expect(containsWordIgnoreCase("وردن، حالت چطوره؟", magic)); // Arabic comma U+060C
+    try std.testing.expect(containsWordIgnoreCase("وردن؟", magic)); // Arabic question mark U+061F
+    try std.testing.expect(containsWordIgnoreCase("سلام وردن؛ خوبی", magic)); // Arabic semicolon U+061B
+    try std.testing.expect(containsWordIgnoreCase("وردن۔", magic)); // Arabic full stop U+06D4
+    try std.testing.expect(containsWordIgnoreCase("«وردن» رو صدا کن", magic)); // guillemets
+    try std.testing.expect(containsWordIgnoreCase("وردن — یه سوال", magic)); // em dash
+    try std.testing.expect(containsWordIgnoreCase("وردن…", magic)); // ellipsis
+    try std.testing.expect(containsWordIgnoreCase("وردن👋", magic)); // emoji
+    try std.testing.expect(containsWordIgnoreCase("hey وردن, hi", magic)); // ASCII still works
+
+    // A name glued to more letters is still not a match, in either direction.
+    try std.testing.expect(!containsWordIgnoreCase("وردنها اومدن", magic));
+    try std.testing.expect(!containsWordIgnoreCase("باوردن", magic));
+    // ZWNJ joins word parts in Persian, so it must not act as a boundary.
+    try std.testing.expect(!containsWordIgnoreCase("وردن\u{200c}ها", magic));
+}
+
+test "word-boundary helpers handle malformed UTF-8 without misreading bytes" {
+    // A truncated sequence next to the needle counts as a boundary rather
+    // than swallowing the match.
+    try std.testing.expect(containsWordIgnoreCase("\xd8 وردن", "وردن"));
+    try std.testing.expect(containsWordIgnoreCase("وردن\xd8", "وردن"));
+    try std.testing.expect(isWordBoundaryBefore("abc", 0));
+    try std.testing.expect(isWordBoundaryAt("abc", 3));
+    try std.testing.expect(!isWordBoundaryAt("abc", 1));
 }
 
 fn replyTarget(msg: iface.Message) ?struct { user_id: []const u8, label: []const u8 } {
