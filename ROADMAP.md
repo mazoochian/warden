@@ -1060,8 +1060,8 @@ write-capable API (draft/send email) rather than a read-only public one
 (weather, crypto, RSS).
 
 ### Phase 16 — Group/Telegram quality-of-life
-*Effort: S/M. Status: slice 1 done (poll generation) — see below for what
-shipped vs. what's deferred.*
+*Effort: S/M. Status: slice 1 (poll generation) and slice 2 (keyword
+alerts) done — see below for what shipped vs. what's deferred.*
 
 Extends `group_admin.zig`'s existing moderation surface rather than adding
 a new subsystem. Covers: welcome messages, scheduled announcements,
@@ -1100,13 +1100,45 @@ reasoning doesn't change here.
   not confirmed against a real Bot API `sendPoll` call. Noted honestly
   rather than claimed, same standard held elsewhere in this file.
 
+**Done (slice 2, keyword alerts, 2026-08-03):**
+- `keyword_alerts` table (migration `0027_keyword_alerts.sql`) + `store/
+  keyword_alerts.zig` (`add`/`listForChat`/`get`/`remove`) — chat-scoped,
+  same "shared, but only the creator or the bot owner may delete" model
+  `notes.zig` already uses. Keywords are lowercased before storage
+  (`AddResult.already_tracked` on a case-insensitive dupe) so "Urgent" and
+  "urgent" don't create two functionally identical rows.
+- `/keyword add <word>` / `/keyword list` / `/keyword remove <id>`
+  (`main.zig`'s `handleKeywordCommand`) — same add/list/delete-by-id shape
+  `/note` already uses.
+- `checkKeywordAlerts`, called from `processMessageTask` right alongside
+  `recordMessage`/`bcast.publish` (not gated behind the owner/credits
+  checks real Q&A uses) — scans every incoming message's text against the
+  chat's tracked keywords via the existing `containsWordIgnoreCase`
+  matcher (the same whole-word, case-insensitive check `/magicword`
+  already uses), and posts one combined flag message naming every keyword
+  that matched, for any sender. Deliberately fires regardless of who sent
+  the message: this is a passive content observation, same tier as message
+  logging itself, not a privileged action — and it's a plain string scan
+  with no LLM call, so there's no credits cost to gate either.
+- **Scope decision**: no corresponding LLM tool this pass (unlike
+  reminders/alerts/notes/memory, which all have a natural-language front
+  end alongside their command) — `/keyword add <word>` is explicit enough
+  that a tool wouldn't add much, similar to how `/digest`/`/briefing` also
+  ship command-only. Revisit if "alert me whenever someone mentions X"
+  turns out to be a natural-language request people actually try.
+- New `keyword_alerts` feature flag gates the command trio and the scan
+  hook together.
+- `zig build` and `zig build test` both green (522/524; same 1 expected
+  skip + 1 pre-existing flake as every other pass this session).
+- **Not live-verified** — covered by unit/store tests (round-trip,
+  per-chat scoping, case-insensitive dedup) but no real Telegram message
+  exercised this pass.
+
 **Deferred, not built this pass:**
-- **Keyword alerts** and **welcome messages** are next in line for a
-  follow-up slice — both need real new plumbing (a per-chat keyword list
-  + a message-scan hook for the former; a new "someone just joined" signal
-  distinct from the existing `observed_users` bag, which today conflates
-  joins with replies/mentions/`new_chat_members` for identity-registration
-  purposes only, for the latter), not done in this pass for time.
+- **Welcome messages** needs a new "someone just joined" signal distinct
+  from the existing `observed_users` bag, which today conflates joins with
+  replies/mentions/`new_chat_members` for identity-registration purposes
+  only — real new plumbing, not done in this pass for time.
 - **Scheduled announcements** needs its own storage + scheduler (a
   genuinely separate sub-feature, not "extends the existing moderation
   surface" the way the rest of this phase does) — bigger than this slice's

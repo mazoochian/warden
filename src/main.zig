@@ -49,6 +49,7 @@ const messages = @import("store/messages.zig");
 const stats = @import("store/stats.zig");
 const reminders = @import("store/reminders.zig");
 const notes = @import("store/notes.zig");
+const keyword_alerts = @import("store/keyword_alerts.zig");
 const memories = @import("store/memories.zig");
 const embeddings = @import("llm/embeddings.zig");
 const reminder_format = @import("features/reminder_format.zig");
@@ -122,6 +123,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "note", .description = "add <text> | list | delete <id> -- a shared notes/lists space for this chat." },
     .{ .name = "notes", .description = "List every note in this chat." },
     .{ .name = "memory", .description = "list | forget <id> -- what I remember about you, across every chat." },
+    .{ .name = "keyword", .description = "add <word> | list | remove <id> -- get flagged here when a word comes up." },
     .{ .name = "alert", .description = "<crypto|weather|aqi> <subject> <above|below> <value> -- set an alert." },
     .{ .name = "alerts", .description = "List pending alerts in this chat." },
     .{ .name = "watch", .description = "<feed url> -- get notified when an RSS/Atom feed publishes." },
@@ -160,11 +162,11 @@ const public_commands = [_]iface.CommandSpec{
 /// public menu, group-chat-only commands, and the free-form LLM path, none
 /// of which fit `CommandSpec`'s flat name/description shape.
 const help_text =
-    \\I'm Warden. Talk to me by mentioning me, replying to my messages, or
-    \\(in a group) saying this chat's magic word -- see /magicword. Ask
-    \\anything in plain language and I'll reach for the right tool (weather,
-    \\crypto, calculator, diagrams, word clouds, web search, URLs) --
-    \\reminders/alerts/conversion/translation below also work as plain asks.
+    \\I'm Warden. Talk to me by mentioning me, replying, or (in a group)
+    \\saying this chat's magic word -- see /magicword. Ask anything and
+    \\I'll reach for the right tool (weather, crypto, calculator, diagrams,
+    \\word clouds, web search, URLs) -- most items below also work as
+    \\plain asks.
     \\
     \\General
     \\/ping -- check I'm responsive
@@ -187,7 +189,8 @@ const help_text =
     \\/note add <text> | list | delete <id> -- notes/shopping lists for
     \\  this chat. /notes lists them all
     \\/memory list | forget <id> -- what I remember about you (I save
-    \\  things myself while we talk)
+    \\  things myself as we talk)
+    \\/keyword add <word> | list | remove <id> -- flag it here when said
     \\
     \\Messaging modes
     \\/translate <lang>, /rewrite <tone>, /eli5, /brainstorm <topic> --
@@ -1105,6 +1108,15 @@ fn processMessageTask(
         // message actually gets answered.
         const sender_display_name = if (msg.identity) |identity| identity.display_name else msg.username orelse msg.user_id;
         bcast.publish(chat_id, sender_display_name, msg.text, ts);
+
+        // ROADMAP.md's Phase 16: keyword alerts. A plain string scan (no
+        // LLM call), fires for any sender -- see `checkKeywordAlerts`'s own
+        // doc comment for why this sits at the same "passive content
+        // observation" tier as `recordMessage`/`bcast.publish` above rather
+        // than behind the owner/credits gates real Q&A uses.
+        if (feature_flags.isEnabled(pool, "keyword_alerts")) {
+            if (msg.text) |t| checkKeywordAlerts(connector, a, pool, chat_id, msg, t);
+        }
     }
     recordObservedUsers(pool, chat_id, msg.observed_users);
 
@@ -2076,6 +2088,9 @@ fn handleMessage(
         handleNoteCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/notes")) {
         handleNotesList(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
+    } else if (std.mem.eql(u8, text, "/keyword") or std.mem.startsWith(u8, text, "/keyword ")) {
+        if (!feature_flags.isEnabled(pool, "keyword_alerts")) return false;
+        handleKeywordCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/memory") or std.mem.startsWith(u8, text, "/memory ")) {
         if (!feature_flags.isEnabled(pool, "memory")) return false;
         handleMemoryCommand(connector, a, pool, identity_id, msg, text);
@@ -3515,6 +3530,136 @@ fn handleNotesList(
         return;
     };
     connector.sendMessage(a, native_chat_id, formatAllNotes(a, listed), reply_to);
+}
+
+/// `/keyword add <word>` / `/keyword list` / `/keyword remove <id>` — see
+/// ROADMAP.md's Phase 16. Same add/list/delete-by-id shape as
+/// `handleNoteCommand`, including its creator-or-owner delete
+/// authorization -- deliberately not open to "anyone in the chat" like
+/// `/watch`/`/digest on`, since a keyword alert firing on every mention
+/// is more disruptive than a shared feed subscription.
+fn handleKeywordCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const usage = "Usage: /keyword add <word>, /keyword list, or /keyword remove <id>";
+    const arg = std.mem.trim(u8, text["/keyword".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const sub = it.first();
+
+    if (std.mem.eql(u8, sub, "list")) {
+        const listed = keyword_alerts.listForChat(pool, a, chat_id) catch |err| {
+            log.err("keyword: list failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't load keyword alerts, try again.");
+            return;
+        };
+        connector.sendMessage(a, msg.chat_id, formatKeywordAlerts(a, listed), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "remove")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /keyword remove <id> (see /keyword list for ids).");
+            return;
+        };
+        const alert = (keyword_alerts.get(pool, a, id) catch |err| {
+            log.err("keyword: lookup failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that up, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No keyword alert with that id.");
+            return;
+        };
+        if (alert.chat_id != chat_id) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No keyword alert with that id.");
+            return;
+        }
+        if (alert.identity_id != identity_id and !auth.isOwner(config, connector.platform(), msg.user_id)) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Only whoever added that alert (or the owner) can remove it.");
+            return;
+        }
+        keyword_alerts.remove(pool, id) catch |err| {
+            log.err("keyword: remove failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't remove that, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Keyword alert removed.");
+        return;
+    }
+
+    if (!std.mem.eql(u8, sub, "add")) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    const keyword = std.mem.trim(u8, it.rest(), " ");
+    if (keyword.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    if (keyword.len > max_keyword_len) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That's too long for a keyword (max 100 bytes).");
+        return;
+    }
+
+    const result = keyword_alerts.add(pool, a, chat_id, identity_id, keyword, now) catch |err| {
+        log.err("keyword: failed to add for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that, try again.");
+        return;
+    };
+    switch (result) {
+        .already_tracked => reply(connector, a, msg.chat_id, msg.message_id, "That keyword is already tracked in this chat."),
+        .added => |id| {
+            const confirmation = std.fmt.allocPrint(a, "Keyword alert #{d} added -- I'll flag it here whenever it comes up.", .{id}) catch return;
+            connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+        },
+    }
+}
+
+const max_keyword_len = 100;
+
+fn formatKeywordAlerts(a: std.mem.Allocator, listed: []const keyword_alerts.KeywordAlert) []const u8 {
+    if (listed.len == 0) return "No keyword alerts yet. Add one with /keyword add <word>.";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Keyword alerts:\n", .{}) catch return "";
+    for (listed) |k| w.print("  #{d} {s}\n", .{ k.id, k.keyword }) catch return "";
+    return buf.writer.buffered();
+}
+
+/// Scans one incoming message's text against `chat_id`'s tracked keyword
+/// alerts (whole-word, case-insensitive -- `containsWordIgnoreCase`, same
+/// matcher the magic-word check already uses) and, on any hit, posts one
+/// combined flag message naming every keyword that matched -- not one
+/// message per match, so a message that happens to contain several
+/// tracked words doesn't spam the chat. Fires for *any* sender (this is a
+/// passive content observation, same "every message is logged regardless
+/// of who sent it" tier as recording itself, not a privileged action), and
+/// is a plain string scan -- no LLM call, so no credits/owner gate either.
+/// Errors loading the tracked list are logged and swallowed, same "never
+/// let a side feature block the main flow" convention `bcast.publish`'s
+/// own call site uses.
+fn checkKeywordAlerts(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
+    if (text.len == 0) return;
+    const tracked = keyword_alerts.listForChat(pool, a, chat_id) catch |err| {
+        log.err("keyword: scan lookup failed for chat {d}: {t}", .{ chat_id, err });
+        return;
+    };
+    if (tracked.len == 0) return;
+
+    var matches: std.ArrayList([]const u8) = .empty;
+    for (tracked) |k| {
+        if (containsWordIgnoreCase(text, k.keyword)) matches.append(a, k.keyword) catch return;
+    }
+    if (matches.items.len == 0) return;
+
+    const sender = if (msg.identity) |identity| identity.display_name else msg.username orelse msg.user_id;
+    var buf: std.Io.Writer.Allocating = .init(a);
+    buf.writer.print("🔔 Keyword alert ({s}) -- mentioned by {s}", .{ std.mem.join(a, ", ", matches.items) catch return, sender }) catch return;
+    connector.sendMessage(a, msg.chat_id, buf.writer.buffered(), msg.message_id);
 }
 
 /// `/memory list` / `/memory forget <id>` — see ROADMAP.md's Phase 12.
@@ -5287,6 +5432,7 @@ test {
     _ = @import("store/stats.zig");
     _ = @import("store/reminders.zig");
     _ = @import("store/notes.zig");
+    _ = @import("store/keyword_alerts.zig");
     _ = @import("store/memories.zig");
     _ = @import("features/qa.zig");
     _ = @import("features/reminder_format.zig");
