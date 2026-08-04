@@ -80,6 +80,7 @@ pub const known_modules = [_]ModuleInfo{
     .{ .key = "polls", .label = "Polls", .category = .standalone },
     .{ .key = "keyword_alerts", .label = "Keyword Alerts", .category = .standalone },
     .{ .key = "welcome_messages", .label = "Welcome Messages", .category = .standalone },
+    .{ .key = "announcements", .label = "Announcements", .category = .standalone },
     .{ .key = "finance", .label = "Finance", .category = .standalone },
     .{ .key = "power_tools", .label = "Power-User Tools", .category = .standalone },
     .{ .key = "weather", .label = "Weather", .category = .llm_tool },

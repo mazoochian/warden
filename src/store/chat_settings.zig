@@ -372,6 +372,57 @@ pub fn setDefaultLocation(pool: *PgPool, chat_id: i64, location: ?[]const u8) !v
     _ = try stmt.step();
 }
 
+/// Whether this chat wants scheduled announcements pinned as they're
+/// posted (ROADMAP.md's Phase 16 auto-pin item) — false unless the chat
+/// explicitly opted in via `/autopin on`, same shape as
+/// `getDigestEnabled`/`getBriefingEnabled` and the same "off until asked"
+/// default as `welcome_message`.
+///
+/// The name is narrower than "auto-pin" on purpose: the only thing this
+/// ever pins is an announcement the bot itself posted, from a schedule a
+/// chat admin explicitly created. It is never a judgment about someone
+/// else's message — see `0036_autopin_announcements.sql`.
+pub fn getAutopinAnnouncements(pool: *PgPool, chat_id: i64) bool {
+    const db = pool.acquire() catch return false;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT autopin_announcements FROM chat_settings WHERE chat_id = $1;") catch return false;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return false;
+    if (!has_row) return false;
+    return stmt.columnBool(0);
+}
+
+pub fn setAutopinAnnouncements(pool: *PgPool, chat_id: i64, value: bool) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, autopin_announcements) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET autopin_announcements = excluded.autopin_announcements;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindBool(2, value);
+    _ = try stmt.step();
+}
+
+test "autopin_announcements is off until a chat opts in, and toggles back off" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    try testing.expect(!getAutopinAnnouncements(&pool, chat_id));
+    try setAutopinAnnouncements(&pool, chat_id, true);
+    try testing.expect(getAutopinAnnouncements(&pool, chat_id));
+    try setAutopinAnnouncements(&pool, chat_id, false);
+    try testing.expect(!getAutopinAnnouncements(&pool, chat_id));
+}
+
 test "default location round-trips, is null by default, and clears back to null" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();

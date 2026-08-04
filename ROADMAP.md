@@ -1146,9 +1146,10 @@ write-capable API (draft/send email) rather than a read-only public one
 (weather, crypto, RSS).
 
 ### Phase 16 — Group/Telegram quality-of-life
-*Effort: S/M. Status: slice 1 (poll generation), slice 2 (keyword alerts),
-and slice 3 (welcome messages) done — see below for what shipped vs.
-what's deferred.*
+*Effort: S/M. Status: **done** — slice 1 (poll generation), slice 2
+(keyword alerts), slice 3 (welcome messages), slice 4 (scheduled
+announcements), slice 5 (auto-pin) and slice 6 (group summaries) have all
+shipped. See below for what shipped vs. what's deferred in each.*
 
 Extends `group_admin.zig`'s existing moderation surface rather than adding
 a new subsystem. Covers: welcome messages, scheduled announcements,
@@ -1250,7 +1251,9 @@ reasoning doesn't change here.
   joiners no-op cases).
 - **Not live-verified** — no real Telegram join event exercised this pass.
 
-**Deferred, not built this pass:**
+**Deferred as of slice 3 (2026-08-03) — superseded by slices 4-6 below,
+kept here because the reasoning is what those slices were built to
+answer, and two of the three objections turned out to be right:**
 - **Scheduled announcements** — **re-examined 2026-08-03 and now judged
   largely redundant, not merely deferred.** The original note assumed this
   needed its own storage + scheduler. It doesn't: `reminders` already
@@ -1274,6 +1277,115 @@ reasoning doesn't change here.
   this group" surface would be redundant rather than additive. Not
   planned unless a real gap between those two and what this item wants
   shows up in practice.
+
+**Done (slices 4-6, 2026-08-04):** the three items above, built the way
+their own deferral notes said they'd have to be if they were built at all
+— as thin layers over machinery that already exists, not as new
+subsystems. Each slice below opens by answering its own objection.
+
+*Slice 4 — scheduled announcements.* The 2026-08-03 note was right that
+this is "a thin presentation layer over `reminders`, not a new
+sub-feature", and that is exactly what shipped: migration
+`0035_announcements.sql` adds a single `kind` column to `reminders`
+(`NOT NULL DEFAULT 'reminder'`, so every pre-existing row backfills as
+what it already was) and `store/reminders.zig` gains a `Kind` enum,
+`createOfKind`, and a required `kind` argument on `listPending`. No second
+table, no second scheduler, no second delivery loop — `checkAndSendDueReminders`
+delivers both kinds and differs only in the prefix (`⏰ Reminder:` vs
+`📣`). `Kind.fromDb` parses leniently, degrading an unrecognized value to
+`.reminder` rather than failing a read, the same `stringToEnum(...) orelse`
+convention `chats.platform` already uses.
+- `/announce <time> <text>`, `/announce every <interval> <text>`,
+  `/announce list`, `/announce cancel <id>` (`main.zig`'s
+  `handleAnnounceCommand`). The scheduling grammar is `/remind`'s
+  verbatim — an admin who knows `/remind every 1d ...` already knows this.
+- **Access is deliberately stricter than `/remind`'s**: chat-admin tier via
+  `auth.checkGroupAdminAccess`, with the token fallback *off*. `/remind` is
+  open to anyone because it delivers one message to the person who asked;
+  an announcement makes the bot broadcast arbitrary text into a whole group
+  at a time nobody is watching, which belongs with `/mute`/`/pin`. Token
+  spending is excluded for the same reason `/redact regex` excludes it: a
+  token buys one moderation action against a known target, not the ability
+  to schedule bot-authored messages into the future. `/announce list` is
+  exempt from the gate (reading what's scheduled for a chat you're in isn't
+  privileged), matching `/reminders`/`/alerts`.
+- `listForIdentity` — the query behind the web panel's personal "my
+  reminders" view — is hard-filtered to `kind = 'reminder'`. A scheduled
+  announcement is a chat-level admin object that happens to share the
+  table, not one of the caller's own reminders. **Known gap, flagged not
+  silently skipped:** the web panel therefore has no announcement surface
+  at all yet.
+- **Known sharp edge, inherited rather than papered over**: `/announce
+  every <interval> <text>` schedules the first occurrence one interval from
+  now, exactly as `/remind every` does. An admin who wants a recurring
+  announcement to start at a specific wall-clock time schedules the first
+  one with the absolute form and repeats it with `every` after. Fixing this
+  is a `/remind` change, not an `/announce` one, so it wasn't done only
+  here.
+
+*Slice 5 — auto-pin.* The 2026-08-03 note was right that "important" is
+undefinable without either a heuristic or an LLM call on every message,
+and that objection is **not** overridden here — it's honored by building
+the narrow version instead. `/autopin on|off` (migration
+`0036_autopin_announcements.sql`, off by default) pins **only a scheduled
+announcement, only as the bot itself posts it**. There is no classifier,
+no heuristic, and no path where the bot forms an opinion about someone
+else's message: every pin traces back to an admin having typed a specific
+`/announce`. Phase 8's backlog rejects spam/toxicity auto-moderation
+because acting on messages the bot wasn't addressed in is a trust-model
+change, and an "importance" scorer over every message is that same change
+wearing a friendlier hat. Pinning someone else's message stays the
+pre-existing manual, admin-only, reply-based `/pin`.
+- Delivery degrades at each step that can fail (`sendAndPinAnnouncement`):
+  `sendMessageReturningId` is an optional vtable slot that returns null
+  *without sending* on platforms that don't implement it (Matrix and XMPP
+  today), so the fallback does the plain send itself; and a failed pin —
+  most likely because the bot was never given pin permission in that group
+  — is logged at warn and leaves the announcement standing. The row is
+  marked delivered (or rescheduled) either way.
+
+*Slice 6 — group summaries.* The 2026-08-03 note was right that a third
+summarizer would be redundant — so there isn't one. `digest.zig`'s single
+LLM round trip is factored out into `summarizeHistory`, and both `/digest`
+and the new `/summary [hours]` call it, which makes "the same summarizer
+over a different window" true by construction rather than by intention.
+- `/summary [hours]` (default 24, max 336) exists next to `/digest now`
+  because `/digest now` summarizes "since the last digest" *and moves that
+  cursor as a side effect*, so it cannot answer "what happened this
+  morning" without disturbing the schedule; and `catch_me_up` is an LLM
+  *tool*, reachable only by addressing the bot in natural language and only
+  when the asker clears the owner-only/credits gate on free-form Q&A.
+  `/summary` is the plain command form: name a window, get a summary,
+  change nothing. `summarizeWindow` is read-only and stateless.
+- **Access** matches `/digest now` (open to anyone allowed in the chat, no
+  credits spent) rather than the messaging-mode commands' owner/credits
+  gate: it summarizes only this chat's own already-logged history and can't
+  be steered into arbitrary generation. Charging a credit like
+  `/translate` does is the obvious knob to turn if this is ever abused.
+- Windowed history is capped at 500 messages regardless of the window, so
+  a very chatty chat over a 2-week window can't produce an unbounded
+  prompt.
+
+- One new `announcements` feature flag gates `/announce` and `/autopin`
+  together (auto-pin is a property of how announcements are delivered, not
+  a separate feature); `/summary` is gated with `digest`, since a chat that
+  turned summarization off means both.
+- `zig build` and `zig build test` both green (570/572; 1 expected skip,
+  1 crash is the same pre-existing `http_util.zig` fetch segfault flagged
+  in every status note above, unrelated to this change).
+- **Not live-verified** — no real Telegram chat, admin account, or pin
+  permission was exercised this pass. Covered by unit/store tests (the
+  `kind` round trip and the two lists' mutual isolation, `Kind.fromDb`'s
+  lenient parse, the auto-pin setting round trip, and `summarizeWindow`'s
+  window filtering and empty-window short circuit against a stub provider).
+  Noted honestly rather than claimed, same standard held elsewhere in this
+  file.
+- **Not built: `/menu` integration.** `/announce`, `/autopin` and
+  `/summary` are command-only this pass — they don't appear in
+  `menu_tree.zig`'s module tree. Deliberate: `/announce`'s creation flow
+  needs the date/time stepper wizard the Reminders module already has, and
+  reusing that wizard for a second object type is its own pass rather than
+  a bullet at the end of this one.
 
 ### Phase 17 — Finance trackers
 *Effort: M. Status: core done (2026-08-03); web API + warden-ui frontend

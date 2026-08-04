@@ -1,0 +1,12 @@
+-- Phase 16 slice 5: auto-pin. FALSE (off) by default -- opt-in per chat via
+-- /autopin on, same "a chat opts in explicitly" convention as
+-- welcome_message/digest_enabled.
+--
+-- Scope note, deliberately narrow: this only ever pins a message the bot
+-- itself posted, and only a scheduled announcement an admin explicitly
+-- created (see 0035_announcements.sql). It never inspects, scores, or acts
+-- on anyone else's messages -- that would be the same trust-model problem
+-- ROADMAP.md's Phase 8 backlog rejects for spam/toxicity auto-moderation.
+-- Pinning someone else's message stays a manual, admin-only, reply-based
+-- /pin.
+ALTER TABLE chat_settings ADD COLUMN autopin_announcements BOOLEAN NOT NULL DEFAULT FALSE;
