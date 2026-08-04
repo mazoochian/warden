@@ -146,6 +146,9 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "location", .description = "<place> | off -- set this chat's default location, used for briefing weather." },
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
     .{ .name = "welcome", .description = "<text> -- greet new members ({name} = their name), or off to disable." },
+    .{ .name = "summary", .description = "[hours] -- summarize the last N hours of this chat (default 24)." },
+    .{ .name = "announce", .description = "<time> <text> | every <interval> <text> | list | cancel <id> -- schedule a broadcast. Admins only." },
+    .{ .name = "autopin", .description = "on | off -- pin each scheduled announcement as it's posted. Admins only." },
     .{ .name = "expense", .description = "add <amt> <category> [desc] | list | summary | delete <id> -- expense tracker." },
     .{ .name = "budget", .description = "set <category> <amt> | list | remove <category> -- monthly budgets. Owner to set." },
     .{ .name = "subscription", .description = "add <name> <amt> every <interval> | list | remove <id> -- recurring costs." },
@@ -2082,6 +2085,20 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/briefing") or std.mem.startsWith(u8, text, "/briefing ")) {
         if (!feature_flags.isEnabled(pool, "briefings")) return false;
         handleBriefingCommand(connector, a, io, pool, chat_id, briefing_scheduler, now, max_message_len, msg.chat_id, msg.message_id, text);
+    } else if (std.mem.eql(u8, text, "/summary") or std.mem.startsWith(u8, text, "/summary ")) {
+        // Gated with `/digest` rather than on its own flag: it's the same
+        // summarizer over a caller-named window (see `handleSummaryCommand`),
+        // so a chat that has turned summarization off means both.
+        if (!feature_flags.isEnabled(pool, "digest")) return false;
+        handleSummaryCommand(connector, a, pool, chat_id, llm_provider, tool_ctx, now, max_message_len, msg, text);
+    } else if (std.mem.eql(u8, text, "/announce") or std.mem.startsWith(u8, text, "/announce ")) {
+        if (!feature_flags.isEnabled(pool, "announcements")) return false;
+        handleAnnounceCommand(connector, a, config, pool, chat_id, identity_id, now, sudo_active, msg, text);
+    } else if (std.mem.eql(u8, text, "/autopin") or std.mem.startsWith(u8, text, "/autopin ")) {
+        // One flag for both commands — auto-pin is a property of how
+        // announcements are delivered, not a separate feature.
+        if (!feature_flags.isEnabled(pool, "announcements")) return false;
+        handleAutopinCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
@@ -4529,6 +4546,303 @@ fn handleRemindCommand(
     connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
 }
 
+// ---------------------------------------------------------------------
+// Phase 16 (ROADMAP.md), slice 4: scheduled announcements. Deliberately a
+// presentation layer over `store/reminders.zig` rather than a second
+// scheduler -- see `reminders.Kind` and `0035_announcements.sql`. The
+// scheduling grammar below is `/remind`'s, verbatim and on purpose: an
+// admin who already knows `/remind every 1d ...` knows this too.
+// ---------------------------------------------------------------------
+
+/// Longer than `max_reminder_message_len` (500): an announcement is a
+/// prepared broadcast to a whole group -- rules, an event notice, a weekly
+/// standup prompt -- not a personal one-liner, and 1000 bytes is the same
+/// ceiling `/welcome` and `/persona`-adjacent text settings already use.
+const max_announcement_len = 1000;
+
+/// `/announce <when> <text>` schedules a one-off announcement;
+/// `/announce every <interval> <text>` a recurring one; `/announce list`
+/// and `/announce cancel <id>` manage them.
+///
+/// **Access**: chat-admin tier via `auth.checkGroupAdminAccess`, with the
+/// token fallback *off* -- unlike `/remind` (open to anyone, delivers one
+/// message to the person who asked for it), an announcement makes the bot
+/// broadcast arbitrary text into the whole group at a time nobody's
+/// watching, so it belongs with `/mute`/`/pin` rather than with `/remind`.
+/// Token-spending is excluded for the same reason `/redact regex` excludes
+/// it: a token buys one moderation action against a known target, not the
+/// ability to schedule bot-authored messages into the future. `list` is
+/// exempt from the gate (reading what's scheduled for a chat you're in
+/// isn't privileged), matching `/reminders`/`/alerts` being open.
+fn handleAnnounceCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    now: i64,
+    sudo_active: bool,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const usage = "Usage: /announce <time e.g. 30m, 14:30, or 5/22 14:30> <text>, /announce every <interval e.g. 1d> <text>, /announce list, or /announce cancel <id>";
+    const arg = std.mem.trim(u8, text["/announce".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const first_word = it.first();
+
+    if (std.mem.eql(u8, first_word, "list")) {
+        const pending = reminders.listPending(pool, a, chat_id, .announcement) catch |err| {
+            log.err("announce: list failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't load announcements, try again.");
+            return;
+        };
+        connector.sendMessage(a, msg.chat_id, formatPendingAnnouncements(a, pool, pending, now), msg.message_id);
+        return;
+    }
+
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "announce")) return;
+
+    if (std.mem.eql(u8, first_word, "cancel")) {
+        const rest = std.mem.trim(u8, it.rest(), " ");
+        const id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /announce cancel <id> (see /announce list for ids).");
+            return;
+        };
+        const row = (reminders.get(pool, a, id) catch |err| {
+            log.err("announce: lookup failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that announcement, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "No scheduled announcement with that id.");
+            return;
+        };
+        // A reminder id passed to `/announce cancel` is told apart from a
+        // nonexistent one on purpose -- they're different mistakes, and
+        // silently refusing to cancel something that demonstrably exists
+        // reads like a bug. `/remind cancel` is the right tool for that id,
+        // and it applies its own creator-or-owner check.
+        if (row.chat_id != chat_id or row.kind != .announcement) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No scheduled announcement with that id (if that's a reminder id, use /remind cancel).");
+            return;
+        }
+        reminders.cancel(pool, id) catch |err| {
+            log.err("announce: cancel failed for id {d}: {t}", .{ id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't cancel that announcement, try again.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Announcement canceled.");
+        return;
+    }
+
+    var recur_interval: ?i64 = null;
+    var when_str = first_word;
+    if (std.mem.eql(u8, first_word, "every")) {
+        when_str = it.next() orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /announce every <interval e.g. 1d> <text>");
+            return;
+        };
+        recur_interval = reminder_format.parseDuration(when_str) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that interval — use e.g. 30m, 2h, or 1d.");
+            return;
+        };
+    }
+
+    const announcement = std.mem.trim(u8, it.rest(), " ");
+    if (announcement.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return;
+    }
+    if (announcement.len > max_announcement_len) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That announcement is too long (max 1000 bytes).");
+        return;
+    }
+
+    const offset_minutes = user_settings.getEffectiveOffsetMinutes(pool, a, identity_id);
+    const date_format = user_settings.getEffectiveDateFormat(pool, a, identity_id);
+    const time_format = user_settings.getEffectiveTimeFormat(pool, a, identity_id);
+
+    // Identical resolution to `/remind`, including the "every <interval>"
+    // shorthand meaning "first one an interval from now" -- an admin
+    // wanting a recurring announcement to start at a specific wall-clock
+    // time schedules the first one with the absolute form and repeats it
+    // with `every` after. Documented in ROADMAP.md as a known sharp edge
+    // inherited from `/remind` rather than papered over only here.
+    const due_at = if (recur_interval) |interval|
+        now + interval
+    else
+        reminder_format.parseWhenLocal(when_str, now, offset_minutes, date_format) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that time — use a duration like 30m/2h/1d, a clock time like 14:30, or a date like 5/22 14:30.");
+            return;
+        };
+
+    const id = reminders.createOfKind(pool, chat_id, identity_id, announcement, due_at, recur_interval, .announcement) catch |err| {
+        log.err("announce: failed to create announcement for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't schedule that announcement, try again.");
+        return;
+    };
+
+    const local = civil_time.localFromUnix(due_at, offset_minutes);
+    const date_str = civil_time.formatDate(a, local, date_format);
+    const time_str = civil_time.formatTime(a, local, time_format);
+
+    const confirmation = if (recur_interval) |interval|
+        std.fmt.allocPrint(a, "Announcement #{d} scheduled, repeating every {s} (next at {s} {s}).", .{ id, reminder_format.formatInterval(a, interval), date_str, time_str }) catch return
+    else
+        std.fmt.allocPrint(a, "Announcement #{d} scheduled for {s} {s}.", .{ id, date_str, time_str }) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+/// `/announce list`'s rendering — same per-setter-timezone rule
+/// `formatPendingReminders` documents, since a chat's announcements can
+/// have been scheduled by different admins each meaning their own local
+/// "09:00".
+fn formatPendingAnnouncements(a: std.mem.Allocator, pool: *store_pool.PgPool, pending: []const reminders.PendingReminder, now: i64) []const u8 {
+    if (pending.len == 0) return "No scheduled announcements. Schedule one with /announce <time> <text> (chat admins only).";
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    const w = &buf.writer;
+    w.print("Scheduled announcements:\n", .{}) catch return "";
+    for (pending) |r| {
+        const offset_minutes = user_settings.getEffectiveOffsetMinutes(pool, a, r.identity_id);
+        const date_format = user_settings.getEffectiveDateFormat(pool, a, r.identity_id);
+        const time_format = user_settings.getEffectiveTimeFormat(pool, a, r.identity_id);
+        const local = civil_time.localFromUnix(r.due_at, offset_minutes);
+        const date_str = civil_time.formatDate(a, local, date_format);
+        const time_str = civil_time.formatTime(a, local, time_format);
+        if (r.recur_interval_seconds) |interval| {
+            w.print("  #{d} in {s} ({s} {s}, repeats every {s}): {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), date_str, time_str, reminder_format.formatInterval(a, interval), r.message }) catch return "";
+        } else {
+            w.print("  #{d} in {s} ({s} {s}): {s}\n", .{ r.id, reminder_format.formatRemaining(a, r.due_at - now), date_str, time_str, r.message }) catch return "";
+        }
+    }
+    return buf.writer.buffered();
+}
+
+/// `/autopin` shows this chat's setting; `/autopin on|off` changes it —
+/// ROADMAP.md's Phase 16 "auto-pin important messages", built as narrowly
+/// as that item can defensibly be built.
+///
+/// **What it pins**: only a scheduled announcement (see
+/// `handleAnnounceCommand`), and only as the bot posts it. That is the
+/// whole trigger. It is not a heuristic, it never reads or scores anyone
+/// else's messages, and there is no "the bot decided this was important"
+/// path at all — every pin traces back to a specific admin having typed a
+/// specific `/announce`. Phase 8's backlog rejects spam/toxicity
+/// auto-moderation because acting on messages the bot wasn't addressed in
+/// is a trust-model change; an "importance" classifier over every message
+/// would be the same change wearing a friendlier hat, so it isn't built.
+/// The alternatives considered and rejected are recorded in ROADMAP.md.
+///
+/// Viewing is open to anyone (matching `/persona`/`/welcome`); changing it
+/// takes the same chat-admin tier `/announce` itself does, since the two
+/// are one feature.
+fn handleAutopinCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    sudo_active: bool,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/autopin".len..], " ");
+    const enabled = chat_settings.getAutopinAnnouncements(pool, chat_id);
+
+    if (arg.len == 0) {
+        const reply_text = std.fmt.allocPrint(
+            a,
+            "Auto-pin is {s} for this chat. When on, I pin each scheduled /announce as I post it (nothing else — I never pin other people's messages on my own). Change it with /autopin on or /autopin off.",
+            .{if (enabled) "on" else "off"},
+        ) catch return;
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    const want = if (std.mem.eql(u8, arg, "on"))
+        true
+    else if (std.mem.eql(u8, arg, "off"))
+        false
+    else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /autopin on | off");
+        return;
+    };
+
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "autopin")) return;
+
+    chat_settings.setAutopinAnnouncements(pool, chat_id, want) catch |err| {
+        log.err("autopin: failed to persist for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that setting, try again.");
+        return;
+    };
+    if (want) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Auto-pin on — I'll pin each scheduled announcement as I post it. (I need pin permission in this group.)");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Auto-pin off — announcements will be posted without pinning.");
+    }
+}
+
+/// How far back `/summary` looks when no window is given.
+const default_summary_hours: i64 = 24;
+/// Hard ceiling, matching `catch_me_up`'s own (2 weeks) so the two
+/// summarization surfaces can't disagree about what "too much history" is.
+const max_summary_hours: i64 = 24 * 14;
+
+/// `/summary [hours]` — ROADMAP.md's Phase 16 "group summaries", composing
+/// `digest.summarizeWindow` (the same summarizer `/digest` uses) rather
+/// than adding a third prompt.
+///
+/// **Why it exists next to `/digest now` and `catch_me_up`**: `/digest now`
+/// summarizes "since the last digest" and moves that cursor as a side
+/// effect, so it can't answer "what happened this morning" without
+/// disturbing the schedule; `catch_me_up` is an LLM *tool*, reachable only
+/// by addressing the bot in natural language and only when the asker clears
+/// the owner-only/credits gate on free-form Q&A. This is the plain,
+/// predictable command form: name a window, get a summary, change nothing.
+///
+/// **Access** deliberately matches `/digest now` (open to anyone allowed in
+/// the chat, no credits spent) rather than the messaging-mode commands'
+/// owner/credits gate: it summarizes only this chat's own already-logged
+/// history and can't be steered into arbitrary generation. The alternative
+/// — charging a credit like `/translate` does — is recorded in ROADMAP.md
+/// as the obvious knob to turn if this ever gets abused.
+fn handleSummaryCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    llm_provider: llm.Provider,
+    tool_ctx: tool_registry.ToolContext,
+    now: i64,
+    max_message_len: usize,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/summary".len..], " ");
+    const hours = if (arg.len == 0) default_summary_hours else std.fmt.parseInt(i64, arg, 10) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /summary [hours] — e.g. /summary 3 for the last 3 hours (default 24, max 336).");
+        return;
+    };
+    if (hours < 1 or hours > max_summary_hours) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Pick a window between 1 and 336 hours.");
+        return;
+    }
+
+    const summary = digest.summarizeWindow(llm_provider, a, tool_ctx, pool, chat_id, hours, now) catch |err| {
+        log.err("summary: generate failed for chat {d}: {t}", .{ chat_id, err });
+        connector.sendMessage(a, msg.chat_id, "Couldn't summarize this chat just now.", msg.message_id);
+        return;
+    };
+    sendTextOrFile(connector, a, msg.chat_id, summary, msg.message_id, max_message_len, "summary.txt");
+}
+
 fn handleRemindersList(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -4538,7 +4852,7 @@ fn handleRemindersList(
     native_chat_id: []const u8,
     reply_to: ?[]const u8,
 ) void {
-    const pending = reminders.listPending(pool, a, chat_id) catch |err| {
+    const pending = reminders.listPending(pool, a, chat_id, .reminder) catch |err| {
         log.err("reminders: list failed for chat {d}: {t}", .{ chat_id, err });
         connector.sendMessage(a, native_chat_id, "Couldn't load reminders, try again.", reply_to);
         return;
@@ -5319,7 +5633,7 @@ const ReminderToolAdapter = struct {
 
     fn listPendingFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8 {
         const self: *ReminderToolAdapter = @ptrCast(@alignCast(ptr));
-        const pending = try reminders.listPending(self.pool, allocator, self.chat_id);
+        const pending = try reminders.listPending(self.pool, allocator, self.chat_id, .reminder);
         return formatPendingReminders(allocator, self.pool, pending, self.now);
     }
 };
@@ -5682,8 +5996,19 @@ fn checkAndSendDueReminders(
         defer arena.deinit();
         const a = arena.allocator();
 
-        const text = std.fmt.allocPrint(a, "⏰ Reminder: {s}", .{r.message}) catch continue;
-        connector.sendMessage(a, r.native_chat_id, text, null);
+        // The only difference between the two kinds at delivery time is the
+        // framing and, for announcements, the optional pin -- see
+        // `reminders.Kind`. One loop delivers both because the scheduling
+        // half is genuinely identical.
+        const text = switch (r.kind) {
+            .reminder => std.fmt.allocPrint(a, "⏰ Reminder: {s}", .{r.message}) catch continue,
+            .announcement => std.fmt.allocPrint(a, "📣 {s}", .{r.message}) catch continue,
+        };
+        if (r.kind == .announcement and chat_settings.getAutopinAnnouncements(pool, r.chat_id)) {
+            sendAndPinAnnouncement(connector, a, r.native_chat_id, text);
+        } else {
+            connector.sendMessage(a, r.native_chat_id, text, null);
+        }
 
         if (r.recur_interval_seconds) |interval| {
             const next_due = reminder_format.nextOccurrence(r.due_at, interval, now);
@@ -5696,6 +6021,34 @@ fn checkAndSendDueReminders(
             };
         }
     }
+}
+
+/// Posts a scheduled announcement into a chat that has `/autopin on` and
+/// pins it, degrading rather than failing at each step that can go wrong:
+///
+/// - `sendMessageReturningId` is an optional vtable slot that returns null
+///   *without sending* when a platform doesn't implement it (Matrix and
+///   XMPP today), so the fallback has to do the plain send itself.
+/// - The pin can fail on its own — most likely because the bot simply
+///   hasn't been given pin permission in that group, which is a
+///   configuration fact about the chat, not an error worth losing the
+///   announcement over. It's logged at warn and the announcement stands.
+///
+/// Either way the message goes out exactly once, which is what matters:
+/// the delivery loop marks the row delivered (or reschedules it)
+/// regardless of whether the pin landed.
+fn sendAndPinAnnouncement(connector: iface.Connector, a: std.mem.Allocator, native_chat_id: []const u8, text: []const u8) void {
+    const sent_id = connector.sendMessageReturningId(a, native_chat_id, text, null) catch |err| {
+        log.err("announce: send failed for chat {s}: {t}", .{ native_chat_id, err });
+        return;
+    };
+    const id = sent_id orelse {
+        connector.sendMessage(a, native_chat_id, text, null);
+        return;
+    };
+    connector.pinMessage(a, native_chat_id, id) catch |err| {
+        log.warn("announce: posted in chat {s} but couldn't pin it ({t}) — do I have pin permission there?", .{ native_chat_id, err });
+    };
 }
 
 /// Housekeeping retention sweep: hard-deletes any chat that's been marked
@@ -6436,7 +6789,7 @@ fn menuDynamicChoices(id: menu_tree.NodeId, ctx: menu.ActionContext) []const ifa
             }
         },
         .reminders_view => {
-            const pending = reminders.listPending(ctx.pool, ctx.a, ctx.chat_id) catch return &.{};
+            const pending = reminders.listPending(ctx.pool, ctx.a, ctx.chat_id, .reminder) catch return &.{};
             for (pending, 0..) |r, i| {
                 // Each reminder's setter's own timezone/format, not the
                 // viewer's -- see `formatPendingReminders`'s doc comment.

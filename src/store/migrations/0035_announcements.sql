@@ -1,0 +1,19 @@
+-- Phase 16 slice 4: scheduled announcements. Deliberately NOT a second
+-- table: `reminders` already stores "post this text into this chat at this
+-- absolute time, optionally repeating every N seconds" (see
+-- 0002_reminders.sql / 0003_reminders_recurrence.sql), and reminders are
+-- already delivered into the chat they were set in rather than DM'd. An
+-- announcement is that exact row with a different audience framing, so all
+-- this migration adds is the framing: `kind` tells the delivery loop
+-- (main.zig's checkAndSendDueReminders) whether to prefix the text with
+-- "⏰ Reminder:" or post it as a "📣" announcement, and lets /reminders and
+-- /announce list show two separate lists over one table.
+--
+-- NOT NULL DEFAULT 'reminder' backfills every pre-existing row as an
+-- ordinary reminder, which is exactly what they all were. Left as free
+-- TEXT rather than a CHECK constraint or a PG enum: store/reminders.zig
+-- parses it through a Zig enum and falls back to `.reminder` on anything
+-- unrecognized, so an unknown value degrades to the pre-existing behavior
+-- instead of failing a write -- the same `stringToEnum(...) orelse` shape
+-- `chats.platform` already uses.
+ALTER TABLE reminders ADD COLUMN kind TEXT NOT NULL DEFAULT 'reminder';

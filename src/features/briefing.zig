@@ -31,7 +31,11 @@ const reminder_format = @import("reminder_format.zig");
 /// project's `ROADMAP.md` uses elsewhere (e.g. Phase 11's deferred voice
 /// notes, Phase 9's deferred `/as` relay).
 pub fn generate(allocator: std.mem.Allocator, pool: *PgPool, chat_id: i64, now: i64, weather_line: ?[]const u8) ![]const u8 {
-    const pending_reminders = try reminders.listPending(pool, allocator, chat_id);
+    // Reminders only, not scheduled announcements (Phase 16) — a briefing
+    // is "what's coming up for you", and an announcement is a broadcast the
+    // chat will see for itself when it fires, so listing it here would just
+    // spoil it a day early.
+    const pending_reminders = try reminders.listPending(pool, allocator, chat_id, .reminder);
     const pending_alerts = try alert_store.listPending(pool, allocator, chat_id);
 
     // Weather alone is enough to make a briefing worth sending -- a chat
