@@ -654,7 +654,9 @@ required):
   otherwise) — in practice a non-issue today, since channels (this
   phase's actual motivating case) only exist on Telegram.
 
-**Deferred, not built this pass** — generic `/as <chat ref> <command>`,
+**Deferred at the time, built as slice 2 (2026-08-04) — see below the
+next paragraph for the answer this deferral was asking for** — generic
+`/as <chat ref> <command>`,
 replaying arbitrary admin commands (kick/mute/pin/etc, not just a notice
 send) against a bound target chat from a management room, the way Mjolnir's
 `!mjolnir <command> !room:server` does. The blocker: every existing admin
@@ -674,6 +676,103 @@ account available to test cross-account authorization against, so this is
 implemented per spec and covered by unit/store tests only, not confirmed
 against a live homeserver/Bot API. Noted honestly rather than claimed,
 same standard Phase 2's Matrix landing held itself to.
+
+**Done (slice 2, 2026-08-04): `/as <chat id> <command>`.**
+
+*The reply-routing answer.* The blocker above was that redirecting a
+relayed command's output would otherwise mean touching every handler. It
+doesn't: the redirection happens once, underneath all of them, at the only
+layer they already share — the `Connector` vtable. New
+`platform/reply_redirect.zig` wraps a connector and rewrites **outbound
+message sends** aimed at the target chat (`sendMessage`, `sendPhoto`,
+`sendDocument`, `sendPoll`, `sendMessageReturningId`, `editMessage`,
+`sendChoicePrompt`, `editChoicePrompt`) to land in the control room
+instead, threaded under the operator's own `/as` message. Everything else
+passes through untouched — `muteUser`, `kickUser`, `banUser`,
+`promoteUser`, `demoteUser`, `pinMessage`, `unpinMessage`,
+`deleteMessage`, `isGroupAdmin`, `listChatAdmins` — because those *are*
+the action, and the action belongs in the target chat. No handler knows
+any of this happened; `/as` then replays the command by calling
+`handleMessage` again with the target's ids and a `relayed` flag.
+
+Three alternatives were considered and are recorded in the module's own
+doc comment: a `reply_chat_id` parameter on every handler (~40 signatures,
+identical to `msg.chat_id` in every case but one, and silently regressed
+by every future handler that forgets it); a `reply_chat_id` field on
+`iface.Message` (dead weight on every message, and misses the handlers
+that reply via a plain `chat_id` argument rather than via `msg`); and
+buffering the relayed command's output to re-emit it (nicest transcript,
+but several commands are asynchronous, so it would delay or reorder
+output). The decorator won because its blast radius is one file and the
+routing rule becomes a single stated invariant that a fake connector can
+unit-test.
+
+*Authorization is strictly narrowing — it can never authorize something
+typing the same command in the target chat wouldn't have.* Five gates
+before the relay even happens: no `/as` inside `/as`; the command must be
+on the `as_relayable_commands` allow-list; the target chat must exist and
+be on this connector's platform (cross-platform management rooms remain
+unsupported, same as slice 1); *this* control room must be bound to that
+target; and the sender must be the owner or a **live admin of the target
+chat**, re-checked against the platform on every single `/as`, never
+cached and never inferred from their standing in the control room. Then
+the relayed command still runs its own gate — and because `ReplyRedirect`
+passes `isGroupAdmin` through unchanged, that gate asks about the target
+chat, not the control room. That passthrough is load-bearing for security,
+not just correctness.
+
+*The allow-list, and what's off it.* A command is relayable when it acts
+on the *chat* (not bot-wide or per-identity, which would be a no-op
+dressed up as an action) and needs no *message* in the target chat to
+point at — `asRelayedMessage` carries the operator's reply-target user
+across, since a user id means the same thing in any chat, but drops the
+reply-target message, since a message id doesn't. So `/pin`, `/delete` and
+`/redact reply|N` are left out rather than silently misfiring. Also
+excluded: `/sudo` (a privilege prefix whose grant message names the chat
+it was used in); `/menu`, `/convert`, `/cancel`, `/confirm` (stateful
+flows keyed by (chat, user) — relayed, the state would be filed under the
+target chat while the operator's follow-up arrives from the control room,
+so the flow could be started but never finished); `/notice` (has its own
+command, and its send-then-pin pair isn't redirect-safe, since the pin is
+an action and isn't redirected); and the LLM-backed commands, which are
+safe to relay but spend credits and produce conversation rather than
+administration. The list is cheap to widen later.
+
+- **`/help` is now two messages, forced by this phase rather than chosen.**
+  Adding `/as` pushed `help_text` past Telegram's 4096-byte cap (the
+  existing headroom test caught it — 3904 bytes against a 3896 limit). The
+  fix isn't shaving bytes off entries, which would only move the ceiling a
+  few commands further out; `help_text` now ends after the everyday-use
+  sections and a new `help_text_admin` carries moderation, tokens, bot
+  admins, management rooms and owner-only. `handleHelp` sends both, with
+  the dynamic `@botusername` suffix on the second. The split point is where
+  the *audience* changes, so each message reads coherently alone.
+- **Worth knowing:** that headroom test only fires because someone thought
+  to write it. There is no equivalent guard that every command in
+  `public_commands` actually appears in `/help` — Phase 16's `/announce`,
+  `/autopin` and `/summary` were added to `public_commands` without help
+  entries and nothing complained. A test asserting the two stay in sync is
+  the obvious follow-up; it wasn't written here because several commands
+  are deliberately grouped or omitted in the help text, so the rule needs
+  defining before it can be enforced.
+- `zig build` and `zig build test` both green (577/579; 1 expected skip, 1
+  crash is the known-flaky `store.crypto` ABRT that also reproduces on
+  clean master locally, not this change).
+- **Not live-verified** — same gap as slice 1: no real Telegram channel and
+  no second admin account to test cross-account authorization against.
+  Covered by unit tests against a fake connector: the redirect rule in both
+  directions, the action-passthrough set (including `isGroupAdmin`, the
+  load-bearing one), send/edit self-consistency, the optional-method
+  fallback, the allow-list, and `asRelayedMessage`'s re-addressing.
+- **Known test gap, flagged not silently skipped:** `resolveAsCommand`'s
+  own five-gate authorization chain has no direct test — it needs a test
+  Postgres with a binding *and* a fake connector answering admin queries at
+  the same time. The gate it leans on, `auth.isOwnerOrLiveAdminOfChat`, is
+  separately unit-tested in `auth.zig` (owner passes, live admin passes,
+  plain user doesn't), so what's untested is the wiring rather than the
+  check. This matches slice 1's own precedent — `/manage` and `/notice`
+  have no handler-level tests either — but it's the first thing to add if
+  this surface grows.
 
 ### Phase 10 — Vision & document understanding
 *Effort: M/L. Status: slice 1 (images) and slice 2 (native PDF documents)
