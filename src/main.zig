@@ -24,6 +24,7 @@ const Identity = @import("domain/identity.zig").Identity;
 const telegram_platform = @import("platform/telegram.zig");
 const matrix_platform = @import("platform/matrix.zig");
 const xmpp_platform = @import("platform/xmpp.zig");
+const reply_redirect = @import("platform/reply_redirect.zig");
 const store_pool = @import("store/pool.zig");
 const api_server = @import("api/server.zig");
 const bot_view = @import("api/bot_view.zig");
@@ -175,6 +176,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "whois", .description = "Reply, or pass @username / user id, to look up who someone is. Bot admin/owner only." },
     .{ .name = "manage", .description = "bind|unbind <chat id> | list -- manage this room's bound chats (see /manage list). Admins only." },
     .{ .name = "notice", .description = "<chat id> <text> -- send a pinned notice to a chat this room is bound to. Admins only." },
+    .{ .name = "as", .description = "<chat id> <command> -- run an admin command against a bound chat; the reply comes back here. Admins only." },
 };
 
 /// Owner-only commands deliberately left out of `public_commands` (see its
@@ -267,6 +269,18 @@ const help_text =
     \\/template save <name> <text> | list | use <name> [extra] | delete
     \\/joke, /riddle, /trivia [topic]; /wordoftheday; /motivate [text]
     \\
+;
+
+/// The second half of `/help`, sent as its own message.
+///
+/// Splitting was forced rather than chosen: the combined text crossed
+/// Telegram's 4096-byte cap when `/as` was added (ROADMAP.md's Phase 9
+/// slice 2), and shaving bytes off entries would only have moved the
+/// ceiling a few commands further out. The split point is where the
+/// audience changes -- everything above is for whoever is using the bot,
+/// everything here is moderation, trust and operations -- so each message
+/// is coherent on its own rather than being an arbitrary cut at N bytes.
+const help_text_admin =
     \\Group moderation (chat admins only, most by replying to a message)
     \\/mute, /unmute, /pin, /unpin, /delete -- reply to the target
     \\/kick, /ban [@user|id] -- reply to the target, or pass @user/id
@@ -292,32 +306,40 @@ const help_text =
     \\Management rooms (for channels/groups with no back-and-forth)
     \\/manage bind|unbind|list <chat id> -- bind this chat as a control room
     \\/notice <chat id> <text> -- pinned notice to a bound chat
+    \\/as <chat id> <command> -- run an admin command against a bound chat
+    \\  (e.g. /as 7 /kick @spammer); the answer comes back here, not there
     \\
     \\Owner only
     \\/scraper -- configure the web-scraping backend
 ;
 
-/// Appends a note about the `/command@botusername` qualified form (see
-/// `normalizeCommandMention`) using this connector's *actual* username when
-/// known, rather than baking a guessed example into the static `help_text`
-/// above — relevant mainly when two bot instances share one group chat.
+/// Sends `/help` as two messages (see `help_text_admin`), appending a note
+/// about the `/command@botusername` qualified form (see
+/// `normalizeCommandMention`) to the second one using this connector's
+/// *actual* username when known, rather than baking a guessed example into
+/// the static text — relevant mainly when two bot instances share one group
+/// chat.
 fn handleHelp(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
+    reply(connector, a, msg.chat_id, msg.message_id, help_text);
+
     const username = connector.selfUsername() orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, help_text);
+        reply(connector, a, msg.chat_id, msg.message_id, help_text_admin);
         return;
     };
     const full = std.fmt.allocPrint(
         a,
         "{s}\n\nSharing this group with another bot? Qualify a command with my username, e.g. /ping@{s}, and I'll ignore commands qualified for a different bot.",
-        .{ help_text, username },
-    ) catch return reply(connector, a, msg.chat_id, msg.message_id, help_text);
+        .{ help_text_admin, username },
+    ) catch return reply(connector, a, msg.chat_id, msg.message_id, help_text_admin);
     connector.sendMessage(a, msg.chat_id, full, msg.message_id);
 }
 
-test "help_text leaves enough headroom under Telegram's 4096-byte message cap for handleHelp's dynamic suffix" {
+test "each /help message stays under Telegram's 4096-byte cap" {
     // A Telegram username is at most 32 bytes, so 200 bytes of slack is
-    // generous for the "Sharing this group..." suffix `handleHelp` appends.
-    try std.testing.expect(help_text.len < 4096 - 200);
+    // generous for the "Sharing this group..." suffix `handleHelp` appends
+    // to the second message.
+    try std.testing.expect(help_text.len < 4096);
+    try std.testing.expect(help_text_admin.len < 4096 - 200);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -1268,7 +1290,7 @@ fn processMessageTask(
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg, false);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -1945,6 +1967,17 @@ fn handleMessage(
     now: i64,
     max_message_len: usize,
     msg: iface.Message,
+    /// True only on the recursive call `/as` makes to replay a command
+    /// against another chat (see `resolveAsCommand`). Its one job is to
+    /// stop `/as` from relaying `/as`: without it, a `/alias` whose
+    /// expansion begins with `/as` would recurse without bound, since
+    /// alias expansion re-runs inside every relayed dispatch. Deliberately
+    /// a parameter rather than something inferred from `connector`
+    /// (`ReplyRedirect` builds a per-instance vtable, so there is no stable
+    /// vtable pointer to compare against) or from `msg` (a relayed message
+    /// is intentionally indistinguishable from a real one — that's the
+    /// whole point of the re-dispatch).
+    relayed: bool,
 ) bool {
     // Coarse "does the bot even respond here" gate — checked before
     // anything else in this function (including the choice_picked/
@@ -2195,6 +2228,40 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/notice") or std.mem.startsWith(u8, text, "/notice ")) {
         if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
         handleNoticeCommand(connector, a, config, pool, chat_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/as") or std.mem.startsWith(u8, text, "/as ")) {
+        // ROADMAP.md's Phase 9 slice 2. Everything that can reject the
+        // request (parsing, the relayable-command allow-list, the binding,
+        // and the target-chat admin check) happens in `resolveAsCommand`;
+        // if it returns a plan, the command is replayed by calling this
+        // very function again, with the *target* chat's ids in place and a
+        // `ReplyRedirect`-wrapped connector so the relayed handler's own
+        // `sendMessage(a, msg.chat_id, ...)` surfaces back here instead of
+        // in the target chat. No handler knows any of this happened.
+        if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
+        const relay = resolveAsCommand(connector, a, config, pool, chat_id, msg, text, relayed) orelse return false;
+        var redirect = reply_redirect.ReplyRedirect.init(connector, relay.target_native_chat_id, msg.chat_id, msg.message_id);
+        return handleMessage(
+            redirect.connector(),
+            a,
+            config,
+            pool,
+            relay.target_chat_id,
+            identity_id,
+            llm_provider,
+            embeddings_client,
+            tool_ctx,
+            tools,
+            pending,
+            digest_scheduler,
+            briefing_scheduler,
+            pending_conversions,
+            menu_sessions,
+            io,
+            now,
+            max_message_len,
+            asRelayedMessage(msg, relay.target_native_chat_id, relay.command),
+            true,
+        );
     } else if (std.mem.eql(u8, text, "/redact") or std.mem.startsWith(u8, text, "/redact ")) {
         // Per-mode gating happens inside handleRedactCommand itself (regex
         // mode is stricter than the other modes) rather than here, since
@@ -4244,6 +4311,324 @@ fn handleNoticeCommand(connector: iface.Connector, a: std.mem.Allocator, config:
         };
     }
     reply(connector, a, msg.chat_id, msg.message_id, "Notice sent.");
+}
+
+/// Commands `/as <chat id> <command>` will replay against a bound chat —
+/// an explicit allow-list, not a deny-list, because this is the one surface
+/// that lets someone drive an admin action in a chat they aren't sitting
+/// in: anything not thought about here fails closed.
+///
+/// A command qualifies when both of these hold:
+///
+///   1. Its effect is *chat-scoped* — it acts on, configures, or reports on
+///      one chat, which is what "run this against chat #7" can even mean.
+///      (`/whois`, `/memory`, `/addadmin` and friends are bot-wide or
+///      per-identity; relaying them would be a no-op dressed up as an
+///      action.)
+///   2. It doesn't need a *message* in the target chat to point at.
+///      `asRelayedMessage` carries the operator's reply target *user*
+///      across (a user id means the same thing in any chat) but drops the
+///      reply target *message* (a message id doesn't), so `/pin`,
+///      `/delete` and `/redact reply|N` have nothing to bite on and are
+///      left out rather than silently misfiring.
+///
+/// Deliberately excluded beyond those two rules:
+///   * `/as` itself — see `handleMessage`'s `relayed` parameter.
+///   * `/sudo` — a privilege prefix, and one whose grant message names the
+///     chat it was used in; it must be typed at top level where it is.
+///   * `/menu`, `/convert`, `/cancel`, `/confirm` — stateful flows keyed by
+///     (chat, user). Relayed, the state would be filed under the target
+///     chat while the operator's follow-up message arrives from the control
+///     room, so the flow could be started but never finished.
+///   * `/notice` — has its own command, and its send-then-pin pair isn't
+///     redirect-safe (see `platform/reply_redirect.zig`'s module doc).
+///   * The LLM-backed commands (`/joke`, `/translate`, `/note`, ...) —
+///     they spend real credits and produce conversation, not administration.
+///     Nothing about them is unsafe to relay; they're simply out of scope
+///     for a management-room surface, and the list is cheap to widen later.
+const as_relayable_commands = [_][]const u8{
+    // Smoke test for the relay itself — replies "pong" into the control
+    // room, proving the binding and the redirect both work, with no effect
+    // on the target chat at all.
+    "ping",
+    // Moderation that targets a *user*, not a message.
+    "kick",   "ban",       "mute",     "unmute",    "promote", "demote", "unpin",
+    // Per-chat configuration.
+    "welcome", "persona",  "location", "magicword", "thinking", "keyword",
+    "digest",  "briefing", "alias",    "template",  "allowchat", "disallowchat",
+    // Read-only reports about the target chat.
+    "stats",   "wordcloud", "reminders", "notes",   "alerts",   "watches",
+};
+
+/// The bare command name in `text` (no leading `/` or `!`, no
+/// `@botusername` qualifier, no arguments), or null if `text` isn't a
+/// command at all. Accepts `!` as well as `/` because
+/// `normalizeCommandMention` only rewrites the *leading* indicator of the
+/// whole message — the relayed half of `!as 7 !kick x` still arrives with
+/// its own `!`.
+fn asCommandName(text: []const u8) ?[]const u8 {
+    if (text.len < 2 or (text[0] != '/' and text[0] != '!')) return null;
+    var end: usize = 1;
+    while (end < text.len and text[end] != ' ' and text[end] != '@') : (end += 1) {}
+    if (end == 1) return null;
+    return text[1..end];
+}
+
+fn isRelayableUnderAs(name: []const u8) bool {
+    for (as_relayable_commands) |c| {
+        if (std.ascii.eqlIgnoreCase(c, name)) return true;
+    }
+    return false;
+}
+
+const AsRelay = struct {
+    /// Warden's internal `chats.id` for the target — what handlers taking a
+    /// `chat_id: i64` need.
+    target_chat_id: i64,
+    /// The target's platform-native id — what goes into the relayed
+    /// `Message.chat_id`, and what `ReplyRedirect` matches sends against.
+    target_native_chat_id: []const u8,
+    /// The command to replay, e.g. "/kick @spammer".
+    command: []const u8,
+};
+
+/// Parses and fully authorizes `/as <chat id> <command>`, returning the
+/// plan for `handleMessage` to replay, or null (having already explained
+/// why) if the request is refused. See ROADMAP.md's Phase 9 slice 2.
+///
+/// The authorization path is deliberately identical to `/notice`'s, and
+/// stacks *on top of* whatever the relayed command checks for itself
+/// rather than replacing it:
+///
+///   1. Not already inside a relay (no `/as` inside `/as`).
+///   2. The command is on `as_relayable_commands`.
+///   3. The target chat exists and is on this connector's platform
+///      (cross-platform management rooms are still unsupported, same as
+///      slice 1).
+///   4. *This* control room is bound to that target — binding is a separate,
+///      deliberate step from having the standing to act.
+///   5. The sender is the owner or a **live admin of the target chat**,
+///      re-checked against the platform on every single `/as`, never
+///      cached and never inferred from their standing in the control room
+///      (`auth.isOwnerOrLiveAdminOfChat`). No `/sudo` or token fallback
+///      tier here, exactly as `/manage`/`/notice` have none.
+///
+/// Then the relayed command runs its *own* gate too (e.g. `/kick` still
+/// calls `auth.checkGroupAdminAccess`), which — because
+/// `ReplyRedirect` passes `isGroupAdmin` through unchanged — asks about the
+/// target chat, not the control room. So `/as` is strictly narrowing: it
+/// can never authorize something typing the same command in the target
+/// chat wouldn't have.
+fn resolveAsCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    control_chat_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+    relayed: bool,
+) ?AsRelay {
+    const usage = "Usage: /as <chat id> <command> — e.g. /as 7 /kick @spammer (see /manage list for ids).";
+
+    if (relayed) {
+        reply(connector, a, msg.chat_id, msg.message_id, "/as can't be relayed through another /as.");
+        return null;
+    }
+
+    const arg = std.mem.trim(u8, text["/as".len..], " ");
+    var it = std.mem.splitScalar(u8, arg, ' ');
+    const id_str = it.first();
+    const target_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return null;
+    };
+    const command = std.mem.trim(u8, it.rest(), " ");
+    if (command.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, usage);
+        return null;
+    }
+    const name = asCommandName(command) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "The relayed part has to be a command — e.g. /as 7 /stats.");
+        return null;
+    };
+    if (!isRelayableUnderAs(name)) {
+        const denial = std.fmt.allocPrint(a, "/{s} can't be run through /as. Relayable: /help lists them; the short version is chat-scoped admin and settings commands that don't need you to reply to a message in that chat.", .{name}) catch return null;
+        connector.sendMessage(a, msg.chat_id, denial, msg.message_id);
+        return null;
+    }
+
+    const target = (chats.getById(pool, a, target_id) catch |err| {
+        log.err("as: getById failed for chat {d}: {t}", .{ target_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that chat, try again.");
+        return null;
+    }) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "No chat with that id.");
+        return null;
+    };
+    if (target.platform != connector.platform()) {
+        reply(connector, a, msg.chat_id, msg.message_id, "That chat is on a different platform than this room — cross-platform management rooms aren't supported yet.");
+        return null;
+    }
+    const is_bound = management_rooms.isBound(pool, control_chat_id, target.id) catch |err| {
+        log.err("as: isBound failed (control {d}, target {d}): {t}", .{ control_chat_id, target.id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't check this room's bindings, try again.");
+        return null;
+    };
+    if (!is_bound) {
+        reply(connector, a, msg.chat_id, msg.message_id, "This room isn't bound to that chat — use /manage bind <chat id> first.");
+        return null;
+    }
+    if (!auth.isOwnerOrLiveAdminOfChat(connector, a, config, target.native_chat_id, msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "You need to be the owner or a live admin of that chat to run commands against it.");
+        return null;
+    }
+
+    log.info("as: relaying {s} from control chat {d} to chat {d} for user {s}", .{ name, control_chat_id, target.id, msg.user_id });
+    return .{
+        .target_chat_id = target.id,
+        .target_native_chat_id = target.native_chat_id,
+        .command = command,
+    };
+}
+
+/// Rebuilds the operator's `/as` message as the message the relayed command
+/// should see: same sender, same platform profile, but addressed to the
+/// target chat and carrying only the relayed command as its text.
+///
+/// The field-by-field choices are the interesting part:
+///   * `chat_id` becomes the target's native id — this is what makes every
+///     handler's `connector.<action>(a, msg.chat_id, ...)` act on the right
+///     chat, and what `ReplyRedirect` matches its sends against.
+///   * `message_id` stays the operator's own. It's only ever used as a
+///     `reply_to` for outbound sends, all of which come back to the control
+///     room, where it's exactly the right thing to thread under.
+///   * `reply_to_user_id`/`reply_to_username` carry over: "the person I
+///     replied to" identifies a human, and a human is the same human in
+///     every chat. This is what makes `/as 7 /mute` (as a reply) work.
+///   * `reply_to_message_id`/`reply_to_text` are dropped: a message id only
+///     means something inside the chat it was sent in, so carrying it over
+///     would have `/pin` pin a control-room message id into the target
+///     chat. (Those commands are also kept off `as_relayable_commands`;
+///     this is the second, structural half of the same decision.)
+///   * `chat_type`/`chat_title` are dropped rather than copied — they
+///     describe the control room, and `handleMessage` has no business
+///     persisting them against the target. `is_group` is forced true: a
+///     management target is a group or a channel, never a 1:1.
+///   * `attachment`/`choice_picked`/`observed_users`/`joined_users` are
+///     dropped — an upload or a button press isn't something `/as` relays.
+fn asRelayedMessage(msg: iface.Message, target_native_chat_id: []const u8, command: []const u8) iface.Message {
+    return .{
+        .chat_id = target_native_chat_id,
+        .message_id = msg.message_id,
+        .user_id = msg.user_id,
+        .username = msg.username,
+        .text = command,
+        .reply_to_user_id = msg.reply_to_user_id,
+        .reply_to_username = msg.reply_to_username,
+        .is_group = true,
+        .identity = msg.identity,
+        .telegram_profile = msg.telegram_profile,
+        .matrix_profile = msg.matrix_profile,
+        .xmpp_profile = msg.xmpp_profile,
+    };
+}
+
+test "asCommandName strips the indicator, arguments and any @bot qualifier" {
+    try std.testing.expectEqualStrings("kick", asCommandName("/kick @spammer").?);
+    try std.testing.expectEqualStrings("stats", asCommandName("/stats").?);
+    // `normalizeCommandMention` only rewrites the leading indicator of the
+    // whole message, so the relayed half can still arrive with a `!`.
+    try std.testing.expectEqualStrings("kick", asCommandName("!kick @spammer").?);
+    try std.testing.expectEqualStrings("ping", asCommandName("/ping@warden_bot").?);
+    try std.testing.expect(asCommandName("kick @spammer") == null);
+    try std.testing.expect(asCommandName("/") == null);
+    try std.testing.expect(asCommandName("") == null);
+    try std.testing.expect(asCommandName("/ x") == null);
+}
+
+test "the /as allow-list admits chat-scoped admin commands and refuses everything else" {
+    try std.testing.expect(isRelayableUnderAs("kick"));
+    try std.testing.expect(isRelayableUnderAs("ban"));
+    try std.testing.expect(isRelayableUnderAs("stats"));
+    try std.testing.expect(isRelayableUnderAs("welcome"));
+    // Case-insensitive, same as `isReservedCommandName`.
+    try std.testing.expect(isRelayableUnderAs("KICK"));
+
+    // No nesting, no privilege prefixes.
+    try std.testing.expect(!isRelayableUnderAs("as"));
+    try std.testing.expect(!isRelayableUnderAs("sudo"));
+    // Needs a message in the target chat to point at.
+    try std.testing.expect(!isRelayableUnderAs("pin"));
+    try std.testing.expect(!isRelayableUnderAs("delete"));
+    try std.testing.expect(!isRelayableUnderAs("redact"));
+    // Stateful flows keyed by (chat, user).
+    try std.testing.expect(!isRelayableUnderAs("menu"));
+    try std.testing.expect(!isRelayableUnderAs("convert"));
+    try std.testing.expect(!isRelayableUnderAs("cancel"));
+    try std.testing.expect(!isRelayableUnderAs("confirm"));
+    // Has its own command; not redirect-safe.
+    try std.testing.expect(!isRelayableUnderAs("notice"));
+    try std.testing.expect(!isRelayableUnderAs("manage"));
+    // Not chat-scoped.
+    try std.testing.expect(!isRelayableUnderAs("whois"));
+    try std.testing.expect(!isRelayableUnderAs("memory"));
+    try std.testing.expect(!isRelayableUnderAs("addadmin"));
+    try std.testing.expect(!isRelayableUnderAs("scraper"));
+    // Not a command at all.
+    try std.testing.expect(!isRelayableUnderAs(""));
+    try std.testing.expect(!isRelayableUnderAs("nonsense"));
+}
+
+test "every /as-relayable command name is a real built-in" {
+    // Guards against a typo in `as_relayable_commands` silently making a
+    // command unrelayable (or, worse, looking relayable and then falling
+    // through to the unrecognized-command path inside the relay).
+    for (as_relayable_commands) |name| {
+        std.testing.expect(isReservedCommandName(name)) catch |err| {
+            std.debug.print("as_relayable_commands lists unknown command /{s}\n", .{name});
+            return err;
+        };
+    }
+}
+
+test "asRelayedMessage re-addresses the message but keeps who sent it" {
+    const original: iface.Message = .{
+        .chat_id = "control-room",
+        .message_id = "op-msg-7",
+        .user_id = "42",
+        .username = "alice",
+        .text = "/as 7 /kick @spammer",
+        .reply_to_message_id = "a-control-room-message",
+        .reply_to_user_id = "99",
+        .reply_to_username = "spammer",
+        .reply_to_text = "buy my coins",
+        .chat_type = "supergroup",
+        .chat_title = "Ops",
+        .is_group = true,
+    };
+
+    const relayed = asRelayedMessage(original, "-1001234", "/kick @spammer");
+
+    try std.testing.expectEqualStrings("-1001234", relayed.chat_id);
+    try std.testing.expectEqualStrings("/kick @spammer", relayed.text.?);
+    // Sender identity is untouched — the relayed command's own auth check
+    // must see the real operator.
+    try std.testing.expectEqualStrings("42", relayed.user_id);
+    try std.testing.expectEqualStrings("alice", relayed.username.?);
+    // Threading target for the redirected reply, back in the control room.
+    try std.testing.expectEqualStrings("op-msg-7", relayed.message_id.?);
+    // A user means the same thing in any chat...
+    try std.testing.expectEqualStrings("99", relayed.reply_to_user_id.?);
+    try std.testing.expectEqualStrings("spammer", relayed.reply_to_username.?);
+    // ...a message id does not.
+    try std.testing.expect(relayed.reply_to_message_id == null);
+    try std.testing.expect(relayed.reply_to_text == null);
+    // Describes the control room, not the target.
+    try std.testing.expect(relayed.chat_type == null);
+    try std.testing.expect(relayed.chat_title == null);
+    try std.testing.expect(relayed.attachment == null);
+    try std.testing.expect(relayed.choice_picked == null);
 }
 
 /// `/redact` — parses which of the five modes (see `features/redact.zig`'s
@@ -7146,6 +7531,7 @@ test {
     _ = @import("matrix/crypto.zig");
     _ = @import("store/crypto.zig");
     _ = @import("platform/xmpp.zig");
+    _ = @import("platform/reply_redirect.zig");
     _ = @import("xmpp/xml.zig");
     _ = @import("xmpp/types.zig");
     _ = @import("xmpp/client.zig");
