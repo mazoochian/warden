@@ -174,6 +174,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "cancel", .description = "Cancel your pending file conversion, or a pending /kick or /ban." },
     .{ .name = "redact", .description = "<N> | reply [N] | text <substring> | regex <pattern> -- delete messages. Admins only." },
     .{ .name = "whois", .description = "Reply, or pass @username / user id, to look up who someone is. Bot admin/owner only." },
+    .{ .name = "chatinfo", .description = "[native chat id] -- this chat's internal id and details, or look another up. Admins only." },
     .{ .name = "manage", .description = "bind|unbind <chat id> | list -- manage this room's bound chats (see /manage list). Admins only." },
     .{ .name = "notice", .description = "<chat id> <text> -- send a pinned notice to a chat this room is bound to. Admins only." },
     .{ .name = "as", .description = "<chat id> <command> -- run an admin command against a bound chat; the reply comes back here. Admins only." },
@@ -306,6 +307,8 @@ const help_text_admin =
     \\  or pass @username/id, to grant/revoke that role
     \\/allowchat, /disallowchat -- allow/disallow this whole chat
     \\/whois [@user|id] -- their name/username/id/flags. Admin/owner only
+    \\/chatinfo [native id] -- this chat's internal id, platform, type and
+    \\  title; pass a native id to look up another chat on this platform
     \\/sudo <command> -- a bot admin can run any moderation command above
     \\  even where they aren't a real chat admin, e.g. /sudo kick
     \\
@@ -2228,6 +2231,14 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/whois") or std.mem.startsWith(u8, text, "/whois ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleWhoisCommand(connector, a, config, pool, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/chatinfo") or std.mem.startsWith(u8, text, "/chatinfo ")) {
+        // Chat-scoped admin tier, not `/whois`'s bot-wide one: this answers
+        // a question about *this* chat, and its whole purpose is to feed
+        // `/manage bind`, which authorizes against the target chat's admins.
+        // No token fallback — a token buys one moderation action (see
+        // `checkGroupAdminAccess`), not a lookup.
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "chatinfo")) return false;
+        handleChatInfoCommand(connector, a, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/manage") or std.mem.startsWith(u8, text, "/manage ")) {
         if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
         handleManageCommand(connector, a, config, pool, chat_id, identity_id, msg, text);
@@ -4124,6 +4135,62 @@ fn platformLabel(platform: iface.Platform) []const u8 {
     };
 }
 
+/// `/chatinfo [native chat id]` — the chat-side counterpart to `/whois`.
+/// With no argument it reports the chat it was sent in; with one it looks up
+/// a chat on this platform by its platform-native id.
+///
+/// Exists because warden's internal `chats.id` had no discoverable surface.
+/// `/manage bind <chat id>` takes that internal id (see
+/// `handleManageCommand`'s doc comment for why it can't take a native one),
+/// but the only place internal ids were ever printed was `/manage list`,
+/// which lists chats *already bound to this room* — so binding the first
+/// chat meant querying Postgres by hand to translate a native id nobody
+/// could otherwise resolve. That is the gap this closes, and the argument
+/// form is the translation step itself.
+///
+/// Read-only, and deliberately resolves through `chats.getByNative` rather
+/// than `upsertChat`: asking about a chat warden has never seen must answer
+/// "no record", not create one (same reasoning as `/whois`'s
+/// `create_if_missing = false`).
+///
+/// Platform is always the caller's own — a native id is only meaningful
+/// within its platform, and cross-platform management is unsupported
+/// everywhere else too (see `handleManageCommand`).
+fn handleChatInfoCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/chatinfo".len..], " ");
+
+    const target_id = if (arg.len == 0) chat_id else blk: {
+        const found = (chats.getByNative(pool, a, connector.platform(), arg) catch |err| {
+            log.err("chatinfo: getByNative failed for {s}: {t}", .{ arg, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that chat up, try again.");
+            return;
+        }) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "I have no record of a chat with that id on this platform.");
+            return;
+        };
+        break :blk found.id;
+    };
+
+    const info = (chats.getInfoById(pool, a, target_id) catch |err| {
+        log.err("chatinfo: getInfoById failed for chat {d}: {t}", .{ target_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that chat up, try again.");
+        return;
+    }) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "I have no record of that chat.");
+        return;
+    };
+
+    var buf: std.Io.Writer.Allocating = .init(a);
+    buf.writer.print("{s}\n", .{if (arg.len == 0) "This chat:" else "That chat:"}) catch {};
+    buf.writer.print("  id: {d} (use this with /manage bind)\n", .{info.id}) catch {};
+    buf.writer.print("  platform: {t}\n", .{info.platform}) catch {};
+    buf.writer.print("  native id: {s}\n", .{info.native_chat_id}) catch {};
+    if (info.chat_type) |t| buf.writer.print("  type: {s}\n", .{t}) catch {};
+    if (info.title) |t| buf.writer.print("  title: {s}\n", .{t}) catch {};
+    if (info.left) buf.writer.print("  status: I'm no longer in this chat\n", .{}) catch {};
+    connector.sendMessage(a, msg.chat_id, buf.writer.buffered(), msg.message_id);
+}
+
 /// `/whois [@username | user_id]` (or reply) — looks a known identity up and
 /// reports every field `identities` tracks about it, including the two
 /// derived-not-stored trust flags (`bot admin`, `superuser`) so this doubles
@@ -4184,7 +4251,7 @@ fn handleWhoisCommand(connector: iface.Connector, a: std.mem.Allocator, config: 
 /// authorized against the *target* chat's admin status, not the current
 /// (control) room's — see `auth.isOwnerOrLiveAdminOfChat`'s doc comment.
 fn handleManageCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, msg: iface.Message, text: []const u8) void {
-    const usage = "Usage: /manage bind <chat id> | /manage unbind <chat id> | /manage list";
+    const usage = "Usage: /manage bind <chat id> | /manage unbind <chat id> | /manage list\nRun /chatinfo in the chat you want to bind to get its id.";
     const arg = std.mem.trim(u8, text["/manage".len..], " ");
     if (arg.len == 0) {
         reply(connector, a, msg.chat_id, msg.message_id, usage);
@@ -4201,7 +4268,7 @@ fn handleManageCommand(connector: iface.Connector, a: std.mem.Allocator, config:
             return;
         };
         if (targets.len == 0) {
-            reply(connector, a, msg.chat_id, msg.message_id, "No chats bound to this room yet. Use /manage bind <chat id>.");
+            reply(connector, a, msg.chat_id, msg.message_id, "No chats bound to this room yet. Run /chatinfo in the chat you want to bind to get its id, then /manage bind <chat id> here.");
             return;
         }
         var buf: std.Io.Writer.Allocating = .init(a);
@@ -4218,7 +4285,7 @@ fn handleManageCommand(connector: iface.Connector, a: std.mem.Allocator, config:
     }
     const rest = std.mem.trim(u8, it.rest(), " ");
     const target_id = std.fmt.parseInt(i64, rest, 10) catch {
-        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /manage bind <chat id> (see /manage list for ids).");
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /manage bind <chat id> — that's warden's own id for the chat, not the platform's. Run /chatinfo in the target chat to get it (or /manage list for ones already bound).");
         return;
     };
     const target = (chats.getById(pool, a, target_id) catch |err| {

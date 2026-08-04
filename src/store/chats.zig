@@ -68,6 +68,73 @@ pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) !?Chat
     };
 }
 
+/// Single-chat lookup by the *platform-native* id — the handle a caller
+/// actually has when it's holding something a human or a platform gave it
+/// (a Telegram `-100…` group id, a Matrix room id) rather than a row id it
+/// could only have learned from warden's own database.
+///
+/// Exists because `upsertChat` was previously the only native → internal
+/// resolution in the codebase, and it is a *write*: it creates the row if
+/// it's missing and clears `left_at` if it's set. Calling it to answer
+/// "which chat is this?" would invent chats warden has never seen and
+/// silently resurrect ones it had left, so any read-only caller needs this
+/// instead. Keyed on `(platform, native_chat_id)`, the same unique index
+/// `upsertChat`'s `ON CONFLICT` targets — native ids are only unique within
+/// a platform, so the platform is part of the question, not an optional
+/// filter.
+pub fn getByNative(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform, native_chat_id: []const u8) !?ChatRef {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT id, native_chat_id, platform FROM chats WHERE platform = $1 AND native_chat_id = $2;");
+    defer stmt.finalize();
+    stmt.bindText(1, @tagName(platform));
+    stmt.bindText(2, native_chat_id);
+    if (!try stmt.step()) return null;
+    return .{
+        .id = stmt.columnInt64(0),
+        .native_chat_id = try allocator.dupe(u8, stmt.columnText(1)),
+        .platform = std.meta.stringToEnum(Platform, stmt.columnText(2)) orelse .telegram,
+    };
+}
+
+/// What `/chatinfo` reports. Deliberately a separate struct from `ChatRef`
+/// rather than more fields on it: `ChatRef` is the *routing* shape (who do
+/// I deliver to, through which connector) and is built in hot paths like
+/// `listAll`, whereas this is the *display* shape and carries the two
+/// human-facing columns nothing routing-related ever needs.
+pub const ChatInfo = struct {
+    id: i64,
+    native_chat_id: []const u8,
+    platform: Platform,
+    chat_type: ?[]const u8,
+    title: ?[]const u8,
+    /// Set when the bot has left/been removed and no message has arrived
+    /// since (see `markLeft`/`upsertChat`) — worth surfacing because a chat
+    /// can still be looked up, and bound, in that state.
+    left: bool,
+};
+
+/// Backs `/chatinfo`. Returns `null` for an unknown id rather than
+/// erroring — "no such chat" is an ordinary answer here, not a failure.
+pub fn getInfoById(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) !?ChatInfo {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT id, native_chat_id, platform, chat_type, title, left_at IS NOT NULL FROM chats WHERE id = $1;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    if (!try stmt.step()) return null;
+    return .{
+        .id = stmt.columnInt64(0),
+        .native_chat_id = try allocator.dupe(u8, stmt.columnText(1)),
+        .platform = std.meta.stringToEnum(Platform, stmt.columnText(2)) orelse .telegram,
+        .chat_type = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
+        .title = if (stmt.columnIsNull(4)) null else try allocator.dupe(u8, stmt.columnText(4)),
+        .left = stmt.columnBool(5),
+    };
+}
+
 /// Marks a chat as no longer active — the bot left, was kicked, or the
 /// chat was deleted (see `main.zig`'s `processMessageTask`, which calls
 /// this on a synthetic `chat_left` message from a connector). Doesn't
@@ -188,6 +255,91 @@ test "upsertChat inserts then updates on conflict, preserving fields when null i
     try testing.expect(try stmt.step());
     try testing.expectEqualStrings("supergroup", stmt.columnText(0));
     try testing.expectEqualStrings("My Group", stmt.columnText(1));
+}
+
+test "getByNative resolves a native id to the internal row without creating one" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const id = try upsertChat(&pool, .telegram, "-100555", "supergroup", "Ops");
+
+    const found = (try getByNative(&pool, testing.allocator, .telegram, "-100555")).?;
+    defer testing.allocator.free(found.native_chat_id);
+    try testing.expectEqual(id, found.id);
+    try testing.expectEqual(Platform.telegram, found.platform);
+
+    // The whole point of not reusing `upsertChat` for this: a miss must
+    // stay a miss, not quietly insert the chat it was asked about.
+    try testing.expect(try getByNative(&pool, testing.allocator, .telegram, "-100999") == null);
+    var count = try db.prepare("SELECT count(*) FROM chats;");
+    defer count.finalize();
+    try testing.expect(try count.step());
+    try testing.expectEqual(@as(i64, 1), count.columnInt64(0));
+}
+
+test "getByNative keys on platform too, so identical native ids on different platforms don't collide" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const tg = try upsertChat(&pool, .telegram, "shared-id", null, null);
+    const mx = try upsertChat(&pool, .matrix, "shared-id", null, null);
+    try testing.expect(tg != mx);
+
+    const found_tg = (try getByNative(&pool, testing.allocator, .telegram, "shared-id")).?;
+    defer testing.allocator.free(found_tg.native_chat_id);
+    const found_mx = (try getByNative(&pool, testing.allocator, .matrix, "shared-id")).?;
+    defer testing.allocator.free(found_mx.native_chat_id);
+    try testing.expectEqual(tg, found_tg.id);
+    try testing.expectEqual(mx, found_mx.id);
+}
+
+test "getInfoById reports type, title and left state, and null for an unknown id" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const id = try upsertChat(&pool, .telegram, "-100777", "supergroup", "Weekend Plans");
+
+    {
+        const info = (try getInfoById(&pool, testing.allocator, id)).?;
+        defer testing.allocator.free(info.native_chat_id);
+        defer if (info.chat_type) |t| testing.allocator.free(t);
+        defer if (info.title) |t| testing.allocator.free(t);
+        try testing.expectEqual(id, info.id);
+        try testing.expectEqualStrings("-100777", info.native_chat_id);
+        try testing.expectEqualStrings("supergroup", info.chat_type.?);
+        try testing.expectEqualStrings("Weekend Plans", info.title.?);
+        try testing.expect(!info.left);
+    }
+
+    try markLeft(&pool, id, 1000);
+    {
+        const info = (try getInfoById(&pool, testing.allocator, id)).?;
+        defer testing.allocator.free(info.native_chat_id);
+        defer if (info.chat_type) |t| testing.allocator.free(t);
+        defer if (info.title) |t| testing.allocator.free(t);
+        try testing.expect(info.left);
+    }
+
+    try testing.expect(try getInfoById(&pool, testing.allocator, id + 12345) == null);
+}
+
+test "getInfoById tolerates a chat with no type or title recorded" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const id = try upsertChat(&pool, .telegram, "42", null, null);
+    const info = (try getInfoById(&pool, testing.allocator, id)).?;
+    defer testing.allocator.free(info.native_chat_id);
+    try testing.expect(info.chat_type == null);
+    try testing.expect(info.title == null);
 }
 
 test "listAll returns every active chat, excluding ones marked left" {

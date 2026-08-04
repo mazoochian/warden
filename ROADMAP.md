@@ -774,6 +774,30 @@ administration. The list is cheap to widen later.
   have no handler-level tests either — but it's the first thing to add if
   this surface grows.
 
+**Slice 3 (2026-08-04) — `/chatinfo`, and a chat lookup by native id.**
+Reported from use: binding the first chat to a management room required
+querying Postgres by hand. `/manage bind` takes warden's internal
+`chats.id` (it has to — see slice 1's reasoning above), but the only place
+an internal id was ever printed was `/manage list`, which lists chats
+*already bound to this room*. So the id you needed to perform a bind was
+only discoverable after you'd already bound something. `/chatinfo` prints
+the current chat's internal id, platform, native id, type, title and
+left-state; `/chatinfo <native id>` translates a platform-native id into
+it, which is the step that previously had no code path at all.
+
+Underneath: `chats.getByNative`. Before this, `upsertChat` was the *only*
+native → internal resolution in the codebase, and it is a write — it
+inserts a row if there isn't one and clears `left_at` if there is. Any
+read-only caller using it to answer "which chat is this?" would invent
+chats warden had never seen and resurrect ones it had left, so anything
+resolving a target chat from a native id (this command today, other
+handlers later — the motivating report explicitly asked for it) needs the
+read-only path instead.
+
+Chat-admin tier, no token fallback: a token buys one moderation action,
+not a lookup. `/manage`'s usage and empty-list replies now point at
+`/chatinfo` rather than leaving the discovery step unstated.
+
 ### Phase 10 — Vision & document understanding
 *Effort: M/L. Status: slice 1 (images) and slice 2 (native PDF documents)
 both done — see below for what shipped in each.*
