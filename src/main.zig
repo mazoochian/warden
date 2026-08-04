@@ -183,7 +183,7 @@ const public_commands = [_]iface.CommandSpec{
 /// own doc comment) but still reserved -- an alias must never shadow one
 /// of these either.
 const reserved_command_names_extra = [_][]const u8{
-    "token", "credit", "scraper", "adduser", "removeuser",
+    "token",     "credit",       "scraper",  "adduser",     "removeuser",
     "allowchat", "disallowchat", "addadmin", "removeadmin", "sudo",
 };
 
@@ -4358,12 +4358,33 @@ const as_relayable_commands = [_][]const u8{
     // on the target chat at all.
     "ping",
     // Moderation that targets a *user*, not a message.
-    "kick",   "ban",       "mute",     "unmute",    "promote", "demote", "unpin",
+    "kick",
+    "ban",
+    "mute",
+    "unmute",
+    "promote",
+    "demote",
+    "unpin",
     // Per-chat configuration.
-    "welcome", "persona",  "location", "magicword", "thinking", "keyword",
-    "digest",  "briefing", "alias",    "template",  "allowchat", "disallowchat",
+    "welcome",
+    "persona",
+    "location",
+    "magicword",
+    "thinking",
+    "keyword",
+    "digest",
+    "briefing",
+    "alias",
+    "template",
+    "allowchat",
+    "disallowchat",
     // Read-only reports about the target chat.
-    "stats",   "wordcloud", "reminders", "notes",   "alerts",   "watches",
+    "stats",
+    "wordcloud",
+    "reminders",
+    "notes",
+    "alerts",
+    "watches",
 };
 
 /// The bare command name in `text` (no leading `/` or `!`, no
