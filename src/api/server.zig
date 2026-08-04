@@ -151,6 +151,7 @@ const PgPool = store_pool.PgPool;
 const test_support = @import("../store/test_support.zig");
 const identities = @import("../store/identities.zig");
 const chats_store = @import("../store/chats.zig");
+const convert = @import("../features/convert.zig");
 
 fn testConfig() config_mod.Config {
     return .{
@@ -618,6 +619,21 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
 // connection buffer, so a regression here reproduces reliably.
 test "convert endpoint: a real multipart POST whose body exceeds one buffered read still finds the file part" {
     const gpa = std.heap.page_allocator;
+
+    // This posts a real txt -> md conversion, which shells out to pandoc
+    // (see `features/convert.zig`), so it needs pandoc present exactly like
+    // the conversion tests in that file — which all skip when it isn't.
+    // This one didn't, and so hard-failed with a 500 on any machine without
+    // it; CI was the machine in question. The regression it actually guards
+    // is multipart parsing across a buffer boundary, not pandoc, so
+    // skipping when the tool is absent loses nothing it's here to protect.
+    // CI installs pandoc so it really runs there rather than quietly
+    // skipping.
+    {
+        var probe = std.heap.ArenaAllocator.init(testing.allocator);
+        defer probe.deinit();
+        if (!convert.binaryAvailable(probe.allocator(), testing.io, &.{ "pandoc", "--version" })) return error.SkipZigTest;
+    }
 
     const db = try gpa.create(Db);
     db.* = try test_support.openTestDb(gpa) orelse return error.SkipZigTest;

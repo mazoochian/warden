@@ -315,7 +315,11 @@ test "convert rejects a pdf source targeting anything but txt" {
     try testing.expectError(error.UnsupportedConversion, result);
 }
 
-fn binaryAvailable(a: std.mem.Allocator, io: Io, argv: []const []const u8) bool {
+/// `pub` so tests outside this file that exercise a conversion end-to-end
+/// (`api/server.zig`'s multipart-POST regression test) can skip on the same
+/// terms as the ones in here, instead of hard-failing wherever the external
+/// tool isn't installed.
+pub fn binaryAvailable(a: std.mem.Allocator, io: Io, argv: []const []const u8) bool {
     if (std.process.run(a, io, .{ .argv = argv })) |r| {
         return r.term == .exited;
     } else |_| return false;

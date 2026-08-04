@@ -46,7 +46,12 @@ jobs:
       WARDEN_TEST_POSTGRES_DSN: postgresql://warden_test:warden_test@postgres:5432/warden_test
     steps:
       - name: Install build dependencies
-        run: apk add --no-cache bash git curl xz postgresql-dev olm-dev
+        # pandoc-cli is a *test* dependency, not a build one: the convert
+        # endpoint shells out to pandoc, and without it `api/server.zig`'s
+        # multipart-POST regression test skips instead of covering the
+        # buffer-boundary parsing it exists to guard. Worth the ~150MB here
+        # rather than losing that coverage on every run.
+        run: apk add --no-cache bash git curl xz postgresql-dev olm-dev pandoc-cli
 
       - uses: actions/checkout@v4
 
