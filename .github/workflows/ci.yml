@@ -21,7 +21,14 @@ jobs:
     container: alpine:3.22
     services:
       postgres:
-        image: postgres:16-alpine
+        # MUST be a pgvector image, not stock postgres: migration 0025
+        # (Phase 12 long-term memory) runs `CREATE EXTENSION vector`, which
+        # stock postgres fails outright with `extension "vector" is not
+        # available`. That took down migrations for every DB-backed test --
+        # 149 of them in one run -- while looking like 149 unrelated
+        # crashes. The local test container is already a pgvector image for
+        # this same reason; CI was the odd one out.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: warden_test
           POSTGRES_PASSWORD: warden_test

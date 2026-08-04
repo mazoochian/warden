@@ -201,9 +201,30 @@ fn runWithDeadline(comptime T: type, db: *Db, comptime func: anytype, args: anyt
     };
 
     const outcome = try db.allocator.create(Outcome);
-    errdefer db.allocator.destroy(outcome);
     outcome.* = .{};
-    const thread = try std.Thread.spawn(.{}, Runner.run, .{ args, outcome });
+    // No `errdefer` here, deliberately. An errdefer guards from its
+    // declaration to the end of the *enclosing function*, and both of this
+    // function's remaining exits return errors, so one here would fire on
+    // top of them:
+    //   - the completed-but-failed path below already has its own `defer`
+    //     destroy, so an errdefer would double-free `outcome` on every
+    //     query that merely returns an error. That is an ordinary outcome,
+    //     not a bug — a failing `CREATE EXTENSION`, a constraint violation,
+    //     a syntax error — and it crashed the process with
+    //     GeneralPurposeAllocator's "Invalid free" panic. Found 2026-08-04
+    //     when CI's Postgres turned out to lack pgvector: 149 tests
+    //     "crashed" that were really one double-free, repeated.
+    //   - the timeout path deliberately abandons `outcome` to the detached
+    //     thread, so freeing it there is a use-after-free on memory that
+    //     thread is still writing to — the exact opposite of what the
+    //     comment down there says happens.
+    // Spawn failure is the one case that does need cleanup, so it gets it
+    // explicitly. Same reasoning, same fix as `http_util.zig`'s
+    // `buildFetchShared`/`spawnFetch` split — see that doc comment.
+    const thread = std.Thread.spawn(.{}, Runner.run, .{ args, outcome }) catch |err| {
+        db.allocator.destroy(outcome);
+        return err;
+    };
 
     var waited_ns: u64 = 0;
     while (!outcome.done.load(.acquire) and waited_ns < db.query_timeout_ns) {
@@ -349,4 +370,25 @@ test "appendConnectionOptions uses space-separated keywords for a non-URI DSN" {
         "host=postgres dbname=warden connect_timeout=10 keepalives=1 keepalives_idle=20 keepalives_interval=10 keepalives_count=3",
         out,
     );
+}
+
+const test_support = @import("test_support.zig");
+
+test "a failing query returns its error instead of double-freeing the deadline outcome (regression 2026-08-04)" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+
+    // `runWithDeadline` used to arm an `errdefer` that stayed live all the
+    // way to the bottom of the function, so this — a query that simply
+    // fails, which is an ordinary thing for a query to do — freed the
+    // outcome twice and aborted the process with "Invalid free" rather than
+    // returning. It went unnoticed locally because every query in the happy
+    // path succeeds; CI found it only because its Postgres lacked pgvector,
+    // so `CREATE EXTENSION vector` failed during migration and took down
+    // 149 tests at once.
+    try testing.expectError(error.PgExecFailed, db.exec("SELECT * FROM a_table_that_does_not_exist;"));
+
+    // Still usable afterwards: the failure path must not poison or corrupt
+    // the connection, only report.
+    try db.exec("SELECT 1;");
 }
