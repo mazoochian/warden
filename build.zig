@@ -32,7 +32,15 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    // `zig build test -Dtest-filter="some test name"` runs just the matching
+    // tests. Worth having because the test runner takes filters only at
+    // COMPILE time -- passing `--test-filter` to the built test binary is a
+    // hard error -- so without this option there is no way at all to run one
+    // test in isolation, and the whole DB-backed suite is a multi-minute
+    // round trip. That cost real time on 2026-08-04 while isolating a crash
+    // that turned out to be misattributed to an innocent test.
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains one of these filters") orelse &[_][]const u8{};
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);

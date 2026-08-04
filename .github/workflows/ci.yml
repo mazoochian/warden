@@ -5,6 +5,12 @@ on:
     branches: [master]
   pull_request:
 
+# A second push to the same branch makes the first run's result irrelevant --
+# cancel it rather than paying for both and waiting on the stale one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -52,30 +58,23 @@ jobs:
       - name: zig build
         run: zig build
 
-      # NOTE: two known, pre-existing test-suite crashes as of 2026-07-28 --
-      # neither is a regression from whatever change you're looking at
-      # unless you touched the specific file involved:
-      #   1. store/crypto.zig's test group (found 2026-07-27) -- a
-      #      different specific crypto.zig test crashes (SIGABRT or
-      #      segfault) on some runs once the full suite got large enough,
-      #      most likely shared-resource/timing contention rather than a
-      #      bug in any one test. Genuinely intermittent here too -- if
-      #      ONLY this one crashes, re-running is worth trying.
-      #   2. http_util.zig's HTTP-client-timeout test (`fetchAndFlag`) --
-      #      segfaults inside std.http.Client.fetch itself (Client.zig's
-      #      fetch, freeing redirect_buffer), called from a detached
-      #      timeout-watcher thread in fetchAndFlag. Found 2026-07-27,
-      #      confirmed 2026-07-28: this one is NOT flaky on THIS runner --
-      #      it has crashed 5/5 consecutive times on GitHub Actions'
-      #      alpine:3.22 container since this workflow was created.
-      #      Re-running will not make it pass here. It IS genuinely
-      #      intermittent locally on glibc, which is the only reason it
-      #      wasn't caught before CI existed. Needs a real debugging pass
-      #      (an Alpine-container local repro would help), not a rerun.
-      # If crypto.zig is the ONLY failure, re-run once. If http_util.zig's
-      # fetchAndFlag is among the failures, that's expected on this runner
-      # today -- don't rerun for it, and don't treat it as a regression
-      # unless you touched http_util.zig yourself. Anything else failing
-      # is real.
+      # This step is expected to be GREEN. It was not, from this workflow's
+      # creation until 2026-08-04: every run crashed, and the note that used
+      # to live here catalogued the crashes as known-and-tolerated, in
+      # store/crypto.zig, features/briefing.zig or http_util.zig depending
+      # on the run. All three were one bug, and none of them were in the
+      # test that got blamed -- http_util.zig's timeout test detached a
+      # thread that went on using an `http.Client` and an allocator owned by
+      # a stack frame that had already died, then faulted ~30s later,
+      # aborting whichever unrelated test happened to hold the main thread
+      # at that moment. Fixed by giving the detached thread sole ownership
+      # of everything it touches (see http_util.zig's module doc).
+      #
+      # So: a crash here is a real failure. Do not re-run hoping it passes,
+      # and do not add it to a tolerated list. If a test aborts in a module
+      # that has no plausible connection to your change, suspect another
+      # detached thread rather than that module -- `coredumpctl info <pid>`
+      # names the actually-faulting thread, which is the fastest way to tell
+      # a real regression from a misattributed one.
       - name: zig build test
         run: zig build test

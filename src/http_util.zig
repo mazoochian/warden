@@ -48,6 +48,18 @@
 //! whatever the orphaned thread manages to buffer) on the rare occasions a
 //! peer actually stalls like this — see `FetchShared`'s doc comment for how
 //! the leak is kept safe rather than a use-after-free.
+//!
+//! That safety claim was only half-true until 2026-08-04, and the half that
+//! was false is what produced this module's long-standing "flaky" crash. An
+//! abandoned thread keeps running against three things: its buffers, its
+//! allocator, and its `http.Client`. Only the first was ever copied. The
+//! other two were borrowed from the caller — `client.allocator` is a
+//! per-message arena at nearly every call site, and the client itself is a
+//! stack local with a `defer client.deinit()` under it — so a timed-out
+//! request would have its arena freed and its connection pool torn down
+//! while the detached thread was still transacting on both. Now all three
+//! live in the `FetchShared`/`StreamShared` the thread owns (allocated from
+//! `detached_gpa`), so "detach and abandon" really is just a leak.
 
 const std = @import("std");
 const Io = std.Io;
@@ -56,6 +68,23 @@ const log = @import("log.zig").scoped("http");
 
 /// How much of a failed response's body makes it into the log.
 const max_logged_body = 400;
+
+/// The allocator for every byte an abandoned request thread can still touch
+/// after `fetchWithTimeout`/`postJsonSSE` has returned to its caller.
+///
+/// Deliberately NOT `client.allocator`, which is what this module used
+/// until 2026-08-04. Nearly every call site builds its `http.Client` with a
+/// per-message arena (`.{ .allocator = ctx.allocator, .io = ctx.io }` — see
+/// `tools/*.zig`, `api/oidc.zig`, `features/transcribe.zig`), and that
+/// arena is freed the moment `error.RequestTimedOut` propagates out. So the
+/// "bounded leak" this module's doc describes was, at those call sites,
+/// actually a use-after-free: the detached thread kept writing its response
+/// into memory the caller had already reclaimed. `page_allocator` is
+/// process-lifetime and thread-safe, which is precisely what a thread
+/// nobody will ever join again needs; the sizes involved (a URL, a payload,
+/// a few headers, one response buffer) make its page granularity a
+/// non-issue.
+const detached_gpa = std.heap.page_allocator;
 
 /// Generous enough to never trip during legitimate slow operations (a 25s
 /// Telegram long poll, a quick tool API call) while still bounding a truly
@@ -110,6 +139,34 @@ const FetchShared = struct {
     url: []const u8,
     payload: ?[]const u8,
     extra_headers: []const http.Header,
+    /// The request runs on *this* client, not the caller's, for the same
+    /// lifetime reason the buffers above are copies. The caller's client is
+    /// typically a stack local with a `defer client.deinit()` right beneath
+    /// it (`tools/weather.zig`, `tools/fetch_url.zig`, and a dozen more), so
+    /// on the timeout path the caller would return, `deinit()` would free
+    /// the connection pool this thread is still transacting on, and then
+    /// the stack frame holding the whole client would go away — a
+    /// use-after-free on every timed-out request, which is exactly the crash
+    /// this module's own regression test was hitting. Owning the client here
+    /// means the detached thread's entire working set is reachable only
+    /// through `FetchShared`, so abandoning it stays the plain bounded leak
+    /// the module doc claims it is.
+    ///
+    /// Known cost, accepted deliberately: a fresh client rescans the system
+    /// CA bundle on its first HTTPS request (`Client.zig`'s `client.now ==
+    /// null` check), so every request now re-reads and re-parses the cert
+    /// store instead of reusing a long-lived client's cached copy. For the
+    /// per-invocation clients in `tools/*.zig` this changes nothing — they
+    /// already paid it per call — but the long-lived ones
+    /// (`telegram/client.zig`, `matrix/client.zig`, the LLM adapters) now
+    /// pay it per request too. It is small next to the network round trip
+    /// it precedes, though not free on a 1-vCPU host. The way to get it
+    /// back is one process-wide client shared by every request (its pool
+    /// and CA bundle are already lock-guarded, and a process-lifetime
+    /// client is trivially safe to detach from) — deliberately NOT done in
+    /// the same change as a crash fix, since it reshapes connection
+    /// handling for the whole bot.
+    client: http.Client,
 };
 
 fn dupeHeaders(allocator: std.mem.Allocator, headers: []const http.Header) ![]http.Header {
@@ -131,21 +188,22 @@ fn freeHeaders(allocator: std.mem.Allocator, headers: []const http.Header) void 
     allocator.free(headers);
 }
 
-fn freeShared(allocator: std.mem.Allocator, shared: *FetchShared) void {
+fn freeShared(shared: *FetchShared) void {
+    shared.client.deinit();
     shared.body.deinit();
-    allocator.free(shared.url);
-    if (shared.payload) |p| allocator.free(p);
-    freeHeaders(allocator, shared.extra_headers);
-    allocator.destroy(shared);
+    detached_gpa.free(shared.url);
+    if (shared.payload) |p| detached_gpa.free(p);
+    freeHeaders(detached_gpa, shared.extra_headers);
+    detached_gpa.destroy(shared);
 }
 
-fn fetchAndFlag(client: *http.Client, base_options: http.Client.FetchOptions, shared: *FetchShared) void {
+fn fetchAndFlag(base_options: http.Client.FetchOptions, shared: *FetchShared) void {
     var opts = base_options;
     opts.location = .{ .url = shared.url };
     opts.payload = shared.payload;
     opts.extra_headers = shared.extra_headers;
     opts.response_writer = &shared.body.writer;
-    shared.result = client.fetch(opts);
+    shared.result = shared.client.fetch(opts);
     shared.done.store(true, .release);
 }
 
@@ -161,21 +219,27 @@ fn fetchAndFlag(client: *http.Client, base_options: http.Client.FetchOptions, sh
 /// by this file's own test suite: two matrix crypto tests whose HTTP send
 /// fails as expected crashed with a general-protection fault inside a
 /// second, spurious `freeHeaders` call.
-fn buildFetchShared(gpa: std.mem.Allocator, options: http.Client.FetchOptions) !*FetchShared {
+fn buildFetchShared(io: Io, options: http.Client.FetchOptions) !*FetchShared {
     const url = switch (options.location) {
         .url => |u| u,
         .uri => unreachable,
     };
 
-    const shared = try gpa.create(FetchShared);
-    errdefer gpa.destroy(shared);
-    const url_copy = try gpa.dupe(u8, url);
-    errdefer gpa.free(url_copy);
-    const payload_copy = if (options.payload) |p| try gpa.dupe(u8, p) else null;
-    errdefer if (payload_copy) |p| gpa.free(p);
-    const headers_copy = try dupeHeaders(gpa, options.extra_headers);
-    errdefer freeHeaders(gpa, headers_copy);
-    shared.* = .{ .body = .init(gpa), .url = url_copy, .payload = payload_copy, .extra_headers = headers_copy };
+    const shared = try detached_gpa.create(FetchShared);
+    errdefer detached_gpa.destroy(shared);
+    const url_copy = try detached_gpa.dupe(u8, url);
+    errdefer detached_gpa.free(url_copy);
+    const payload_copy = if (options.payload) |p| try detached_gpa.dupe(u8, p) else null;
+    errdefer if (payload_copy) |p| detached_gpa.free(p);
+    const headers_copy = try dupeHeaders(detached_gpa, options.extra_headers);
+    errdefer freeHeaders(detached_gpa, headers_copy);
+    shared.* = .{
+        .body = .init(detached_gpa),
+        .url = url_copy,
+        .payload = payload_copy,
+        .extra_headers = headers_copy,
+        .client = .{ .allocator = detached_gpa, .io = io },
+    };
     return shared;
 }
 
@@ -183,9 +247,9 @@ fn buildFetchShared(gpa: std.mem.Allocator, options: http.Client.FetchOptions) !
 /// `errdefer` here needs to free `shared` only if spawning genuinely
 /// fails, without staying armed into `fetchWithTimeout`'s later, normal
 /// `defer freeShared(...)` on the request-completed-but-failed path.
-fn spawnFetch(client: *http.Client, options: http.Client.FetchOptions, shared: *FetchShared) !std.Thread {
-    errdefer freeShared(client.allocator, shared);
-    return std.Thread.spawn(.{}, fetchAndFlag, .{ client, options, shared });
+fn spawnFetch(options: http.Client.FetchOptions, shared: *FetchShared) !std.Thread {
+    errdefer freeShared(shared);
+    return std.Thread.spawn(.{}, fetchAndFlag, .{ options, shared });
 }
 
 /// Runs `client.fetch(options)` with a hard wall-clock deadline of
@@ -194,9 +258,8 @@ fn spawnFetch(client: *http.Client, options: http.Client.FetchOptions, shared: *
 /// finish in time. `options.location` must be `.url` — the only variant
 /// this module ever builds.
 fn fetchWithTimeout(client: *http.Client, options: http.Client.FetchOptions, timeout_ns: u64) !http.Client.FetchResult {
-    const gpa = client.allocator;
-    const shared = try buildFetchShared(gpa, options);
-    const thread = try spawnFetch(client, options, shared);
+    const shared = try buildFetchShared(client.io, options);
+    const thread = try spawnFetch(options, shared);
 
     var waited_ns: u64 = 0;
     while (!shared.done.load(.acquire) and waited_ns < timeout_ns) {
@@ -207,7 +270,7 @@ fn fetchWithTimeout(client: *http.Client, options: http.Client.FetchOptions, tim
 
     if (shared.done.load(.acquire)) {
         thread.join();
-        defer freeShared(gpa, shared);
+        defer freeShared(shared);
         const result = try shared.result;
         if (options.response_writer) |w| try w.writeAll(shared.body.writer.buffered());
         return result;
@@ -549,17 +612,20 @@ const StreamShared = struct {
     payload: []const u8,
     extra_headers: []const http.Header,
     sink_guard: SinkGuard,
+    /// Owned for the same reason as `FetchShared.client` — see there.
+    client: http.Client,
 };
 
-fn freeStreamShared(allocator: std.mem.Allocator, shared: *StreamShared) void {
-    allocator.free(shared.url);
-    allocator.free(shared.payload);
-    freeHeaders(allocator, shared.extra_headers);
-    allocator.destroy(shared);
+fn freeStreamShared(shared: *StreamShared) void {
+    shared.client.deinit();
+    detached_gpa.free(shared.url);
+    detached_gpa.free(shared.payload);
+    freeHeaders(detached_gpa, shared.extra_headers);
+    detached_gpa.destroy(shared);
 }
 
-fn streamJsonSSEAndFlag(client: *http.Client, gpa: std.mem.Allocator, shared: *StreamShared) void {
-    shared.result = postJsonSSEOnce(client, gpa, shared.url, shared.extra_headers, shared.payload, shared.sink_guard.sink());
+fn streamJsonSSEAndFlag(shared: *StreamShared) void {
+    shared.result = postJsonSSEOnce(&shared.client, detached_gpa, shared.url, shared.extra_headers, shared.payload, shared.sink_guard.sink());
     shared.done.store(true, .release);
 }
 
@@ -569,22 +635,28 @@ fn streamJsonSSEAndFlag(client: *http.Client, gpa: std.mem.Allocator, shared: *S
 /// `shared.result` (an ordinary request failure, not a bug) propagates out
 /// near the bottom of that function, double-freeing alongside the later
 /// `defer freeStreamShared(...)`.
-fn buildStreamShared(gpa: std.mem.Allocator, url: []const u8, extra_headers: []const http.Header, payload: []const u8, sink: SseLineSink) !*StreamShared {
-    const shared = try gpa.create(StreamShared);
-    errdefer gpa.destroy(shared);
-    const url_copy = try gpa.dupe(u8, url);
-    errdefer gpa.free(url_copy);
-    const payload_copy = try gpa.dupe(u8, payload);
-    errdefer gpa.free(payload_copy);
-    const headers_copy = try dupeHeaders(gpa, extra_headers);
-    errdefer freeHeaders(gpa, headers_copy);
-    shared.* = .{ .url = url_copy, .payload = payload_copy, .extra_headers = headers_copy, .sink_guard = .{ .inner = sink } };
+fn buildStreamShared(io: Io, url: []const u8, extra_headers: []const http.Header, payload: []const u8, sink: SseLineSink) !*StreamShared {
+    const shared = try detached_gpa.create(StreamShared);
+    errdefer detached_gpa.destroy(shared);
+    const url_copy = try detached_gpa.dupe(u8, url);
+    errdefer detached_gpa.free(url_copy);
+    const payload_copy = try detached_gpa.dupe(u8, payload);
+    errdefer detached_gpa.free(payload_copy);
+    const headers_copy = try dupeHeaders(detached_gpa, extra_headers);
+    errdefer freeHeaders(detached_gpa, headers_copy);
+    shared.* = .{
+        .url = url_copy,
+        .payload = payload_copy,
+        .extra_headers = headers_copy,
+        .sink_guard = .{ .inner = sink },
+        .client = .{ .allocator = detached_gpa, .io = io },
+    };
     return shared;
 }
 
-fn spawnStream(client: *http.Client, gpa: std.mem.Allocator, shared: *StreamShared) !std.Thread {
-    errdefer freeStreamShared(gpa, shared);
-    return std.Thread.spawn(.{}, streamJsonSSEAndFlag, .{ client, gpa, shared });
+fn spawnStream(shared: *StreamShared) !std.Thread {
+    errdefer freeStreamShared(shared);
+    return std.Thread.spawn(.{}, streamJsonSSEAndFlag, .{shared});
 }
 
 /// Like `postJson`, but for a Server-Sent-Events endpoint (`"stream":true`
@@ -620,9 +692,8 @@ pub fn postJsonSSE(
     sink: SseLineSink,
 ) !void {
     _ = allocator;
-    const gpa = client.allocator;
-    const shared = try buildStreamShared(gpa, url, extra_headers, payload, sink);
-    const thread = try spawnStream(client, gpa, shared);
+    const shared = try buildStreamShared(client.io, url, extra_headers, payload, sink);
+    const thread = try spawnStream(shared);
 
     var waited_ns: u64 = 0;
     while (!shared.done.load(.acquire) and waited_ns < timeout_ns) {
@@ -633,7 +704,7 @@ pub fn postJsonSSE(
 
     if (shared.done.load(.acquire)) {
         thread.join();
-        defer freeStreamShared(gpa, shared);
+        defer freeStreamShared(shared);
         return shared.result;
     }
 
@@ -712,8 +783,14 @@ test "getWithTimeout returns RequestTimedOut instead of hanging forever when a p
     const io = testing.io;
 
     var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-    var server = try address.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
+    // Heap-allocated and never deinit'd for the same lifetime reason as
+    // `client` below: the acceptor thread is detached and holds this
+    // pointer, so a stack-local server would dangle the moment this test
+    // returns (the acceptor is still inside `accept`, or about to close the
+    // connection, well after that). A listening socket held open for the
+    // rest of the test binary's life is the cheap, safe end of that trade.
+    const server = try std.heap.page_allocator.create(Io.net.Server);
+    server.* = try address.listen(io, .{ .reuse_address = true });
     const port = server.socket.address.getPort();
 
     // Accepts the connection and then goes silent forever: no read, no
@@ -732,18 +809,28 @@ test "getWithTimeout returns RequestTimedOut instead of hanging forever when a p
             Io.sleep(accept_io, .fromSeconds(30), .awake) catch {};
         }
     };
-    const thread = try std.Thread.spawn(.{}, Acceptor.run, .{ &server, io });
+    const thread = try std.Thread.spawn(.{}, Acceptor.run, .{ server, io });
     defer thread.detach();
 
-    // Deliberately not `testing.allocator` and no `client.deinit()` below:
-    // this test's whole point is that the fetch thread gets abandoned
-    // still holding a live connection out of `client`'s pool, which is
-    // exactly the state `deinit()` asserts never happens
-    // (`connection_pool.used.first == null`) and which `testing.allocator`
-    // would report as a leak. Both are correct, expected consequences of
-    // this one deliberate, bounded leak — see this file's module doc — not
-    // bugs to paper over.
+    // A plain stack local with a `defer client.deinit()`, exactly like every
+    // real call site (`tools/weather.zig`, `tools/fetch_url.zig`, ...) — and
+    // that is the point of writing it this way rather than heap-allocating
+    // it. Until 2026-08-04 this shape was a use-after-free on the timeout
+    // path: `fetchWithTimeout` detached a thread that was still inside
+    // `client.fetch(...)`, then this frame returned, `deinit()` tore down
+    // the connection pool that thread was transacting on, and the frame
+    // holding the client went away. The fault landed ~30s later (when the
+    // silent peer below finally closes the socket) on a *detached* thread,
+    // so it aborted whichever unrelated test happened to hold the main
+    // thread just then — which is why it read for weeks as a mystery flake
+    // in `store/crypto.zig` or `features/briefing.zig`, and why running the
+    // blamed test alone always "passed" (a short run exits before the fuse
+    // burns down). The request now runs on a client owned by `FetchShared`,
+    // so the caller's client is untouched after detach. Keeping this a
+    // stack local means this test exercises the production shape and would
+    // catch that ownership regressing.
     var client: http.Client = .{ .allocator = std.heap.page_allocator, .io = io };
+    defer client.deinit();
 
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
