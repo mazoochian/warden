@@ -229,6 +229,8 @@ const help_text =
     \\/wordcloud -- word cloud from recent activity
     \\/digest on|off|now -- enable/disable/generate a recent-activity summary
     \\/briefing on|off|now -- like /digest
+    \\/summary [hours] -- summarize the last N hours (default 24), no
+    \\  side effects, unlike /digest now
     \\/poll <question> | <opt1> | <opt2> | ... -- create a poll (2-10 opts)
     \\
     \\Reminders, alerts, feeds
@@ -288,6 +290,10 @@ const help_text_admin =
     \\/confirm, /cancel -- confirm/cancel a pending /kick or /ban
     \\/redact <N> | (reply) [N] | text <sub> | regex <pat> -- delete up
     \\  to 100 messages. regex is admin/owner only
+    \\/announce <time> <text> -- schedule a broadcast here. every
+    \\  <interval> <text> to repeat; list, cancel <id> to manage
+    \\/autopin on|off -- pin each scheduled announcement as it's posted
+    \\  (only those -- I never pin anyone else's messages on my own)
     \\
     \\Tokens and credits (reply to a user, or pass @username, to view/set)
     \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban
