@@ -1,8 +1,28 @@
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
+const store_pool = @import("../store/pool.zig");
+const audit_notify = @import("audit_notify.zig");
 
 pub const ActionKind = enum { ban, kick };
+
+/// Bundles what `mute`/`unmute`/`promote`/`demote` need to log an audit
+/// entry (Phase 20, ROADMAP.md) alongside the action itself — a small
+/// struct rather than four more positional parameters on each function,
+/// since each is already called from more than one site (the main dispatch
+/// chain and `/menu`'s resume-awaiting-input path).
+pub const AuditContext = struct {
+    pool: *store_pool.PgPool,
+    pending_undos: *audit_notify.PendingUndos,
+    /// Warden's internal id for `msg.chat_id` — what `audit_notify`'s
+    /// store-layer calls need (`chats.id`, not the platform-native id).
+    chat_id: i64,
+    actor_identity_id: i64,
+    /// Cheap, no-DB-read actor label for the log line — `msg.username
+    /// orelse msg.user_id` at the call site is enough; a resolved display
+    /// name isn't worth an extra query here.
+    actor_label: []const u8,
+};
 
 const PendingAction = struct {
     kind: ActionKind,
@@ -112,19 +132,21 @@ fn replyTarget(msg: iface.Message) ?struct { user_id: []const u8, label: []const
 
 const default_mute_seconds: i64 = 3600;
 
-pub fn mute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, now: i64) void {
+pub fn mute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, now: i64, audit: AuditContext) void {
     const target = replyTarget(msg) orelse {
         connector.sendMessage(a, msg.chat_id, "Reply to the message of the person you want to mute.", msg.message_id);
         return;
     };
-    connector.muteUser(a, msg.chat_id, target.user_id, now + default_mute_seconds) catch |err| {
+    const until = now + default_mute_seconds;
+    connector.muteUser(a, msg.chat_id, target.user_id, until) catch |err| {
         reportFailure(connector, a, msg.chat_id, msg.message_id, "mute", err);
         return;
     };
+    audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .mute = .{ .target_user_id = target.user_id, .target_label = target.label, .until_unix_time = until } });
     reply(connector, a, msg.chat_id, msg.message_id, "Muted {s} for 1 hour.", .{target.label});
 }
 
-pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
+pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, now: i64, audit: AuditContext) void {
     const target = replyTarget(msg) orelse {
         connector.sendMessage(a, msg.chat_id, "Reply to the message of the person you want to unmute.", msg.message_id);
         return;
@@ -133,6 +155,9 @@ pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Messa
         reportFailure(connector, a, msg.chat_id, msg.message_id, "unmute", err);
         return;
     };
+    // Not undoable (see `audit_notify.AuditAction.undoable`'s doc comment)
+    // -- logged for the record regardless.
+    audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .unmute = .{ .target_user_id = target.user_id, .target_label = target.label } });
     reply(connector, a, msg.chat_id, msg.message_id, "Unmuted {s}.", .{target.label});
 }
 
@@ -144,27 +169,34 @@ pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Messa
 /// fully trusted for everything else, and a confirm step mainly guards
 /// against a *different* admin acting rashly, which doesn't apply once
 /// this is owner-only.
-pub fn promote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
+pub fn promote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, now: i64, audit: AuditContext) void {
     const target = replyTarget(msg) orelse {
         connector.sendMessage(a, msg.chat_id, "Reply to the message of the person you want to promote.", msg.message_id);
         return;
     };
+    // Read before mutating -- this is the "before" state `audit_notify`
+    // needs both to log accurately and to know whether an Undo (demote)
+    // would actually reverse something (see `AuditAction.undoable`).
+    const was_admin_before = connector.isGroupAdmin(a, msg.chat_id, target.user_id) catch false;
     connector.promoteUser(a, msg.chat_id, target.user_id) catch |err| {
         reportFailure(connector, a, msg.chat_id, msg.message_id, "promote", err);
         return;
     };
+    audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .promote = .{ .target_user_id = target.user_id, .target_label = target.label, .was_admin_before = was_admin_before } });
     reply(connector, a, msg.chat_id, msg.message_id, "Promoted {s} to admin.", .{target.label});
 }
 
-pub fn demote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
+pub fn demote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, now: i64, audit: AuditContext) void {
     const target = replyTarget(msg) orelse {
         connector.sendMessage(a, msg.chat_id, "Reply to the message of the person you want to demote.", msg.message_id);
         return;
     };
+    const was_admin_before = connector.isGroupAdmin(a, msg.chat_id, target.user_id) catch true;
     connector.demoteUser(a, msg.chat_id, target.user_id) catch |err| {
         reportFailure(connector, a, msg.chat_id, msg.message_id, "demote", err);
         return;
     };
+    audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .demote = .{ .target_user_id = target.user_id, .target_label = target.label, .was_admin_before = was_admin_before } });
     reply(connector, a, msg.chat_id, msg.message_id, "Demoted {s}.", .{target.label});
 }
 
@@ -219,17 +251,22 @@ pub fn requestConfirmation(
     msg: iface.Message,
     kind: ActionKind,
     target_user_id: []const u8,
+    target_label: []const u8,
+    now: i64,
+    audit: AuditContext,
 ) void {
     if (kind == .kick) {
         connector.kickUser(a, msg.chat_id, target_user_id) catch |err| {
             reportFailure(connector, a, msg.chat_id, msg.message_id, "kick", err);
             return;
         };
+        audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .kick = .{ .target_user_id = target_user_id, .target_label = target_label } });
     } else if (kind == .ban) {
         connector.banUser(a, msg.chat_id, target_user_id) catch |err| {
             reportFailure(connector, a, msg.chat_id, msg.message_id, "ban", err);
             return;
         };
+        audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .ban = .{ .target_user_id = target_user_id, .target_label = target_label } });
     }
 }
 

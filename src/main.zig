@@ -73,6 +73,7 @@ const dynamic_provider_mod = @import("llm/dynamic_provider.zig");
 const toolcall = @import("llm/toolcall.zig");
 const tool_registry = @import("tools/registry.zig");
 const group_admin = @import("features/group_admin.zig");
+const audit_notify = @import("features/audit_notify.zig");
 const wordcloud = @import("features/wordcloud.zig");
 const digest = @import("features/digest.zig");
 const briefing = @import("features/briefing.zig");
@@ -148,7 +149,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
     .{ .name = "welcome", .description = "<text> -- greet new members ({name} = their name), or off to disable." },
     .{ .name = "summary", .description = "[hours] -- summarize the last N hours of this chat (default 24)." },
-    .{ .name = "announce", .description = "<time> <text> | every <interval> <text> | list | cancel <id> -- schedule a broadcast. Admins only." },
+    .{ .name = "announce", .description = "<text> -- broadcast now, pinned. Or: at <time> <text> | every <interval> <text> | list | cancel <id>. Admins only." },
     .{ .name = "autopin", .description = "on | off -- pin each scheduled announcement as it's posted. Admins only." },
     .{ .name = "expense", .description = "add <amt> <category> [desc] | list | summary | delete <id> -- expense tracker." },
     .{ .name = "budget", .description = "set <category> <amt> | list | remove <category> -- monthly budgets. Owner to set." },
@@ -176,8 +177,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "whois", .description = "Reply, or pass @username / user id, to look up who someone is. Bot admin/owner only." },
     .{ .name = "chatinfo", .description = "[native chat id] -- this chat's internal id and details, or look another up. Admins only." },
     .{ .name = "manage", .description = "bind|unbind <chat id> | list -- manage this room's bound chats (see /manage list). Admins only." },
-    .{ .name = "notice", .description = "<chat id> <text> -- send a pinned notice to a chat this room is bound to. Admins only." },
-    .{ .name = "as", .description = "<chat id> <command> -- run an admin command against a bound chat; the reply comes back here. Admins only." },
+    .{ .name = "as", .description = "<chat id> <command> -- run an admin command against a chat you're an admin of; the reply comes back here. Admins only." },
 };
 
 /// Owner-only commands deliberately left out of `public_commands` (see its
@@ -291,8 +291,9 @@ const help_text_admin =
     \\/confirm, /cancel -- confirm/cancel a pending /kick or /ban
     \\/redact <N> | (reply) [N] | text <sub> | regex <pat> -- delete up
     \\  to 100 messages. regex is admin/owner only
-    \\/announce <time> <text> -- schedule a broadcast here. every
-    \\  <interval> <text> to repeat; list, cancel <id> to manage
+    \\/announce <text> -- broadcast now, pinned. at <time> <text> to
+    \\  schedule instead; every <interval> <text> to repeat; list,
+    \\  cancel <id> to manage
     \\/autopin on|off -- pin each scheduled announcement as it's posted
     \\  (only those -- I never pin anyone else's messages on my own)
     \\
@@ -309,14 +310,12 @@ const help_text_admin =
     \\/whois [@user|id] -- their name/username/id/flags. Admin/owner only
     \\/chatinfo [native id] -- this chat's internal id, platform, type and
     \\  title; pass a native id to look up another chat on this platform
-    \\/sudo <command> -- a bot admin can run any moderation command above
-    \\  even where they aren't a real chat admin, e.g. /sudo kick
     \\
     \\Management rooms (for channels/groups with no back-and-forth)
-    \\/manage bind|unbind|list <chat id> -- bind this chat as a control room
-    \\/notice <chat id> <text> -- pinned notice to a bound chat
-    \\/as <chat id> <command> -- run an admin command against a bound chat
-    \\  (e.g. /as 7 /kick @spammer); the answer comes back here, not there
+    \\/manage bind|unbind|list <chat id> -- bind this room to one target
+    \\  chat (rebinding moves it -- one room, one target). Most moderation
+    \\  and settings commands above then run directly here against that
+    \\  target, no prefix needed.
     \\
     \\Owner only
     \\/scraper -- configure the web-scraping backend
@@ -458,6 +457,13 @@ pub fn main(init: std.process.Init) !void {
 
     var pending_confirmations = group_admin.PendingConfirmations.init(gpa, io, config.confirm_timeout_seconds);
     defer pending_confirmations.deinit();
+
+    // 24h, not `config.confirm_timeout_seconds` -- reaching for an audit-log
+    // undo well after the fact is a reasonable thing to want, unlike a
+    // ban/kick confirmation where seconds matter. See `audit_notify.
+    // PendingUndos`'s own doc comment.
+    var pending_undos = audit_notify.PendingUndos.init(gpa, io, 24 * 3600);
+    defer pending_undos.deinit();
 
     var digest_scheduler = scheduler.DigestScheduler.init(gpa, io, config.digest_interval_seconds);
     defer digest_scheduler.deinit();
@@ -612,6 +618,7 @@ pub fn main(init: std.process.Init) !void {
             embeddings_client,
             active_tools,
             &pending_confirmations,
+            &pending_undos,
             &digest_scheduler,
             &briefing_scheduler,
             &pending_conversions,
@@ -892,6 +899,7 @@ fn connectorPollLoop(
     embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
+    pending_undos: *audit_notify.PendingUndos,
     digest_scheduler: *scheduler.DigestScheduler,
     briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
@@ -976,6 +984,7 @@ fn connectorPollLoop(
                 .embeddings_client = embeddings_client,
                 .tools = tools,
                 .pending = pending,
+                .pending_undos = pending_undos,
                 .digest_scheduler = digest_scheduler,
                 .briefing_scheduler = briefing_scheduler,
                 .pending_conversions = pending_conversions,
@@ -1061,6 +1070,7 @@ const MessageTask = struct {
     embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
+    pending_undos: *audit_notify.PendingUndos,
     digest_scheduler: *scheduler.DigestScheduler,
     briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
@@ -1082,6 +1092,7 @@ const MessageTask = struct {
             self.embeddings_client,
             self.tools,
             self.pending,
+            self.pending_undos,
             self.digest_scheduler,
             self.briefing_scheduler,
             self.pending_conversions,
@@ -1109,6 +1120,7 @@ fn processMessageTask(
     embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
+    pending_undos: *audit_notify.PendingUndos,
     digest_scheduler: *scheduler.DigestScheduler,
     briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
@@ -1299,7 +1311,7 @@ fn processMessageTask(
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg, false);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg, false);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -1968,6 +1980,7 @@ fn handleMessage(
     tool_ctx: tool_registry.ToolContext,
     tools: []const tool_registry.ToolDef,
     pending: *group_admin.PendingConfirmations,
+    pending_undos: *audit_notify.PendingUndos,
     digest_scheduler: *scheduler.DigestScheduler,
     briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
@@ -2014,6 +2027,15 @@ fn handleMessage(
     // A button press / reaction pick has neither text nor an attachment of
     // its own, so this must run before the "neither" bail-out just below.
     if (msg.choice_picked) |picked| {
+        // Phase 20's "Undo" button on an audit-log entry — keyed by
+        // (control room, prompt message) rather than (chat, user), so it's
+        // checked on its own first rather than folded into the
+        // isAwaitingFormat/else split below; returns `false` (not handled)
+        // for anything that isn't its own button, so a stray pick still
+        // falls through to convert_flow/menu normally.
+        if (audit_notify.handleUndoPicked(connector, a, pool, pending_undos, now, msg, picked)) {
+            return false;
+        }
         // Both flows key their pending state the same way ((chat, user)),
         // so only one of them should ever actually claim a given pick --
         // `isAwaitingFormat` decides which, rather than trying `menu` only
@@ -2023,7 +2045,7 @@ fn handleMessage(
         if (pending_conversions.isAwaitingFormat(now, msg.chat_id, msg.user_id)) {
             convert_flow.handleChoicePicked(connector, a, io, config.tmp_dir, pending_conversions, now, msg, picked);
         } else {
-            menu_sessions.handleChoicePicked(menu_runner, now, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions), picked);
+            menu_sessions.handleChoicePicked(menu_runner, now, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos), picked);
         }
         return false;
     }
@@ -2088,7 +2110,7 @@ fn handleMessage(
     // (one of whose fallback tiers is exactly this session), rather than
     // being swallowed as a failed target-resolution attempt.
     if (!std.mem.eql(u8, text, "/cancel") and
-        menu_sessions.handleAwaitingInputMessage(menu_runner, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions)))
+        menu_sessions.handleAwaitingInputMessage(menu_runner, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos)))
     {
         return false;
     }
@@ -2105,6 +2127,46 @@ fn handleMessage(
         if (convert_flow.claimAttachmentForConvert(connector, a, pending_conversions, now, msg, tool_ctx.attachment_path.?, tool_ctx.attachment_file_name)) return true;
         // Claim failed (e.g. no candidate targets for this file type) —
         // fall through to normal dispatch below.
+    }
+
+    // Phase 21: a command typed directly in a room bound to a target chat
+    // (`/manage bind`, 1:1 as of Phase 20) runs against that target with no
+    // `/as <id>` prefix — same allow-list and authorization `/as` itself
+    // uses, via the identical relay/redirect mechanism. Checked once here,
+    // before the big dispatch chain, since it needs to match any of
+    // `as_relayable_commands` generically rather than one literal string;
+    // returns `null` silently for anything that isn't both bound and
+    // allow-listed, so ordinary chatting (or an unbound room, or a
+    // non-relayable command) falls straight through to normal dispatch
+    // below, unchanged. `feature_flags.isEnabled(pool, "management_rooms")`
+    // gates this the same as `/manage`/`/as` themselves.
+    if (feature_flags.isEnabled(pool, "management_rooms")) {
+        if (resolveDirectRoomCommand(connector, a, config, pool, chat_id, msg, text, relayed)) |relay| {
+            var redirect = reply_redirect.ReplyRedirect.init(connector, relay.target_native_chat_id, msg.chat_id, msg.message_id);
+            return handleMessage(
+                redirect.connector(),
+                a,
+                config,
+                pool,
+                relay.target_chat_id,
+                identity_id,
+                llm_provider,
+                embeddings_client,
+                tool_ctx,
+                tools,
+                pending,
+                pending_undos,
+                digest_scheduler,
+                briefing_scheduler,
+                pending_conversions,
+                menu_sessions,
+                io,
+                now,
+                max_message_len,
+                asRelayedMessage(msg, relay.target_native_chat_id, relay.command),
+                true,
+            );
+        }
     }
 
     if (std.mem.eql(u8, text, "/ping")) {
@@ -2144,11 +2206,11 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/mute")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
-        group_admin.mute(connector, a, msg, now);
+        group_admin.mute(connector, a, msg, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
     } else if (std.mem.eql(u8, text, "/unmute")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "unmute")) return false;
-        group_admin.unmute(connector, a, msg);
+        group_admin.unmute(connector, a, msg, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
     } else if (std.mem.eql(u8, text, "/pin")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "pin")) return false;
@@ -2170,19 +2232,19 @@ fn handleMessage(
         // `group_admin.promote`'s doc comment). Deliberately not extended
         // to bot admins/`/sudo` either, same reasoning.
         if (!is_owner) return false;
-        group_admin.promote(connector, a, msg);
+        group_admin.promote(connector, a, msg, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
     } else if (std.mem.eql(u8, text, "/demote")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!is_owner) return false;
-        group_admin.demote(connector, a, msg);
+        group_admin.demote(connector, a, msg, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
     } else if (std.mem.eql(u8, text, "/kick") or std.mem.startsWith(u8, text, "/kick ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "kick")) return false;
-        handleKickBanCommand(connector, a, pool, now, msg, text, "/kick", .kick);
+        handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text, "/kick", .kick);
     } else if (std.mem.eql(u8, text, "/ban") or std.mem.startsWith(u8, text, "/ban ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "ban")) return false;
-        handleKickBanCommand(connector, a, pool, now, msg, text, "/ban", .ban);
+        handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text, "/ban", .ban);
     } else if (std.mem.eql(u8, text, "/confirm")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "confirm")) return false;
@@ -2206,10 +2268,10 @@ fn handleMessage(
         }
     } else if (std.mem.startsWith(u8, text, "/token")) {
         if (!auth.checkTokenGrantAccess(connector, a, config, msg, is_bot_admin)) return false;
-        handleToken(connector, a, pool, chat_id, now, msg, text);
+        handleToken(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text);
     } else if (std.mem.eql(u8, text, "/credit") or std.mem.startsWith(u8, text, "/credit ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
-        handleCredit(connector, a, pool, now, msg, text);
+        handleCredit(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text);
     } else if (std.mem.eql(u8, text, "/adduser") or std.mem.startsWith(u8, text, "/adduser ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleAddUserCommand(connector, a, pool, identity_id, now, msg, text);
@@ -2242,13 +2304,11 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/manage") or std.mem.startsWith(u8, text, "/manage ")) {
         if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
         handleManageCommand(connector, a, config, pool, chat_id, identity_id, msg, text);
-    } else if (std.mem.eql(u8, text, "/notice") or std.mem.startsWith(u8, text, "/notice ")) {
-        if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
-        handleNoticeCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/as") or std.mem.startsWith(u8, text, "/as ")) {
-        // ROADMAP.md's Phase 9 slice 2. Everything that can reject the
-        // request (parsing, the relayable-command allow-list, the binding,
-        // and the target-chat admin check) happens in `resolveAsCommand`;
+        // ROADMAP.md's Phase 9 slice 2 (widened in Phase 20: no binding
+        // required any more). Everything that can reject the request
+        // (parsing, the relayable-command allow-list, and the target-chat
+        // admin check) happens in `resolveAsCommand`;
         // if it returns a plan, the command is replayed by calling this
         // very function again, with the *target* chat's ids in place and a
         // `ReplyRedirect`-wrapped connector so the relayed handler's own
@@ -2269,6 +2329,7 @@ fn handleMessage(
             tool_ctx,
             tools,
             pending,
+            pending_undos,
             digest_scheduler,
             briefing_scheduler,
             pending_conversions,
@@ -3881,6 +3942,8 @@ fn handleToken(
     a: std.mem.Allocator,
     pool: *store_pool.PgPool,
     chat_id: i64,
+    identity_id: i64,
+    pending_undos: *audit_notify.PendingUndos,
     now: i64,
     msg: iface.Message,
     text: []const u8,
@@ -3908,10 +3971,12 @@ fn handleToken(
     // Else set the token count to the parsed value and reply with a confirmation.
     const count = std.fmt.parseInt(i64, parsed.balance_str, 10) catch 0;
     log.debug("token: parsed count {d}", .{count});
+    const prev_balance = chat_members.getTokens(pool, chat_id, target.id, 0);
     chat_members.setTokens(pool, chat_id, target.id, count) catch |err| {
         log.err("token: failed to set tokens: {t}", .{err});
         return;
     };
+    audit_notify.recordAndNotify(connector, a, pool, pending_undos, now, chat_id, msg.chat_id, identity_id, msg.username orelse msg.user_id, .{ .token_grant = .{ .target_identity_id = target.id, .target_label = target.display_name, .prev_balance = prev_balance, .new_balance = count } });
     const message = std.fmt.allocPrint(a, "token count updated to {}", .{count}) catch |err| {
         log.err("token: failed to allocate message string: {t}", .{err});
         return; // Exit the function early since we couldn't format the message
@@ -3923,11 +3988,16 @@ fn handleToken(
 /// `<balance> [@username]` argument order), but backed by
 /// `identities.getCredits`/`setCredits` (global per-identity) instead of
 /// `chat_members`'s per-chat tokens. Gate (`auth.isOwnerOrBotAdmin`) is
-/// checked by the caller.
+/// checked by the caller. `chat_id` is only used to resolve which bound
+/// room (if any) an audit entry posts into — credits themselves aren't
+/// chat-scoped.
 fn handleCredit(
     connector: iface.Connector,
     a: std.mem.Allocator,
     pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    pending_undos: *audit_notify.PendingUndos,
     now: i64,
     msg: iface.Message,
     text: []const u8,
@@ -3952,10 +4022,12 @@ fn handleCredit(
         return;
     }
     const count = std.fmt.parseInt(i64, parsed.balance_str, 10) catch 0;
+    const prev_balance = identities.getCredits(pool, target.id, 0);
     identities.setCredits(pool, target.id, count) catch |err| {
         log.err("credit: failed to set credits: {t}", .{err});
         return;
     };
+    audit_notify.recordAndNotify(connector, a, pool, pending_undos, now, chat_id, msg.chat_id, identity_id, msg.username orelse msg.user_id, .{ .credit_grant = .{ .target_identity_id = target.id, .target_label = target.display_name, .prev_balance = prev_balance, .new_balance = count } });
     const message = std.fmt.allocPrint(a, "credit count updated to {}", .{count}) catch |err| {
         log.err("credit: failed to allocate message string: {t}", .{err});
         return;
@@ -3986,7 +4058,7 @@ fn usernameFromArg(arg: []const u8) ?[]const u8 {
 /// resolved a reply, so `/kick @spammer`/`/kick 123456789` silently matched
 /// no dispatch branch at all (see the exact-`eql` match this replaced).
 /// Permission is already checked by the caller before this runs.
-fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8, comptime prefix: []const u8, kind: group_admin.ActionKind) void {
+fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, pending_undos: *audit_notify.PendingUndos, now: i64, msg: iface.Message, text: []const u8, comptime prefix: []const u8, kind: group_admin.ActionKind) void {
     const arg = std.mem.trim(u8, text[prefix.len..], " ");
     const target = (resolveTargetIdentity(pool, connector, a, now, msg, arg, true) catch |err| {
         log.err("{s}: failed to resolve target: {t}", .{ @tagName(kind), err });
@@ -3996,7 +4068,7 @@ fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: 
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
         return;
     };
-    group_admin.requestConfirmation(connector, a, msg, kind, target.native_id);
+    group_admin.requestConfirmation(connector, a, msg, kind, target.native_id, target.display_name, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
 }
 
 fn handleAddUserCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
@@ -4324,70 +4396,10 @@ fn handleManageCommand(connector: iface.Connector, a: std.mem.Allocator, config:
     }
 }
 
-/// `/notice <chat id> <text>` — sends `<text>` into a bound target chat as
-/// the bot and pins it, distinct from an ordinary relayed message (see
-/// ROADMAP.md's Phase 9, "Admin notices"). Two checks, in order: the room
-/// must actually be bound to that chat (`management_rooms.isBound` —
-/// binding is a separate, deliberate step from having send rights),
-/// then the sender must currently be the owner or a live admin of the
-/// *target* — checked fresh every time, not just at bind time, so a
-/// demotion after binding takes effect immediately.
-fn handleNoticeCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
-    const usage = "Usage: /notice <chat id> <text>";
-    const arg = std.mem.trim(u8, text["/notice".len..], " ");
-    var it = std.mem.splitScalar(u8, arg, ' ');
-    const id_str = it.first();
-    const target_id = std.fmt.parseInt(i64, id_str, 10) catch {
-        reply(connector, a, msg.chat_id, msg.message_id, usage);
-        return;
-    };
-    const notice_text = std.mem.trim(u8, it.rest(), " ");
-    if (notice_text.len == 0) {
-        reply(connector, a, msg.chat_id, msg.message_id, usage);
-        return;
-    }
-
-    const target = (chats.getById(pool, a, target_id) catch |err| {
-        log.err("notice: getById failed for chat {d}: {t}", .{ target_id, err });
-        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that chat, try again.");
-        return;
-    }) orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, "No chat with that id.");
-        return;
-    };
-    if (target.platform != connector.platform()) {
-        reply(connector, a, msg.chat_id, msg.message_id, "That chat is on a different platform than this room — cross-platform management rooms aren't supported yet.");
-        return;
-    }
-    const is_bound = management_rooms.isBound(pool, chat_id, target.id) catch |err| {
-        log.err("notice: isBound failed (control {d}, target {d}): {t}", .{ chat_id, target.id, err });
-        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't check this room's bindings, try again.");
-        return;
-    };
-    if (!is_bound) {
-        reply(connector, a, msg.chat_id, msg.message_id, "This room isn't bound to that chat — use /manage bind <chat id> first.");
-        return;
-    }
-    if (!auth.isOwnerOrLiveAdminOfChat(connector, a, config, target.native_chat_id, msg.user_id)) {
-        reply(connector, a, msg.chat_id, msg.message_id, "You need to be the owner or a live admin of that chat to send a notice there.");
-        return;
-    }
-
-    const sent_id = connector.sendMessageReturningId(a, target.native_chat_id, notice_text, null) catch |err| {
-        log.err("notice: send failed for chat {d}: {t}", .{ target.id, err });
-        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't send that notice, try again.");
-        return;
-    };
-    if (sent_id) |sid| {
-        connector.pinMessage(a, target.native_chat_id, sid) catch |err| {
-            log.warn("notice: sent to chat {d} but pin failed: {t}", .{ target.id, err });
-        };
-    }
-    reply(connector, a, msg.chat_id, msg.message_id, "Notice sent.");
-}
-
-/// Commands `/as <chat id> <command>` will replay against a bound chat —
-/// an explicit allow-list, not a deny-list, because this is the one surface
+/// Commands `/as <chat id> <command>` will replay against a chat, and (as
+/// of Phase 21) that a bound management room's own direct dispatch
+/// (`resolveDirectRoomCommand`) will run with no `/as` prefix at all — an
+/// explicit allow-list, not a deny-list, because this is the one surface
 /// that lets someone drive an admin action in a chat they aren't sitting
 /// in: anything not thought about here fails closed.
 ///
@@ -4401,9 +4413,15 @@ fn handleNoticeCommand(connector: iface.Connector, a: std.mem.Allocator, config:
 ///   2. It doesn't need a *message* in the target chat to point at.
 ///      `asRelayedMessage` carries the operator's reply target *user*
 ///      across (a user id means the same thing in any chat) but drops the
-///      reply target *message* (a message id doesn't), so `/pin`,
-///      `/delete` and `/redact reply|N` have nothing to bite on and are
-///      left out rather than silently misfiring.
+///      reply target *message* (a message id doesn't), so `/pin` and
+///      `/delete` have nothing to bite on and are left out rather than
+///      silently misfiring. `/redact` was excluded here too until Phase
+///      21 — re-reading `handleRedactCommand`, none of its four modes
+///      (regex/text/reply-scoped-last-N/plain-last-N) actually need a
+///      *message* id, only ever a user id (via `replyTarget`) or a plain
+///      count/pattern, both of which survive the relay fine — so it's
+///      included now; the earlier exclusion was overcautious, not a real
+///      technical block.
 ///
 /// Deliberately excluded beyond those two rules:
 ///   * `/as` itself — see `handleMessage`'s `relayed` parameter.
@@ -4411,18 +4429,16 @@ fn handleNoticeCommand(connector: iface.Connector, a: std.mem.Allocator, config:
 ///     chat it was used in; it must be typed at top level where it is.
 ///   * `/menu`, `/convert`, `/cancel`, `/confirm` — stateful flows keyed by
 ///     (chat, user). Relayed, the state would be filed under the target
-///     chat while the operator's follow-up message arrives from the control
-///     room, so the flow could be started but never finished.
-///   * `/notice` — has its own command, and its send-then-pin pair isn't
-///     redirect-safe (see `platform/reply_redirect.zig`'s module doc).
+///     chat while the operator's follow-up message arrives from wherever
+///     `/as` was typed, so the flow could be started but never finished.
 ///   * The LLM-backed commands (`/joke`, `/translate`, `/note`, ...) —
 ///     they spend real credits and produce conversation, not administration.
 ///     Nothing about them is unsafe to relay; they're simply out of scope
 ///     for a management-room surface, and the list is cheap to widen later.
 const as_relayable_commands = [_][]const u8{
-    // Smoke test for the relay itself — replies "pong" into the control
-    // room, proving the binding and the redirect both work, with no effect
-    // on the target chat at all.
+    // Smoke test for the relay itself — replies "pong" back to wherever
+    // `/as` was typed, proving the redirect works, with no effect on the
+    // target chat at all.
     "ping",
     // Moderation that targets a *user*, not a message.
     "kick",
@@ -4432,6 +4448,7 @@ const as_relayable_commands = [_][]const u8{
     "promote",
     "demote",
     "unpin",
+    "redact",
     // Per-chat configuration.
     "welcome",
     "persona",
@@ -4445,6 +4462,13 @@ const as_relayable_commands = [_][]const u8{
     "template",
     "allowchat",
     "disallowchat",
+    "announce",
+    // Identity/balance grants scoped to *this* chat (`/token`) or the
+    // target identity (`/credit`) — chat-scoped in the sense that matters
+    // here: the command names a target user via reply/`@username`, which
+    // survives the relay exactly like every moderation command above.
+    "token",
+    "credit",
     // Read-only reports about the target chat.
     "stats",
     "wordcloud",
@@ -4488,24 +4512,22 @@ const AsRelay = struct {
 
 /// Parses and fully authorizes `/as <chat id> <command>`, returning the
 /// plan for `handleMessage` to replay, or null (having already explained
-/// why) if the request is refused. See ROADMAP.md's Phase 9 slice 2.
+/// why) if the request is refused. See ROADMAP.md's Phase 9 slice 2 and
+/// Phase 20 (which dropped the bound-room requirement below — `/as` now
+/// works from any chat or DM, not just a room bound to the target).
 ///
-/// The authorization path is deliberately identical to `/notice`'s, and
-/// stacks *on top of* whatever the relayed command checks for itself
+/// Stacks *on top of* whatever the relayed command checks for itself
 /// rather than replacing it:
 ///
 ///   1. Not already inside a relay (no `/as` inside `/as`).
 ///   2. The command is on `as_relayable_commands`.
 ///   3. The target chat exists and is on this connector's platform
-///      (cross-platform management rooms are still unsupported, same as
-///      slice 1).
-///   4. *This* control room is bound to that target — binding is a separate,
-///      deliberate step from having the standing to act.
-///   5. The sender is the owner or a **live admin of the target chat**,
+///      (cross-platform `/as` is still unsupported, same as slice 1).
+///   4. The sender is the owner or a **live admin of the target chat**,
 ///      re-checked against the platform on every single `/as`, never
-///      cached and never inferred from their standing in the control room
-///      (`auth.isOwnerOrLiveAdminOfChat`). No `/sudo` or token fallback
-///      tier here, exactly as `/manage`/`/notice` have none.
+///      cached and never inferred from their standing in whatever chat
+///      `/as` was typed in (`auth.isOwnerOrLiveAdminOfChat`). No `/sudo`
+///      or token fallback tier here, exactly as `/manage` has none.
 ///
 /// Then the relayed command runs its *own* gate too (e.g. `/kick` still
 /// calls `auth.checkGroupAdminAccess`), which — because
@@ -4561,16 +4583,7 @@ fn resolveAsCommand(
         return null;
     };
     if (target.platform != connector.platform()) {
-        reply(connector, a, msg.chat_id, msg.message_id, "That chat is on a different platform than this room — cross-platform management rooms aren't supported yet.");
-        return null;
-    }
-    const is_bound = management_rooms.isBound(pool, control_chat_id, target.id) catch |err| {
-        log.err("as: isBound failed (control {d}, target {d}): {t}", .{ control_chat_id, target.id, err });
-        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't check this room's bindings, try again.");
-        return null;
-    };
-    if (!is_bound) {
-        reply(connector, a, msg.chat_id, msg.message_id, "This room isn't bound to that chat — use /manage bind <chat id> first.");
+        reply(connector, a, msg.chat_id, msg.message_id, "That chat is on a different platform than where you typed this — cross-platform /as isn't supported yet.");
         return null;
     }
     if (!auth.isOwnerOrLiveAdminOfChat(connector, a, config, target.native_chat_id, msg.user_id)) {
@@ -4578,11 +4591,76 @@ fn resolveAsCommand(
         return null;
     }
 
-    log.info("as: relaying {s} from control chat {d} to chat {d} for user {s}", .{ name, control_chat_id, target.id, msg.user_id });
+    log.info("as: relaying {s} from chat {d} to chat {d} for user {s}", .{ name, control_chat_id, target.id, msg.user_id });
     return .{
         .target_chat_id = target.id,
         .target_native_chat_id = target.native_chat_id,
         .command = command,
+    };
+}
+
+/// Bundles what `group_admin.mute`/`unmute`/`promote`/`demote` need to log
+/// an audit entry — `msg.username orelse msg.user_id` is a cheap,
+/// no-DB-read actor label, good enough for a log line (see
+/// `group_admin.AuditContext`'s own doc comment).
+fn auditCtx(pool: *store_pool.PgPool, pending_undos: *audit_notify.PendingUndos, chat_id: i64, identity_id: i64, msg: iface.Message) group_admin.AuditContext {
+    return .{
+        .pool = pool,
+        .pending_undos = pending_undos,
+        .chat_id = chat_id,
+        .actor_identity_id = identity_id,
+        .actor_label = msg.username orelse msg.user_id,
+    };
+}
+
+/// Phase 21: a command typed *directly* in a bound management room, no
+/// `/as <id>` prefix needed. Resolves to the same `AsRelay` plan `/as`
+/// itself builds — same allow-list, same target-chat authorization,
+/// reusing `asRelayedMessage`/`ReplyRedirect` identically — just with the
+/// target read from `management_rooms.getBoundTarget` (1:1 as of Phase 20,
+/// so "the" target is unambiguous) instead of parsed from an explicit id.
+///
+/// Returns `null` silently (no reply at all) for anything that should fall
+/// through to ordinary same-chat dispatch instead: this chat isn't
+/// currently bound to a target, the command isn't on
+/// `as_relayable_commands`, or we're already inside a relay (`relayed`,
+/// to keep `/as` and direct-room dispatch from compounding). Returns
+/// `null` *after* explaining why only for the one case that's bound and
+/// allow-listed but still refused: the sender isn't authorized against the
+/// target — silently falling through there would risk the command running
+/// against the room itself instead, which is never what a denied operator
+/// wants.
+fn resolveDirectRoomCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+    relayed: bool,
+) ?AsRelay {
+    if (relayed) return null;
+    const name = asCommandName(text) orelse return null;
+    if (!isRelayableUnderAs(name)) return null;
+
+    const target = (management_rooms.getBoundTarget(pool, a, chat_id) catch |err| {
+        log.err("direct-room: getBoundTarget failed for room {d}: {t}", .{ chat_id, err });
+        return null;
+    }) orelse return null;
+
+    if (target.platform != connector.platform()) return null;
+
+    if (!auth.isOwnerOrLiveAdminOfChat(connector, a, config, target.native_chat_id, msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "This room is bound to a chat, but you need to be its owner or a live admin to run commands against it here.");
+        return null;
+    }
+
+    log.info("direct-room: relaying {s} from bound room {d} to chat {d} for user {s}", .{ name, chat_id, target.id, msg.user_id });
+    return .{
+        .target_chat_id = target.id,
+        .target_native_chat_id = target.native_chat_id,
+        .command = text,
     };
 }
 
@@ -4648,6 +4726,12 @@ test "the /as allow-list admits chat-scoped admin commands and refuses everythin
     try std.testing.expect(isRelayableUnderAs("welcome"));
     // Case-insensitive, same as `isReservedCommandName`.
     try std.testing.expect(isRelayableUnderAs("KICK"));
+    // Added in Phase 21 -- none of these need a message id (see the
+    // allow-list's own doc comment for `/redact`'s re-examined reasoning).
+    try std.testing.expect(isRelayableUnderAs("redact"));
+    try std.testing.expect(isRelayableUnderAs("announce"));
+    try std.testing.expect(isRelayableUnderAs("token"));
+    try std.testing.expect(isRelayableUnderAs("credit"));
 
     // No nesting, no privilege prefixes.
     try std.testing.expect(!isRelayableUnderAs("as"));
@@ -4655,14 +4739,11 @@ test "the /as allow-list admits chat-scoped admin commands and refuses everythin
     // Needs a message in the target chat to point at.
     try std.testing.expect(!isRelayableUnderAs("pin"));
     try std.testing.expect(!isRelayableUnderAs("delete"));
-    try std.testing.expect(!isRelayableUnderAs("redact"));
     // Stateful flows keyed by (chat, user).
     try std.testing.expect(!isRelayableUnderAs("menu"));
     try std.testing.expect(!isRelayableUnderAs("convert"));
     try std.testing.expect(!isRelayableUnderAs("cancel"));
     try std.testing.expect(!isRelayableUnderAs("confirm"));
-    // Has its own command; not redirect-safe.
-    try std.testing.expect(!isRelayableUnderAs("notice"));
     try std.testing.expect(!isRelayableUnderAs("manage"));
     // Not chat-scoped.
     try std.testing.expect(!isRelayableUnderAs("whois"));
@@ -5039,20 +5120,33 @@ fn handleRemindCommand(
 /// ceiling `/welcome` and `/persona`-adjacent text settings already use.
 const max_announcement_len = 1000;
 
-/// `/announce <when> <text>` schedules a one-off announcement;
-/// `/announce every <interval> <text>` a recurring one; `/announce list`
-/// and `/announce cancel <id>` manage them.
+/// `/announce <text>` sends `<text>` into this chat right now and pins it
+/// (Phase 21 merged the old standalone `/notice <chat id> <text>` into
+/// this bare-text form -- ROADMAP.md's Phase 9 gave `/notice` its own
+/// command specifically because it needed to target a *different* chat
+/// than the one the operator was typing in, and its send-then-pin pair
+/// wasn't safe to relay through `/as`; both of those blockers are gone now
+/// that `/as`/direct-room dispatch (Phase 20/21) can run any relayable
+/// command, `/announce` included, against another chat with no separate
+/// mechanism needed -- "send a notice to chat #7" is just
+/// `/as 7 /announce <text>`). `/announce at <when> <text>` schedules a
+/// one-off announcement for later; `/announce every <interval> <text>` a
+/// recurring one; `/announce list` and `/announce cancel <id>` manage
+/// scheduled ones. The `at`/`every` keywords are what disambiguate "this
+/// is a time expression" from "this is just the start of the announcement
+/// text" -- a bare `/announce 30 people are coming` sends literally that
+/// text now, rather than trying (and failing) to parse "30" as a time.
 ///
 /// **Access**: chat-admin tier via `auth.checkGroupAdminAccess`, with the
 /// token fallback *off* -- unlike `/remind` (open to anyone, delivers one
 /// message to the person who asked for it), an announcement makes the bot
-/// broadcast arbitrary text into the whole group at a time nobody's
-/// watching, so it belongs with `/mute`/`/pin` rather than with `/remind`.
-/// Token-spending is excluded for the same reason `/redact regex` excludes
-/// it: a token buys one moderation action against a known target, not the
-/// ability to schedule bot-authored messages into the future. `list` is
-/// exempt from the gate (reading what's scheduled for a chat you're in
-/// isn't privileged), matching `/reminders`/`/alerts` being open.
+/// broadcast arbitrary text into the whole group, so it belongs with
+/// `/mute`/`/pin` rather than with `/remind`. Token-spending is excluded
+/// for the same reason `/redact regex` excludes it: a token buys one
+/// moderation action against a known target, not the ability to broadcast
+/// bot-authored messages. `list` is exempt from the gate (reading what's
+/// scheduled for a chat you're in isn't privileged), matching
+/// `/reminders`/`/alerts` being open.
 fn handleAnnounceCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5065,7 +5159,7 @@ fn handleAnnounceCommand(
     msg: iface.Message,
     text: []const u8,
 ) void {
-    const usage = "Usage: /announce <time e.g. 30m, 14:30, or 5/22 14:30> <text>, /announce every <interval e.g. 1d> <text>, /announce list, or /announce cancel <id>";
+    const usage = "Usage: /announce <text> (sends now, pinned), /announce at <time e.g. 30m, 14:30, or 5/22 14:30> <text> to schedule, /announce every <interval e.g. 1d> <text> to repeat, /announce list, or /announce cancel <id>";
     const arg = std.mem.trim(u8, text["/announce".len..], " ");
     if (arg.len == 0) {
         reply(connector, a, msg.chat_id, msg.message_id, usage);
@@ -5119,10 +5213,18 @@ fn handleAnnounceCommand(
         return;
     }
 
+    const offset_minutes = user_settings.getEffectiveOffsetMinutes(pool, a, identity_id);
+    const date_format = user_settings.getEffectiveDateFormat(pool, a, identity_id);
+    const time_format = user_settings.getEffectiveTimeFormat(pool, a, identity_id);
+
     var recur_interval: ?i64 = null;
-    var when_str = first_word;
+    var due_at: i64 = now;
+    var announcement: []const u8 = arg;
+    var immediate = true;
+
     if (std.mem.eql(u8, first_word, "every")) {
-        when_str = it.next() orelse {
+        immediate = false;
+        const when_str = it.next() orelse {
             reply(connector, a, msg.chat_id, msg.message_id, "Usage: /announce every <interval e.g. 1d> <text>");
             return;
         };
@@ -5130,9 +5232,27 @@ fn handleAnnounceCommand(
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that interval — use e.g. 30m, 2h, or 1d.");
             return;
         };
+        // "every <interval>" alone means "first one an interval from now" --
+        // same shorthand `/remind every` uses. An admin wanting a recurring
+        // announcement to start at a specific wall-clock time schedules the
+        // first one with `at` and repeats it with `every` after; documented
+        // in ROADMAP.md as a known sharp edge inherited from `/remind`
+        // rather than papered over only here.
+        due_at = now + recur_interval.?;
+        announcement = std.mem.trim(u8, it.rest(), " ");
+    } else if (std.mem.eql(u8, first_word, "at")) {
+        immediate = false;
+        const when_str = it.next() orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /announce at <time e.g. 30m, 14:30, or 5/22 14:30> <text>");
+            return;
+        };
+        due_at = reminder_format.parseWhenLocal(when_str, now, offset_minutes, date_format) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that time — use a duration like 30m/2h/1d, a clock time like 14:30, or a date like 5/22 14:30.");
+            return;
+        };
+        announcement = std.mem.trim(u8, it.rest(), " ");
     }
 
-    const announcement = std.mem.trim(u8, it.rest(), " ");
     if (announcement.len == 0) {
         reply(connector, a, msg.chat_id, msg.message_id, usage);
         return;
@@ -5142,23 +5262,20 @@ fn handleAnnounceCommand(
         return;
     }
 
-    const offset_minutes = user_settings.getEffectiveOffsetMinutes(pool, a, identity_id);
-    const date_format = user_settings.getEffectiveDateFormat(pool, a, identity_id);
-    const time_format = user_settings.getEffectiveTimeFormat(pool, a, identity_id);
-
-    // Identical resolution to `/remind`, including the "every <interval>"
-    // shorthand meaning "first one an interval from now" -- an admin
-    // wanting a recurring announcement to start at a specific wall-clock
-    // time schedules the first one with the absolute form and repeats it
-    // with `every` after. Documented in ROADMAP.md as a known sharp edge
-    // inherited from `/remind` rather than papered over only here.
-    const due_at = if (recur_interval) |interval|
-        now + interval
-    else
-        reminder_format.parseWhenLocal(when_str, now, offset_minutes, date_format) orelse {
-            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that time — use a duration like 30m/2h/1d, a clock time like 14:30, or a date like 5/22 14:30.");
+    if (immediate) {
+        const sent_id = connector.sendMessageReturningId(a, msg.chat_id, announcement, null) catch |err| {
+            log.err("announce: immediate send failed for chat {d}: {t}", .{ chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't send that announcement, try again.");
             return;
         };
+        if (sent_id) |sid| {
+            connector.pinMessage(a, msg.chat_id, sid) catch |err| {
+                log.warn("announce: sent to chat {d} but pin failed: {t}", .{ chat_id, err });
+            };
+        }
+        reply(connector, a, msg.chat_id, msg.message_id, "Announcement sent.");
+        return;
+    }
 
     const id = reminders.createOfKind(pool, chat_id, identity_id, announcement, due_at, recur_interval, .announcement) catch |err| {
         log.err("announce: failed to create announcement for chat {d}: {t}", .{ chat_id, err });
@@ -7070,6 +7187,7 @@ fn menuCtx(
     io: Io,
     digest_scheduler: *scheduler.DigestScheduler,
     pending_conversions: *convert_flow.PendingConversions,
+    pending_undos: *audit_notify.PendingUndos,
 ) menu.ActionContext {
     return .{
         .connector = connector,
@@ -7083,6 +7201,7 @@ fn menuCtx(
         .io = io,
         .digest_scheduler = digest_scheduler,
         .pending_conversions = pending_conversions,
+        .pending_undos = pending_undos,
     };
 }
 
@@ -7335,22 +7454,22 @@ fn menuResumeAwaitingInput(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.O
         }
     }
     switch (id) {
-        .group_admin_mute => group_admin.mute(ctx.connector, ctx.a, ctx.msg, ctx.now),
-        .group_admin_unmute => group_admin.unmute(ctx.connector, ctx.a, ctx.msg),
+        .group_admin_mute => group_admin.mute(ctx.connector, ctx.a, ctx.msg, ctx.now, auditCtx(ctx.pool, ctx.pending_undos, ctx.chat_id, ctx.identity_id, ctx.msg)),
+        .group_admin_unmute => group_admin.unmute(ctx.connector, ctx.a, ctx.msg, ctx.now, auditCtx(ctx.pool, ctx.pending_undos, ctx.chat_id, ctx.identity_id, ctx.msg)),
         .group_admin_pin => group_admin.pin(ctx.connector, ctx.a, ctx.msg),
         .group_admin_delete => group_admin.deleteMessage(ctx.connector, ctx.a, ctx.msg),
         .group_admin_promote => {
             if (!auth.isOwner(ctx.config, ctx.connector.platform(), ctx.msg.user_id)) {
                 ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Bot owner only.", null);
             } else {
-                group_admin.promote(ctx.connector, ctx.a, ctx.msg);
+                group_admin.promote(ctx.connector, ctx.a, ctx.msg, ctx.now, auditCtx(ctx.pool, ctx.pending_undos, ctx.chat_id, ctx.identity_id, ctx.msg));
             }
         },
         .group_admin_demote => {
             if (!auth.isOwner(ctx.config, ctx.connector.platform(), ctx.msg.user_id)) {
                 ctx.connector.sendMessage(ctx.a, ctx.msg.chat_id, "Bot owner only.", null);
             } else {
-                group_admin.demote(ctx.connector, ctx.a, ctx.msg);
+                group_admin.demote(ctx.connector, ctx.a, ctx.msg, ctx.now, auditCtx(ctx.pool, ctx.pending_undos, ctx.chat_id, ctx.identity_id, ctx.msg));
             }
         },
         .group_admin_kick => menuResumeViaCommand(ctx, "/kick", handleKickBanCommandKick),
@@ -7500,16 +7619,16 @@ fn menuResumeViaTextAdd(ctx: menu.ActionContext, comptime cmd: []const u8, handl
     handler(ctx.connector, ctx.a, ctx.pool, ctx.identity_id, ctx.now, ctx.msg, menuSyntheticText(ctx, cmd));
 }
 
-fn menuResumeViaCommand(ctx: menu.ActionContext, comptime cmd: []const u8, handler: fn (iface.Connector, std.mem.Allocator, *store_pool.PgPool, i64, iface.Message, []const u8) void) void {
-    handler(ctx.connector, ctx.a, ctx.pool, ctx.now, ctx.msg, menuSyntheticText(ctx, cmd));
+fn menuResumeViaCommand(ctx: menu.ActionContext, comptime cmd: []const u8, handler: fn (iface.Connector, std.mem.Allocator, *store_pool.PgPool, i64, i64, *audit_notify.PendingUndos, i64, iface.Message, []const u8) void) void {
+    handler(ctx.connector, ctx.a, ctx.pool, ctx.chat_id, ctx.identity_id, ctx.pending_undos, ctx.now, ctx.msg, menuSyntheticText(ctx, cmd));
 }
 
-fn handleKickBanCommandKick(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
-    handleKickBanCommand(connector, a, pool, now, msg, text, "/kick", .kick);
+fn handleKickBanCommandKick(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, pending_undos: *audit_notify.PendingUndos, now: i64, msg: iface.Message, text: []const u8) void {
+    handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text, "/kick", .kick);
 }
 
-fn handleKickBanCommandBan(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
-    handleKickBanCommand(connector, a, pool, now, msg, text, "/ban", .ban);
+fn handleKickBanCommandBan(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, pending_undos: *audit_notify.PendingUndos, now: i64, msg: iface.Message, text: []const u8) void {
+    handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text, "/ban", .ban);
 }
 
 // Zig's test collector only walks `test` blocks reachable from the file
@@ -7592,6 +7711,7 @@ test {
     _ = @import("tools/calculator.zig");
     _ = @import("llm/toolcall.zig");
     _ = @import("features/group_admin.zig");
+    _ = @import("features/audit_notify.zig");
     _ = @import("features/wordcloud.zig");
     _ = @import("tools/weather.zig");
     _ = @import("tools/currency.zig");

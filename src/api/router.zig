@@ -466,7 +466,7 @@ fn handleLogout(ctx: *const ServerContext, request: *http.Server.Request) !void 
                 web_sessions.revoke(ctx.pool, session_id, now) catch |err| {
                     log.warn("logout: failed to revoke session {d}: {t}", .{ session_id, err });
                 };
-                audit_log.record(ctx.pool, account_id, "auth.logout", null, null);
+                audit_log.record(ctx.pool, account_id, null, "auth.logout", null, null);
             }
         }
     }
@@ -554,7 +554,7 @@ fn handleRevokeSession(ctx: *const ServerContext, request: *http.Server.Request,
         log.err("revoke-session: failed to revoke session {d}: {t}", .{ session_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to revoke session");
     };
-    audit_log.record(ctx.pool, account_id, "auth.session_revoke", session_id_str, null);
+    audit_log.record(ctx.pool, account_id, null, "auth.session_revoke", session_id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -776,7 +776,7 @@ fn handleAdminSetModule(ctx: *const ServerContext, request: *http.Server.Request
         log.err("admin-set-module: failed to set {s}={} : {t}", .{ module, body.enabled, err });
         return respondError(request, .internal_server_error, "internal", "failed to update module");
     };
-    audit_log.record(ctx.pool, account_id, "module.set", module, if (body.enabled) "{\"enabled\":true}" else "{\"enabled\":false}");
+    audit_log.record(ctx.pool, account_id, null, "module.set", module, if (body.enabled) "{\"enabled\":true}" else "{\"enabled\":false}");
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -947,7 +947,7 @@ fn handleAdminSetConfig(ctx: *const ServerContext, request: *http.Server.Request
         log.err("admin-set-config: failed to set {s}: {t}", .{ key, err });
         return respondError(request, .internal_server_error, "internal", "failed to update config");
     };
-    audit_log.record(ctx.pool, account_id, "config.set", key, null);
+    audit_log.record(ctx.pool, account_id, null, "config.set", key, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -1237,7 +1237,7 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
     };
 
     const a = resolveAuth(ctx, request);
-    audit_log.record(ctx.pool, a.account_id, "chat_settings.set", id_str, null);
+    audit_log.record(ctx.pool, a.account_id, null, "chat_settings.set", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -1425,7 +1425,7 @@ fn handleChatActionKick(ctx: *const ServerContext, request: *http.Server.Request
         return respondError(request, .internal_server_error, "internal", "kick failed");
     };
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.kick", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.kick", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1450,7 +1450,7 @@ fn handleChatActionBan(ctx: *const ServerContext, request: *http.Server.Request,
         return respondError(request, .internal_server_error, "internal", "ban failed");
     };
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.ban", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.ban", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1477,7 +1477,7 @@ fn handleChatActionMute(ctx: *const ServerContext, request: *http.Server.Request
         return respondError(request, .internal_server_error, "internal", "mute failed");
     };
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.mute", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.mute", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1502,7 +1502,7 @@ fn handleChatActionUnmute(ctx: *const ServerContext, request: *http.Server.Reque
         return respondError(request, .internal_server_error, "internal", "unmute failed");
     };
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.unmute", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.unmute", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1531,7 +1531,7 @@ fn handleChatActionPromote(ctx: *const ServerContext, request: *http.Server.Requ
         return respondError(request, .internal_server_error, "internal", "promote failed");
     };
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.promote", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.promote", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1557,7 +1557,7 @@ fn handleChatActionDemote(ctx: *const ServerContext, request: *http.Server.Reque
         return respondError(request, .internal_server_error, "internal", "demote failed");
     };
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.demote", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.demote", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1587,7 +1587,7 @@ fn handleChatActionPin(ctx: *const ServerContext, request: *http.Server.Request,
         return respondError(request, .internal_server_error, "internal", "pin failed");
     };
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.pin", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.pin", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1611,7 +1611,7 @@ fn handleChatActionUnpin(ctx: *const ServerContext, request: *http.Server.Reques
         return respondError(request, .internal_server_error, "internal", "unpin failed");
     };
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.unpin", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.unpin", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1659,7 +1659,7 @@ fn handleChatActionRedact(ctx: *const ServerContext, request: *http.Server.Reque
         }
     }
 
-    audit_log.record(ctx.pool, ac.ra.account_id, "chat.action.redact", id_str, null);
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.action.redact", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -1822,7 +1822,7 @@ fn handleConvert(ctx: *const ServerContext, request: *http.Server.Request) !void
         };
     };
 
-    audit_log.record(ctx.pool, ra.account_id, "convert", filename, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "convert", filename, null);
 
     return respondFile(request, .ok, mimeTypeForExt(convert_feature.extensionOf(result.file_name)), result.file_name, result.bytes);
 }
@@ -1903,7 +1903,7 @@ fn handleBotViewSend(ctx: *const ServerContext, request: *http.Server.Request) !
     var target_buf: [32]u8 = undefined;
     const target_str = std.fmt.bufPrint(&target_buf, "{d}", .{body.chat_id}) catch "?";
     const detail_json = std.json.Stringify.valueAlloc(arena, .{ .text = body.text }, .{}) catch null;
-    audit_log.record(ctx.pool, ra.account_id, "bot_view.send", target_str, detail_json);
+    audit_log.record(ctx.pool, ra.account_id, null, "bot_view.send", target_str, detail_json);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -2099,7 +2099,7 @@ fn handleSetMySettings(ctx: *const ServerContext, request: *http.Server.Request)
         return respondError(request, .internal_server_error, "internal", "failed to update settings");
     };
 
-    audit_log.record(ctx.pool, account_id, "me.settings.set", null, null);
+    audit_log.record(ctx.pool, account_id, null, "me.settings.set", null, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -2353,7 +2353,7 @@ fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request
         return respondError(request, .internal_server_error, "internal", "failed to create reminder");
     };
 
-    audit_log.record(ctx.pool, ra.account_id, "reminder.create", null, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "reminder.create", null, null);
 
     return respondJson(ctx, request, .ok, .{ .id = id, .due_at = due_at });
 }
@@ -2389,7 +2389,7 @@ fn handleCancelReminder(ctx: *const ServerContext, request: *http.Server.Request
         log.err("cancel-reminder: failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to cancel reminder");
     };
-    audit_log.record(ctx.pool, ra.account_id, "reminder.cancel", id_str, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "reminder.cancel", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -2498,7 +2498,7 @@ fn handleCreateAlert(ctx: *const ServerContext, request: *http.Server.Request) !
         log.err("create-alert: failed for chat {d}: {t}", .{ body.chat_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to create alert");
     };
-    audit_log.record(ctx.pool, ra.account_id, "alert.create", null, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "alert.create", null, null);
     return respondJson(ctx, request, .ok, .{ .id = id });
 }
 
@@ -2531,7 +2531,7 @@ fn handleCancelAlert(ctx: *const ServerContext, request: *http.Server.Request, i
         log.err("cancel-alert: failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to cancel alert");
     };
-    audit_log.record(ctx.pool, ra.account_id, "alert.cancel", id_str, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "alert.cancel", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -2601,7 +2601,7 @@ fn handleCreateWatch(ctx: *const ServerContext, request: *http.Server.Request) !
         log.err("create-watch: failed for chat {d}: {t}", .{ body.chat_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to create watch");
     };
-    audit_log.record(ctx.pool, ra.account_id, "watch.create", null, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "watch.create", null, null);
     return respondJson(ctx, request, .ok, .{ .created = created });
 }
 
@@ -2644,7 +2644,7 @@ fn handleDeleteWatch(ctx: *const ServerContext, request: *http.Server.Request, i
         log.err("delete-watch: failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to delete watch");
     };
-    audit_log.record(ctx.pool, ra.account_id, "watch.delete", id_str, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "watch.delete", id_str, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
@@ -2719,7 +2719,7 @@ fn handleCreateNote(ctx: *const ServerContext, request: *http.Server.Request) !v
         return respondError(request, .internal_server_error, "internal", "failed to create note");
     };
 
-    audit_log.record(ctx.pool, ra.account_id, "note.create", null, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "note.create", null, null);
 
     return respondJson(ctx, request, .ok, .{ .id = id });
 }
@@ -2755,7 +2755,7 @@ fn handleDeleteNote(ctx: *const ServerContext, request: *http.Server.Request, id
         log.err("delete-note: failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to delete note");
     };
-    audit_log.record(ctx.pool, ra.account_id, "note.delete", id_str, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "note.delete", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3084,7 +3084,7 @@ fn handleCreateExpense(ctx: *const ServerContext, request: *http.Server.Request)
         return respondError(request, .internal_server_error, "internal", "failed to create expense");
     };
 
-    audit_log.record(ctx.pool, ra.account_id, "expense.create", null, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "expense.create", null, null);
 
     return respondJson(ctx, request, .ok, .{ .id = id });
 }
@@ -3123,7 +3123,7 @@ fn handleDeleteExpense(ctx: *const ServerContext, request: *http.Server.Request,
         log.err("delete-expense: failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to delete expense");
     };
-    audit_log.record(ctx.pool, ra.account_id, "expense.delete", id_str, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "expense.delete", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3200,7 +3200,7 @@ fn handleSetBudget(ctx: *const ServerContext, request: *http.Server.Request) !vo
         return respondError(request, .internal_server_error, "internal", "failed to set budget");
     };
 
-    audit_log.record(ctx.pool, ra.account_id, "budget.set", body.category, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "budget.set", body.category, null);
 
     return respondJson(ctx, request, .ok, .{ .id = id });
 }
@@ -3232,7 +3232,7 @@ fn handleDeleteBudget(ctx: *const ServerContext, request: *http.Server.Request, 
         log.err("delete-budget: failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to delete budget");
     };
-    audit_log.record(ctx.pool, ra.account_id, "budget.remove", id_str, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "budget.remove", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3353,7 +3353,7 @@ fn handleCreateSubscription(ctx: *const ServerContext, request: *http.Server.Req
         return respondError(request, .internal_server_error, "internal", "failed to create subscription");
     };
 
-    audit_log.record(ctx.pool, ra.account_id, "subscription.create", null, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "subscription.create", null, null);
 
     return respondJson(ctx, request, .ok, .{ .id = id });
 }
@@ -3390,7 +3390,7 @@ fn handleDeleteSubscription(ctx: *const ServerContext, request: *http.Server.Req
         log.err("delete-subscription: failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to remove subscription");
     };
-    audit_log.record(ctx.pool, ra.account_id, "subscription.delete", id_str, null);
+    audit_log.record(ctx.pool, ra.account_id, null, "subscription.delete", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3434,7 +3434,7 @@ fn mintSessionCookie(ctx: *const ServerContext, account_id: i64, user_agent: ?[]
         log.err("failed to create session for account {d}: {t}", .{ account_id, err });
         return null;
     };
-    audit_log.record(ctx.pool, account_id, "auth.login", null, null);
+    audit_log.record(ctx.pool, account_id, null, "auth.login", null, null);
 
     const secret = ctx.config.api_session_secret orelse {
         // Unreachable in practice: `Config.load` refuses to start the API

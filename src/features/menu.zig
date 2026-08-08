@@ -5,6 +5,7 @@ const store_pool = @import("../store/pool.zig");
 const config_mod = @import("../config.zig");
 const scheduler = @import("scheduler.zig");
 const convert_flow = @import("convert_flow.zig");
+const audit_notify = @import("audit_notify.zig");
 const tree = @import("menu_tree.zig");
 const civil_time = @import("../text/civil_time.zig");
 const reminder_format = @import("reminder_format.zig");
@@ -106,6 +107,7 @@ pub const ActionContext = struct {
     io: Io,
     digest_scheduler: *scheduler.DigestScheduler,
     pending_conversions: *convert_flow.PendingConversions,
+    pending_undos: *audit_notify.PendingUndos,
 };
 
 /// Every implementation lives in `main.zig` (the only place with every
@@ -412,7 +414,7 @@ pub const Sessions = struct {
     /// task) — distinct from `self.allocator`, the session store's own
     /// long-lived allocator used only for what `putSession` actually keeps.
     pub fn open(self: *Sessions, connector: iface.Connector, a: std.mem.Allocator, runner: ActionRunner, now: i64, msg: iface.Message) void {
-        const ctx = ActionContext{ .connector = connector, .a = a, .pool = undefined, .config = undefined, .chat_id = 0, .identity_id = 0, .now = now, .msg = msg, .io = self.io, .digest_scheduler = undefined, .pending_conversions = undefined };
+        const ctx = ActionContext{ .connector = connector, .a = a, .pool = undefined, .config = undefined, .chat_id = 0, .identity_id = 0, .now = now, .msg = msg, .io = self.io, .digest_scheduler = undefined, .pending_conversions = undefined, .pending_undos = undefined };
         const rendered = renderNode(.root, .normal, runner, ctx, 0);
         const prompt_id = (connector.sendChoicePrompt(a, msg.chat_id, rendered.text, rendered.choices, msg.message_id) catch |err| {
             log.err("failed to open menu for chat {s}: {t}", .{ msg.chat_id, err });
