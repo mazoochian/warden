@@ -50,8 +50,12 @@ jobs:
         # endpoint shells out to pandoc, and without it `api/server.zig`'s
         # multipart-POST regression test skips instead of covering the
         # buffer-boundary parsing it exists to guard. Worth the ~150MB here
-        # rather than losing that coverage on every run.
-        run: apk add --no-cache bash git curl xz postgresql-dev olm-dev pandoc-cli
+        # rather than losing that coverage on every run. yt-dlp is the same
+        # deal for ROADMAP.md's Phase 25 video-download feature
+        # (src/features/video_download.zig) -- without it, its yt-dlp-gated
+        # tests skip instead of actually exercising the binary-presence and
+        # failure-path checks.
+        run: apk add --no-cache bash git curl xz postgresql-dev olm-dev pandoc-cli yt-dlp
 
       - uses: actions/checkout@v4
 

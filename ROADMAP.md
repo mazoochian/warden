@@ -2017,6 +2017,112 @@ which needs no external provider or big decision) was done first, out of
 its numeric order, rather than leaving the bot idle while this one
 waited. Revisit once the owner has chosen a provider.
 
+### Phase 25 — Auto-download YouTube/Instagram/X links
+*Effort: M. Status: done (2026-08-09).*
+
+Passive auto-fetch-and-repost for YouTube/Instagram/X (Twitter) video
+links, dropped in mid-survey of a larger management-room/ACL plan (see
+that plan's own Phase 20-24 entries, worked separately) as an unrelated
+but independently shippable feature.
+
+**Done:**
+- New runtime dependency: `yt-dlp`, added to the Alpine final stage
+  (`Dockerfile`) alongside the existing `ffmpeg`/`pandoc` block, and to
+  CI's `apk add` step (`.github/workflows/ci.yml`) so it's actually
+  exercised there rather than always skipped, same precedent as
+  `pandoc-cli`.
+- `src/features/video_download.zig` (new) — `findLink` is a plain
+  substring scan over a message's text (no LLM call, same "passive
+  content observation" tier as Phase 16's `keyword_alerts`) matching
+  `youtube.com/watch`, `youtu.be/`, `instagram.com/reel|p/`, `x.com/`,
+  `twitter.com/`. `download` shells out to `yt-dlp -o
+  <tmp>/video_download_<nanos>.%(ext)s --max-filesize 50M --no-playlist
+  <url>` (`--no-playlist` is one addition beyond the original ask, needed
+  so a playlist-tagged watch link can't turn into an unbounded multi-file
+  fetch), reads the result back capped via `readFileAlloc(.limited(50MB))`,
+  same idiom `features/convert.zig` already uses for its own external
+  tools. `binaryAvailable` (reused from `convert.zig` — the check itself
+  has nothing video-specific about it) lets tests skip cleanly without
+  `yt-dlp` installed, same pattern the pandoc-skip precedent set the
+  commit before this phase started.
+- **New infrastructure this phase actually introduces**: a subprocess
+  timeout. Neither `convert.zig` nor `transcribe.zig` bounds its
+  `std.process.run` call at all — fine for them (local binaries, local
+  files) but not for `yt-dlp` (network-bound against an arbitrary remote
+  server, can hang far longer). Turns out this Zig version's
+  `std.process.run` already exposes a `timeout: Io.Timeout` option that
+  does exactly what was needed rather than requiring a hand-rolled
+  thread-race: passing a `.deadline` (a fixed point in time, computed once
+  up front — **not** `.duration`, which gets silently recomputed as "now +
+  N" on every internal poll and would degrade into a never-firing *idle*
+  timeout given `yt-dlp`'s steady progress output) makes `run()`'s own
+  `defer child.kill(io)` fire on timeout, synchronously sending `SIGTERM`
+  and reaping the child before returning — no zombie left, no caller left
+  blocked. Documented, not solved: `Child.kill` on this Zig version only
+  signals the direct child pid, not a process group, so a grandchild
+  `yt-dlp` had already forked (e.g. `ffmpeg`, mid-merge) at the exact
+  moment of a timeout isn't guaranteed to die with it — accepted as a
+  narrow, self-terminating gap, strictly better than the alternative this
+  does prevent (the `yt-dlp` process itself hanging forever). Covered by a
+  real test (`runWithTimeout kills a subprocess that outlives its
+  deadline`) using `sleep` as a stand-in slow process, so the kill/no-hang
+  behavior is verified without needing `yt-dlp` or network access at all.
+- Gated by both a new `video_download` `feature_flags` module (bot-wide)
+  and a new per-chat `chat_settings.getVideoDownloadEnabled`/
+  `setVideoDownloadEnabled` (migration `0040_video_download.sql`, same
+  `ON CONFLICT` idiom as `getAutopinAnnouncements`) — **off by default**,
+  unlike `keyword_alerts`: this changes what happens with any link *any*
+  member posts, not something a user opts themselves into. `/videodownload
+  on|off` (admin-tier, `auth.checkGroupAdminAccess`, no token fallback)
+  toggles it, mirroring `/autopin`'s shape exactly.
+- The passive scanner call site sits in `processMessageTask` right next to
+  `checkKeywordAlerts`, same tier — but unlike keyword alerts (and unlike
+  every other passive check at that call site), a match hands off to a
+  detached `std.Thread` (`videoDownloadWorker`) and returns immediately
+  rather than running inline, since a download can take up to the
+  timeout's 2 minutes, far past `processMessageTask`'s own ~15s expected
+  budget. `native_chat_id`/the matched url are `page_allocator` dupes, not
+  `task_arena`-backed, since the arena is destroyed the moment
+  `processMessageTask` returns — same reasoning `qa.zig`'s `tickerLoop`
+  doc comment gives for its own detached thread.
+- Sends via the existing `sendDocument` connector vtable slot (Telegram +
+  Matrix). XMPP has no `sendDocument` implementation at all — checked
+  explicitly (`connector.vtable.sendDocument == null`) *before* attempting
+  a download, logged plainly, and deliberately never falls through to
+  `Connector.sendDocument`'s own "this platform doesn't support sending
+  files" chat-message fallback, which would otherwise spam an error into
+  every XMPP chat with this feature on for every video link posted.
+- Failure handling is fail-closed throughout: age-restricted/private/geo-
+  blocked/DRM'd/oversized links and any other `yt-dlp` error just log and
+  do nothing visible in-chat, same "never block on failure" philosophy
+  `transcribe.zig`'s caller already follows for a failed transcription.
+- `README.md`'s feature list and `/help`'s admin section (`help_text_admin`,
+  next to `/autopin`) updated; `/videodownload` added to `public_commands`.
+- `zig build` and `zig build test` both green locally (`yt-dlp` absent in
+  this sandbox — its gated tests skip via `binaryAvailable`, confirmed via
+  `which yt-dlp` before writing them; every other test, including the new
+  `findLink`/timeout-kill/chat_settings/feature_flags tests, ran and
+  passed for real).
+- **Not live-verified** — this phase was implemented in a sandboxed git
+  worktree with no real Telegram/Matrix chat and no outbound network
+  access to YouTube/Instagram/X to confirm an actual end-to-end download-
+  and-repost. Everything above is verified at the unit/integration level
+  (link matching, the timeout/kill mechanism against a stand-in slow
+  process, the feature-flag/chat-setting round trip, the XMPP no-op path)
+  but not against a real link in a real chat — flagged plainly rather than
+  claimed, per this project's own standard for saying so (e.g. Phase 19's
+  own "not live-verified" note).
+- **Deliberately not attempted**: the local self-hosted Telegram Bot API
+  server (which would raise the upload ceiling from 50MB to 2GB) — a
+  possible future backlog item if 50MB proves too small in practice, not
+  solved this phase.
+- **Merged into master 2026-08-09**: this phase's migration was originally
+  numbered `0037_video_download.sql` (picked independently in this phase's
+  own worktree) but collided with migrations three other in-flight phases
+  claimed under the same number in master meanwhile — renumbered to
+  `0040_video_download.sql` at merge time, `migrate.zig`'s registration
+  updated to match, no SQL content changed.
+
 ### Explicitly excluded
 
 Cut outright rather than phased, because they assume a product shape

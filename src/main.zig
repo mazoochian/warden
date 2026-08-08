@@ -66,6 +66,7 @@ const alert_feature = @import("features/alerts.zig");
 const feed_watches = @import("store/feed_watches.zig");
 const feed_watcher = @import("features/feed_watcher.zig");
 const transcribe = @import("features/transcribe.zig");
+const video_download = @import("features/video_download.zig");
 const convert_flow = @import("features/convert_flow.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
@@ -153,6 +154,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "summary", .description = "[hours] -- summarize the last N hours of this chat (default 24)." },
     .{ .name = "announce", .description = "<text> -- broadcast now, pinned. Or: at <time> <text> | every <interval> <text> | list | cancel <id>. Admins only." },
     .{ .name = "autopin", .description = "on | off -- pin each scheduled announcement as it's posted. Admins only." },
+    .{ .name = "videodownload", .description = "on | off -- auto-download YouTube/Instagram/X video links posted here. Off by default, admins only." },
     .{ .name = "expense", .description = "add <amt> <category> [desc] | list | summary | delete <id> -- expense tracker." },
     .{ .name = "budget", .description = "set <category> <amt> | list | remove <category> -- monthly budgets. Owner to set." },
     .{ .name = "subscription", .description = "add <name> <amt> every <interval> | list | remove <id> -- recurring costs." },
@@ -298,6 +300,8 @@ const help_text_admin =
     \\  cancel <id> to manage
     \\/autopin on|off -- pin each scheduled announcement as it's posted
     \\  (only those -- I never pin anyone else's messages on my own)
+    \\/videodownload on|off -- auto-download YouTube/Instagram/X video
+    \\  links posted here, under 50MB, best-effort. Off by default
     \\
     \\Tokens and credits (reply to a user, or pass @username, to view/set)
     \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban
@@ -1226,6 +1230,19 @@ fn processMessageTask(
         // than behind the owner/credits gates real Q&A uses.
         if (feature_flags.isEnabled(pool, "keyword_alerts")) {
             if (msg.text) |t| checkKeywordAlerts(connector, a, pool, chat_id, msg, t);
+        }
+
+        // ROADMAP.md's Phase 25: video auto-download. Same passive-
+        // observation tier as `checkKeywordAlerts` right above (no LLM
+        // call, fires for any sender), but gated by both the bot-wide
+        // `video_download` feature flag and a per-chat opt-in (off by
+        // default -- see `chat_settings.getVideoDownloadEnabled`'s doc
+        // comment) rather than firing unconditionally the way keyword
+        // alerts do, since this changes what happens with any link any
+        // member posts, not just something a user asked to be notified
+        // about.
+        if (feature_flags.isEnabled(pool, "video_download") and chat_settings.getVideoDownloadEnabled(pool, chat_id)) {
+            if (msg.text) |t| checkVideoDownload(connector, io, config, msg, t);
         }
     }
     recordObservedUsers(pool, chat_id, msg.observed_users);
@@ -2264,6 +2281,9 @@ fn handleMessage(
         // announcements are delivered, not a separate feature.
         if (!feature_flags.isEnabled(pool, "announcements")) return false;
         handleAutopinCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
+    } else if (std.mem.eql(u8, text, "/videodownload") or std.mem.startsWith(u8, text, "/videodownload ")) {
+        if (!feature_flags.isEnabled(pool, "video_download")) return false;
+        handleVideoDownloadCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
     } else if (std.mem.eql(u8, text, "/mute")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
@@ -5671,6 +5691,134 @@ fn handleAutopinCommand(
     }
 }
 
+/// `/videodownload` shows this chat's setting; `/videodownload on|off`
+/// changes it — same shape as `handleAutopinCommand` right above (view is
+/// open to anyone, changing it is admin-tier via `auth.checkGroupAdminAccess`,
+/// no token fallback, same `chat_settings` `ON CONFLICT` idiom).
+fn handleVideoDownloadCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    sudo_active: bool,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/videodownload".len..], " ");
+    const enabled = chat_settings.getVideoDownloadEnabled(pool, chat_id);
+
+    if (arg.len == 0) {
+        const reply_text = std.fmt.allocPrint(
+            a,
+            "Video auto-download is {s} for this chat. When on, I try to fetch and repost YouTube/Instagram/X video links posted here (best-effort, under 50MB -- age-restricted/private/oversized links are silently skipped, never an error message). Change it with /videodownload on or /videodownload off.",
+            .{if (enabled) "on" else "off"},
+        ) catch return;
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    const want = if (std.mem.eql(u8, arg, "on"))
+        true
+    else if (std.mem.eql(u8, arg, "off"))
+        false
+    else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /videodownload on | off");
+        return;
+    };
+
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "videodownload")) return;
+
+    chat_settings.setVideoDownloadEnabled(pool, chat_id, want) catch |err| {
+        log.err("videodownload: failed to persist for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that setting, try again.");
+        return;
+    };
+    if (want) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Video auto-download on — I'll try to fetch and repost YouTube/Instagram/X links posted here (best-effort, under 50MB).");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Video auto-download off.");
+    }
+}
+
+/// ROADMAP.md's Phase 25: passive auto-download of YouTube/Instagram/X
+/// links. Same "passive content observation" tier as `checkKeywordAlerts`
+/// (plain substring scan, no LLM call, fires for any sender) — but unlike
+/// every other check at that call site, a match here can trigger a
+/// genuinely slow, network-bound external process (`yt-dlp`, capped at
+/// `video_download.timeout_seconds` — currently 2 minutes), far past
+/// `processMessageTask`'s own ~15s expected budget (see its own timing-log
+/// comment). So this does not run inline: it hands off to a detached
+/// `std.Thread` (`videoDownloadWorker`) and returns immediately, the same
+/// "don't occupy a `WorkerPool` worker for a slow background op" reasoning
+/// `qa.zig`'s thinking-ticker (`tickerLoop`) already uses for its own
+/// detached thread.
+///
+/// XMPP has no `sendDocument` support at all (see `platform/xmpp.zig`'s
+/// vtable — no `sendDocument` slot is wired up there). Checked up front,
+/// before spending up to two minutes on a download nobody could receive —
+/// logged plainly rather than left silent. Calling `connector.sendDocument`
+/// unconditionally instead would have `Connector.sendDocument`'s own
+/// "platform doesn't support this" fallback post a visible chat message for
+/// *every* video link a group posts, exactly the per-link error spam this
+/// feature's fail-closed philosophy exists to avoid — so that fallback is
+/// deliberately never reached here.
+fn checkVideoDownload(connector: iface.Connector, io: Io, config: *const config_mod.Config, msg: iface.Message, text: []const u8) void {
+    const url = video_download.findLink(text) orelse return;
+
+    if (connector.vtable.sendDocument == null) {
+        log.info("video_download: {t} has no sendDocument support, skipping {s}", .{ connector.platform(), url });
+        return;
+    }
+
+    // `page_allocator`-owned dupes, NOT `task_arena`-backed: `task_arena`
+    // is destroyed the moment `processMessageTask` returns, long before
+    // this detached thread (which can run for up to two minutes) is done
+    // with them — same reasoning `tickerLoop`'s own doc comment gives for
+    // never touching the per-message arena from a detached thread.
+    const native_chat_id = std.heap.page_allocator.dupe(u8, msg.chat_id) catch |err| {
+        log.warn("video_download: couldn't allocate for chat {s}: {t}", .{ msg.chat_id, err });
+        return;
+    };
+    const url_dup = std.heap.page_allocator.dupe(u8, url) catch |err| {
+        log.warn("video_download: couldn't allocate for chat {s}: {t}", .{ msg.chat_id, err });
+        std.heap.page_allocator.free(native_chat_id);
+        return;
+    };
+
+    const thread = std.Thread.spawn(.{}, videoDownloadWorker, .{ connector, io, config.tmp_dir, native_chat_id, url_dup }) catch |err| {
+        log.warn("video_download: failed to spawn a download thread for chat {s}: {t}", .{ msg.chat_id, err });
+        std.heap.page_allocator.free(native_chat_id);
+        std.heap.page_allocator.free(url_dup);
+        return;
+    };
+    thread.detach();
+}
+
+/// Body of the detached thread `checkVideoDownload` spawns. Owns
+/// (and frees) `native_chat_id`/`url`, both `page_allocator` dupes taken
+/// before spawning — see `checkVideoDownload`'s doc comment for why they
+/// can't be `task_arena`-backed. Never surfaces a failure into the chat
+/// (see `video_download.zig`'s module doc on fail-closed handling) — a log
+/// line either way is the only trace of a download attempt that didn't
+/// result in a sent file.
+fn videoDownloadWorker(connector: iface.Connector, io: Io, tmp_dir: []const u8, native_chat_id: []const u8, url: []const u8) void {
+    const a = std.heap.page_allocator;
+    defer a.free(native_chat_id);
+    defer a.free(url);
+
+    const result = video_download.download(a, io, tmp_dir, url) catch |err| {
+        log.info("video_download: not downloading {s} for chat {s}: {t}", .{ url, native_chat_id, err });
+        return;
+    };
+    defer a.free(result.bytes);
+    defer a.free(result.file_name);
+
+    connector.sendDocument(a, native_chat_id, result.bytes, result.file_name, null);
+    log.info("video_download: sent {s} ({d} bytes) to chat {s}", .{ result.file_name, result.bytes.len, native_chat_id });
+}
+
 /// How far back `/summary` looks when no window is given.
 const default_summary_hours: i64 = 24;
 /// Hard ceiling, matching `catch_me_up`'s own (2 weeks) so the two
@@ -8030,6 +8178,7 @@ test {
     _ = @import("features/feed_watcher.zig");
     _ = @import("features/feed_parse.zig");
     _ = @import("features/transcribe.zig");
+    _ = @import("features/video_download.zig");
     _ = @import("features/convert_flow.zig");
     _ = @import("tools/begin_conversion.zig");
     _ = @import("tools/find_chat_member.zig");
