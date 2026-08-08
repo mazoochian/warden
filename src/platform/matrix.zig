@@ -182,6 +182,7 @@ pub const MatrixConnector = struct {
         .banUser = banUserFn,
         .promoteUser = promoteUserFn,
         .demoteUser = demoteUserFn,
+        .restrictChatMemberPermissions = restrictChatMemberPermissionsFn,
         .pinMessage = pinMessageFn,
         .unpinMessage = unpinMessageFn,
         .deleteMessage = deleteMessageFn,
@@ -711,6 +712,23 @@ pub const MatrixConnector = struct {
     fn demoteUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
         const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
         return self.client.demoteUser(allocator, chat_id, user_id);
+    }
+
+    /// Matrix has no granular permission object — best-effort maps only the
+    /// `write` bit onto the same power-level mechanism `muteUser`/
+    /// `unmuteUser` already use (a member with `write` cleared is set to
+    /// the same "muted" power level `muteUser` uses; otherwise ordinary).
+    /// Every other bit (`p`/`v`/`f`/`m`/`o`/`d`/`s`/`l`/`e`/`i`/`r`/`a`/`t`)
+    /// stays stored-but-unenforced here, same as Telegram's `r`/`a`/`t`.
+    /// `until_unix_time` is ignored — Matrix power levels have no expiry,
+    /// same note as `muteUserFn` above.
+    fn restrictChatMemberPermissionsFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, permission_bits: u32, until_unix_time: i64) anyerror!void {
+        _ = until_unix_time;
+        const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
+        if (permission_bits & iface.MemberPermission.write != 0) {
+            return self.client.unmuteUser(allocator, chat_id, user_id);
+        }
+        return self.client.muteUser(allocator, chat_id, user_id);
     }
 
     fn pinMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void {

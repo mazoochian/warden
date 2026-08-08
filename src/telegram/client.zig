@@ -592,6 +592,55 @@ pub const Client = struct {
         });
     }
 
+    /// The subset of Telegram's `ChatPermissions` object the granular
+    /// `/permission` model (ROADMAP.md's Phase 24) actually has bits for —
+    /// unlike `restrictChatMember`/`unrestrictChatMember` above (which only
+    /// ever set every field to the same bool), each field here is set
+    /// independently. See `platform/telegram.zig`'s
+    /// `restrictChatMemberPermissionsFn` for the bitmask -> field mapping,
+    /// and `interface.zig`'s `MemberPermission.telegram_enforceable` doc
+    /// comment for which grammar letters have no field here at all
+    /// (`r`/`a`/`t` — no Bot API equivalent exists).
+    pub const ChatPermissionOverrides = struct {
+        can_send_messages: bool,
+        can_send_audios: bool,
+        can_send_documents: bool,
+        can_send_photos: bool,
+        can_send_videos: bool,
+        can_send_video_notes: bool,
+        can_send_voice_notes: bool,
+        can_send_polls: bool,
+        can_send_other_messages: bool,
+        can_add_web_page_previews: bool,
+        can_change_info: bool,
+    };
+
+    /// `until_date` is a Unix timestamp (0 = forever) — same convention as
+    /// `restrictChatMember`.
+    pub fn restrictChatMemberWithPermissions(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64, until_date: i64, permissions: ChatPermissionOverrides) !void {
+        return self.callMethod(allocator, "restrictChatMember", .{
+            .chat_id = chat_id,
+            .user_id = user_id,
+            .until_date = until_date,
+            .permissions = permissions,
+        });
+    }
+
+    /// Sets `user_id`'s custom admin title in `chat_id` (`/tag`) — Telegram
+    /// rejects this outright (a `TelegramApiError`, per `callMethod`'s doc
+    /// comment) unless the target is already a chat administrator; there is
+    /// no Bot API concept of a custom title for an ordinary member. An
+    /// empty `custom_title` clears a previously-set one. 0-16 characters,
+    /// emoji not allowed per Telegram's docs — not validated here, Telegram
+    /// itself will reject an invalid one via the same error path.
+    pub fn setChatAdministratorCustomTitle(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64, custom_title: []const u8) !void {
+        return self.callMethod(allocator, "setChatAdministratorCustomTitle", .{
+            .chat_id = chat_id,
+            .user_id = user_id,
+            .custom_title = custom_title,
+        });
+    }
+
     /// A moderate permission set — deliberately omits `can_promote_members`
     /// so a bot-promoted admin can't themselves mint further admins
     /// through the bot (`/promote` is owner-gated; a promoted admin

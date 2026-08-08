@@ -1730,6 +1730,139 @@ this until everything above has shipped.
   upsert-and-scoping round trips, `isReservedCommandName`'s coverage of
   both the public menu and the owner-only extras).
 
+### Phase 24 — Member ACL: rate limiting, permission model, tags
+*Effort: M. Status: done (2026-08-09).*
+
+Three independent per-member, per-chat controls, landed together since they
+share the same shape (a store table keyed by `(chat_id, identity_id)`, an
+admin-tier slash command, best-effort platform enforcement). Implemented
+directly against master's Phase 19 baseline, independently of the broader
+management-room rework (Phases 20-23) sketched in the same planning pass —
+those are separate in-flight work, possibly landing from other worktrees,
+and this phase deliberately didn't touch any of their files
+(`/as`/management rooms/`/announce`/`/notice`/audit logging/group photo-
+title-description commands/yt-dlp video download).
+
+**Slow mode.** Telegram's Bot API has no method exposing a chat's native
+slow-mode delay to bots — confirmed while implementing this (it's a
+client-UI-only setting) — so `/slowmode <seconds>`/`/slowmode off` is
+warden's own cooldown logic instead, applied uniformly on Telegram and
+Matrix via the existing `Connector.deleteMessage` vtable slot: a
+non-admin's message arriving before the configured number of seconds have
+passed since their last *accepted* one is deleted immediately (the
+deletion is the feedback — no separate "you're rate limited" reply).
+Owner/live platform admins are exempt. New `store/rate_limits.zig`
+(`rate_limits` for the per-chat setting, `member_message_cooldowns` for the
+per-(chat, member) last-accepted-message timestamp — deliberately its own
+table rather than reading `chat_members.last_seen`, which gets bumped for
+every inbound message including the one currently being checked, so it
+can't tell "just now" from "the last accepted one"). Checked in
+`processMessageTask` ahead of `recordMessage`/keyword alerts/dispatch — a
+rate-limited message never reaches any of them. No-op on XMPP (its
+connector has no moderation vtable slots at all, so `deleteMessage`
+reports `error.Unsupported`, logged and harmless).
+
+**Permission model.** `/permission [<duration>] <+|-><letters> @user` (or
+reply to their message) against a 14-bit bitmask: `r`ead, `w`rite, `p`hotos,
+`v`ideos, `f`ile, `m`usic, voice (`o`), video messages (`d`), `s`tickers/
+GIFs, pol`l`s, `e`mbed links, re`a`ctions, edit-own-`t`ag, change-`i`nfo.
+New `store/member_permissions.zig` — a member with no row has the implicit
+default (every bit set); `getBits`/`setBits`/`applyChange`/`parseChange`
+are all independently unit-tested (grant/revoke, multi-letter, and every
+rejection case: missing sign, empty letters, unknown letter). An optional
+leading `<duration>` reuses `features/reminder_format.zig`'s `parseDuration`
+as-is rather than writing a second interval parser, per the plan — that
+function only supports `m`/`h`/`d` (minutes/hours/days), no `w` (week) or
+month at all, and `m` already means "minutes" there, colliding with this
+command's own `m` = "music" letter (harmless in practice: a bare duration
+token is always a number-then-letter like `"30m"`, never starts with `+`/
+`-`, so the two never actually get confused during parsing). **Resolved
+explicitly rather than guessed at**: this phase does not add week/month
+duration support to `/permission` — a temporary grant only accepts `<n>m`/
+`<n>h`/`<n>d`, documented in the command's own usage text; a week/month-long
+grant needs a day count instead (`7d`, `30d`). A duration sets `expires_at`
+alongside the bitmask; a new scheduler tick function,
+`checkAndRevertExpiredPermissions` (same polling shape as
+`checkAndSendDueReminders`), reverts to the full default bitmask once it
+lapses, best-effort re-applying that on the live platform too.
+
+Enforcement is **partial by design, and the command says so in its own
+reply and usage text** rather than implying full coverage: Telegram's
+`restrictChatMember` `ChatPermissions` object has a real field for every
+letter except `r`/`a`/`t` (no Bot API concept of "can't read"/"can't
+react"/"can't edit your own tag" exists) — those three are stored for
+cross-platform intent but never actually restrict anything on Telegram,
+same documented-gap convention this project already uses for Matrix's
+mute-has-no-expiry and every XMPP moderation gap. `telegram/client.zig`
+gained `ChatPermissionOverrides` + `restrictChatMemberWithPermissions`
+(the existing `restrictChatMember`/`unrestrictChatMember` only ever set
+every field to the same bool; this sets each independently) and
+`setChatAdministratorCustomTitle`. `platform/interface.zig` gained a
+`MemberPermission` bit-flags type (shared by the store layer and every
+platform's own enforcement code, same reasoning `Platform` itself lives
+there) and two new optional vtable slots, `restrictChatMemberPermissions`/
+`setChatAdminTitle`, following the existing `?*const fn(...) = null`
+convention for a platform gap. Matrix has no granular permission object at
+all — only `w` is best-effort mapped onto the same power-level mechanism
+`/mute` already uses (`platform/matrix.zig`'s `restrictChatMemberPermissionsFn`
+just calls the existing `muteUser`/`unmuteUser`, no new Matrix client
+method needed); everything else is stored-but-unenforced there too.
+Nothing is enforced on XMPP.
+
+**`/tag`.** `/tag @user <text>` / `/tag @user off` (or reply) — Telegram's
+`setChatAdministratorCustomTitle`, which the Bot API only allows on chat
+*administrators*; running it against an ordinary member returns Telegram's
+own rejection, surfaced as a clear "must already be an admin" message
+rather than a silent no-op or a generic failure. No Matrix/XMPP equivalent
+primitive exists — `setChatAdminTitle`'s vtable slot stays `null` for both,
+same convention as every other platform gap in this codebase.
+
+**Scope decision: no new `feature_flags` module.** All three commands are
+gated behind the existing `"group_admin"` flag rather than three new
+per-feature toggles — they're the same moderation-tier command family as
+`/mute`/`/kick`/etc, not a separately-optional module, and adding new flag
+keys would have meant editing `store/feature_flags.zig`'s shared
+`known_modules` list, which this phase's scope note deliberately avoided
+touching (other in-flight worktrees may also be editing it).
+
+**Scope decision: three new tables, not additive columns.** The plan
+allowed either shape (`rate_limits`/`member_permissions` as their own
+tables, or new columns on `chat_settings`/`chat_members`); this phase
+picked new tables specifically to avoid touching those two large,
+frequently-edited files at all, since other Phase 20-23 work may be
+concurrently editing them in a different worktree — a pure-addition
+migration (`0037_member_acl.sql`) and two new store files were the lower-
+collision-risk choice.
+
+**Verification:**
+- Unit tests, no Postgres required: `member_permissions.zig`'s
+  `parseChange`/`applyChange` (grant/revoke, multi-letter, every rejection
+  case), `rate_limits.zig`'s `isRateLimited` (off, no prior message, and
+  the cooldown boundary itself — exactly-at-the-boundary is allowed,
+  strictly-less-than not less-or-equal, matching `parseAbsoluteTime`'s
+  existing "must be strictly after" convention). Duration parsing itself
+  isn't re-tested here — `reminder_format.parseDuration`'s own test
+  coverage already covers `m`/`h`/`d` acceptance and garbage rejection,
+  and this phase deliberately didn't change that function.
+- DB-backed tests (skip gracefully without `WARDEN_TEST_POSTGRES_DSN`, via
+  the existing `test_support.openTestDb` pattern): `getSlowModeSeconds`/
+  `setSlowModeSeconds`/`getLastMessageAt`/`touchLastMessage` round trips,
+  `getBits`/`setBits`/`listExpired`/`revert` round trips including the
+  "still-pending and permanent rows are untouched" case.
+- `zig build` and `zig build test` both green — see the commit for the
+  exact pass count at the time of this change.
+- `zig fmt .` run over the whole tree (not just changed files — this
+  repo's CI runs `zig fmt --check .` first and dies before the test step
+  on any tree-wide violation, not just ones in touched files).
+- **Not live-verified** — this worktree has no real Telegram/Matrix bot
+  credentials to exercise `/slowmode`, `/permission`, or `/tag` against an
+  actual chat. Everything above is unit/store-level coverage plus a clean
+  `zig build`; the manual smoke tests the original plan called for
+  (rapid-fire message actually getting deleted under `/slowmode 30`,
+  `/permission -w @user` actually muting someone on live Telegram,
+  `/tag @admin "..."` actually showing up in Telegram's member list) still
+  need to happen against a real bot account before this is fully trusted.
+
 ### Phase 18 — Media generation
 *Effort: M/L. Status: held, not started — see below.*
 

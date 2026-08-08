@@ -17,6 +17,69 @@ pub const Platform = enum {
 
 pub const AttachmentKind = enum { photo, document, voice, audio, video };
 
+/// Bit flags for the granular per-member permission model (`/permission`,
+/// ROADMAP.md's Phase 24) — one bit per grammar letter
+/// (`+rwpvfmodslaeti`/`-<letters>`). Lives here rather than in
+/// `store/member_permissions.zig` so both the store layer (bitmask
+/// persistence) and each platform's own enforcement code can share one
+/// definition without the platform layer depending on the store layer for
+/// a value type — same reasoning as `Platform` itself living here and
+/// already being imported by store files (see `store/chat_members.zig`).
+pub const MemberPermission = struct {
+    pub const read: u32 = 1 << 0;
+    pub const write: u32 = 1 << 1;
+    pub const photos: u32 = 1 << 2;
+    pub const videos: u32 = 1 << 3;
+    pub const file: u32 = 1 << 4;
+    pub const music: u32 = 1 << 5;
+    pub const voice: u32 = 1 << 6;
+    pub const video_messages: u32 = 1 << 7;
+    pub const stickers: u32 = 1 << 8;
+    pub const polls: u32 = 1 << 9;
+    pub const embed_links: u32 = 1 << 10;
+    pub const reactions: u32 = 1 << 11;
+    pub const edit_tags: u32 = 1 << 12;
+    pub const change_info: u32 = 1 << 13;
+
+    /// Every bit set — the implicit bitmask a member has until `/permission`
+    /// ever restricts them, and what a timed grant/revoke reverts to once
+    /// it expires (see `store/member_permissions.zig`'s `getBits`/`revert`).
+    pub const all: u32 = read | write | photos | videos | file | music | voice |
+        video_messages | stickers | polls | embed_links | reactions | edit_tags | change_info;
+
+    /// Bits that have a real, enforceable Telegram Bot API equivalent via
+    /// `restrictChatMember`'s `ChatPermissions` object — the complement
+    /// (`read`/`reactions`/`edit_tags`) is stored for cross-platform intent
+    /// but never actually restricts anything on Telegram (no Bot API field
+    /// exists for "can't read"/"can't react"/"can't edit own tag"). See
+    /// `platform/telegram.zig`'s `restrictChatMemberPermissionsFn`.
+    pub const telegram_enforceable: u32 = write | photos | videos | file | music | voice |
+        video_messages | stickers | polls | embed_links | change_info;
+
+    /// Maps a single grammar letter to its bit, or `null` for an
+    /// unrecognized one — the source of truth `member_permissions.
+    /// parseChange` (parsing `+`/`-<letters>`) keys off of.
+    pub fn bitForLetter(c: u8) ?u32 {
+        return switch (c) {
+            'r' => read,
+            'w' => write,
+            'p' => photos,
+            'v' => videos,
+            'f' => file,
+            'm' => music,
+            'o' => voice,
+            'd' => video_messages,
+            's' => stickers,
+            'l' => polls,
+            'e' => embed_links,
+            'a' => reactions,
+            't' => edit_tags,
+            'i' => change_info,
+            else => null,
+        };
+    }
+};
+
 /// One entry in the bot's advertised command menu (Telegram's `/`
 /// autocomplete) — see `Connector.VTable.setCommands`.
 pub const CommandSpec = struct {
@@ -347,6 +410,25 @@ pub const Connector = struct {
         promoteUser: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void = null,
         /// Reverses `promoteUser` — back to an ordinary member.
         demoteUser: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void = null,
+        /// Applies the granular `/permission` bitmask (`MemberPermission`)
+        /// to `user_id`, best-effort per platform — see
+        /// `MemberPermission.telegram_enforceable`'s doc comment for exactly
+        /// which bits a given platform can actually restrict.
+        /// `until_unix_time` mirrors `muteUser` (0 = no expiry at the
+        /// platform level; warden's own scheduler is what re-applies the
+        /// default bitmask once `store/member_permissions.zig`'s
+        /// `expires_at` lapses, same "no native expiry" situation `muteUser`
+        /// documents for Matrix). Optional: a platform with no granular
+        /// permission concept at all (XMPP) reports `error.Unsupported` —
+        /// the bitmask is still stored, just never enforced there.
+        restrictChatMemberPermissions: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, permission_bits: u32, until_unix_time: i64) anyerror!void = null,
+        /// Sets `user_id`'s custom admin title (`/tag`) — Telegram's
+        /// `setChatAdministratorCustomTitle`, which only works on chat
+        /// *administrators* (a Telegram Bot API limitation, not a bug —
+        /// callers should surface that distinctly from a generic failure).
+        /// An empty `title` clears it. Optional: no equivalent primitive on
+        /// Matrix/XMPP, reports `error.Unsupported`.
+        setChatAdminTitle: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, title: []const u8) anyerror!void = null,
         pinMessage: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void = null,
         /// `message_id` null unpins whatever's currently pinned.
         unpinMessage: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: ?[]const u8) anyerror!void = null,
@@ -500,6 +582,16 @@ pub const Connector = struct {
     pub fn demoteUser(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) !void {
         const f = self.vtable.demoteUser orelse return error.Unsupported;
         return f(self.ptr, allocator, chat_id, user_id);
+    }
+
+    pub fn restrictChatMemberPermissions(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, permission_bits: u32, until_unix_time: i64) !void {
+        const f = self.vtable.restrictChatMemberPermissions orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id, user_id, permission_bits, until_unix_time);
+    }
+
+    pub fn setChatAdminTitle(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, title: []const u8) !void {
+        const f = self.vtable.setChatAdminTitle orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id, user_id, title);
     }
 
     pub fn pinMessage(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) !void {
