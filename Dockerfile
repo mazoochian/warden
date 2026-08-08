@@ -52,10 +52,11 @@ RUN cd piechart && npm ci --omit=dev
 # then chromium --headless --print-to-pdf) rather than pulling in a whole
 # separate LaTeX toolchain just for that one direction. `olm` is the runtime
 # half of Matrix E2E encryption's libolm binding (see src/matrix/olm.zig) —
-# `olm-dev` above is the build-time headers/import-lib half.
+# `olm-dev` above is the build-time headers/import-lib half. `yt-dlp` backs
+# ROADMAP.md's Phase 25 auto-download feature (src/features/video_download.zig).
 # ---------------------------------------------------------------------------
 FROM node:22-alpine
-RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq olm pandoc poppler-utils imagemagick ffmpeg && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq olm pandoc poppler-utils imagemagick ffmpeg yt-dlp && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && test -x /usr/bin/chromium-browser
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
     PUPPETEER_SKIP_DOWNLOAD=true

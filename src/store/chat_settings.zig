@@ -423,6 +423,54 @@ test "autopin_announcements is off until a chat opts in, and toggles back off" {
     try testing.expect(!getAutopinAnnouncements(&pool, chat_id));
 }
 
+/// Whether this chat wants YouTube/Instagram/X video links auto-downloaded
+/// and reposted (ROADMAP.md's Phase 25) -- false unless a chat admin
+/// explicitly opted in via `/videodownload on`, same "off until asked"
+/// default as `getAutopinAnnouncements`/`welcome_message`. Off by default
+/// on purpose: unlike `keyword_alerts` (a word a user opts *themselves*
+/// into tracking), this changes what the bot does with a link *any*
+/// member posts -- see `0037_video_download.sql`.
+pub fn getVideoDownloadEnabled(pool: *PgPool, chat_id: i64) bool {
+    const db = pool.acquire() catch return false;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT video_download_enabled FROM chat_settings WHERE chat_id = $1;") catch return false;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return false;
+    if (!has_row) return false;
+    return stmt.columnBool(0);
+}
+
+pub fn setVideoDownloadEnabled(pool: *PgPool, chat_id: i64, value: bool) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, video_download_enabled) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET video_download_enabled = excluded.video_download_enabled;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindBool(2, value);
+    _ = try stmt.step();
+}
+
+test "video_download_enabled is off until a chat opts in, and toggles back off" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    try testing.expect(!getVideoDownloadEnabled(&pool, chat_id));
+    try setVideoDownloadEnabled(&pool, chat_id, true);
+    try testing.expect(getVideoDownloadEnabled(&pool, chat_id));
+    try setVideoDownloadEnabled(&pool, chat_id, false);
+    try testing.expect(!getVideoDownloadEnabled(&pool, chat_id));
+}
+
 test "default location round-trips, is null by default, and clears back to null" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
