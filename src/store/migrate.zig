@@ -50,6 +50,7 @@ const migrations = [_]Migration{
     .{ .version = 36, .name = "0036_autopin_announcements", .sql = @embedFile("migrations/0036_autopin_announcements.sql") },
     .{ .version = 37, .name = "0037_audit_log_identity", .sql = @embedFile("migrations/0037_audit_log_identity.sql") },
     .{ .version = 38, .name = "0038_management_rooms_1to1", .sql = @embedFile("migrations/0038_management_rooms_1to1.sql") },
+    .{ .version = 39, .name = "0039_member_acl", .sql = @embedFile("migrations/0039_member_acl.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each

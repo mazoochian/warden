@@ -35,6 +35,8 @@ const management_rooms = @import("store/management_rooms.zig");
 const identities = @import("store/identities.zig");
 const chat_members = @import("store/chat_members.zig");
 const chat_settings = @import("store/chat_settings.zig");
+const rate_limits = @import("store/rate_limits.zig");
+const member_permissions = @import("store/member_permissions.zig");
 const bot_config = @import("store/bot_config.zig");
 const bot_admins = @import("store/bot_admins.zig");
 const bot_allowlist = @import("store/bot_allowlist.zig");
@@ -690,6 +692,7 @@ pub fn main(init: std.process.Init) !void {
         checkAndSendDueDigests(connectors, gpa, io, &config, &pool, &digest_scheduler, llm_provider, max_message_len, now);
         checkAndSendDueBriefings(connectors, gpa, io, &config, &pool, &briefing_scheduler, max_message_len, now);
         checkAndSendDueReminders(connectors, gpa, &pool, now);
+        checkAndRevertExpiredPermissions(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
         pending_conversions.sweepExpired(gpa, now);
@@ -1198,6 +1201,14 @@ fn processMessageTask(
         return;
     };
     if (msg.choice_picked == null) {
+        // ROADMAP.md's Phase 24: warden's own slow-mode enforcement, ahead
+        // of recordMessage/keyword-alerts/dispatch below -- a rate-limited
+        // message is deleted right here and the rest of this task never
+        // runs for it (same early-exit shape `choice_picked` gets above).
+        // See `checkSlowMode`'s doc comment for why this can't just read
+        // `chat_members.last_seen`.
+        if (checkSlowMode(connector, a, config, pool, chat_id, identity_id, msg, ts)) return;
+
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
         recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, retention_messages);
 
@@ -1532,6 +1543,56 @@ fn recordMessage(pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, messa
     messages.pruneKeepLast(pool, chat_id, retention) catch |err| {
         log.err("prune failed for chat {d}: {t}", .{ chat_id, err });
     };
+}
+
+/// ROADMAP.md's Phase 24 slow mode: warden's own per-(chat, member)
+/// cooldown between messages — Telegram's Bot API has no method exposing a
+/// chat's native slow-mode delay to bots (client-UI-only setting), so this
+/// is warden's own logic, enforced the same way on Telegram and Matrix via
+/// `Connector.deleteMessage` (already in the vtable for both) and left a
+/// no-op on XMPP, whose vtable has no moderation slots at all — the
+/// `deleteMessage` call below simply reports `error.Unsupported` there,
+/// logged and otherwise harmless.
+///
+/// Deliberately checked *before* `recordMessage` runs (see the call site in
+/// `processMessageTask`): `chat_members.last_seen` gets bumped by
+/// `recordMessage`'s own `chat_members.touch` for every inbound message,
+/// including the one currently being checked, so reading it here would
+/// always see "now" — `store/rate_limits.zig`'s own
+/// `member_message_cooldowns` table exists specifically so this check has
+/// something to compare against that isn't already clobbered.
+///
+/// Returns `true` if the message was rate-limited (and thus already
+/// deleted — the deletion is the feedback, no separate reply is sent) and
+/// the caller should stop processing this message entirely; `false`
+/// otherwise (slow mode off, sender exempt, within the cooldown boundary,
+/// or no `message_id` to delete).
+///
+/// Owner and any live platform admin of this chat are exempt — an admin's
+/// own moderation commands (e.g. running `/slowmode` itself) shouldn't get
+/// rate-limited by a slow mode they just set.
+fn checkSlowMode(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, msg: iface.Message, now: i64) bool {
+    const min_seconds = rate_limits.getSlowModeSeconds(pool, chat_id);
+    if (min_seconds <= 0) return false;
+
+    if (auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+    const is_admin = connector.isGroupAdmin(a, msg.chat_id, msg.user_id) catch false;
+    if (is_admin) return false;
+
+    const last = rate_limits.getLastMessageAt(pool, chat_id, identity_id);
+    if (rate_limits.isRateLimited(last, min_seconds, now)) {
+        const message_id = msg.message_id orelse return false;
+        connector.deleteMessage(a, msg.chat_id, message_id) catch |err| {
+            log.warn("slowmode: failed to delete rate-limited message in chat {s}: {t}", .{ msg.chat_id, err });
+        };
+        log.debug("slowmode: deleted rate-limited message from user {s} in chat {s}", .{ msg.user_id, msg.chat_id });
+        return true;
+    }
+
+    rate_limits.touchLastMessage(pool, chat_id, identity_id, now) catch |err| {
+        log.err("slowmode: failed to record last-message time for chat {d}: {t}", .{ chat_id, err });
+    };
+    return false;
 }
 
 /// Rebuilds the in-memory enabled-chat set from every known chat's
@@ -2266,6 +2327,21 @@ fn handleMessage(
             if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "cancel")) return false;
             group_admin.cancel(connector, a, pending, msg);
         }
+    } else if (std.mem.eql(u8, text, "/slowmode") or std.mem.startsWith(u8, text, "/slowmode ")) {
+        // ROADMAP.md's Phase 24. Gated with the same "group_admin" flag as
+        // /mute/etc -- it's the same moderation-tier feature set, not its
+        // own toggle.
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "slowmode")) return false;
+        handleSlowmodeCommand(connector, a, pool, chat_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/permission") or std.mem.startsWith(u8, text, "/permission ")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "permission")) return false;
+        handlePermissionCommand(connector, a, pool, chat_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/tag") or std.mem.startsWith(u8, text, "/tag ")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "tag")) return false;
+        handleTagCommand(connector, a, pool, now, msg, text);
     } else if (std.mem.startsWith(u8, text, "/token")) {
         if (!auth.checkTokenGrantAccess(connector, a, config, msg, is_bot_admin)) return false;
         handleToken(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text);
@@ -4069,6 +4145,216 @@ fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: 
         return;
     };
     group_admin.requestConfirmation(connector, a, msg, kind, target.native_id, target.display_name, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
+}
+
+/// `/slowmode <seconds>` sets warden's own per-chat cooldown between a
+/// member's messages, `/slowmode off` clears it (stored as 0, same
+/// "0/absent both mean unset" convention as `rate_limits.zig`'s doc
+/// comment). Permission is already checked by the caller. See
+/// `checkSlowMode` (in `processMessageTask`) for where this is actually
+/// enforced.
+fn handleSlowmodeCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/slowmode".len..], " ");
+    if (arg.len == 0) {
+        const current = rate_limits.getSlowModeSeconds(pool, chat_id);
+        if (current > 0) {
+            const message = std.fmt.allocPrint(a, "Slow mode is on: {d}s between messages per member. Usage: /slowmode <seconds>|off", .{current}) catch return;
+            connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, "Slow mode is off. Usage: /slowmode <seconds>|off");
+        }
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(arg, "off")) {
+        rate_limits.setSlowModeSeconds(pool, chat_id, 0) catch |err| {
+            log.err("slowmode: failed to disable for chat {d}: {t}", .{ chat_id, err });
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Slow mode disabled.");
+        return;
+    }
+    const seconds = std.fmt.parseInt(i64, arg, 10) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /slowmode <seconds>|off");
+        return;
+    };
+    if (seconds <= 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Seconds must be positive -- use /slowmode off to disable.");
+        return;
+    }
+    rate_limits.setSlowModeSeconds(pool, chat_id, seconds) catch |err| {
+        log.err("slowmode: failed to set for chat {d}: {t}", .{ chat_id, err });
+        return;
+    };
+    const message = std.fmt.allocPrint(
+        a,
+        "Slow mode set: {d}s between messages per member (enforced on Telegram/Matrix by deleting messages sent too soon; not enforced on XMPP). Admins are exempt.",
+        .{seconds},
+    ) catch return;
+    connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+}
+
+/// Order-independent tokenizer for `/permission`'s arg string, same style
+/// as `parseBalanceAndUsernameArgs` above -- a `@`-prefixed token is the
+/// target, a `+`/`-`-prefixed token is the permission spec, and the first
+/// remaining token (there's at most one meaningful one) is the optional
+/// duration.
+fn parsePermissionArgs(arg: []const u8) struct { duration_str: []const u8, spec: []const u8, target_arg: []const u8 } {
+    var duration_str: []const u8 = "";
+    var spec: []const u8 = "";
+    var target_arg: []const u8 = "";
+    var it = std.mem.tokenizeScalar(u8, arg, ' ');
+    while (it.next()) |tok| {
+        if (tok.len > 0 and tok[0] == '@') {
+            target_arg = tok;
+        } else if (tok.len > 0 and (tok[0] == '+' or tok[0] == '-')) {
+            spec = tok;
+        } else if (duration_str.len == 0) {
+            duration_str = tok;
+        }
+    }
+    return .{ .duration_str = duration_str, .spec = spec, .target_arg = target_arg };
+}
+
+const permission_usage =
+    "Usage: /permission [<duration>] <+|-><letters> <@user>  (or reply to their message)\n" ++
+    "Letters: r=read w=write p=photos v=videos f=file m=music o=voice d=video-messages s=stickers/gifs l=polls e=embed-links a=reactions t=edit-own-tag i=change-info\n" ++
+    "Example: /permission -w @user   (mutes them)\n" ++
+    "Duration uses the same grammar as /remind: <n>m (minutes), <n>h (hours), <n>d (days) -- no week/month shorthand.\n" ++
+    "Enforcement is partial: w/p/v/f/m/o/d/s/l/e/i are enforced on Telegram (best-effort on Matrix: only w); r/a/t are stored but not enforceable on any platform today; nothing is enforced on XMPP.";
+
+/// `/permission [<duration>] <+|-><letters> <@user|reply>` — see
+/// `permission_usage` for the full grammar/enforcement-gap text (also sent
+/// back verbatim on every successful change, since the plan for this
+/// command was explicit that partial enforcement must be said plainly
+/// rather than implied to be complete). Permission (admin-tier) is already
+/// checked by the caller.
+fn handlePermissionCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/permission".len..], " ");
+    if (arg.len == 0) {
+        connector.sendMessage(a, msg.chat_id, permission_usage, msg.message_id);
+        return;
+    }
+    const parsed = parsePermissionArgs(arg);
+    if (parsed.spec.len == 0) {
+        connector.sendMessage(a, msg.chat_id, permission_usage, msg.message_id);
+        return;
+    }
+    const change = member_permissions.parseChange(parsed.spec) catch |err| {
+        const message = switch (err) {
+            error.MissingSign => "Permission spec must start with + (grant) or - (revoke).",
+            error.EmptyLetters => "Permission spec needs at least one letter after the +/-.",
+            error.UnknownLetter => "Unknown permission letter -- use any of: r w p v f m o d s l e a t i.",
+        };
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        return;
+    };
+
+    var expires_at: ?i64 = null;
+    if (parsed.duration_str.len > 0) {
+        const secs = reminder_format.parseDuration(parsed.duration_str) orelse {
+            const message = std.fmt.allocPrint(a, "Couldn't parse duration '{s}' -- use <n>m (minutes), <n>h (hours), or <n>d (days).", .{parsed.duration_str}) catch return;
+            connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+            return;
+        };
+        expires_at = now + secs;
+    }
+
+    const target = (resolveTargetIdentity(pool, connector, a, now, msg, parsed.target_arg, true) catch |err| {
+        log.err("permission: failed to resolve target: {t}", .{err});
+        return;
+    }) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Reply to the target's message, or pass @username, then the +/-letters.");
+        return;
+    };
+
+    const current_bits = member_permissions.getBits(pool, chat_id, target.id);
+    const new_bits = member_permissions.applyChange(current_bits, change);
+    member_permissions.setBits(pool, chat_id, target.id, new_bits, expires_at) catch |err| {
+        log.err("permission: failed to save bits for identity {d} in chat {d}: {t}", .{ target.id, chat_id, err });
+        return;
+    };
+
+    // Best-effort live enforcement -- `error.Unsupported` (no granular
+    // permission concept on this platform at all, e.g. XMPP) is expected
+    // and not worth alarming about; anything else is a real failure worth
+    // a log line, but the bitmask itself is already saved either way (see
+    // `interface.zig`'s `restrictChatMemberPermissions` doc comment).
+    connector.restrictChatMemberPermissions(a, msg.chat_id, target.native_id, new_bits, if (expires_at) |e| e else 0) catch |err| {
+        if (err == error.Unsupported) {
+            log.debug("permission: platform has no granular permission enforcement for {s} in chat {s} (bitmask stored only)", .{ target.native_id, msg.chat_id });
+        } else {
+            log.warn("permission: failed to enforce live restriction for {s} in chat {s}: {t}", .{ target.native_id, msg.chat_id, err });
+        }
+    };
+
+    const duration_note: []const u8 = if (expires_at != null) " (temporary -- reverts automatically)" else "";
+    const message = std.fmt.allocPrint(
+        a,
+        "Updated permissions for {s}{s}. Enforcement is partial by platform: w/p/v/f/m/o/d/s/l/e/i are enforced on Telegram; only w (mute) is enforced on Matrix; r/a/t are stored but not enforceable anywhere; nothing is enforced on XMPP. Run /permission with no arguments for the full letter grammar.",
+        .{ target.display_name, duration_note },
+    ) catch return;
+    connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+}
+
+/// `/tag @user <text>` / `/tag @user off` (or reply to the target's
+/// message instead of `@user`) — Telegram's `setChatAdministratorCustomTitle`,
+/// which only works on chat *administrators* (no Bot API concept of a
+/// custom title for an ordinary member); Matrix/XMPP have no equivalent
+/// primitive at all (`Connector.setChatAdminTitle`'s vtable slot is null
+/// for both, so this always reports `error.Unsupported` there). Permission
+/// is already checked by the caller.
+fn handleTagCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/tag".len..], " ");
+    if (arg.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tag <@user|reply> <text>  or  /tag <@user|reply> off  (Telegram only -- target must already be a chat administrator)");
+        return;
+    }
+
+    var target_arg: []const u8 = "";
+    var tag_text: []const u8 = arg;
+    if (arg[0] == '@') {
+        const sp = std.mem.indexOfScalar(u8, arg, ' ') orelse arg.len;
+        target_arg = arg[0..sp];
+        tag_text = std.mem.trim(u8, arg[sp..], " ");
+    }
+
+    const target = (resolveTargetIdentity(pool, connector, a, now, msg, target_arg, true) catch |err| {
+        log.err("tag: failed to resolve target: {t}", .{err});
+        return;
+    }) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Reply to the target's message, or pass @username, then the tag text (or 'off' to clear).");
+        return;
+    };
+
+    if (tag_text.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tag <@user|reply> <text>  or  /tag <@user|reply> off");
+        return;
+    }
+
+    const clearing = std.ascii.eqlIgnoreCase(tag_text, "off");
+    const title: []const u8 = if (clearing) "" else tag_text;
+
+    connector.setChatAdminTitle(a, msg.chat_id, target.native_id, title) catch |err| {
+        if (err == error.Unsupported) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Custom tags aren't supported on this platform.");
+        } else {
+            const message = std.fmt.allocPrint(
+                a,
+                "Couldn't set a tag for {s} -- Telegram only allows a custom title on chat *administrators*. Make sure they're an admin and the bot itself has admin rights here.",
+                .{target.display_name},
+            ) catch return;
+            connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+        }
+        return;
+    };
+
+    if (clearing) {
+        const message = std.fmt.allocPrint(a, "Tag cleared for {s}.", .{target.display_name}) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+    } else {
+        const message = std.fmt.allocPrint(a, "Tagged {s} as \"{s}\".", .{ target.display_name, tag_text }) catch return;
+        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+    }
 }
 
 fn handleAddUserCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
@@ -6616,6 +6902,53 @@ fn checkAndSendDueReminders(
                 log.err("remind: failed to mark reminder {d} delivered: {t}", .{ r.id, err });
             };
         }
+    }
+}
+
+/// ROADMAP.md's Phase 24: reverts a timed `/permission <duration> ...`
+/// grant/revoke back to the default (unrestricted) bitmask once its
+/// `expires_at` passes — same polling-loop shape as
+/// `checkAndSendDueReminders` above. Attempts the live platform call
+/// first (best-effort, same as `handlePermissionCommand`'s own
+/// enforcement — logged, not fatal, since the bitmask itself is the
+/// source of truth) and clears the DB row regardless of whether that live
+/// call succeeded, so a persistent platform error (e.g. the bot no longer
+/// being an admin) can't wedge this in a retry loop forever.
+fn checkAndRevertExpiredPermissions(
+    connectors: []const iface.Connector,
+    gpa: std.mem.Allocator,
+    pool: *store_pool.PgPool,
+    now: i64,
+) void {
+    const expired = member_permissions.listExpired(pool, gpa, now) catch |err| {
+        log.err("permission: failed to query expired grants: {t}", .{err});
+        return;
+    };
+    defer {
+        for (expired) |e| {
+            gpa.free(e.native_chat_id);
+            gpa.free(e.native_user_id);
+        }
+        gpa.free(expired);
+    }
+
+    for (expired) |e| {
+        if (findConnector(connectors, e.platform)) |connector| {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            connector.restrictChatMemberPermissions(a, e.native_chat_id, e.native_user_id, iface.MemberPermission.all, 0) catch |err| {
+                if (err != error.Unsupported) {
+                    log.warn("permission: failed to re-apply default bitmask for {s} in chat {s}: {t}", .{ e.native_user_id, e.native_chat_id, err });
+                }
+            };
+        } else {
+            log.warn("permission: no active connector for platform {s}, reverting stored bitmask anyway for chat {d}", .{ @tagName(e.platform), e.chat_id });
+        }
+
+        member_permissions.revert(pool, e.chat_id, e.identity_id) catch |err| {
+            log.err("permission: failed to clear expired grant for identity {d} in chat {d}: {t}", .{ e.identity_id, e.chat_id, err });
+        };
     }
 }
 

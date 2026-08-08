@@ -310,6 +310,8 @@ pub const TelegramConnector = struct {
         .banUser = banUserFn,
         .promoteUser = promoteUserFn,
         .demoteUser = demoteUserFn,
+        .restrictChatMemberPermissions = restrictChatMemberPermissionsFn,
+        .setChatAdminTitle = setChatAdminTitleFn,
         .pinMessage = pinMessageFn,
         .unpinMessage = unpinMessageFn,
         .deleteMessage = deleteMessageFn,
@@ -603,6 +605,45 @@ pub const TelegramConnector = struct {
     fn demoteUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         return self.client.demoteChatMember(allocator, try parseId(chat_id), try parseId(user_id));
+    }
+
+    /// Decodes the `MemberPermission` bitmask into Telegram's
+    /// `ChatPermissions` fields — see `interface.zig`'s
+    /// `MemberPermission.telegram_enforceable` doc comment for which bits
+    /// have no Bot API field at all (`read`/`reactions`/`edit_tags`); those
+    /// are silently ignored here (stored in the bitmask, never enforced),
+    /// logged once per call so the gap stays visible without spamming the
+    /// chat itself — `main.zig`'s `/permission` reply is what tells the
+    /// admin who ran the command, this is just the operational trail.
+    fn restrictChatMemberPermissionsFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, permission_bits: u32, until_unix_time: i64) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        const unenforceable = permission_bits & ~iface.MemberPermission.telegram_enforceable;
+        if (unenforceable != 0) {
+            log.debug("telegram: permission bits 0x{x} (read/reactions/edit_tags) have no Bot API equivalent, stored but not enforced for user {s} in chat {s}", .{ unenforceable, user_id, chat_id });
+        }
+        return self.client.restrictChatMemberWithPermissions(allocator, try parseId(chat_id), try parseId(user_id), until_unix_time, .{
+            .can_send_messages = permission_bits & iface.MemberPermission.write != 0,
+            .can_send_audios = permission_bits & iface.MemberPermission.music != 0,
+            .can_send_documents = permission_bits & iface.MemberPermission.file != 0,
+            .can_send_photos = permission_bits & iface.MemberPermission.photos != 0,
+            .can_send_videos = permission_bits & iface.MemberPermission.videos != 0,
+            .can_send_video_notes = permission_bits & iface.MemberPermission.video_messages != 0,
+            .can_send_voice_notes = permission_bits & iface.MemberPermission.voice != 0,
+            .can_send_polls = permission_bits & iface.MemberPermission.polls != 0,
+            .can_send_other_messages = permission_bits & iface.MemberPermission.stickers != 0,
+            .can_add_web_page_previews = permission_bits & iface.MemberPermission.embed_links != 0,
+            .can_change_info = permission_bits & iface.MemberPermission.change_info != 0,
+        });
+    }
+
+    /// `/tag` — see `raw.Client.setChatAdministratorCustomTitle`'s doc
+    /// comment for the "target must already be a chat administrator"
+    /// limitation; the resulting `error.TelegramApiError` propagates
+    /// as-is so `main.zig`'s `handleTagCommand` can surface a clear
+    /// platform-limitation message instead of a generic failure.
+    fn setChatAdminTitleFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, title: []const u8) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.client.setChatAdministratorCustomTitle(allocator, try parseId(chat_id), try parseId(user_id), title);
     }
 
     fn pinMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void {

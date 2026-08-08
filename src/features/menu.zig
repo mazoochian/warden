@@ -1030,6 +1030,7 @@ fn baseCtx(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8
         .io = testing.io,
         .digest_scheduler = undefined,
         .pending_conversions = undefined,
+        .pending_undos = undefined,
     };
 }
 

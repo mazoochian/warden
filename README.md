@@ -6,6 +6,7 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Stats: Provides statistics about the group's conversations
 - Word Cloud: Shows a word cloud of the most common words used in the group's conversations
 - Group Management: Allows the bot to manage the group's conversations, including kicking and banning users. Restricted to the chat's own Telegram admins (or the bot owner) — checked live against Telegram on every use, not cached. A non-admin can still `/kick`/`/ban` by spending a token (see "Access control" below), and a bot admin can override the check entirely with `/sudo`
+- Member ACL: `/slowmode <seconds>|off` enforces warden's own per-member cooldown between messages (Telegram's Bot API has no native slow-mode setter for bots) by deleting a message sent too soon — uniform on Telegram/Matrix, not enforced on XMPP. `/permission [<duration>] <+|-><letters> @user` (or reply) grants/revokes a granular per-member permission bitmask (letters: read/write/photos/videos/file/music/voice/video-messages/stickers/polls/embed-links/reactions/edit-own-tag/change-info) — enforcement is partial and platform-dependent, see "Member ACL" below. `/tag @user <text>|off` sets a Telegram custom admin title (Telegram-only, and only works on existing chat administrators — a real Bot API limitation)
 - Access Control: nobody but the owner talks to the bot at all by default — `/adduser`/`/allowchat` opt a user or a whole chat in. A separate `bot admin` role (`/addadmin`, owner-only to grant) is trusted bot-wide, not scoped to one chat, and can run any moderation command via `/sudo <command>` even where they aren't a real chat admin. `/redact` deletes messages in bulk (by count, by user, by literal text, or by a hardened regex engine — bot-admin-only, immune to catastrophic-backtracking hangs by construction)
 - Web Search: Answers questions using a private SearXNG metasearch instance — no API keys or bot checks
 - Air Quality: Current US AQI / PM2.5 / PM10 for any city (Open-Meteo)
@@ -86,6 +87,45 @@ sent before this bot joined/was online — the local DB was never going to
 have those. `/redact [N]` as a reply to someone, `/redact text <substring>`,
 and `/redact regex <pattern>` still search the local log, since those need
 to look at message *content* to know what to delete.
+
+# Member ACL
+Three more per-chat, per-member controls, gated the same way as `/mute`/
+`/kick`/etc above:
+
+- **Slow mode** (`/slowmode <seconds>`, `/slowmode off`) — Telegram's Bot
+  API has no method exposing a chat's native slow-mode delay to bots (it's
+  client-UI-only), so this is warden's own logic instead, applied the same
+  way on Telegram and Matrix: a message from a non-admin sent before the
+  configured number of seconds have passed since their last one is
+  deleted right away — the deletion itself is the feedback, no extra
+  "you're rate limited" reply. Admins and the owner are always exempt,
+  including from a slow mode they just set. Not enforced on XMPP (its
+  connector has no moderation vtable slots at all).
+- **Permission model** (`/permission [<duration>] <+|-><letters> @user`,
+  or reply to their message instead of `@user`) — a 14-bit per-member
+  permission mask: `r`ead, `w`rite (send messages), `p`hotos, `v`ideos,
+  `f`ile, `m`usic, voice (`o`), video messages (`d`), `s`tickers/GIFs,
+  pol`l`s, `e`mbed links, re`a`ctions, edit-own-`t`ag, change-`i`nfo.
+  `/permission +rwpvfmodslaeti @user` grants everything, `/permission -w
+  @user` mutes them. An optional leading `<duration>` (same grammar as
+  `/remind`: `<n>m`/`<n>h`/`<n>d` — no week/month shorthand, since `m`
+  already means minutes here) makes the change temporary; it reverts to
+  full permissions automatically once it lapses (checked on the same
+  ~30s scheduler tick as reminders/alerts). **Enforcement is partial by
+  design** — Telegram's `restrictChatMember` has a real field for every
+  letter except `r`/`a`/`t` (no Bot API concept of "can't read", "can't
+  react", or "can't edit your own tag" exists), so those three are stored
+  for cross-platform intent but never actually restrict anything on
+  Telegram. Matrix has no granular permission object at all; only `w` is
+  best-effort mapped onto the same power-level mechanism `/mute` uses,
+  everything else is stored-but-unenforced. Nothing is enforced on XMPP.
+  `/permission` with no arguments prints the full letter legend and this
+  same enforcement caveat.
+- **Custom tags** (`/tag @user <text>`, `/tag @user off`, or reply) —
+  Telegram's `setChatAdministratorCustomTitle`, which the Bot API only
+  allows on chat *administrators*; running it on an ordinary member
+  returns a clear "must already be an admin" error rather than silently
+  doing nothing. No equivalent primitive exists on Matrix or XMPP.
 
 # Access control
 Two independent trust tiers, both DB-backed (not just `.env`, unlike the
@@ -267,7 +307,10 @@ Two smaller simplifications versus Telegram, both worth knowing about:
 - Mute/unmute work via room power levels rather than a dedicated
   "restricted" state, and have no expiry — `/mute` normally auto-expires
   after an hour on Telegram, but on Matrix it lasts until explicitly
-  `/unmute`d.
+  `/unmute`d. `/permission`'s granular bitmask (see "Member ACL" above)
+  is the same story on Matrix: only the `w` bit is mapped, onto that same
+  power-level mechanism; everything else in the bitmask is stored but not
+  live-enforced there. `/tag` has no Matrix equivalent at all.
 
 # XMPP
 Warden can also connect to an XMPP server (self-hosted Prosody/ejabberd),
@@ -301,7 +344,10 @@ would have are deliberately out of scope for now:
   rooms (via `WARDEN_XMPP_MUC_ROOMS`) and send/receive `groupchat` messages,
   but there's no kick/ban/affiliation support — every moderation vtable slot
   reports "unsupported" for XMPP, same as the pre-built-out Matrix/XMPP
-  stubs used to before either connector was real.
+  stubs used to before either connector was real. That includes `/slowmode`
+  (stored per-chat but never enforced, since there's no `deleteMessage` to
+  act on), `/permission` (the bitmask still saves, nothing is ever
+  restricted live), and `/tag` (no custom-title primitive at all).
 - **No roster UI.** Any incoming presence-subscription request is
   auto-accepted (mirrors Matrix's auto-join-on-invite) — there's no way to
   see or manage a roster from within the bot.
