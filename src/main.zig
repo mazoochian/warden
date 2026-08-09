@@ -159,6 +159,7 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "autopin", .description = "on | off -- pin each scheduled announcement as it's posted. Admins only." },
     .{ .name = "silent", .description = "on | off -- default moderation/settings commands to -s (no in-group confirmation). Admins only." },
     .{ .name = "videodownload", .description = "on | off -- auto-download YouTube/Instagram/X video links posted here. Off by default, admins only." },
+    .{ .name = "videoquality", .description = "lossy | lossless -- delivery mode for auto-downloaded videos. Lossy (default) sends a native compressed video; lossless keeps original quality, capped at 50MB, sent as a file. Admins only." },
     .{ .name = "expense", .description = "add <amt> <category> [desc] | list | summary | delete <id> -- expense tracker." },
     .{ .name = "budget", .description = "set <category> <amt> | list | remove <category> -- monthly budgets. Owner to set." },
     .{ .name = "subscription", .description = "add <name> <amt> every <interval> | list | remove <id> -- recurring costs." },
@@ -306,6 +307,9 @@ const help_text_admin =
     \\  (only those -- I never pin anyone else's messages on my own)
     \\/videodownload on|off -- auto-download YouTube/Instagram/X video
     \\  links posted here, under 50MB, best-effort. Off by default
+    \\/videoquality lossy|lossless -- lossy (default) sends a compressed
+    \\  native video; lossless keeps original quality, capped at 50MB,
+    \\  sent as a file
     \\/photo -- send an image with this as its caption to set the chat
     \\  photo; /photo remove clears it
     \\/title <text> -- rename this chat
@@ -1253,7 +1257,7 @@ fn processMessageTask(
         // member posts, not just something a user asked to be notified
         // about.
         if (feature_flags.isEnabled(pool, "video_download") and chat_settings.getVideoDownloadEnabled(pool, chat_id)) {
-            if (msg.text) |t| checkVideoDownload(connector, io, config, msg, t);
+            if (msg.text) |t| checkVideoDownload(connector, io, config, pool, chat_id, msg, t);
         }
     }
     recordObservedUsers(pool, chat_id, msg.observed_users);
@@ -2298,6 +2302,9 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/videodownload") or std.mem.startsWith(u8, text, "/videodownload ")) {
         if (!feature_flags.isEnabled(pool, "video_download")) return false;
         handleVideoDownloadCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
+    } else if (std.mem.eql(u8, text, "/videoquality") or std.mem.startsWith(u8, text, "/videoquality ")) {
+        if (!feature_flags.isEnabled(pool, "video_download")) return false;
+        handleVideoQualityCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
     } else if (std.mem.eql(u8, text, "/mute") or std.mem.startsWith(u8, text, "/mute ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
@@ -5996,29 +6003,144 @@ fn handleVideoDownloadCommand(
     }
 }
 
+/// `/videoquality` shows this chat's video-auto-download delivery mode;
+/// `/videoquality lossy|lossless` changes it — same shape as
+/// `handleVideoDownloadCommand` right above (view is open to anyone,
+/// changing it is admin-tier via `auth.checkGroupAdminAccess`, no token
+/// fallback, same `chat_settings` `ON CONFLICT` idiom). A sub-setting of
+/// `video_download` itself, not a separate feature -- gated on the same
+/// `video_download` feature flag at the dispatch site, no flag of its own.
+fn handleVideoQualityCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    sudo_active: bool,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/videoquality".len..], " ");
+    const lossy = chat_settings.getVideoDownloadLossy(pool, chat_id);
+
+    if (arg.len == 0) {
+        const reply_text = std.fmt.allocPrint(
+            a,
+            "Video delivery mode is {s} for this chat. Lossy sends a compressed native video (always fits, some quality loss on longer clips); lossless keeps the original file, capped at 50MB, and silently skips anything bigger. Change it with /videoquality lossy or /videoquality lossless.",
+            .{if (lossy) "lossy" else "lossless"},
+        ) catch return;
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    const want_lossy = if (std.mem.eql(u8, arg, "lossy"))
+        true
+    else if (std.mem.eql(u8, arg, "lossless"))
+        false
+    else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /videoquality lossy | lossless");
+        return;
+    };
+
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "videoquality")) return;
+
+    chat_settings.setVideoDownloadLossy(pool, chat_id, want_lossy) catch |err| {
+        log.err("videoquality: failed to persist for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that setting, try again.");
+        return;
+    };
+    if (want_lossy) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Video delivery set to lossy — auto-downloaded videos will be compressed and sent as a native video.");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Video delivery set to lossless — auto-downloaded videos will keep original quality, capped at 50MB, sent as a file.");
+    }
+}
+
+/// How often `videoProgressTickerLoop` may edit the placeholder message --
+/// longer than QA's `ticker_interval_ms` (1200ms) since downloads run far
+/// longer than an LLM call and there's no need to poll/edit as often.
+const video_progress_ticker_interval_ms: i64 = 3500;
+
+/// Shared between `videoDownloadWorker` (which owns it) and
+/// `videoProgressTickerLoop`. Unlike `TickerState`, progress here is
+/// *pulled* by the ticker polling the filesystem each tick
+/// (`video_download.pollCurrentBytes`) rather than *pushed* by another
+/// thread, so no mutex-guarded status field is needed -- otherwise the same
+/// shape, heap-allocated on `page_allocator` (not stack-local) for the same
+/// reason `TickerState` is; see `tickerLoop`'s doc comment for the full
+/// stop/done-atomic rationale, which applies here unchanged.
+const VideoProgressState = struct {
+    io: Io,
+    tmp_dir: []const u8,
+    ts: i96,
+    estimated_total_bytes: ?u64,
+    started_at: Io.Timestamp,
+    stop: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+/// Runs on its own detached `std.Thread`, exactly like `tickerLoop` --
+/// cooperative `state.stop` checked before *and* after each sleep,
+/// deliberately not `Future.cancel()` (see `tickerLoop`'s doc comment for
+/// the production wedge that pattern avoids; the same risk applies to any
+/// detached thread blocked in an in-flight `editMessage`). Each tick polls
+/// the growing download file's size (`pollCurrentBytes`) and formats a
+/// status line (`formatProgressText`), deduping against the last text it
+/// actually sent -- unlike `tickerLoop`'s static strings, this text is
+/// freshly allocated every tick, so the dedupe copy must be owned and freed
+/// here rather than just compared by reference.
+fn videoProgressTickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []const u8, state: *VideoProgressState) void {
+    defer state.done.store(true, .release);
+    const a = std.heap.page_allocator;
+    var last_sent: ?[]const u8 = null;
+    defer if (last_sent) |t| a.free(t);
+
+    while (!state.stop.load(.acquire)) {
+        Io.sleep(state.io, .fromMilliseconds(video_progress_ticker_interval_ms), .awake) catch return;
+        if (state.stop.load(.acquire)) return;
+
+        const elapsed_seconds: i64 = @intCast(@divTrunc(Io.Timestamp.now(state.io, .real).toNanoseconds() - state.started_at.toNanoseconds(), std.time.ns_per_s));
+        const current_bytes = video_download.pollCurrentBytes(state.io, state.tmp_dir, state.ts);
+        const text = video_download.formatProgressText(a, elapsed_seconds, current_bytes, state.estimated_total_bytes) catch continue;
+
+        if (last_sent != null and std.mem.eql(u8, text, last_sent.?)) {
+            a.free(text);
+            continue;
+        }
+        connector.editMessage(a, chat_id, message_id, text) catch |err| {
+            log.warn("video_download: progress edit failed for chat {s}: {t}", .{ chat_id, err });
+        };
+        if (last_sent) |t| a.free(t);
+        last_sent = text;
+    }
+}
+
 /// ROADMAP.md's Phase 25: passive auto-download of YouTube/Instagram/X
 /// links. Same "passive content observation" tier as `checkKeywordAlerts`
 /// (plain substring scan, no LLM call, fires for any sender) — but unlike
 /// every other check at that call site, a match here can trigger a
-/// genuinely slow, network-bound external process (`yt-dlp`, capped at
-/// `video_download.timeout_seconds` — currently 2 minutes), far past
-/// `processMessageTask`'s own ~15s expected budget (see its own timing-log
-/// comment). So this does not run inline: it hands off to a detached
-/// `std.Thread` (`videoDownloadWorker`) and returns immediately, the same
-/// "don't occupy a `WorkerPool` worker for a slow background op" reasoning
-/// `qa.zig`'s thinking-ticker (`tickerLoop`) already uses for its own
-/// detached thread.
+/// genuinely slow, network-bound external process (`yt-dlp`, plus in lossy
+/// mode possibly `ffmpeg`/`ffprobe` too), far past `processMessageTask`'s
+/// own ~15s expected budget (see its own timing-log comment). So this does
+/// not run inline: it hands off to a detached `std.Thread`
+/// (`videoDownloadWorker`) and returns immediately, the same "don't occupy
+/// a `WorkerPool` worker for a slow background op" reasoning `qa.zig`'s
+/// thinking-ticker (`tickerLoop`) already uses for its own detached thread.
 ///
 /// XMPP has no `sendDocument` support at all (see `platform/xmpp.zig`'s
 /// vtable — no `sendDocument` slot is wired up there). Checked up front,
-/// before spending up to two minutes on a download nobody could receive —
+/// before spending several minutes on a download nobody could receive —
 /// logged plainly rather than left silent. Calling `connector.sendDocument`
 /// unconditionally instead would have `Connector.sendDocument`'s own
 /// "platform doesn't support this" fallback post a visible chat message for
 /// *every* video link a group posts, exactly the per-link error spam this
 /// feature's fail-closed philosophy exists to avoid — so that fallback is
-/// deliberately never reached here.
-fn checkVideoDownload(connector: iface.Connector, io: Io, config: *const config_mod.Config, msg: iface.Message, text: []const u8) void {
+/// deliberately never reached here. `sendVideo` (lossy mode's preferred
+/// delivery) is intentionally NOT gated the same way: it's strictly
+/// additive on top of this baseline check, with `videoDownloadWorker`
+/// itself falling back to `sendDocument` when a connector lacks it.
+fn checkVideoDownload(connector: iface.Connector, io: Io, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
     const url = video_download.findLink(text) orelse return;
 
     if (connector.vtable.sendDocument == null) {
@@ -6026,11 +6148,18 @@ fn checkVideoDownload(connector: iface.Connector, io: Io, config: *const config_
         return;
     }
 
+    const quality: video_download.Quality = if (chat_settings.getVideoDownloadLossy(pool, chat_id)) .lossy else .lossless;
+    // Generated here, not inside `video_download.download`, so
+    // `videoProgressTickerLoop` (spawned by `videoDownloadWorker`) can poll
+    // the same `tmp_dir/video_download_{ts}*` prefix `download` writes to.
+    const ts = Io.Timestamp.now(io, .real).toNanoseconds();
+
     // `page_allocator`-owned dupes, NOT `task_arena`-backed: `task_arena`
     // is destroyed the moment `processMessageTask` returns, long before
-    // this detached thread (which can run for up to two minutes) is done
-    // with them — same reasoning `tickerLoop`'s own doc comment gives for
-    // never touching the per-message arena from a detached thread.
+    // this detached thread (which can run for several minutes in lossy
+    // mode) is done with them — same reasoning `tickerLoop`'s own doc
+    // comment gives for never touching the per-message arena from a
+    // detached thread.
     const native_chat_id = std.heap.page_allocator.dupe(u8, msg.chat_id) catch |err| {
         log.warn("video_download: couldn't allocate for chat {s}: {t}", .{ msg.chat_id, err });
         return;
@@ -6040,37 +6169,116 @@ fn checkVideoDownload(connector: iface.Connector, io: Io, config: *const config_
         std.heap.page_allocator.free(native_chat_id);
         return;
     };
+    // Reply-threads the placeholder to the original link message, so it's
+    // clear which link is being fetched if several are posted in quick
+    // succession -- best-effort, `null` (no threading) on any allocation
+    // failure rather than aborting the whole download over it.
+    const reply_to_dup: ?[]const u8 = if (msg.message_id) |mid| std.heap.page_allocator.dupe(u8, mid) catch null else null;
 
-    const thread = std.Thread.spawn(.{}, videoDownloadWorker, .{ connector, io, config.tmp_dir, native_chat_id, url_dup }) catch |err| {
+    const thread = std.Thread.spawn(.{}, videoDownloadWorker, .{ connector, io, config.tmp_dir, native_chat_id, url_dup, reply_to_dup, quality, ts }) catch |err| {
         log.warn("video_download: failed to spawn a download thread for chat {s}: {t}", .{ msg.chat_id, err });
         std.heap.page_allocator.free(native_chat_id);
         std.heap.page_allocator.free(url_dup);
+        if (reply_to_dup) |rt| std.heap.page_allocator.free(rt);
         return;
     };
     thread.detach();
 }
 
-/// Body of the detached thread `checkVideoDownload` spawns. Owns
-/// (and frees) `native_chat_id`/`url`, both `page_allocator` dupes taken
-/// before spawning — see `checkVideoDownload`'s doc comment for why they
-/// can't be `task_arena`-backed. Never surfaces a failure into the chat
-/// (see `video_download.zig`'s module doc on fail-closed handling) — a log
-/// line either way is the only trace of a download attempt that didn't
-/// result in a sent file.
-fn videoDownloadWorker(connector: iface.Connector, io: Io, tmp_dir: []const u8, native_chat_id: []const u8, url: []const u8) void {
+/// Body of the detached thread `checkVideoDownload` spawns. Owns (and
+/// frees) `native_chat_id`/`url`/`reply_to`, all `page_allocator` dupes
+/// taken before spawning — see `checkVideoDownload`'s doc comment for why
+/// they can't be `task_arena`-backed.
+///
+/// Sends a "⬇️ Downloading…" placeholder immediately, animates it via
+/// `videoProgressTickerLoop` while `video_download.download` runs, then
+/// deletes the placeholder and sends the real result as a fresh message.
+/// `editMessage` is text-only and can never attach media to an existing
+/// message, so unlike the QA flow's placeholder, this one is never "edited
+/// into" the final result -- it's always deleted, success or failure alike.
+/// Never surfaces a failure into the chat (see `video_download.zig`'s
+/// module doc on fail-closed handling): on any download error the
+/// placeholder is silently deleted rather than edited into an error
+/// message -- a log line either way is the only trace of a download
+/// attempt that didn't result in a sent video.
+fn videoDownloadWorker(connector: iface.Connector, io: Io, tmp_dir: []const u8, native_chat_id: []const u8, url: []const u8, reply_to: ?[]const u8, quality: video_download.Quality, ts: i96) void {
     const a = std.heap.page_allocator;
     defer a.free(native_chat_id);
     defer a.free(url);
+    defer if (reply_to) |rt| a.free(rt);
 
-    const result = video_download.download(a, io, tmp_dir, url) catch |err| {
+    const placeholder_id = connector.sendMessageReturningId(a, native_chat_id, "⬇️ Downloading…", reply_to) catch |err| blk: {
+        log.warn("video_download: couldn't send a placeholder for chat {s}: {t}", .{ native_chat_id, err });
+        break :blk null;
+    };
+
+    var ticker_thread: ?std.Thread = null;
+    var progress_state: ?*VideoProgressState = null;
+    if (placeholder_id) |pid| {
+        // Lossless mode's own fetch doesn't use `estimateSize`'s ~720p
+        // format selector, so its estimate would be meaningless -- only
+        // ask for one in lossy mode, same as `downloadLossy` itself.
+        const estimate = if (quality == .lossy) video_download.estimateSize(a, io, url) else null;
+
+        const s = a.create(VideoProgressState) catch |err| blk: {
+            log.warn("video_download: couldn't allocate progress state for chat {s}: {t}", .{ native_chat_id, err });
+            break :blk null;
+        };
+        if (s) |state| {
+            state.* = .{ .io = io, .tmp_dir = tmp_dir, .ts = ts, .estimated_total_bytes = estimate, .started_at = Io.Timestamp.now(io, .real) };
+            progress_state = state;
+            ticker_thread = std.Thread.spawn(.{}, videoProgressTickerLoop, .{ connector, native_chat_id, pid, state }) catch |err| blk: {
+                log.warn("video_download: couldn't start the progress ticker for chat {s}: {t}", .{ native_chat_id, err });
+                break :blk null;
+            };
+        }
+    }
+
+    const result = video_download.download(a, io, tmp_dir, url, quality, ts);
+
+    // Stop the ticker before touching the placeholder ourselves -- same
+    // bounded stop-then-join-or-detach dance `replyWithAnswer` uses for
+    // `tickerLoop`, for the same reason (see `tickerLoop`'s doc comment on
+    // the production wedge this avoids).
+    if (progress_state) |state| {
+        state.stop.store(true, .release);
+        var waited_ms: i64 = 0;
+        while (!state.done.load(.acquire) and waited_ms < 5000) {
+            Io.sleep(io, .fromMilliseconds(50), .awake) catch break;
+            waited_ms += 50;
+        }
+        if (ticker_thread) |t| {
+            if (state.done.load(.acquire)) {
+                t.join();
+                a.destroy(state);
+            } else {
+                log.warn("video_download: progress ticker for chat {s} didn't stop within {d}ms, detaching it", .{ native_chat_id, waited_ms });
+                t.detach();
+            }
+        }
+    }
+
+    const download_result = result catch |err| {
         log.info("video_download: not downloading {s} for chat {s}: {t}", .{ url, native_chat_id, err });
+        if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |del_err| {
+            log.warn("video_download: failed to delete placeholder for chat {s}: {t}", .{ native_chat_id, del_err });
+        };
         return;
     };
-    defer a.free(result.bytes);
-    defer a.free(result.file_name);
+    defer a.free(download_result.bytes);
+    defer a.free(download_result.file_name);
 
-    connector.sendDocument(a, native_chat_id, result.bytes, result.file_name, null);
-    log.info("video_download: sent {s} ({d} bytes) to chat {s}", .{ result.file_name, result.bytes.len, native_chat_id });
+    if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |err| {
+        log.warn("video_download: failed to delete placeholder for chat {s}: {t}", .{ native_chat_id, err });
+    };
+
+    if (quality == .lossy and connector.vtable.sendVideo != null) {
+        connector.sendVideo(a, native_chat_id, download_result.bytes, download_result.file_name, null);
+        log.info("video_download: sent {s} ({d} bytes) as a video to chat {s}", .{ download_result.file_name, download_result.bytes.len, native_chat_id });
+    } else {
+        connector.sendDocument(a, native_chat_id, download_result.bytes, download_result.file_name, null);
+        log.info("video_download: sent {s} ({d} bytes) as a file to chat {s}", .{ download_result.file_name, download_result.bytes.len, native_chat_id });
+    }
 }
 
 /// How far back `/summary` looks when no window is given.

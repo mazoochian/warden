@@ -348,6 +348,14 @@ pub const Connector = struct {
         /// how `convert_file` delivers a converted file. Optional like
         /// `sendPhoto`, with the same "unsupported platform" fallback.
         sendDocument: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, file_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void = null,
+        /// Sends a native, inline-playable video message (as opposed to
+        /// `sendDocument`'s generic file attachment) — `video_download.zig`'s
+        /// lossy delivery path (ROADMAP.md's Phase 25 follow-up). Optional
+        /// like `sendPhoto`/`sendDocument`, same "unsupported platform"
+        /// fallback; the only current producer always emits `.mp4` bytes, so
+        /// there's no mime-type parameter here (add one if a second producer
+        /// ever needs it).
+        sendVideo: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, video_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void = null,
         /// Sends a native poll (ROADMAP.md's Phase 16), if this platform has
         /// the concept. Fire-and-forget like `sendPhoto`/`sendDocument` --
         /// the wrapper method below falls back to a plain text listing of
@@ -503,6 +511,14 @@ pub const Connector = struct {
             return;
         };
         f(self.ptr, allocator, chat_id, file_bytes, file_name, caption);
+    }
+
+    pub fn sendVideo(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, video_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void {
+        const f = self.vtable.sendVideo orelse {
+            self.sendMessage(allocator, chat_id, "This platform doesn't support sending videos.", null);
+            return;
+        };
+        f(self.ptr, allocator, chat_id, video_bytes, file_name, caption);
     }
 
     /// Renders `question`/`options` as plain numbered text when this

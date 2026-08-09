@@ -297,6 +297,7 @@ pub const TelegramConnector = struct {
         .sendMessage = sendMessageFn,
         .sendPhoto = sendPhotoFn,
         .sendDocument = sendDocumentFn,
+        .sendVideo = sendVideoFn,
         .sendPoll = sendPollFn,
         .maxMessageLength = maxMessageLengthFn,
         .downloadFile = downloadFileFn,
@@ -567,6 +568,12 @@ pub const TelegramConnector = struct {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         const id = parseChatId(chat_id) orelse return;
         self.client.sendDocument(allocator, id, file_bytes, file_name, caption);
+    }
+
+    fn sendVideoFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, video_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        const id = parseChatId(chat_id) orelse return;
+        self.client.sendVideo(allocator, id, video_bytes, file_name, caption);
     }
 
     fn sendPollFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, question: []const u8, options: []const []const u8, reply_to_message_id: ?[]const u8) void {

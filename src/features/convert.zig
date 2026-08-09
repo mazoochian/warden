@@ -321,6 +321,8 @@ test "convert rejects a pdf source targeting anything but txt" {
 /// tool isn't installed.
 pub fn binaryAvailable(a: std.mem.Allocator, io: Io, argv: []const []const u8) bool {
     if (std.process.run(a, io, .{ .argv = argv })) |r| {
+        a.free(r.stdout);
+        a.free(r.stderr);
         return r.term == .exited;
     } else |_| return false;
 }

@@ -502,6 +502,54 @@ pub fn setVideoDownloadEnabled(pool: *PgPool, chat_id: i64, value: bool) !void {
     _ = try stmt.step();
 }
 
+/// Whether video auto-download delivers a compressed native video (lossy,
+/// the default) or the original-quality file capped at 50MB (lossless, an
+/// opt-in) -- see `video_download.Quality` and `0042_video_download_lossy.sql`.
+/// Unlike `getVideoDownloadEnabled`, the no-row fallback here is `true`,
+/// not `false` -- this setting only matters once a chat has already opted
+/// into `video_download_enabled` itself, and among chats that have, lossy
+/// is the better default, matching the column's own `DEFAULT TRUE`.
+pub fn getVideoDownloadLossy(pool: *PgPool, chat_id: i64) bool {
+    const db = pool.acquire() catch return true;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT video_download_lossy FROM chat_settings WHERE chat_id = $1;") catch return true;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return true;
+    if (!has_row) return true;
+    return stmt.columnBool(0);
+}
+
+pub fn setVideoDownloadLossy(pool: *PgPool, chat_id: i64, value: bool) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, video_download_lossy) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET video_download_lossy = excluded.video_download_lossy;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindBool(2, value);
+    _ = try stmt.step();
+}
+
+test "video_download_lossy defaults to true and toggles both ways" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
+
+    try testing.expect(getVideoDownloadLossy(&pool, chat_id));
+    try setVideoDownloadLossy(&pool, chat_id, false);
+    try testing.expect(!getVideoDownloadLossy(&pool, chat_id));
+    try setVideoDownloadLossy(&pool, chat_id, true);
+    try testing.expect(getVideoDownloadLossy(&pool, chat_id));
+}
+
 test "video_download_enabled is off until a chat opts in, and toggles back off" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();

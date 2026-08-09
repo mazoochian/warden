@@ -491,6 +491,70 @@ pub const Client = struct {
         }
     }
 
+    /// Sends a native, inline-playable video message (`video_download.zig`'s
+    /// lossy delivery path) -- same multipart shape as `sendDocumentErr`,
+    /// just the `video` field/endpoint instead of `document`. Fire-and-
+    /// forget like `sendMessage`/`sendPhoto`/`sendDocument`.
+    ///
+    /// `Content-Type` is hardcoded to `video/mp4` rather than derived from
+    /// `file_name` -- same precedent `sendPhotoErr` already sets by
+    /// hardcoding `image/png` regardless of the actual bytes, and safe here
+    /// because the only producer (`video_download.zig`) always emits
+    /// `.mp4`. Telegram's real `sendVideo` also accepts optional
+    /// `duration`/`width`/`height`/`thumbnail` fields -- deliberately
+    /// omitted (Telegram infers them from the file itself); a possible
+    /// future enhancement if that inference proves poor, not required now.
+    pub fn sendVideo(self: *Client, allocator: std.mem.Allocator, chat_id: i64, video_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void {
+        self.sendVideoErr(allocator, chat_id, video_bytes, file_name, caption) catch |err| {
+            std.log.err("sendVideo failed: {t}", .{err});
+        };
+    }
+
+    fn sendVideoErr(self: *Client, allocator: std.mem.Allocator, chat_id: i64, video_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) !void {
+        const boundary = "----WardenBoundary7f3a9c2e";
+
+        var body_writer: Io.Writer.Allocating = .init(allocator);
+        defer body_writer.deinit();
+        const w = &body_writer.writer;
+
+        try w.print("--{s}\r\n", .{boundary});
+        try w.print("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{chat_id});
+
+        if (caption) |c| {
+            try w.print("--{s}\r\n", .{boundary});
+            try w.print("Content-Disposition: form-data; name=\"caption\"\r\n\r\n{s}\r\n", .{c});
+        }
+
+        try w.print("--{s}\r\n", .{boundary});
+        try w.print("Content-Disposition: form-data; name=\"video\"; filename=\"{s}\"\r\nContent-Type: video/mp4\r\n\r\n", .{file_name});
+        try w.writeAll(video_bytes);
+        try w.writeAll("\r\n");
+        try w.print("--{s}--\r\n", .{boundary});
+        const body = w.buffered();
+
+        const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendVideo", .{self.bot_token});
+        defer allocator.free(url);
+
+        const content_type = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{boundary});
+        defer allocator.free(content_type);
+
+        const resp_body = try http_util.postRaw(&self.http_client, allocator, url, content_type, &.{}, body);
+        defer allocator.free(resp_body);
+
+        var parsed = try json.parseFromSlice(
+            MethodResponse,
+            allocator,
+            resp_body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+        defer parsed.deinit();
+
+        if (!parsed.value.ok) {
+            std.log.err("telegram sendVideo failed: {?s}", .{parsed.value.description});
+            return error.TelegramApiError;
+        }
+    }
+
     /// Resolves a `file_id` (from an inbound photo/document/voice/audio/
     /// video) to downloadable bytes — Telegram's two-step process: look up
     /// the file's `file_path` via `getFile`, then GET it from the separate
