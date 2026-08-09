@@ -650,6 +650,58 @@ pub const Client = struct {
         defer allocator.free(body);
     }
 
+    /// PUTs a single-field room state event (`m.room.name`/`m.room.topic`/
+    /// `m.room.avatar`) — unlike `m.room.power_levels`, each of these has
+    /// exactly one meaningful key, so a plain PUT of `{field: value}`
+    /// replaces the whole content correctly with no read-modify-write
+    /// needed first.
+    fn putSingleFieldState(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_type: []const u8, field: []const u8, value: []const u8) !void {
+        const encoded_room = try encodeSegment(allocator, room_id);
+        defer allocator.free(encoded_room);
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/state/{s}", .{ self.homeserver_url, encoded_room, event_type });
+        defer allocator.free(url);
+
+        var payload_writer: Io.Writer.Allocating = .init(allocator);
+        defer payload_writer.deinit();
+        try payload_writer.writer.print("{{\"{s}\":", .{field});
+        try json.Stringify.value(value, .{}, &payload_writer.writer);
+        try payload_writer.writer.writeAll("}");
+        const payload = payload_writer.writer.buffered();
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        const body = try http_util.putJson(&self.http_client, allocator, url, &.{auth}, payload);
+        defer allocator.free(body);
+    }
+
+    /// `/title` (ROADMAP.md's Phase 22) — `m.room.name`.
+    pub fn setRoomName(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, name: []const u8) !void {
+        return self.putSingleFieldState(allocator, room_id, "m.room.name", "name", name);
+    }
+
+    /// `/description` — `m.room.topic`. An empty `topic` clears it (Matrix
+    /// has no separate "unset" — an empty string is the convention).
+    pub fn setRoomTopic(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, topic: []const u8) !void {
+        return self.putSingleFieldState(allocator, room_id, "m.room.topic", "topic", topic);
+    }
+
+    /// `/photo` — uploads the image, then points `m.room.avatar` at the
+    /// resulting `mxc://` uri, same upload-then-reference shape
+    /// `sendMedia` already uses for messages.
+    pub fn setRoomAvatar(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, image_bytes: []const u8, content_type: []const u8) !void {
+        const uri = try self.uploadMedia(allocator, image_bytes, content_type, "avatar");
+        defer allocator.free(uri);
+        return self.putSingleFieldState(allocator, room_id, "m.room.avatar", "url", uri);
+    }
+
+    /// `/photo remove` — clears `m.room.avatar`'s `url` rather than
+    /// removing the state event (Matrix has no delete-state-event
+    /// operation Bot-API-style; an empty `url` is how clients render "no
+    /// avatar").
+    pub fn removeRoomAvatar(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) !void {
+        return self.putSingleFieldState(allocator, room_id, "m.room.avatar", "url", "");
+    }
+
     /// Adds `event_id` to the room's pinned list if it isn't already there
     /// — Matrix supports pinning several messages at once, unlike
     /// Telegram's single pinned message, but appending (not replacing) is

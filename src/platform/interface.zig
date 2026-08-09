@@ -429,6 +429,17 @@ pub const Connector = struct {
         /// An empty `title` clears it. Optional: no equivalent primitive on
         /// Matrix/XMPP, reports `error.Unsupported`.
         setChatAdminTitle: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, title: []const u8) anyerror!void = null,
+        /// `/title` (ROADMAP.md's Phase 22). Optional: no equivalent on
+        /// XMPP.
+        setChatTitle: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, title: []const u8) anyerror!void = null,
+        /// `/description`. Optional: no equivalent on XMPP. An empty
+        /// `description` clears it.
+        setChatDescription: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, description: []const u8) anyerror!void = null,
+        /// `/photo` (reply to or send with an image). Optional: no
+        /// equivalent on XMPP.
+        setChatPhoto: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, photo_bytes: []const u8) anyerror!void = null,
+        /// `/photo remove`. Optional: no equivalent on XMPP.
+        deleteChatPhoto: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8) anyerror!void = null,
         pinMessage: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void = null,
         /// `message_id` null unpins whatever's currently pinned.
         unpinMessage: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: ?[]const u8) anyerror!void = null,
@@ -592,6 +603,26 @@ pub const Connector = struct {
     pub fn setChatAdminTitle(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, title: []const u8) !void {
         const f = self.vtable.setChatAdminTitle orelse return error.Unsupported;
         return f(self.ptr, allocator, chat_id, user_id, title);
+    }
+
+    pub fn setChatTitle(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, title: []const u8) !void {
+        const f = self.vtable.setChatTitle orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id, title);
+    }
+
+    pub fn setChatDescription(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, description: []const u8) !void {
+        const f = self.vtable.setChatDescription orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id, description);
+    }
+
+    pub fn setChatPhoto(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, photo_bytes: []const u8) !void {
+        const f = self.vtable.setChatPhoto orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id, photo_bytes);
+    }
+
+    pub fn deleteChatPhoto(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8) !void {
+        const f = self.vtable.deleteChatPhoto orelse return error.Unsupported;
+        return f(self.ptr, allocator, chat_id);
     }
 
     pub fn pinMessage(self: Connector, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) !void {

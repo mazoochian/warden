@@ -1862,6 +1862,109 @@ idea and folds the old standalone `/notice` into `/announce`.
   exercised this pass; covered by the extended `/as` allow-list unit tests
   and `asCommandName`/`isRelayableUnderAs` coverage.
 
+### Phase 22 — Group photo, title, and description management
+*Effort: S/M. Dependencies: Phase 20/21 (for audit logging and relay
+support). Status: done.*
+
+Four new optional `Connector.VTable` slots (`setChatTitle`,
+`setChatDescription`, `setChatPhoto`, `deleteChatPhoto`), following the
+file's existing optional-slot convention:
+
+- **Telegram**: plain `callMethod` POSTs for `setChatTitle`/
+  `setChatDescription`/`deleteChatPhoto`; `setChatPhoto` reuses
+  `sendPhotoErr`'s exact multipart-body shape (`telegram/client.zig`).
+- **Matrix**: `setChatTitle`/`setChatDescription` PUT `m.room.name`/
+  `m.room.topic` directly (single-field state events, unlike
+  `m.room.power_levels`'s read-modify-write dance, since only one key
+  matters); `setChatPhoto` uploads via the existing `uploadMedia` then
+  points `m.room.avatar`'s `url` at the resulting `mxc://` uri;
+  `deleteChatPhoto` clears that `url` to empty (Matrix has no
+  delete-state-event operation Bot-API-style).
+- **XMPP**: left unimplemented, consistent with every other
+  moderation/media gap already documented for that connector.
+- `platform/reply_redirect.zig` gained pass-through wiring for all four
+  (action-against-the-target-chat, not a redirected send) — the same
+  omission on Phase 24's new `restrictChatMemberPermissions`/
+  `setChatAdminTitle` slots was noted but left alone since neither of
+  those commands is `/as`-relayable yet; this phase's three *are*, so
+  the gap had to be closed here.
+
+Commands: `/photo` (send an image with this as its caption; `/photo
+remove` clears it — reply-to-an-existing-image is **not** supported,
+since `iface.Message`'s reply fields carry the replied-to user/text, never
+a replied-to *attachment*, and there's no plumbing today to fetch one — a
+real, documented gap rather than solved this phase), `/title <text>`,
+`/description <text>` (empty clears it). All three are admin-tier
+(`auth.checkGroupAdminAccess`, no token fallback), added to
+`as_relayable_commands` and `public_commands`, and — unlike moderation
+commands — also runnable directly in the group itself by its own live
+admins, since there's no "keep it out of the group" reason to restrict
+them to a bound room/`/as` the way kick/ban are.
+
+Each wraps its action with `audit_notify.recordAndNotify`, but **none are
+undoable**: Telegram has no `getChat`-style read wired up in this codebase
+to capture a "before" title/description, and there's no way to read a
+chat's current photo back at all — logged as a plain change (new value
+only), same honest simplification the plan itself anticipated for photo
+and extended here to title/description rather than adding a new `getChat`
+call just to enable undo.
+
+- `zig build` and `zig build test` both green.
+- **Not live-verified** — no real Telegram/Matrix group exercised this
+  pass; covered by the extended `/as` allow-list unit tests.
+
+### Phase 23 — Silent (`-s`) and phantom (`-p`) flags
+*Effort: S/M. Dependencies: Phase 20 (audit logging), Phase 22 (photo/
+title/description). Status: done (partial scope — see below).*
+
+New `group_admin.Visibility` (`.normal`/`.silent`/`.phantom`) and
+`group_admin.parseVisibility(a, arg, is_superuser)`, which strips a
+`-s`/`-p` token from anywhere among an argument's whitespace-separated
+tokens (either side of the target, per the original ask) and returns the
+remaining tokens rejoined plus the resulting `Visibility`. `-p` from a
+non-superuser is silently downgraded to `-s` rather than refused outright
+— a misfired flag on an otherwise-valid action shouldn't hard-fail it.
+`group_admin.AuditContext` gained a `visibility` field (default `.normal`,
+so every existing call site compiled unchanged); `.silent` skips the
+in-group confirmation reply but still posts the full bound-room audit
+entry; `.phantom` skips both, gated to `is_bot_admin` at every call site
+(no separate "is this actually a superuser" check needed — the same
+`is_bot_admin`/`is_owner` values `handleMessage` already computes cover
+it).
+
+New `chat_settings.getSilentByDefault`/`setSilentByDefault`
+(`0041_silent_by_default.sql`) + `/silent on|off` lets a chat's admins
+make `-s` the default without typing it every time — a chat default only
+ever upgrades `.normal` to `.silent`, never overrides an explicit
+`-s`/`-p` typed on the command itself (`main.zig`'s `resolveVisibility`
+combines the two).
+
+**Wired into**: `/mute`, `/unmute`, `/promote`, `/demote` (all four
+widened from an exact-match dispatch to a prefix match, since none
+previously accepted any trailing text at all — needed room for the flag),
+`/kick`/`/ban` (which, discovered while wiring this up, had **no
+in-group confirmation message at all** before this phase — see the Phase
+8 backlog note on `/confirm`/`/cancel` being dead code for them; adding
+one gated on `.normal` is what makes `-s` mean anything for these two,
+not just accepted-and-ignored), and Phase 22's `/photo`/`/title`/
+`/description`.
+
+**Deliberately narrower than the original ask**: `/redact` is **not**
+wired this phase. Its four modes (regex/text/reply-scoped-last-N/
+plain-last-N) live in `features/redact.zig`, each with its own
+independent final reply, and none of them were ever wired to
+`audit_notify` in Phase 20 either (see that phase's own note on why —
+lower-stakes, no message content worth logging without more work). Adding
+`-s`/`-p` there cleanly needs its own pass through that file rather than
+being folded into this one; tracked here, not silently dropped.
+
+- New unit test (`parseVisibility: -s and -p in either position, and -p
+  downgrades without superuser`) covering both flag positions, the
+  no-flag case, and the superuser-gate downgrade.
+- `zig build` and `zig build test` both green.
+- **Not live-verified** — no real Telegram/Matrix group exercised this
+  pass.
+
 ### Phase 24 — Member ACL: rate limiting, permission model, tags
 *Effort: M. Status: done (2026-08-09).*
 

@@ -128,6 +128,10 @@ pub const ReplyRedirect = struct {
                 .banUser = if (in.banUser != null) banUserFn else null,
                 .promoteUser = if (in.promoteUser != null) promoteUserFn else null,
                 .demoteUser = if (in.demoteUser != null) demoteUserFn else null,
+                .setChatTitle = if (in.setChatTitle != null) setChatTitleFn else null,
+                .setChatDescription = if (in.setChatDescription != null) setChatDescriptionFn else null,
+                .setChatPhoto = if (in.setChatPhoto != null) setChatPhotoFn else null,
+                .deleteChatPhoto = if (in.deleteChatPhoto != null) deleteChatPhotoFn else null,
                 .pinMessage = if (in.pinMessage != null) pinMessageFn else null,
                 .unpinMessage = if (in.unpinMessage != null) unpinMessageFn else null,
                 .deleteMessage = if (in.deleteMessage != null) deleteMessageFn else null,
@@ -245,6 +249,22 @@ pub const ReplyRedirect = struct {
 
     fn demoteUserFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!void {
         return self_(ptr).inner.demoteUser(allocator, chat_id, user_id);
+    }
+
+    fn setChatTitleFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, title: []const u8) anyerror!void {
+        return self_(ptr).inner.setChatTitle(allocator, chat_id, title);
+    }
+
+    fn setChatDescriptionFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, description: []const u8) anyerror!void {
+        return self_(ptr).inner.setChatDescription(allocator, chat_id, description);
+    }
+
+    fn setChatPhotoFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, photo_bytes: []const u8) anyerror!void {
+        return self_(ptr).inner.setChatPhoto(allocator, chat_id, photo_bytes);
+    }
+
+    fn deleteChatPhotoFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8) anyerror!void {
+        return self_(ptr).inner.deleteChatPhoto(allocator, chat_id);
     }
 
     fn pinMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void {

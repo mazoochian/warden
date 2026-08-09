@@ -312,6 +312,10 @@ pub const TelegramConnector = struct {
         .demoteUser = demoteUserFn,
         .restrictChatMemberPermissions = restrictChatMemberPermissionsFn,
         .setChatAdminTitle = setChatAdminTitleFn,
+        .setChatTitle = setChatTitleFn,
+        .setChatDescription = setChatDescriptionFn,
+        .setChatPhoto = setChatPhotoFn,
+        .deleteChatPhoto = deleteChatPhotoFn,
         .pinMessage = pinMessageFn,
         .unpinMessage = unpinMessageFn,
         .deleteMessage = deleteMessageFn,
@@ -644,6 +648,26 @@ pub const TelegramConnector = struct {
     fn setChatAdminTitleFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, title: []const u8) anyerror!void {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         return self.client.setChatAdministratorCustomTitle(allocator, try parseId(chat_id), try parseId(user_id), title);
+    }
+
+    fn setChatTitleFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, title: []const u8) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.client.setChatTitle(allocator, try parseId(chat_id), title);
+    }
+
+    fn setChatDescriptionFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, description: []const u8) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.client.setChatDescription(allocator, try parseId(chat_id), description);
+    }
+
+    fn setChatPhotoFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, photo_bytes: []const u8) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.client.setChatPhoto(allocator, try parseId(chat_id), photo_bytes);
+    }
+
+    fn deleteChatPhotoFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8) anyerror!void {
+        const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
+        return self.client.deleteChatPhoto(allocator, try parseId(chat_id));
     }
 
     fn pinMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void {

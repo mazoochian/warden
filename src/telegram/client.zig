@@ -641,6 +641,67 @@ pub const Client = struct {
         });
     }
 
+    /// `/title` (ROADMAP.md's Phase 22) — Bot API `setChatTitle`, 1-128
+    /// characters, not validated here (Telegram rejects an invalid one via
+    /// the same `TelegramApiError` path `callMethod` already gives every
+    /// other method).
+    pub fn setChatTitle(self: *Client, allocator: std.mem.Allocator, chat_id: i64, title: []const u8) !void {
+        return self.callMethod(allocator, "setChatTitle", .{ .chat_id = chat_id, .title = title });
+    }
+
+    /// `/description` — Bot API `setChatDescription`. An empty string
+    /// clears it (Telegram treats a missing/empty `description` field as
+    /// "remove the description").
+    pub fn setChatDescription(self: *Client, allocator: std.mem.Allocator, chat_id: i64, description: []const u8) !void {
+        return self.callMethod(allocator, "setChatDescription", .{ .chat_id = chat_id, .description = description });
+    }
+
+    /// `/photo remove` — Bot API `deleteChatPhoto`.
+    pub fn deleteChatPhoto(self: *Client, allocator: std.mem.Allocator, chat_id: i64) !void {
+        return self.callMethod(allocator, "deleteChatPhoto", .{ .chat_id = chat_id });
+    }
+
+    /// `/photo` — same multipart shape as `sendPhotoErr` (the "photo" field
+    /// name and PNG content-type are Telegram convention, not a real format
+    /// requirement; Telegram re-encodes whatever image format is posted).
+    pub fn setChatPhoto(self: *Client, allocator: std.mem.Allocator, chat_id: i64, photo_bytes: []const u8) !void {
+        const boundary = "----WardenBoundary7f3a9c2e";
+
+        var body_writer: Io.Writer.Allocating = .init(allocator);
+        defer body_writer.deinit();
+        const w = &body_writer.writer;
+
+        try w.print("--{s}\r\n", .{boundary});
+        try w.print("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n{d}\r\n", .{chat_id});
+        try w.print("--{s}\r\n", .{boundary});
+        try w.writeAll("Content-Disposition: form-data; name=\"photo\"; filename=\"image.png\"\r\nContent-Type: image/png\r\n\r\n");
+        try w.writeAll(photo_bytes);
+        try w.writeAll("\r\n");
+        try w.print("--{s}--\r\n", .{boundary});
+        const body = w.buffered();
+
+        const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/setChatPhoto", .{self.bot_token});
+        defer allocator.free(url);
+        const content_type = try std.fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{boundary});
+        defer allocator.free(content_type);
+
+        const resp_body = try http_util.postRaw(&self.http_client, allocator, url, content_type, &.{}, body);
+        defer allocator.free(resp_body);
+
+        var parsed = try json.parseFromSlice(
+            MethodResponse,
+            allocator,
+            resp_body,
+            .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
+        );
+        defer parsed.deinit();
+
+        if (!parsed.value.ok) {
+            std.log.err("telegram setChatPhoto failed: {?s}", .{parsed.value.description});
+            return error.TelegramApiError;
+        }
+    }
+
     /// A moderate permission set — deliberately omits `can_promote_members`
     /// so a bot-promoted admin can't themselves mint further admins
     /// through the bot (`/promote` is owner-gated; a promoted admin

@@ -183,6 +183,10 @@ pub const MatrixConnector = struct {
         .promoteUser = promoteUserFn,
         .demoteUser = demoteUserFn,
         .restrictChatMemberPermissions = restrictChatMemberPermissionsFn,
+        .setChatTitle = setChatTitleFn,
+        .setChatDescription = setChatDescriptionFn,
+        .setChatPhoto = setChatPhotoFn,
+        .deleteChatPhoto = deleteChatPhotoFn,
         .pinMessage = pinMessageFn,
         .unpinMessage = unpinMessageFn,
         .deleteMessage = deleteMessageFn,
@@ -729,6 +733,26 @@ pub const MatrixConnector = struct {
             return self.client.unmuteUser(allocator, chat_id, user_id);
         }
         return self.client.muteUser(allocator, chat_id, user_id);
+    }
+
+    fn setChatTitleFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, title: []const u8) anyerror!void {
+        const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
+        return self.client.setRoomName(allocator, chat_id, title);
+    }
+
+    fn setChatDescriptionFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, description: []const u8) anyerror!void {
+        const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
+        return self.client.setRoomTopic(allocator, chat_id, description);
+    }
+
+    fn setChatPhotoFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, photo_bytes: []const u8) anyerror!void {
+        const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
+        return self.client.setRoomAvatar(allocator, chat_id, photo_bytes, "image/png");
+    }
+
+    fn deleteChatPhotoFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8) anyerror!void {
+        const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
+        return self.client.removeRoomAvatar(allocator, chat_id);
     }
 
     fn pinMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, message_id: []const u8) anyerror!void {

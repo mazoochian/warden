@@ -53,6 +53,16 @@ pub const AuditAction = union(enum) {
     ban: struct { target_user_id: []const u8, target_label: []const u8 },
     token_grant: struct { target_identity_id: i64, target_label: []const u8, prev_balance: i64, new_balance: i64 },
     credit_grant: struct { target_identity_id: i64, target_label: []const u8, prev_balance: i64, new_balance: i64 },
+    /// Phase 22 — none of these three act on a *member*, so there's no
+    /// `target_user_id`; `new_*`/`removed` doubles as the audit-log
+    /// "target" text. No "before" value captured (Telegram has no
+    /// `getChat`-style read wired up yet, and there's no way to read a
+    /// chat's current photo back at all) — logged as a plain change, same
+    /// documented simplification as everything else in this module that
+    /// isn't undoable.
+    title_change: struct { new_title: []const u8 },
+    description_change: struct { new_description: []const u8 },
+    photo_change: struct { removed: bool },
 
     fn actionName(self: AuditAction) []const u8 {
         return switch (self) {
@@ -64,6 +74,9 @@ pub const AuditAction = union(enum) {
             .ban => "chat.action.ban",
             .token_grant => "chat.action.token",
             .credit_grant => "chat.action.credit",
+            .title_change => "chat.action.title",
+            .description_change => "chat.action.description",
+            .photo_change => "chat.action.photo",
         };
     }
 
@@ -77,6 +90,9 @@ pub const AuditAction = union(enum) {
             .ban => "Banned",
             .token_grant => "Tokens changed",
             .credit_grant => "Credits changed",
+            .title_change => "Title changed",
+            .description_change => "Description changed",
+            .photo_change => |p| if (p.removed) "Photo removed" else "Photo changed",
         };
     }
 
@@ -90,6 +106,9 @@ pub const AuditAction = union(enum) {
             .ban => |x| x.target_label,
             .token_grant => |x| x.target_label,
             .credit_grant => |x| x.target_label,
+            .title_change => |x| x.new_title,
+            .description_change => |x| x.new_description,
+            .photo_change => |x| if (x.removed) "removed" else "changed",
         };
     }
 
@@ -98,7 +117,7 @@ pub const AuditAction = union(enum) {
             .mute, .token_grant, .credit_grant => true,
             .promote => |p| !p.was_admin_before,
             .demote => |d| d.was_admin_before,
-            .unmute, .kick, .ban => false,
+            .unmute, .kick, .ban, .title_change, .description_change, .photo_change => false,
         };
     }
 };
@@ -113,6 +132,9 @@ fn dupeAction(a: std.mem.Allocator, action: AuditAction) !AuditAction {
         .ban => |m| .{ .ban = .{ .target_user_id = try a.dupe(u8, m.target_user_id), .target_label = try a.dupe(u8, m.target_label) } },
         .token_grant => |m| .{ .token_grant = .{ .target_identity_id = m.target_identity_id, .target_label = try a.dupe(u8, m.target_label), .prev_balance = m.prev_balance, .new_balance = m.new_balance } },
         .credit_grant => |m| .{ .credit_grant = .{ .target_identity_id = m.target_identity_id, .target_label = try a.dupe(u8, m.target_label), .prev_balance = m.prev_balance, .new_balance = m.new_balance } },
+        .title_change => |m| .{ .title_change = .{ .new_title = try a.dupe(u8, m.new_title) } },
+        .description_change => |m| .{ .description_change = .{ .new_description = try a.dupe(u8, m.new_description) } },
+        .photo_change => |m| .{ .photo_change = .{ .removed = m.removed } },
     };
 }
 
@@ -144,6 +166,9 @@ fn freeAction(a: std.mem.Allocator, action: AuditAction) void {
         },
         .token_grant => |m| a.free(m.target_label),
         .credit_grant => |m| a.free(m.target_label),
+        .title_change => |m| a.free(m.new_title),
+        .description_change => |m| a.free(m.new_description),
+        .photo_change => {},
     }
 }
 
@@ -163,6 +188,9 @@ fn formatLogText(a: std.mem.Allocator, actor_label: []const u8, action: AuditAct
         .ban => |m| buf.writer.print("Target: {s}", .{m.target_label}) catch {},
         .token_grant => |m| buf.writer.print("Target: {s}\nTokens: {d} \xe2\x86\x92 {d}", .{ m.target_label, m.prev_balance, m.new_balance }) catch {},
         .credit_grant => |m| buf.writer.print("Target: {s}\nCredits: {d} \xe2\x86\x92 {d}", .{ m.target_label, m.prev_balance, m.new_balance }) catch {},
+        .title_change => |m| buf.writer.print("New title: {s}", .{m.new_title}) catch {},
+        .description_change => |m| buf.writer.print("New description: {s}", .{m.new_description}) catch {},
+        .photo_change => {},
     }
     return buf.writer.buffered();
 }
@@ -341,7 +369,7 @@ fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool
         },
         .token_grant => |t| try chat_members.setTokens(pool, entry.target_chat_id, t.target_identity_id, t.prev_balance),
         .credit_grant => |c| try identities.setCredits(pool, c.target_identity_id, c.prev_balance),
-        .unmute, .kick, .ban => return error.NotUndoable,
+        .unmute, .kick, .ban, .title_change, .description_change, .photo_change => return error.NotUndoable,
     }
 }
 

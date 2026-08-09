@@ -22,7 +22,56 @@ pub const AuditContext = struct {
     /// orelse msg.user_id` at the call site is enough; a resolved display
     /// name isn't worth an extra query here.
     actor_label: []const u8,
+    /// Phase 23's `-s`/`-p` flags (or a chat's own `/silent on` default) —
+    /// `.normal` logs and confirms exactly as before; `.silent` still logs
+    /// to the bound room but skips the in-group confirmation reply;
+    /// `.phantom` skips both. See `parseVisibility`'s doc comment for how
+    /// this is derived.
+    visibility: Visibility = .normal,
 };
+
+pub const Visibility = enum { normal, silent, phantom };
+
+/// Parses a leading/trailing `-s`/`-p` token out of `arg`'s
+/// whitespace-separated tokens (either position — "before or after the
+/// target" per the original ask), returning the remaining tokens rejoined
+/// with single spaces and the resulting `Visibility`.
+///
+/// `-p` is silently downgraded to `-s` unless `is_superuser` — a non-
+/// superuser's misfired `-p` shouldn't block an otherwise-valid action
+/// with a hard error, matching this project's existing "explain and
+/// continue" tone for a tier mismatch (see `/redact regex`'s owner/sudo
+/// gate, which denies the *regex* mode outright rather than half-running
+/// it — the difference here is `-p` is a modifier on an action that's
+/// still valid without it, so downgrading is the more useful failure
+/// mode). Callers wanting to surface that downgrade to the user can
+/// compare the returned `Visibility` against what a bare `-p` would have
+/// asked for.
+///
+/// A chat's own `/silent on` default (`chat_settings.getSilentByDefault`)
+/// is deliberately NOT applied here — callers combine it with the parsed
+/// result themselves (`.normal` from parsing, chat default silent =>
+/// `.silent`), since only the caller knows whether this command is one
+/// the per-chat default should apply to.
+pub fn parseVisibility(a: std.mem.Allocator, arg: []const u8, is_superuser: bool) struct { visibility: Visibility, rest: []const u8 } {
+    var it = std.mem.tokenizeScalar(u8, arg, ' ');
+    var visibility: Visibility = .normal;
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(a);
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "-s")) {
+            if (visibility == .normal) visibility = .silent;
+            continue;
+        }
+        if (std.mem.eql(u8, tok, "-p")) {
+            visibility = if (is_superuser) .phantom else .silent;
+            continue;
+        }
+        out.append(a, tok) catch {};
+    }
+    const rest = std.mem.join(a, " ", out.items) catch arg;
+    return .{ .visibility = visibility, .rest = rest };
+}
 
 const PendingAction = struct {
     kind: ActionKind,
@@ -142,8 +191,10 @@ pub fn mute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message
         reportFailure(connector, a, msg.chat_id, msg.message_id, "mute", err);
         return;
     };
-    audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .mute = .{ .target_user_id = target.user_id, .target_label = target.label, .until_unix_time = until } });
-    reply(connector, a, msg.chat_id, msg.message_id, "Muted {s} for 1 hour.", .{target.label});
+    if (audit.visibility != .phantom) {
+        audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .mute = .{ .target_user_id = target.user_id, .target_label = target.label, .until_unix_time = until } });
+    }
+    if (audit.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Muted {s} for 1 hour.", .{target.label});
 }
 
 pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, now: i64, audit: AuditContext) void {
@@ -157,8 +208,10 @@ pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Messa
     };
     // Not undoable (see `audit_notify.AuditAction.undoable`'s doc comment)
     // -- logged for the record regardless.
-    audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .unmute = .{ .target_user_id = target.user_id, .target_label = target.label } });
-    reply(connector, a, msg.chat_id, msg.message_id, "Unmuted {s}.", .{target.label});
+    if (audit.visibility != .phantom) {
+        audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .unmute = .{ .target_user_id = target.user_id, .target_label = target.label } });
+    }
+    if (audit.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Unmuted {s}.", .{target.label});
 }
 
 /// Grants real platform admin/moderator standing — unlike every other
@@ -182,8 +235,10 @@ pub fn promote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Mess
         reportFailure(connector, a, msg.chat_id, msg.message_id, "promote", err);
         return;
     };
-    audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .promote = .{ .target_user_id = target.user_id, .target_label = target.label, .was_admin_before = was_admin_before } });
-    reply(connector, a, msg.chat_id, msg.message_id, "Promoted {s} to admin.", .{target.label});
+    if (audit.visibility != .phantom) {
+        audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .promote = .{ .target_user_id = target.user_id, .target_label = target.label, .was_admin_before = was_admin_before } });
+    }
+    if (audit.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Promoted {s} to admin.", .{target.label});
 }
 
 pub fn demote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, now: i64, audit: AuditContext) void {
@@ -196,8 +251,10 @@ pub fn demote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Messa
         reportFailure(connector, a, msg.chat_id, msg.message_id, "demote", err);
         return;
     };
-    audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .demote = .{ .target_user_id = target.user_id, .target_label = target.label, .was_admin_before = was_admin_before } });
-    reply(connector, a, msg.chat_id, msg.message_id, "Demoted {s}.", .{target.label});
+    if (audit.visibility != .phantom) {
+        audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .demote = .{ .target_user_id = target.user_id, .target_label = target.label, .was_admin_before = was_admin_before } });
+    }
+    if (audit.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Demoted {s}.", .{target.label});
 }
 
 pub fn pin(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
@@ -260,14 +317,23 @@ pub fn requestConfirmation(
             reportFailure(connector, a, msg.chat_id, msg.message_id, "kick", err);
             return;
         };
-        audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .kick = .{ .target_user_id = target_user_id, .target_label = target_label } });
+        if (audit.visibility != .phantom) {
+            audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .kick = .{ .target_user_id = target_user_id, .target_label = target_label } });
+        }
     } else if (kind == .ban) {
         connector.banUser(a, msg.chat_id, target_user_id) catch |err| {
             reportFailure(connector, a, msg.chat_id, msg.message_id, "ban", err);
             return;
         };
-        audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .ban = .{ .target_user_id = target_user_id, .target_label = target_label } });
+        if (audit.visibility != .phantom) {
+            audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .ban = .{ .target_user_id = target_user_id, .target_label = target_label } });
+        }
     }
+    // No in-group confirmation existed here before Phase 23 (see
+    // ROADMAP.md's Phase 8 backlog note on `/confirm`/`/cancel` being dead
+    // code for kick/ban) -- adding one, gated on `.normal`, is what makes
+    // `-s` mean something for these two, not just a no-op flag.
+    if (audit.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "{s} {s}.", .{ actionVerbPast(kind), target_label });
 }
 
 pub fn confirm(connector: iface.Connector, a: std.mem.Allocator, pending: *PendingConfirmations, now: i64, msg: iface.Message) void {
@@ -322,6 +388,51 @@ fn reply(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, 
 }
 
 const testing = std.testing;
+
+test "parseVisibility: -s and -p in either position, and -p downgrades without superuser" {
+    const a = testing.allocator;
+
+    {
+        const r = parseVisibility(a, "-s @spammer", false);
+        defer a.free(r.rest);
+        try testing.expectEqual(Visibility.silent, r.visibility);
+        try testing.expectEqualStrings("@spammer", r.rest);
+    }
+    {
+        // Flag after the target works the same.
+        const r = parseVisibility(a, "@spammer -s", false);
+        defer a.free(r.rest);
+        try testing.expectEqual(Visibility.silent, r.visibility);
+        try testing.expectEqualStrings("@spammer", r.rest);
+    }
+    {
+        const r = parseVisibility(a, "-p @spammer", true);
+        defer a.free(r.rest);
+        try testing.expectEqual(Visibility.phantom, r.visibility);
+        try testing.expectEqualStrings("@spammer", r.rest);
+    }
+    {
+        // Non-superuser -p is silently downgraded to silent, not refused.
+        const r = parseVisibility(a, "-p @spammer", false);
+        defer a.free(r.rest);
+        try testing.expectEqual(Visibility.silent, r.visibility);
+        try testing.expectEqualStrings("@spammer", r.rest);
+    }
+    {
+        // No flag at all.
+        const r = parseVisibility(a, "@spammer", true);
+        defer a.free(r.rest);
+        try testing.expectEqual(Visibility.normal, r.visibility);
+        try testing.expectEqualStrings("@spammer", r.rest);
+    }
+    {
+        // No target, just a flag.
+        const r = parseVisibility(a, "-s", false);
+        defer a.free(r.rest);
+        try testing.expectEqual(Visibility.silent, r.visibility);
+        try testing.expectEqualStrings("", r.rest);
+    }
+}
 
 test "PendingConfirmations set/take round trip and expiry" {
     var pending = PendingConfirmations.init(testing.allocator, testing.io, 60);

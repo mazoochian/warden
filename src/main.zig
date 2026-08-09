@@ -151,9 +151,13 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "location", .description = "<place> | off -- set this chat's default location, used for briefing weather." },
     .{ .name = "persona", .description = "<text> -- set a custom personality for this chat (or off to reset)." },
     .{ .name = "welcome", .description = "<text> -- greet new members ({name} = their name), or off to disable." },
+    .{ .name = "photo", .description = "send an image with this as its caption to set the chat photo, or 'remove' to clear it. Admins only." },
+    .{ .name = "title", .description = "<text> -- rename this chat. Admins only." },
+    .{ .name = "description", .description = "<text> -- set this chat's description (empty to clear). Admins only." },
     .{ .name = "summary", .description = "[hours] -- summarize the last N hours of this chat (default 24)." },
     .{ .name = "announce", .description = "<text> -- broadcast now, pinned. Or: at <time> <text> | every <interval> <text> | list | cancel <id>. Admins only." },
     .{ .name = "autopin", .description = "on | off -- pin each scheduled announcement as it's posted. Admins only." },
+    .{ .name = "silent", .description = "on | off -- default moderation/settings commands to -s (no in-group confirmation). Admins only." },
     .{ .name = "videodownload", .description = "on | off -- auto-download YouTube/Instagram/X video links posted here. Off by default, admins only." },
     .{ .name = "expense", .description = "add <amt> <category> [desc] | list | summary | delete <id> -- expense tracker." },
     .{ .name = "budget", .description = "set <category> <amt> | list | remove <category> -- monthly budgets. Owner to set." },
@@ -302,6 +306,13 @@ const help_text_admin =
     \\  (only those -- I never pin anyone else's messages on my own)
     \\/videodownload on|off -- auto-download YouTube/Instagram/X video
     \\  links posted here, under 50MB, best-effort. Off by default
+    \\/photo -- send an image with this as its caption to set the chat
+    \\  photo; /photo remove clears it
+    \\/title <text> -- rename this chat
+    \\/description <text> -- set the description (empty clears it)
+    \\-s on mute/unmute/kick/ban/promote/demote/photo/title/description
+    \\  skips the in-group confirmation (the bound room's audit log still
+    \\  sees it regardless); /silent on|off makes -s the default here
     \\
     \\Tokens and credits (reply to a user, or pass @username, to view/set)
     \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban
@@ -2281,17 +2292,22 @@ fn handleMessage(
         // announcements are delivered, not a separate feature.
         if (!feature_flags.isEnabled(pool, "announcements")) return false;
         handleAutopinCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
+    } else if (std.mem.eql(u8, text, "/silent") or std.mem.startsWith(u8, text, "/silent ")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
+        handleSilentCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
     } else if (std.mem.eql(u8, text, "/videodownload") or std.mem.startsWith(u8, text, "/videodownload ")) {
         if (!feature_flags.isEnabled(pool, "video_download")) return false;
         handleVideoDownloadCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
-    } else if (std.mem.eql(u8, text, "/mute")) {
+    } else if (std.mem.eql(u8, text, "/mute") or std.mem.startsWith(u8, text, "/mute ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
-        group_admin.mute(connector, a, msg, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
-    } else if (std.mem.eql(u8, text, "/unmute")) {
+        const vis = resolveVisibility(pool, a, chat_id, std.mem.trim(u8, text["/mute".len..], " "), is_bot_admin);
+        group_admin.mute(connector, a, msg, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
+    } else if (std.mem.eql(u8, text, "/unmute") or std.mem.startsWith(u8, text, "/unmute ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "unmute")) return false;
-        group_admin.unmute(connector, a, msg, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
+        const vis = resolveVisibility(pool, a, chat_id, std.mem.trim(u8, text["/unmute".len..], " "), is_bot_admin);
+        group_admin.unmute(connector, a, msg, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
     } else if (std.mem.eql(u8, text, "/pin")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "pin")) return false;
@@ -2304,7 +2320,7 @@ fn handleMessage(
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "delete")) return false;
         group_admin.deleteMessage(connector, a, msg);
-    } else if (std.mem.eql(u8, text, "/promote")) {
+    } else if (std.mem.eql(u8, text, "/promote") or std.mem.startsWith(u8, text, "/promote ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         // Owner-only, not `checkGroupAdminAccess` — granting real admin
         // rights is more consequential than mute/kick/pin, and Telegram's
@@ -2313,19 +2329,21 @@ fn handleMessage(
         // `group_admin.promote`'s doc comment). Deliberately not extended
         // to bot admins/`/sudo` either, same reasoning.
         if (!is_owner) return false;
-        group_admin.promote(connector, a, msg, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
-    } else if (std.mem.eql(u8, text, "/demote")) {
+        const vis = resolveVisibility(pool, a, chat_id, std.mem.trim(u8, text["/promote".len..], " "), is_bot_admin);
+        group_admin.promote(connector, a, msg, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
+    } else if (std.mem.eql(u8, text, "/demote") or std.mem.startsWith(u8, text, "/demote ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!is_owner) return false;
-        group_admin.demote(connector, a, msg, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
+        const vis = resolveVisibility(pool, a, chat_id, std.mem.trim(u8, text["/demote".len..], " "), is_bot_admin);
+        group_admin.demote(connector, a, msg, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
     } else if (std.mem.eql(u8, text, "/kick") or std.mem.startsWith(u8, text, "/kick ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "kick")) return false;
-        handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text, "/kick", .kick);
+        handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, is_bot_admin, now, msg, text, "/kick", .kick);
     } else if (std.mem.eql(u8, text, "/ban") or std.mem.startsWith(u8, text, "/ban ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "ban")) return false;
-        handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text, "/ban", .ban);
+        handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, is_bot_admin, now, msg, text, "/ban", .ban);
     } else if (std.mem.eql(u8, text, "/confirm")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "confirm")) return false;
@@ -2449,6 +2467,15 @@ fn handleMessage(
         handlePersonaCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/welcome") or std.mem.startsWith(u8, text, "/welcome ")) {
         handleWelcomeCommand(connector, a, config, pool, chat_id, msg, text);
+    } else if (std.mem.eql(u8, text, "/photo") or std.mem.startsWith(u8, text, "/photo ")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
+        handlePhotoCommand(connector, a, config, pool, io, chat_id, identity_id, pending_undos, now, sudo_active, is_bot_admin, msg, text, tool_ctx.attachment_path);
+    } else if (std.mem.eql(u8, text, "/title") or std.mem.startsWith(u8, text, "/title ")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
+        handleTitleCommand(connector, a, config, pool, chat_id, identity_id, pending_undos, now, sudo_active, is_bot_admin, msg, text);
+    } else if (std.mem.eql(u8, text, "/description") or std.mem.startsWith(u8, text, "/description ")) {
+        if (!feature_flags.isEnabled(pool, "group_admin")) return false;
+        handleDescriptionCommand(connector, a, config, pool, chat_id, identity_id, pending_undos, now, sudo_active, is_bot_admin, msg, text);
     } else if (std.mem.eql(u8, text, "/thinking") or std.mem.startsWith(u8, text, "/thinking ")) {
         handleThinkingCommand(connector, a, config, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/scraper") or std.mem.startsWith(u8, text, "/scraper ")) {
@@ -4154,9 +4181,10 @@ fn usernameFromArg(arg: []const u8) ?[]const u8 {
 /// resolved a reply, so `/kick @spammer`/`/kick 123456789` silently matched
 /// no dispatch branch at all (see the exact-`eql` match this replaced).
 /// Permission is already checked by the caller before this runs.
-fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, pending_undos: *audit_notify.PendingUndos, now: i64, msg: iface.Message, text: []const u8, comptime prefix: []const u8, kind: group_admin.ActionKind) void {
-    const arg = std.mem.trim(u8, text[prefix.len..], " ");
-    const target = (resolveTargetIdentity(pool, connector, a, now, msg, arg, true) catch |err| {
+fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, pending_undos: *audit_notify.PendingUndos, is_superuser: bool, now: i64, msg: iface.Message, text: []const u8, comptime prefix: []const u8, kind: group_admin.ActionKind) void {
+    const raw_arg = std.mem.trim(u8, text[prefix.len..], " ");
+    const vis = resolveVisibility(pool, a, chat_id, raw_arg, is_superuser);
+    const target = (resolveTargetIdentity(pool, connector, a, now, msg, vis.rest, true) catch |err| {
         log.err("{s}: failed to resolve target: {t}", .{ @tagName(kind), err });
         return;
     }) orelse {
@@ -4164,7 +4192,7 @@ fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: 
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
         return;
     };
-    group_admin.requestConfirmation(connector, a, msg, kind, target.native_id, target.display_name, now, auditCtx(pool, pending_undos, chat_id, identity_id, msg));
+    group_admin.requestConfirmation(connector, a, msg, kind, target.native_id, target.display_name, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
 }
 
 /// `/slowmode <seconds>` sets warden's own per-chat cooldown between a
@@ -4769,6 +4797,9 @@ const as_relayable_commands = [_][]const u8{
     "allowchat",
     "disallowchat",
     "announce",
+    "photo",
+    "title",
+    "description",
     // Identity/balance grants scoped to *this* chat (`/token`) or the
     // target identity (`/credit`) — chat-scoped in the sense that matters
     // here: the command names a target user via reply/`@username`, which
@@ -4919,6 +4950,29 @@ fn auditCtx(pool: *store_pool.PgPool, pending_undos: *audit_notify.PendingUndos,
     };
 }
 
+/// Same as `auditCtx`, plus Phase 23's `-s`/`-p` visibility.
+fn auditCtxWithVisibility(pool: *store_pool.PgPool, pending_undos: *audit_notify.PendingUndos, chat_id: i64, identity_id: i64, msg: iface.Message, visibility: group_admin.Visibility) group_admin.AuditContext {
+    var ctx = auditCtx(pool, pending_undos, chat_id, identity_id, msg);
+    ctx.visibility = visibility;
+    return ctx;
+}
+
+/// Parses Phase 23's `-s`/`-p` flag out of `arg` (see
+/// `group_admin.parseVisibility`'s doc comment for the token-stripping
+/// rule and the `-p`-without-superuser downgrade), then folds in the
+/// chat's own `/silent on` default (`chat_settings.getSilentByDefault`) —
+/// a chat default only ever *upgrades* `.normal` to `.silent`; an explicit
+/// `-s`/`-p` flag always wins as typed, and `-p` from a superuser is never
+/// downgraded by a chat default that only knows about `-s`.
+fn resolveVisibility(pool: *store_pool.PgPool, a: std.mem.Allocator, chat_id: i64, arg: []const u8, is_superuser: bool) struct { visibility: group_admin.Visibility, rest: []const u8 } {
+    const parsed = group_admin.parseVisibility(a, arg, is_superuser);
+    const visibility: group_admin.Visibility = if (parsed.visibility == .normal and chat_settings.getSilentByDefault(pool, chat_id))
+        .silent
+    else
+        parsed.visibility;
+    return .{ .visibility = visibility, .rest = parsed.rest };
+}
+
 /// Phase 21: a command typed *directly* in a bound management room, no
 /// `/as <id>` prefix needed. Resolves to the same `AsRelay` plan `/as`
 /// itself builds — same allow-list, same target-chat authorization,
@@ -5038,6 +5092,10 @@ test "the /as allow-list admits chat-scoped admin commands and refuses everythin
     try std.testing.expect(isRelayableUnderAs("announce"));
     try std.testing.expect(isRelayableUnderAs("token"));
     try std.testing.expect(isRelayableUnderAs("credit"));
+    // Added in Phase 22 -- none of these act on a message either.
+    try std.testing.expect(isRelayableUnderAs("photo"));
+    try std.testing.expect(isRelayableUnderAs("title"));
+    try std.testing.expect(isRelayableUnderAs("description"));
 
     // No nesting, no privilege prefixes.
     try std.testing.expect(!isRelayableUnderAs("as"));
@@ -5689,6 +5747,202 @@ fn handleAutopinCommand(
     } else {
         reply(connector, a, msg.chat_id, msg.message_id, "Auto-pin off — announcements will be posted without pinning.");
     }
+}
+
+/// `/silent on|off` — ROADMAP.md's Phase 23. Sets this chat's default for
+/// managerial commands' `-s` flag, so an admin who always wants quiet
+/// moderation doesn't have to type it every time. Same shape as
+/// `/autopin`; view is open to anyone, changing it is admin-tier.
+fn handleSilentCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    sudo_active: bool,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    const arg = std.mem.trim(u8, text["/silent".len..], " ");
+    const enabled = chat_settings.getSilentByDefault(pool, chat_id);
+
+    if (arg.len == 0) {
+        const reply_text = std.fmt.allocPrint(
+            a,
+            "Silent-by-default is {s} for this chat. When on, moderation/settings commands (redact, kick, ban, promote, demote, mute, unmute, photo, title, description) skip their in-group confirmation unless run without -s. Change it with /silent on or /silent off.",
+            .{if (enabled) "on" else "off"},
+        ) catch return;
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    const want = if (std.mem.eql(u8, arg, "on"))
+        true
+    else if (std.mem.eql(u8, arg, "off"))
+        false
+    else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /silent on | off");
+        return;
+    };
+
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "silent")) return;
+
+    chat_settings.setSilentByDefault(pool, chat_id, want) catch |err| {
+        log.err("silent: failed to persist for chat {d}: {t}", .{ chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that setting, try again.");
+        return;
+    };
+    if (want) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Silent-by-default on — moderation/settings commands will skip their in-group confirmation unless run without -s.");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Silent-by-default off.");
+    }
+}
+
+/// `/photo` (send an image with this as its caption) sets the chat's
+/// photo; `/photo remove` clears it — ROADMAP.md's Phase 22. Only the
+/// caption form is supported, not "reply to an existing image with
+/// /photo": `iface.Message`'s reply fields carry the replied-to user/text,
+/// never a replied-to *attachment*, so there's no plumbing today to fetch
+/// bytes for a message this one merely replies to (unlike `/redact`'s
+/// reply-scoped mode, which only ever needs a user id). A real gap if it
+/// turns out to matter, not solved this phase.
+fn handlePhotoCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    io: Io,
+    chat_id: i64,
+    identity_id: i64,
+    pending_undos: *audit_notify.PendingUndos,
+    now: i64,
+    sudo_active: bool,
+    is_superuser: bool,
+    msg: iface.Message,
+    text: []const u8,
+    attachment_path: ?[]const u8,
+) void {
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "photo")) return;
+    const raw_arg = std.mem.trim(u8, text["/photo".len..], " ");
+    const vis = resolveVisibility(pool, a, chat_id, raw_arg, is_superuser);
+
+    if (std.mem.eql(u8, vis.rest, "remove")) {
+        connector.deleteChatPhoto(a, msg.chat_id) catch |err| {
+            reportChatSettingFailure(connector, a, msg.chat_id, msg.message_id, "remove the photo", err);
+            return;
+        };
+        if (vis.visibility != .phantom) {
+            audit_notify.recordAndNotify(connector, a, pool, pending_undos, now, chat_id, msg.chat_id, identity_id, msg.username orelse msg.user_id, .{ .photo_change = .{ .removed = true } });
+        }
+        if (vis.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Photo removed.");
+        return;
+    }
+
+    const path = attachment_path orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Send an image with /photo as its caption, or use /photo remove.");
+        return;
+    };
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, a, .limited(20 * 1024 * 1024)) catch |err| {
+        log.err("photo: failed to read downloaded attachment {s}: {t}", .{ path, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't read that image, try again.");
+        return;
+    };
+    connector.setChatPhoto(a, msg.chat_id, bytes) catch |err| {
+        reportChatSettingFailure(connector, a, msg.chat_id, msg.message_id, "set the photo", err);
+        return;
+    };
+    if (vis.visibility != .phantom) {
+        audit_notify.recordAndNotify(connector, a, pool, pending_undos, now, chat_id, msg.chat_id, identity_id, msg.username orelse msg.user_id, .{ .photo_change = .{ .removed = false } });
+    }
+    if (vis.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Photo updated.");
+}
+
+/// `/title <text>` — ROADMAP.md's Phase 22. Runnable directly in the group
+/// by its own live admins (unlike moderation commands, there's no "keep it
+/// out of the group" reason to gate this to a bound room/`/as`), and also
+/// relayable through both, same as everything else on
+/// `as_relayable_commands`.
+fn handleTitleCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    pending_undos: *audit_notify.PendingUndos,
+    now: i64,
+    sudo_active: bool,
+    is_superuser: bool,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "title")) return;
+    const raw_arg = std.mem.trim(u8, text["/title".len..], " ");
+    const vis = resolveVisibility(pool, a, chat_id, raw_arg, is_superuser);
+    const new_title = vis.rest;
+    if (new_title.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /title <text>");
+        return;
+    }
+    connector.setChatTitle(a, msg.chat_id, new_title) catch |err| {
+        reportChatSettingFailure(connector, a, msg.chat_id, msg.message_id, "set the title", err);
+        return;
+    };
+    if (vis.visibility != .phantom) {
+        audit_notify.recordAndNotify(connector, a, pool, pending_undos, now, chat_id, msg.chat_id, identity_id, msg.username orelse msg.user_id, .{ .title_change = .{ .new_title = new_title } });
+    }
+    if (vis.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Title updated.");
+}
+
+/// `/description <text>` — same shape as `/title`. An empty argument
+/// clears the description (Telegram/Matrix both treat an empty
+/// description/topic as "no description" natively).
+fn handleDescriptionCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    pending_undos: *audit_notify.PendingUndos,
+    now: i64,
+    sudo_active: bool,
+    is_superuser: bool,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "description")) return;
+    const raw_arg = std.mem.trim(u8, text["/description".len..], " ");
+    const vis = resolveVisibility(pool, a, chat_id, raw_arg, is_superuser);
+    const new_description = vis.rest;
+    connector.setChatDescription(a, msg.chat_id, new_description) catch |err| {
+        reportChatSettingFailure(connector, a, msg.chat_id, msg.message_id, "set the description", err);
+        return;
+    };
+    if (vis.visibility != .phantom) {
+        audit_notify.recordAndNotify(connector, a, pool, pending_undos, now, chat_id, msg.chat_id, identity_id, msg.username orelse msg.user_id, .{ .description_change = .{ .new_description = new_description } });
+    }
+    if (vis.visibility != .normal) return;
+    if (new_description.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Description cleared.");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "Description updated.");
+    }
+}
+
+/// Shared failure reply for the three chat-settings commands above —
+/// same "distinguish unsupported-platform from a real failure" shape
+/// `group_admin.reportFailure` uses for moderation commands.
+fn reportChatSettingFailure(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, reply_to: ?[]const u8, action: []const u8, err: anyerror) void {
+    log.err("{s} failed: {t}", .{ action, err });
+    if (err == error.Unsupported) {
+        reply(connector, a, chat_id, reply_to, "That isn't supported on this platform.");
+        return;
+    }
+    const message = std.fmt.allocPrint(a, "Couldn't {s} — check the bot is an admin here with the right permissions.", .{action}) catch return;
+    connector.sendMessage(a, chat_id, message, reply_to);
 }
 
 /// `/videodownload` shows this chat's setting; `/videodownload on|off`
@@ -8105,11 +8359,13 @@ fn menuResumeViaCommand(ctx: menu.ActionContext, comptime cmd: []const u8, handl
 }
 
 fn handleKickBanCommandKick(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, pending_undos: *audit_notify.PendingUndos, now: i64, msg: iface.Message, text: []const u8) void {
-    handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text, "/kick", .kick);
+    // `false`: `/menu`'s synthetic text never carries a `-s`/`-p` flag, so
+    // whether the caller is a superuser is moot here.
+    handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, false, now, msg, text, "/kick", .kick);
 }
 
 fn handleKickBanCommandBan(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, pending_undos: *audit_notify.PendingUndos, now: i64, msg: iface.Message, text: []const u8) void {
-    handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text, "/ban", .ban);
+    handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, false, now, msg, text, "/ban", .ban);
 }
 
 // Zig's test collector only walks `test` blocks reachable from the file
