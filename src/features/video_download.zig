@@ -27,16 +27,19 @@
 //!     and polling a growing file's size on disk gets a good-enough
 //!     percentage without introducing that new, riskier pattern.
 //!
-//! **Failure handling is fail-closed by design**: age-restricted, private,
-//! geo-blocked, DRM'd, oversized (even after compression), or otherwise
-//! undownloadable links are never surfaced as an in-chat error -- `download`
-//! just returns an error, `main.zig`'s caller logs it and does nothing
-//! visible, exactly the "never block the reply on failure" philosophy
-//! `transcribe.zig`'s own caller (`resolveQuestion`) already follows for a
-//! failed transcription. A chat with this feature on posts a lot of
-//! ordinary links that are not videos at all (a news article, a github
-//! repo) -- erroring loudly on every one of those would be far worse than
-//! silently doing nothing.
+//! **Failure handling**: `download` never returns partial/garbage bytes --
+//! anything that isn't a clean success (age-restricted, private,
+//! geo-blocked, DRM'd, oversized even after compression, or otherwise
+//! undownloadable) is a plain returned error, this module doing no
+//! `Connector` calls itself. What `main.zig`'s caller does with that error
+//! is its own call, not this module's: today (`videoDownloadWorker`) it
+//! edits a short "couldn't download that" note into the placeholder it
+//! already showed, rather than either erroring loudly on every link or
+//! (the original design, changed after a real report of a placeholder
+//! silently vanishing with zero explanation) deleting it without a trace.
+//! That's a reasonable default specifically because a placeholder already
+//! went out for every trigger-pattern match, real video or not -- see
+//! `checkVideoDownload`'s own doc comment.
 const std = @import("std");
 const Io = std.Io;
 
@@ -73,7 +76,22 @@ const lossless_timeout_seconds: i64 = 120;
 /// fetched. Bounded to ~720p: a reasonable "shareable clip" resolution that
 /// keeps most short social clips at or near `max_bytes` already, so the
 /// `compressToFit` fallback below is the exception, not the common case.
-const lossy_format_selector = "bv*[height<=720]+ba/b[height<=720]";
+///
+/// The trailing `/bv*+ba/b` fallback is load-bearing, not decorative:
+/// `height` in a yt-dlp format spec is the *long* pixel dimension, not
+/// "vertical resolution" -- for a portrait clip (an Instagram Reel, a
+/// YouTube Short) that's the value that reads e.g. 1280 or 1920, so
+/// `height<=720` matches *zero* formats and yt-dlp hard-fails with
+/// "Requested format is not available" instead of just picking a smaller
+/// one. Confirmed live against a real Reel (`--list-formats` showed only
+/// 720x1280/1080x1920 DASH video streams, all excluded by the height cap).
+/// yt-dlp format specs have no portable "shorter side" filter to fix this
+/// properly, so the pragmatic fix is a fallback: try the 720p-capped
+/// selection first (the common, bandwidth-saving case for landscape
+/// video), and if that matches nothing, fall through to the fully
+/// unconstrained `bv*+ba/b` (still bounded by `--max-filesize` below, and
+/// by `compressToFit` after download) rather than failing outright.
+const lossy_format_selector = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b";
 
 /// Safety-valve ceiling on `yt-dlp`'s own `--max-filesize` in lossy mode --
 /// NOT the delivered-size budget (that's still `max_bytes`, enforced by

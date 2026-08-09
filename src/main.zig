@@ -5973,7 +5973,7 @@ fn handleVideoDownloadCommand(
     if (arg.len == 0) {
         const reply_text = std.fmt.allocPrint(
             a,
-            "Video auto-download is {s} for this chat. When on, I try to fetch and repost YouTube/Instagram/X video links posted here (best-effort, under 50MB -- age-restricted/private/oversized links are silently skipped, never an error message). Change it with /videodownload on or /videodownload off.",
+            "Video auto-download is {s} for this chat. When on, I try to fetch and repost YouTube/Instagram/X video links posted here (best-effort, under 50MB -- if it can't be fetched, whether it's private/age-restricted/too large or a downstream error, you'll get a short note instead of nothing). Change it with /videodownload on or /videodownload off.",
             .{if (enabled) "on" else "off"},
         ) catch return;
         connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
@@ -6191,16 +6191,19 @@ fn checkVideoDownload(connector: iface.Connector, io: Io, config: *const config_
 /// they can't be `task_arena`-backed.
 ///
 /// Sends a "⬇️ Downloading…" placeholder immediately, animates it via
-/// `videoProgressTickerLoop` while `video_download.download` runs, then
-/// deletes the placeholder and sends the real result as a fresh message.
-/// `editMessage` is text-only and can never attach media to an existing
-/// message, so unlike the QA flow's placeholder, this one is never "edited
-/// into" the final result -- it's always deleted, success or failure alike.
-/// Never surfaces a failure into the chat (see `video_download.zig`'s
-/// module doc on fail-closed handling): on any download error the
-/// placeholder is silently deleted rather than edited into an error
-/// message -- a log line either way is the only trace of a download
-/// attempt that didn't result in a sent video.
+/// `videoProgressTickerLoop` while `video_download.download` runs, then on
+/// success deletes the placeholder and sends the real result as a fresh
+/// message (`editMessage` is text-only and can never attach media to an
+/// existing message, so unlike the QA flow's placeholder, this one is
+/// never "edited into" the final video). On failure the placeholder is
+/// instead edited into a short failure notice, same shape
+/// `replyWithAnswer` already uses for its own error case -- a placeholder
+/// went out for every trigger-pattern match already, real video or not
+/// (see `checkVideoDownload`'s own doc comment), so silently deleting it
+/// with zero explanation reads as broken rather than as the intended
+/// "ordinary non-video link, nothing to see" case. Previously deleted the
+/// placeholder silently instead; changed after a live report of exactly
+/// that looking like a bug (2026-08-09).
 fn videoDownloadWorker(connector: iface.Connector, io: Io, tmp_dir: []const u8, native_chat_id: []const u8, url: []const u8, reply_to: ?[]const u8, quality: video_download.Quality, ts: i96) void {
     const a = std.heap.page_allocator;
     defer a.free(native_chat_id);
@@ -6260,9 +6263,17 @@ fn videoDownloadWorker(connector: iface.Connector, io: Io, tmp_dir: []const u8, 
 
     const download_result = result catch |err| {
         log.info("video_download: not downloading {s} for chat {s}: {t}", .{ url, native_chat_id, err });
-        if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |del_err| {
-            log.warn("video_download: failed to delete placeholder for chat {s}: {t}", .{ native_chat_id, del_err });
-        };
+        const error_text = "❌ Couldn't download that video — it may be private, age-restricted, geo-blocked, or too large.";
+        if (placeholder_id) |pid| {
+            if (connector.editMessage(a, native_chat_id, pid, error_text)) |_| {
+                log.info("video_download: failure notice edited into placeholder for chat {s}", .{native_chat_id});
+            } else |edit_err| {
+                log.warn("video_download: editing failure notice into placeholder failed for chat {s}: {t}, sending a new message instead", .{ native_chat_id, edit_err });
+                connector.sendMessage(a, native_chat_id, error_text, reply_to);
+            }
+        } else {
+            connector.sendMessage(a, native_chat_id, error_text, reply_to);
+        }
         return;
     };
     defer a.free(download_result.bytes);
