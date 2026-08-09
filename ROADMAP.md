@@ -1730,6 +1730,31 @@ this until everything above has shipped.
   upsert-and-scoping round trips, `isReservedCommandName`'s coverage of
   both the public menu and the owner-only extras).
 
+## Phases 20-25 — Management-room/ACL overhaul (2026-08-09)
+
+Six phases, direct user request, all landed and deployed the same night:
+1:1 management rooms with an audit log and undo (20), direct-in-room
+dispatch and the `/notice`→`/announce` merge (21), group photo/title/
+description management (22), `-s`/`-p` visibility flags (23), member ACL
+— slow mode, granular `/permission`, `/tag` (24), and passive yt-dlp video
+auto-download (25). Phases 24 and 25 were built concurrently in isolated
+git worktrees while 20-23 were built directly on master; merged in with
+migrations renumbered to a clean 0037-0041 sequence (each phase's own
+entry below notes its original number where it moved). All six merged to
+master (commits d056563, ec7c135, 1d69b2d, 1538b9c) and **deployed to
+the production VPS (mzn-warden) at 2026-08-09 00:46 UTC** — `zig build
+test` green (607/609, 2 expected skips, 0 leaks) immediately beforehand,
+all 5 new migrations applied cleanly on deploy (`schema_migrations` at
+41), all six docker-compose services healthy afterward with zero restarts
+and no errors in the logs. "Not live-verified" notes on the individual
+phases below refer specifically to exercising each new command against a
+real chat (nobody has typed `/photo`, `/permission`, etc. into a real
+Telegram group yet) — the deploy itself, migrations, and process health
+are confirmed live, not simulated.
+
+**Known follow-up, tracked not forgotten**: `/redact`'s four modes don't
+support Phase 23's `-s`/`-p` flags yet (see that phase's own note).
+
 ### Phase 20 — Management rooms become 1:1 audit logs, with undo
 *Effort: M. Dependencies: Phase 9. Status: done.*
 
