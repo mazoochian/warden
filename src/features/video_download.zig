@@ -52,13 +52,14 @@ const timeout_seconds: i64 = 120;
 /// Substrings identifying a link this module will attempt to download —
 /// deliberately conservative and literal (no real regex engine in `std`),
 /// equivalent to the plan's own
-/// `(youtube\.com/watch|youtu\.be/|instagram\.com/(reel|p)/|x\.com/|twitter\.com/)`.
+/// `(youtube\.com/watch|youtube\.com/shorts/|youtu\.be/|instagram\.com/(reel|p)/|x\.com/|twitter\.com/)`.
 /// Case-sensitive on purpose: real URLs use lowercase domains, and a
 /// hand-rolled case-insensitive substring search isn't worth the extra
 /// code for a fail-closed feature where a missed match just means no
 /// download, not a functional gap.
 const trigger_patterns = [_][]const u8{
     "youtube.com/watch",
+    "youtube.com/shorts/",
     "youtu.be/",
     "instagram.com/reel/",
     "instagram.com/p/",
@@ -239,6 +240,10 @@ test "findLink matches every trigger pattern and extracts the exact url" {
     try testing.expectEqualStrings(
         "https://youtu.be/dQw4w9WgXcQ",
         findLink("https://youtu.be/dQw4w9WgXcQ").?,
+    );
+    try testing.expectEqualStrings(
+        "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        findLink("https://www.youtube.com/shorts/dQw4w9WgXcQ").?,
     );
     try testing.expectEqualStrings(
         "https://www.instagram.com/reel/abc123/",
