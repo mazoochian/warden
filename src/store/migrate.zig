@@ -54,6 +54,7 @@ const migrations = [_]Migration{
     .{ .version = 40, .name = "0040_video_download", .sql = @embedFile("migrations/0040_video_download.sql") },
     .{ .version = 41, .name = "0041_silent_by_default", .sql = @embedFile("migrations/0041_silent_by_default.sql") },
     .{ .version = 42, .name = "0042_video_download_lossy", .sql = @embedFile("migrations/0042_video_download_lossy.sql") },
+    .{ .version = 43, .name = "0043_reply_autonomy", .sql = @embedFile("migrations/0043_reply_autonomy.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each

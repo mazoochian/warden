@@ -4541,6 +4541,7 @@ fn handleRemoveAdminCommand(connector: iface.Connector, a: std.mem.Allocator, po
 fn platformLabel(platform: iface.Platform) []const u8 {
     return switch (platform) {
         .telegram => "Telegram",
+        .telegram_user => "Telegram (personal)",
         .matrix => "Matrix",
         .xmpp => "XMPP",
         .discord => "Discord",
@@ -8703,6 +8704,7 @@ test {
     _ = @import("store/crypto.zig");
     _ = @import("platform/xmpp.zig");
     _ = @import("platform/reply_redirect.zig");
+    _ = @import("platform/telegram_user.zig");
     _ = @import("xmpp/xml.zig");
     _ = @import("xmpp/types.zig");
     _ = @import("xmpp/client.zig");

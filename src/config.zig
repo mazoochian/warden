@@ -52,6 +52,21 @@ pub const XmppConfig = struct {
     muc_rooms: []const []const u8,
 };
 
+/// TDLib (personal-account) connector config — the owner's own Telegram
+/// account, connected via MTProto rather than the Bot API. `api_id`/
+/// `api_hash` come from my.telegram.org (per-application credentials,
+/// unrelated to a bot token). `session_dir` is where TDLib persists its
+/// login session (phone/code/2FA happens once, interactively — see
+/// `platform/telegram_user.zig`'s login flow — then this directory is
+/// reused on every subsequent start, same "half-configured stays disabled"
+/// convention as `MatrixConfig`/`XmppConfig`: all three of these are
+/// required together or the connector doesn't start).
+pub const TelegramUserConfig = struct {
+    api_id: i32,
+    api_hash: []const u8,
+    session_dir: []const u8,
+};
+
 pub const LlmConfig = union(LlmProviderKind) {
     anthropic: AnthropicConfig,
     openai_compat: OpenAiCompatConfig,
@@ -241,6 +256,11 @@ pub const Config = struct {
     /// `XmppConnector` (and adds it to the active connector list) when
     /// this is set.
     xmpp: ?XmppConfig = null,
+    /// Null when the personal-account (TDLib) connector isn't configured —
+    /// `main.zig` only constructs a `TelegramUserConnector` (and adds it to
+    /// the active connector list) when this is set. See
+    /// `platform/telegram_user.zig`.
+    telegram_user: ?TelegramUserConfig = null,
     /// Null (the default) means the warden-ui HTTP+WebSocket API
     /// (`src/api/`) stays entirely off — same half-configured-stays-
     /// disabled convention as `matrix`/`xmpp` above, and a deliberate
@@ -287,8 +307,9 @@ pub const Config = struct {
         const matrix = loadMatrixConfig(env);
         const matrix_pickle_key = nonEmpty(env.get("WARDEN_MATRIX_PICKLE_KEY"));
         const xmpp = try loadXmppConfig(arena, env);
+        const telegram_user = loadTelegramUserConfig(env);
 
-        var owners_buf: [3]OwnerEntry = undefined;
+        var owners_buf: [4]OwnerEntry = undefined;
         var owners_len: usize = 0;
         owners_buf[owners_len] = .{ .platform = .telegram, .owner_id = telegram_owner_id };
         owners_len += 1;
@@ -306,6 +327,23 @@ pub const Config = struct {
                 owners_len += 1;
             } else {
                 std.log.warn("WARDEN_XMPP_JID/WARDEN_XMPP_PASSWORD are set but WARDEN_XMPP_OWNER_ID isn't — owner-gated Q&A will reject the XMPP owner until it's set", .{});
+            }
+        }
+        if (telegram_user != null) {
+            // Unlike Matrix/XMPP, this connector's account IS the owner by
+            // definition — there's no other identity it could authenticate
+            // as. Still sourced from an explicit env var rather than
+            // resolved automatically from the TDLib session at startup:
+            // `Config.load` runs before any connector exists, and requiring
+            // the same numeric id you already know as the bot owner keeps
+            // this whole block's shape identical to Matrix/XMPP's (each
+            // platform's owner_id is a plain, explicit env var, no
+            // exceptions) rather than special-casing one of the four.
+            if (env.get("WARDEN_TELEGRAM_USER_OWNER_ID")) |user_owner_id| {
+                owners_buf[owners_len] = .{ .platform = .telegram_user, .owner_id = user_owner_id };
+                owners_len += 1;
+            } else {
+                std.log.warn("WARDEN_TELEGRAM_USER_API_ID/_API_HASH/_SESSION_DIR are set but WARDEN_TELEGRAM_USER_OWNER_ID isn't — owner-gated actions will reject the personal account until it's set to its own numeric Telegram user id", .{});
             }
         }
         const owners = try arena.dupe(OwnerEntry, owners_buf[0..owners_len]);
@@ -469,6 +507,7 @@ pub const Config = struct {
             .matrix = matrix,
             .matrix_pickle_key = matrix_pickle_key,
             .xmpp = xmpp,
+            .telegram_user = telegram_user,
             .api_port = api_port,
             .api_workers = api_workers,
             .api_session_secret = api_session_secret,
@@ -574,6 +613,38 @@ pub const Config = struct {
             .password = pw,
             .muc_rooms = try muc_rooms.toOwnedSlice(arena),
         };
+    }
+
+    /// `null` unless all three of `WARDEN_TELEGRAM_USER_API_ID`/
+    /// `_API_HASH`/`_SESSION_DIR` are set (same half-configured-stays-
+    /// disabled reasoning as `loadMatrixConfig`/`loadXmppConfig`, extended
+    /// to three required fields instead of two — `session_dir` isn't
+    /// optional-with-a-default since it holds session material equivalent
+    /// to full account access; a silent default risks landing it somewhere
+    /// unintended).
+    fn loadTelegramUserConfig(env: *const std.process.Environ.Map) ?TelegramUserConfig {
+        const api_id_raw = nonEmpty(env.get("WARDEN_TELEGRAM_USER_API_ID"));
+        const api_hash = nonEmpty(env.get("WARDEN_TELEGRAM_USER_API_HASH"));
+        const session_dir = nonEmpty(env.get("WARDEN_TELEGRAM_USER_SESSION_DIR"));
+        if (api_id_raw == null and api_hash == null and session_dir == null) return null;
+
+        const id_raw = api_id_raw orelse {
+            std.log.err("WARDEN_TELEGRAM_USER_API_HASH/_SESSION_DIR are set but WARDEN_TELEGRAM_USER_API_ID isn't — the personal-account connector stays disabled", .{});
+            return null;
+        };
+        const hash = api_hash orelse {
+            std.log.err("WARDEN_TELEGRAM_USER_API_ID/_SESSION_DIR are set but WARDEN_TELEGRAM_USER_API_HASH isn't — the personal-account connector stays disabled", .{});
+            return null;
+        };
+        const dir = session_dir orelse {
+            std.log.err("WARDEN_TELEGRAM_USER_API_ID/_API_HASH are set but WARDEN_TELEGRAM_USER_SESSION_DIR isn't — the personal-account connector stays disabled", .{});
+            return null;
+        };
+        const api_id = std.fmt.parseInt(i32, id_raw, 10) catch {
+            std.log.err("WARDEN_TELEGRAM_USER_API_ID '{s}' isn't a valid integer — the personal-account connector stays disabled", .{id_raw});
+            return null;
+        };
+        return .{ .api_id = api_id, .api_hash = hash, .session_dir = dir };
     }
 
     const LoadedLlmConfig = struct {

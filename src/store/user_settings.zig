@@ -62,6 +62,20 @@ pub fn offsetForLanguageCode(a: std.mem.Allocator, language_code: []const u8) ?i
     return null;
 }
 
+/// How much autonomy a drafted "reply on my behalf" gets — see migration
+/// `0043_reply_autonomy.sql`'s doc comment for what each level means.
+/// `.off` is both the enum default and what `getEffectiveReplyAutonomy`
+/// falls back to when nothing's ever been set, so a fresh install (or a
+/// chat that's never touched the setting) never drafts anything until the
+/// owner explicitly opts in — same "off until asked" convention
+/// `silent_by_default`/every other opt-in `chat_settings` flag already
+/// follows.
+pub const ReplyAutonomy = enum {
+    off,
+    draft,
+    auto,
+};
+
 fn upsertColumn(pool: *PgPool, identity_id: i64, comptime column: []const u8, value: anytype) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -94,6 +108,13 @@ pub fn setTimeFormat(pool: *PgPool, identity_id: i64, format: ?civil_time.TimeFo
     try upsertColumn(pool, identity_id, "time_format", if (format) |f| tagForTimeFormat(f) else null);
 }
 
+/// `null` clears the override (falls back to `.off` — see
+/// `getEffectiveReplyAutonomy`).
+pub fn setReplyAutonomyDefault(pool: *PgPool, identity_id: i64, value: ?ReplyAutonomy) !void {
+    const text: ?[]const u8 = if (value) |v| @tagName(v) else null;
+    try upsertColumn(pool, identity_id, "reply_autonomy_default", text);
+}
+
 fn tagForTimeFormat(f: civil_time.TimeFormat) []const u8 {
     return switch (f) {
         .h24 => "24h",
@@ -106,6 +127,7 @@ const Row = struct {
     date_format: ?[]const u8,
     time_format: ?[]const u8,
     language_code: ?[]const u8,
+    reply_autonomy_default: ?[]const u8,
 };
 
 /// One query joining `user_settings` and `telegram_profiles` — every
@@ -116,7 +138,7 @@ fn loadRow(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ?Row {
     defer pool.release(db);
 
     var stmt = db.prepare(
-        \\SELECT us.utc_offset_minutes, us.date_format, us.time_format, tp.language_code
+        \\SELECT us.utc_offset_minutes, us.date_format, us.time_format, tp.language_code, us.reply_autonomy_default
         \\FROM identities i
         \\LEFT JOIN user_settings us ON us.identity_id = i.id
         \\LEFT JOIN telegram_profiles tp ON tp.identity_id = i.id
@@ -131,6 +153,7 @@ fn loadRow(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ?Row {
         .date_format = if (stmt.columnIsNull(1)) null else allocator.dupe(u8, stmt.columnText(1)) catch null,
         .time_format = if (stmt.columnIsNull(2)) null else allocator.dupe(u8, stmt.columnText(2)) catch null,
         .language_code = if (stmt.columnIsNull(3)) null else allocator.dupe(u8, stmt.columnText(3)) catch null,
+        .reply_autonomy_default = if (stmt.columnIsNull(4)) null else allocator.dupe(u8, stmt.columnText(4)) catch null,
     };
 }
 
@@ -141,6 +164,7 @@ fn freeRow(allocator: std.mem.Allocator, row: Row) void {
     if (row.date_format) |v| allocator.free(v);
     if (row.time_format) |v| allocator.free(v);
     if (row.language_code) |v| allocator.free(v);
+    if (row.reply_autonomy_default) |v| allocator.free(v);
 }
 
 /// Explicit override, else a `language_code`-derived guess, else UTC (0).
@@ -171,6 +195,17 @@ pub fn getEffectiveTimeFormat(pool: *PgPool, allocator: std.mem.Allocator, ident
     const raw = row.time_format orelse return .h24;
     if (std.mem.eql(u8, raw, "12h")) return .h12;
     return .h24;
+}
+
+/// The owner's global "reply on my behalf" default. Explicit override,
+/// else `.off` — see `ReplyAutonomy`'s doc comment for why `.off` (not
+/// `.draft`) is the fail-closed default. `chat_settings.getReplyAutonomy`
+/// is the per-chat override that beats this when set.
+pub fn getEffectiveReplyAutonomyDefault(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ReplyAutonomy {
+    const row = loadRow(pool, allocator, identity_id) orelse return .off;
+    defer freeRow(allocator, row);
+    const raw = row.reply_autonomy_default orelse return .off;
+    return std.meta.stringToEnum(ReplyAutonomy, raw) orelse .off;
 }
 
 const testing = std.testing;
@@ -206,6 +241,26 @@ test "getEffectiveOffsetMinutes: override beats language_code guess beats UTC de
 
     try setUtcOffsetMinutes(&pool, with_lang, null);
     try testing.expectEqual(@as(i32, 210), getEffectiveOffsetMinutes(&pool, a, with_lang));
+}
+
+test "getEffectiveReplyAutonomyDefault defaults to .off, respects an override, clears back to .off" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const id = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
+    try testing.expectEqual(ReplyAutonomy.off, getEffectiveReplyAutonomyDefault(&pool, a, id));
+
+    try setReplyAutonomyDefault(&pool, id, .draft);
+    try testing.expectEqual(ReplyAutonomy.draft, getEffectiveReplyAutonomyDefault(&pool, a, id));
+
+    try setReplyAutonomyDefault(&pool, id, .auto);
+    try testing.expectEqual(ReplyAutonomy.auto, getEffectiveReplyAutonomyDefault(&pool, a, id));
+
+    try setReplyAutonomyDefault(&pool, id, null);
+    try testing.expectEqual(ReplyAutonomy.off, getEffectiveReplyAutonomyDefault(&pool, a, id));
 }
 
 test "getEffectiveDateFormat/getEffectiveTimeFormat default then respect an explicit setting" {

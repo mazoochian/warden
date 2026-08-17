@@ -4,11 +4,25 @@ const TelegramProfile = @import("../domain/telegram_profile.zig").TelegramProfil
 const MatrixProfile = @import("../domain/matrix_profile.zig").MatrixProfile;
 const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
 
-/// Chat platforms Warden can be wired up to. Only `.telegram` has an
-/// implementation right now; the others exist so config/auth code can
-/// already be written against a stable enum instead of raw strings.
+/// Chat platforms Warden can be wired up to. `.telegram`/`.matrix`/`.xmpp`
+/// have implementations; `.discord`/`.whatsapp` exist so config/auth code
+/// can already be written against a stable enum instead of raw strings.
+///
+/// `.telegram_user` is deliberately distinct from `.telegram`, not a mode
+/// flag on it: they're different protocols entirely (MTProto via TDLib vs.
+/// the HTTPS Bot API), with their own connector, own credentials (TDLib
+/// api_id/api_hash vs. a bot token), and their own session lifecycle
+/// (interactive phone/code/2FA login vs. a static token). The two can be
+/// connected at once — the bot account and the owner's personal account
+/// are different Telegram users occupying the same `Platform` *family* but
+/// not the same identity. This is exactly why `chats`/`identities` are
+/// keyed by `(platform, native_id)`, not bare native id (see
+/// `store/chats.zig`'s `upsertChat`) — a `.telegram_user` chat/identity
+/// with the same native numeric id as a `.telegram` one is a distinct row,
+/// never collides.
 pub const Platform = enum {
     telegram,
+    telegram_user,
     matrix,
     xmpp,
     discord,

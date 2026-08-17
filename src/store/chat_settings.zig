@@ -1,6 +1,7 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
+const ReplyAutonomy = @import("user_settings.zig").ReplyAutonomy;
 
 /// Typed replacement for the old stringly-typed per-chat `chat_settings` KV
 /// table (`digest_enabled`/`last_digest_ts`/`magic_word` used to be
@@ -144,6 +145,51 @@ pub fn setMagicWord(pool: *PgPool, chat_id: i64, word: ?[]const u8) !void {
     _ = try stmt.step();
 }
 
+/// This chat's explicit "reply on my behalf" override, or `null` if it just
+/// inherits the owner's global default (`user_settings.
+/// getEffectiveReplyAutonomyDefault`) — see `resolveReplyAutonomy` for the
+/// combined result callers actually want, and migration
+/// `0043_reply_autonomy.sql`'s doc comment for what each level means.
+pub fn getReplyAutonomy(pool: *PgPool, chat_id: i64) ?ReplyAutonomy {
+    const db = pool.acquire() catch return null;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT reply_autonomy FROM chat_settings WHERE chat_id = $1;") catch return null;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return null;
+    if (!has_row or stmt.columnIsNull(0)) return null;
+    return std.meta.stringToEnum(ReplyAutonomy, stmt.columnText(0));
+}
+
+/// `null` clears the override (falls back to the owner's global default).
+pub fn setReplyAutonomy(pool: *PgPool, chat_id: i64, value: ?ReplyAutonomy) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, reply_autonomy) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET reply_autonomy = excluded.reply_autonomy;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    if (value) |v| stmt.bindText(2, @tagName(v)) else stmt.bindNull(2);
+    _ = try stmt.step();
+}
+
+/// The autonomy level a "reply on my behalf" draft for `chat_id` should
+/// actually use: this chat's override if it has one, else the owner's
+/// global default. The one function `features/`-layer code calling into
+/// this should use — `getReplyAutonomy`/`user_settings.
+/// getEffectiveReplyAutonomyDefault` individually are for the settings UI
+/// (which needs to show "unset, inheriting X" rather than just X) and for
+/// each other's tests.
+pub fn resolveReplyAutonomy(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, owner_identity_id: i64) ReplyAutonomy {
+    const user_settings = @import("user_settings.zig");
+    if (getReplyAutonomy(pool, chat_id)) |override| return override;
+    return user_settings.getEffectiveReplyAutonomyDefault(pool, allocator, owner_identity_id);
+}
+
 /// Returns the per-chat system-prompt override duped into `allocator`, or
 /// `null` if unset (the caller falls back to `config.system_prompt`) — see
 /// the `0006_persona.sql` migration comment.
@@ -239,6 +285,35 @@ pub fn setShowThinkingOverride(pool: *PgPool, chat_id: i64, value: ?bool) !void 
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const chats = @import("chats.zig");
+const identities = @import("identities.zig");
+const user_settings = @import("user_settings.zig");
+
+test "resolveReplyAutonomy: no override inherits the owner's global default, override beats it, clearing restores inheritance" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const owner_id = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
+    const chat_id = try chats.upsertChat(&pool, .telegram_user, "100", null, null);
+
+    // Nothing set anywhere yet -> fails closed to .off.
+    try testing.expectEqual(ReplyAutonomy.off, resolveReplyAutonomy(&pool, a, chat_id, owner_id));
+
+    // Global default set, no per-chat override -> inherits it.
+    try user_settings.setReplyAutonomyDefault(&pool, owner_id, .draft);
+    try testing.expectEqual(@as(?ReplyAutonomy, null), getReplyAutonomy(&pool, chat_id));
+    try testing.expectEqual(ReplyAutonomy.draft, resolveReplyAutonomy(&pool, a, chat_id, owner_id));
+
+    // Per-chat override beats the global default.
+    try setReplyAutonomy(&pool, chat_id, .off);
+    try testing.expectEqual(ReplyAutonomy.off, resolveReplyAutonomy(&pool, a, chat_id, owner_id));
+
+    // Clearing the override falls back to inheriting the global default again.
+    try setReplyAutonomy(&pool, chat_id, null);
+    try testing.expectEqual(ReplyAutonomy.draft, resolveReplyAutonomy(&pool, a, chat_id, owner_id));
+}
 
 test "digest_enabled/last_digest_ts/magic_word round trip with defaults when unset" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;

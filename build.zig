@@ -19,6 +19,11 @@ pub fn build(b: *std.Build) void {
     // libolm (Matrix E2E encryption, see src/matrix/olm.zig) — same
     // reasoning/shape as the pq linkage above.
     exe_mod.linkSystemLibrary("olm", .{});
+    // TDLib's JSON client (src/platform/telegram_user.zig) — same
+    // reasoning/shape as the pq linkage above. Header lives under
+    // /usr/include/td/telegram/td_json_client.h (the `tdlib-devel`/
+    // `telegram-tdlib-dev` package, depending on distro).
+    exe_mod.linkSystemLibrary("tdjson", .{});
 
     const exe = b.addExecutable(.{
         .name = "warden",
