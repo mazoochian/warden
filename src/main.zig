@@ -2220,6 +2220,13 @@ fn handleMessage(
         if (audit_notify.handleUndoPicked(connector, a, pool, pending_undos, now, msg, picked)) {
             return false;
         }
+        // Same "checked on its own first, false for anything not its own"
+        // shape as the Undo button above — the Approve/Discard buttons on a
+        // `reply_autonomy = .draft` notification (see
+        // `handleTelegramUserAutoReply`/`handleDraftChoicePicked`).
+        if (handleDraftChoicePicked(connector, a, telegram_user, pending_drafts, now, msg, picked)) {
+            return false;
+        }
         // Both flows key their pending state the same way ((chat, user)),
         // so only one of them should ever actually claim a given pick --
         // `isAwaitingFormat` decides which, rather than trying `menu` only
@@ -4409,6 +4416,13 @@ const default_reply_as_owner_prompt =
     \\details.
 ;
 
+/// `Choice.value` prefixes for the Approve/Discard buttons on a
+/// `reply_autonomy = .draft` notification — see `handleTelegramUserAutoReply`
+/// (sends them) and `handleDraftChoicePicked` (consumes them). The target
+/// native chat id is appended verbatim after the prefix.
+const draft_approve_prefix = "draft_approve:";
+const draft_discard_prefix = "draft_discard:";
+
 /// Owner-configured `reply_autonomy` for an incoming personal-account
 /// message (Phase D of the plan sent to the owner). `.off` (the resolved
 /// default until the owner ever touches `/autonomy`) is a pure no-op — see
@@ -4483,12 +4497,71 @@ fn handleTelegramUserAutoReply(
             const incoming_preview = if (text.len > 300) text[0..300] else text;
             const notify_text = std.fmt.allocPrint(
                 a,
-                "\u{1f4ac} Draft reply ready\nChat: {s} ({s})\nThey said: \"{s}\"\n\nDraft: \"{s}\"\n\n/approve {s} to send as-is\n/discard {s} to drop it",
-                .{ chat_title, msg.chat_id, incoming_preview, answer, msg.chat_id, msg.chat_id },
+                "\u{1f4ac} Draft reply ready\nChat: {s} ({s})\nThey said: \"{s}\"\n\nDraft: \"{s}\"",
+                .{ chat_title, msg.chat_id, incoming_preview, answer },
             ) catch return;
-            owner_notify.sendMessage(a, owner_chat_id, notify_text, null);
+            // Buttons, not "type /approve <chat id>" — see
+            // `handleDraftChoicePicked` for what picking one does.
+            // `Choice.value` becomes Telegram's `callback_data` verbatim
+            // (`Connector.sendChoicePrompt`'s doc comment), so the target
+            // chat id travels on the button itself; no separate
+            // (control chat, prompt message) lookup is needed the way
+            // `audit_notify.PendingUndos` needs one; `pending_drafts` is
+            // already keyed by this same native chat id.
+            const approve_value = std.fmt.allocPrint(a, "{s}{s}", .{ draft_approve_prefix, msg.chat_id }) catch return;
+            const discard_value = std.fmt.allocPrint(a, "{s}{s}", .{ draft_discard_prefix, msg.chat_id }) catch return;
+            const choices = [_]iface.Choice{
+                .{ .emoji = "\xe2\x9c\x85", .label = "Approve", .value = approve_value },
+                .{ .emoji = "\xe2\x9d\x8c", .label = "Discard", .value = discard_value },
+            };
+            _ = owner_notify.sendChoicePrompt(a, owner_chat_id, notify_text, &choices, null) catch |err| {
+                log.warn("reply_autonomy: sendChoicePrompt failed for the owner notification, chat {s}: {t}", .{ msg.chat_id, err });
+            };
         },
     }
+}
+
+/// Consumes a `ChoicePicked` that's an Approve/Discard button press on a
+/// `reply_autonomy = .draft` notification (see `handleTelegramUserAutoReply`
+/// and the `draft_approve_prefix`/`draft_discard_prefix` doc comment) —
+/// returns `false` for anything else (a stray pick, or one of
+/// `audit_notify`/`convert_flow`/`menu`'s own buttons) so `handleMessage`
+/// falls through to its other `choice_picked` consumers unchanged, same
+/// contract as `audit_notify.handleUndoPicked`.
+fn handleDraftChoicePicked(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    pending_drafts: *reply_drafts.PendingDrafts,
+    now: i64,
+    msg: iface.Message,
+    picked: iface.ChoicePicked,
+) bool {
+    if (std.mem.startsWith(u8, picked.value, draft_approve_prefix)) {
+        const native_chat_id = picked.value[draft_approve_prefix.len..];
+        const draft = pending_drafts.take(a, now, native_chat_id) orelse {
+            connector.sendMessage(a, msg.chat_id, "That draft is gone (already sent/discarded, or expired).", msg.message_id);
+            return true;
+        };
+        const conn = telegram_user orelse {
+            connector.sendMessage(a, msg.chat_id, "The personal-account connector isn't configured on this deployment.", msg.message_id);
+            return true;
+        };
+        conn.connector().sendMessage(a, native_chat_id, draft.draft_text, draft.reply_to);
+        const confirmation = std.fmt.allocPrint(a, "Sent to {s}.", .{draft.chat_title}) catch "Sent.";
+        connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+        return true;
+    }
+    if (std.mem.startsWith(u8, picked.value, draft_discard_prefix)) {
+        const native_chat_id = picked.value[draft_discard_prefix.len..];
+        if (pending_drafts.discard(native_chat_id)) {
+            connector.sendMessage(a, msg.chat_id, "Draft discarded.", msg.message_id);
+        } else {
+            connector.sendMessage(a, msg.chat_id, "That draft is already gone.", msg.message_id);
+        }
+        return true;
+    }
+    return false;
 }
 
 fn handleThinkingCommand(
