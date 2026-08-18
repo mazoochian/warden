@@ -230,6 +230,24 @@ pub fn summarizeChat(
     return out.writer.buffered();
 }
 
+/// Plain-text "id — title" lines, one per chat, capped at `limit` with a
+/// "...and N more" tail — the LLM-tool-facing counterpart to `main.zig`'s
+/// `renderTdChatsPage` (which builds Telegram-specific button UI instead
+/// of plain text a model can read). Backs `list_personal_chats`.
+pub fn formatChatList(allocator: std.mem.Allocator, chat_list: []const ChatMatch, limit: usize) ![]const u8 {
+    if (chat_list.len == 0) return "No chats found.";
+
+    var out: Io.Writer.Allocating = .init(allocator);
+    const shown = @min(chat_list.len, limit);
+    for (chat_list[0..shown]) |c| {
+        try out.writer.print("{s} — {s}\n", .{ c.native_chat_id, c.title });
+    }
+    if (chat_list.len > shown) {
+        try out.writer.print("...and {d} more (narrow your query to see them).", .{chat_list.len - shown});
+    }
+    return out.writer.buffered();
+}
+
 /// Natural-language-tool counterpart to `summarizeChat`: same resolve +
 /// fetch+mark-read, but returns raw formatted lines (or a short status
 /// line for the empty/ambiguous/no-such-chat cases) instead of running its

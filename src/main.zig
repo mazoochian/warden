@@ -114,6 +114,8 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/create_poll.zig").tool,
     @import("tools/set_expense.zig").tool,
     @import("tools/summarize_unread_chat.zig").tool,
+    @import("tools/list_personal_chats.zig").tool,
+    @import("tools/send_personal_message.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
@@ -752,6 +754,7 @@ pub fn main(init: std.process.Init) !void {
             .auth_limiter = &auth_limiter,
             .bot_view_send_limiter = &bot_view_send_limiter,
             .telegram_user = if (telegram_user_adapter) |*t| t else null,
+            .llm_provider = llm_provider,
         };
         if (std.Thread.spawn(.{}, apiServerThread, .{ api_ctx, port, config.api_workers })) |thread| {
             thread.detach();
@@ -1402,7 +1405,7 @@ fn processMessageTask(
         .chat_id = chat_id,
         .now = ts,
     };
-    var chat_summary_adapter: ChatSummaryToolAdapter = .{
+    var personal_account_adapter: PersonalAccountToolAdapter = .{
         .telegram_user = telegram_user,
         .io = io,
     };
@@ -1428,7 +1431,7 @@ fn processMessageTask(
         .memory = if (embeddings_client != null) memory_adapter.sink() else null,
         .chat_history = chat_history_adapter.sink(),
         .expenses = expense_adapter.sink(),
-        .chat_summary = chat_summary_adapter.sink(),
+        .personal_account = personal_account_adapter.sink(),
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -2619,7 +2622,10 @@ fn handleMessage(
         }
     } else if (std.mem.eql(u8, text, "/sendas") or std.mem.startsWith(u8, text, "/sendas ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
-        handleSendAsCommand(connector, a, config, telegram_user, msg, text);
+        handleSendAsCommand(connector, a, config, telegram_user, msg, "/sendas", text);
+    } else if (std.mem.eql(u8, text, "/tdsend") or std.mem.startsWith(u8, text, "/tdsend ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleSendAsCommand(connector, a, config, telegram_user, msg, "/tdsend", text);
     } else if (std.mem.eql(u8, text, "/tdchats")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleTdchatsCommand(connector, a, config, telegram_user, msg);
@@ -4160,22 +4166,38 @@ fn performTdLogout(connector: iface.Connector, a: std.mem.Allocator, conn: *tele
     reply(connector, a, msg.chat_id, msg.message_id, "Logging out of the personal-account session — Telegram will clear it locally and end it server-side, same as removing the device from your active sessions list. Log back in any time with /tdlogin phone <number>.");
 }
 
-/// `/sendas <chat_id> <text...>` — Phase C of the plan sent to the owner:
-/// a manual, owner-only command that sends a real message through the
-/// personal-account connector, proving the send path (and, longer term,
-/// rate-limiting) before any auto-drafting/autonomous send exists.
+/// `/sendas <chat_id> <text...>` / `/tdsend <chat_id> <text...>` — same
+/// command, two spellings, one implementation (`command_prefix` is which
+/// one the caller matched). `/sendas` is Phase C of the plan sent to the
+/// owner: a manual, owner-only command that sends a real message through
+/// the personal-account connector, proving the send path (and, longer
+/// term, rate-limiting) before any auto-drafting/autonomous send existed.
+/// `/tdsend` is the same thing under the `/td*` family's naming
+/// convention (`/tdlogin`/`/tdchats`/`/tdsearch`/`/tdsummary`/`/tdlogout`),
+/// added by direct request once that family existed and `/sendas` was the
+/// one outlier not matching it — both are kept working rather than
+/// breaking `/sendas` for anyone already using it.
+///
 /// `chat_id` is TDLib's own native chat id (not the Bot API's — see
 /// `Platform.telegram_user`'s doc comment on why these are different
 /// numbering schemes for "the same" real-world chat) — findable via
-/// warden-ui's admin chat list, or simply by seeing which chat a real
-/// inbound message from that contact recorded once one arrives, since
-/// `store/chats.upsertChat` runs for every connector uniformly.
+/// `/tdchats`/`/tdsearch`, warden-ui's admin chat list, or simply by seeing
+/// which chat a real inbound message from that contact recorded once one
+/// arrives, since `store/chats.upsertChat` runs for every connector
+/// uniformly. Deliberately id-only, not name-resolved like `/tdsummary`
+/// (`chat_summary.resolveChat`): a name can contain spaces, which would
+/// make "where does the target end and the message begin" ambiguous for a
+/// two-argument command the way it isn't for `/tdsummary`'s single
+/// argument. Name-based targeting instead lives in the `send_personal_
+/// message` LLM tool, where `chat`/`message` are already separate
+/// structured fields with no such ambiguity.
 fn handleSendAsCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
     config: *const config_mod.Config,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     msg: iface.Message,
+    command_prefix: []const u8,
     text: []const u8,
 ) void {
     if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
@@ -4191,12 +4213,13 @@ fn handleSendAsCommand(
         return;
     }
 
-    const rest = std.mem.trim(u8, text["/sendas".len..], " ");
+    const rest = std.mem.trim(u8, text[command_prefix.len..], " ");
     const space = std.mem.indexOfScalar(u8, rest, ' ');
     const target_chat_id = if (space) |i| rest[0..i] else rest;
     const body = if (space) |i| std.mem.trim(u8, rest[i + 1 ..], " ") else "";
     if (target_chat_id.len == 0 or body.len == 0) {
-        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /sendas <chat id> <message>");
+        const usage = std.fmt.allocPrint(a, "Usage: {s} <chat id> <message>", .{command_prefix}) catch "Usage: <chat id> <message>";
+        connector.sendMessage(a, msg.chat_id, usage, msg.message_id);
         return;
     }
 
@@ -8379,31 +8402,74 @@ const ChatHistoryToolAdapter = struct {
 /// own doc comment for why both bounds exist together).
 const catch_me_up_row_limit = 2000;
 
-/// Backs `summarize_unread_chat` — unlike `ChatHistoryToolAdapter` (this
-/// Bot-API chat's own logged Postgres history), this reaches the
-/// personal-account TDLib connector, which may not be configured at all on
-/// this deployment. Always constructed and always wired into `ToolContext`
-/// (never gated to `null` the way `.memory` is) so the model gets a plain
-/// explanatory string back either way — "not configured"/"not logged in
-/// yet" are normal runtime states worth relaying to the owner directly,
-/// not a raw tool error to work around.
-const ChatSummaryToolAdapter = struct {
+/// Hard cap on how many chats `list_personal_chats` hands the model in one
+/// call — same "don't blow out the model's context on an account in a lot
+/// of chats" reasoning as `catch_me_up_row_limit` above, just for chat
+/// count instead of message count.
+const list_personal_chats_limit = 60;
+
+/// Backs the personal-account (TDLib) LLM tools —
+/// `summarize_unread_chat`/`list_personal_chats`/`send_personal_message` —
+/// unlike `ChatHistoryToolAdapter` (this Bot-API chat's own logged
+/// Postgres history), these reach the personal-account TDLib connector,
+/// which may not be configured at all on this deployment. Always
+/// constructed and always wired into `ToolContext` (never gated to `null`
+/// the way `.memory` is) so the model gets a plain explanatory string back
+/// either way — "not configured"/"not logged in yet" are normal runtime
+/// states worth relaying to the owner directly, not a raw tool error to
+/// work around.
+const PersonalAccountToolAdapter = struct {
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     io: Io,
 
-    fn sink(self: *ChatSummaryToolAdapter) tool_registry.ChatSummarySink {
+    fn sink(self: *PersonalAccountToolAdapter) tool_registry.PersonalAccountSink {
         return .{ .ptr = self, .vtable = &vt };
     }
 
-    const vt: tool_registry.ChatSummarySink.VTable = .{
+    const vt: tool_registry.PersonalAccountSink.VTable = .{
         .summarizeUnread = summarizeUnreadFn,
+        .listChats = listChatsFn,
+        .sendMessage = sendMessageFn,
     };
 
     fn summarizeUnreadFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8) anyerror![]const u8 {
-        const self: *ChatSummaryToolAdapter = @ptrCast(@alignCast(ptr));
+        const self: *PersonalAccountToolAdapter = @ptrCast(@alignCast(ptr));
         const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
         if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
         return chat_summary.describeUnreadForModel(conn, allocator, self.io, chat_query);
+    }
+
+    fn listChatsFn(ptr: *anyopaque, allocator: std.mem.Allocator, query: ?[]const u8) anyerror![]const u8 {
+        const self: *PersonalAccountToolAdapter = @ptrCast(@alignCast(ptr));
+        const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
+        if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
+
+        const chat_list = if (query) |q|
+            try chat_summary.searchChatsByTitle(conn, allocator, q)
+        else
+            try chat_summary.allChatsSortedByTitle(conn, allocator);
+        return chat_summary.formatChatList(allocator, chat_list, list_personal_chats_limit);
+    }
+
+    fn sendMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, message: []const u8) anyerror![]const u8 {
+        const self: *PersonalAccountToolAdapter = @ptrCast(@alignCast(ptr));
+        const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
+        if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
+
+        const resolution = try chat_summary.resolveChat(conn, allocator, chat_query);
+        switch (resolution) {
+            .none => return "No known chat matches that — try list_personal_chats first to find the right one.",
+            .ambiguous => |matches| {
+                var out: Io.Writer.Allocating = .init(allocator);
+                try out.writer.writeAll("That matches more than one chat — ask which one, then retry with its id:\n");
+                for (matches) |m| try out.writer.print("{s} (id {s})\n", .{ m.title, m.native_chat_id });
+                return out.writer.buffered();
+            },
+            .one => |m| {
+                conn.connector().sendMessage(allocator, m.native_chat_id, message, null);
+                return std.fmt.allocPrint(allocator, "Sent to \"{s}\".", .{m.title});
+            },
+        }
     }
 };
 
@@ -8839,6 +8905,8 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
         .{ .name = "create_poll", .key = "polls" },
         .{ .name = "set_expense", .key = "finance" },
         .{ .name = "summarize_unread_chat", .key = "messaging_modes" },
+        .{ .name = "list_personal_chats", .key = "messaging_modes" },
+        .{ .name = "send_personal_message", .key = "messaging_modes" },
     };
     for (pairs) |p| {
         if (std.mem.eql(u8, p.name, name)) return p.key;

@@ -20,6 +20,8 @@ const dynamic_config = @import("../store/dynamic_config.zig");
 const config_mod = @import("../config.zig");
 const iface = @import("../platform/interface.zig");
 const telegram_user_platform = @import("../platform/telegram_user.zig");
+const chat_summary = @import("../features/chat_summary.zig");
+const tool_registry = @import("../tools/registry.zig");
 const chats_store = @import("../store/chats.zig");
 const chat_members = @import("../store/chat_members.zig");
 const chat_settings = @import("../store/chat_settings.zig");
@@ -231,6 +233,15 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/password")) {
         return handleTelegramUserPassword(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/telegram-user/chats")) {
+        return handleTelegramUserListChats(ctx, request, target);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/chats/summarize")) {
+        return handleTelegramUserSummarizeChat(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/chats/send")) {
+        return handleTelegramUserSendMessage(ctx, request);
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/reminders")) {
         return handleListReminders(ctx, request, target);
@@ -2230,6 +2241,117 @@ fn handleTelegramUserPassword(ctx: *const ServerContext, request: *http.Server.R
         return respondError(request, .conflict, "wrong_state", "not currently waiting for a 2FA password");
     }
     conn.submitPassword(body.password);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/telegram-user/chats[?query=...]` — warden-ui's chat
+/// browser, backing the same data `/tdchats`/`/tdsearch` expose in Telegram
+/// itself. No pagination here (unlike `/tdchats`' button pager, which
+/// exists specifically to work around Telegram's message-length limit):
+/// a web table just scrolls, so the whole (sorted, optionally
+/// query-filtered) list goes back in one response and the client renders
+/// it directly.
+fn handleTelegramUserListChats(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    if (conn.authState() != .ready) {
+        return respondError(request, .conflict, "not_ready", "the personal account isn't logged in yet");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const query = queryParam(target, "query");
+    const chat_list = blk: {
+        if (query) |q| {
+            break :blk chat_summary.searchChatsByTitle(conn, arena, q) catch {
+                return respondError(request, .internal_server_error, "internal", "failed to search chats");
+            };
+        }
+        break :blk chat_summary.allChatsSortedByTitle(conn, arena) catch {
+            return respondError(request, .internal_server_error, "internal", "failed to list chats");
+        };
+    };
+
+    return respondJson(ctx, request, .ok, .{ .chats = chat_list });
+}
+
+const SummarizeTdChatBody = struct { chat_id: []const u8 };
+
+/// `POST /api/v1/telegram-user/chats/summarize` — warden-ui's trigger for
+/// the same unread-summary-and-mark-read action `/tdsummary` performs in
+/// Telegram, reusing `chat_summary.summarizeChat` (the exact same LLM
+/// round trip) rather than a second, subtly-divergent implementation.
+/// `chat_id` is expected to be an exact id from a prior `GET .../chats`
+/// response — this endpoint doesn't do `/tdsummary`'s name-substring
+/// resolution, since the client already has the exact id from the chat
+/// list it rendered.
+fn handleTelegramUserSummarizeChat(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    if (conn.authState() != .ready) {
+        return respondError(request, .conflict, "not_ready", "the personal account isn't logged in yet");
+    }
+    const provider = ctx.llm_provider orelse {
+        return respondError(request, .internal_server_error, "internal", "no LLM provider configured");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(SummarizeTdChatBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "expected {\"chat_id\": \"...\"}");
+    };
+    if (body.chat_id.len == 0) {
+        return respondError(request, .bad_request, "bad_request", "chat_id is required");
+    }
+
+    // Empty tool list, same as `digest.zig`'s own callers — this ToolContext
+    // exists only to satisfy `summarizeChat`'s signature, no tool ever
+    // actually runs against it, so every other field is fine left at its
+    // zero-value default.
+    const tool_ctx = tool_registry.ToolContext{ .allocator = arena, .io = ctx.io };
+    const summary = chat_summary.summarizeChat(conn, provider, arena, ctx.io, tool_ctx, body.chat_id) catch {
+        return respondError(request, .internal_server_error, "internal", "failed to summarize chat");
+    };
+    return respondJson(ctx, request, .ok, .{ .summary = summary });
+}
+
+const SendTdMessageBody = struct { chat_id: []const u8, message: []const u8 };
+
+/// `POST /api/v1/telegram-user/chats/send` — warden-ui's trigger for the
+/// same manual send `/tdsend`/`/sendas` perform in Telegram. Like
+/// `handleTelegramUserSummarizeChat`, `chat_id` is expected to already be
+/// an exact id the client picked from `GET .../chats` — no name resolution
+/// here.
+fn handleTelegramUserSendMessage(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    if (conn.authState() != .ready) {
+        return respondError(request, .conflict, "not_ready", "the personal account isn't logged in yet");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [8 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(8 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(SendTdMessageBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "expected {\"chat_id\": \"...\", \"message\": \"...\"}");
+    };
+    if (body.chat_id.len == 0 or body.message.len == 0) {
+        return respondError(request, .bad_request, "bad_request", "chat_id and message are both required");
+    }
+
+    conn.connector().sendMessage(arena, body.chat_id, body.message, null);
     return respondJson(ctx, request, .ok, .{});
 }
 

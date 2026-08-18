@@ -18,6 +18,7 @@ const config_mod = @import("../config.zig");
 const iface = @import("../platform/interface.zig");
 const telegram_user_platform = @import("../platform/telegram_user.zig");
 const bot_view = @import("bot_view.zig");
+const llm = @import("../llm/provider.zig");
 const rate_limit = @import("rate_limit.zig");
 const router = @import("router.zig");
 const log = @import("../log.zig").scoped("api");
@@ -65,6 +66,14 @@ pub const ServerContext = struct {
     /// none of which are (or should be) part of the platform-agnostic
     /// vtable every connector implements.
     telegram_user: ?*telegram_user_platform.TelegramUserConnector = null,
+    /// The bot's LLM provider — needed by the `/api/v1/telegram-user/
+    /// chats/summarize` endpoint (see `router.zig`'s `handleTelegramUser
+    /// SummarizeChat`), which reuses `features/chat_summary.zig`'s exact
+    /// same LLM summarization call the bot's own `/tdsummary` command
+    /// uses. `null` in every test that doesn't specifically exercise that
+    /// endpoint, same "safe-for-tests default" convention every other
+    /// optional field on this struct already follows.
+    llm_provider: ?llm.Provider = null,
 };
 
 const ConnectionItem = struct {

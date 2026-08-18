@@ -24,7 +24,7 @@ pub const tool: registry.ToolDef = .{
 };
 
 fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u8 {
-    const sink = ctx.chat_summary orelse return error.MissingToolContext;
+    const sink = ctx.personal_account orelse return error.MissingToolContext;
 
     var parsed = try json.parseFromSlice(
         Args,
@@ -49,16 +49,35 @@ const FakeSink = struct {
     requested_chat: ?[]const u8 = null,
     result_text: []const u8 = "\"Alice\" -- 2 unread message(s), now marked read:\nalice: hey\nalice: you around?",
 
-    fn sink(self: *FakeSink) registry.ChatSummarySink {
+    fn sink(self: *FakeSink) registry.PersonalAccountSink {
         return .{ .ptr = self, .vtable = &vt };
     }
-    const vt: registry.ChatSummarySink.VTable = .{ .summarizeUnread = summarizeUnreadFn };
+    const vt: registry.PersonalAccountSink.VTable = .{
+        .summarizeUnread = summarizeUnreadFn,
+        .listChats = unusedListChatsFn,
+        .sendMessage = unusedSendMessageFn,
+    };
 
     fn summarizeUnreadFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8) anyerror![]const u8 {
         _ = allocator;
         const self: *FakeSink = @ptrCast(@alignCast(ptr));
         self.requested_chat = chat_query;
         return self.result_text;
+    }
+
+    fn unusedListChatsFn(ptr: *anyopaque, allocator: std.mem.Allocator, query: ?[]const u8) anyerror![]const u8 {
+        _ = ptr;
+        _ = allocator;
+        _ = query;
+        return error.Unsupported;
+    }
+
+    fn unusedSendMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, message: []const u8) anyerror![]const u8 {
+        _ = ptr;
+        _ = allocator;
+        _ = chat_query;
+        _ = message;
+        return error.Unsupported;
     }
 };
 
@@ -68,7 +87,7 @@ test "execute passes the chat argument through and returns the sink's text" {
     const a = arena.allocator();
 
     var fake = FakeSink{};
-    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io, .chat_summary = fake.sink() };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io, .personal_account = fake.sink() };
 
     const out = try execute(ctx, "{\"chat\":\"alice\"}");
     try testing.expectEqualStrings("alice", fake.requested_chat.?);
