@@ -69,6 +69,40 @@ pub fn resolveChat(telegram_user: *TelegramUserConnector, allocator: std.mem.All
     };
 }
 
+/// Every known chat, alphabetized by title (case-insensitive) — the
+/// `/tdchats` pager's data source. Sorted rather than left in
+/// `knownChats()`'s hashmap-iteration order so paging forward/backward
+/// shows a stable, predictable sequence instead of one that could reorder
+/// itself between two page requests.
+pub fn allChatsSortedByTitle(telegram_user: *TelegramUserConnector, allocator: std.mem.Allocator) ![]ChatMatch {
+    const chats = try telegram_user.knownChats(allocator);
+    const matches = try allocator.alloc(ChatMatch, chats.len);
+    for (chats, 0..) |c, i| matches[i] = .{ .native_chat_id = c.chat_id, .title = c.title };
+    std.mem.sort(ChatMatch, matches, {}, titleLessThanIgnoreCase);
+    return matches;
+}
+
+fn titleLessThanIgnoreCase(_: void, a: ChatMatch, b: ChatMatch) bool {
+    return std.ascii.orderIgnoreCase(a.title, b.title) == .lt;
+}
+
+/// Every chat whose title contains `query` (case-insensitive), alphabetized
+/// — `/tdsearch`'s data source. Unlike `resolveChat`, this never treats a
+/// numeric query as an id lookup and never collapses to a single "the"
+/// match: it's a browsing tool, not a targeting one, so it always returns
+/// the full match set (even zero or one result) for the caller to list.
+pub fn searchChatsByTitle(telegram_user: *TelegramUserConnector, allocator: std.mem.Allocator, query: []const u8) ![]ChatMatch {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    const all = try allChatsSortedByTitle(telegram_user, allocator);
+    if (trimmed.len == 0) return all;
+
+    var out: std.ArrayList(ChatMatch) = .empty;
+    for (all) |c| {
+        if (containsIgnoreCase(c.title, trimmed)) try out.append(allocator, c);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0 or needle.len > haystack.len) return false;
     var i: usize = 0;

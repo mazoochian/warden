@@ -2234,6 +2234,14 @@ fn handleMessage(
         if (handleDraftChoicePicked(connector, a, telegram_user, pending_drafts, now, msg, picked)) {
             return false;
         }
+        // Same shape again — `/tdchats`' Prev/Next pager buttons. Checked
+        // by `callback_data` prefix rather than any stored pending state
+        // (see `handleTdChatsPagePicked`'s doc comment on why it's
+        // stateless), so ordering relative to the two checks above doesn't
+        // matter beyond "somewhere before the isAwaitingFormat split".
+        if (handleTdChatsPagePicked(connector, a, config, telegram_user, msg, picked)) {
+            return false;
+        }
         // Both flows key their pending state the same way ((chat, user)),
         // so only one of them should ever actually claim a given pick --
         // `isAwaitingFormat` decides which, rather than trying `menu` only
@@ -2602,12 +2610,22 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/tdlogin") or std.mem.startsWith(u8, text, "/tdlogin ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleTdloginCommand(connector, a, config, telegram_user, msg, text);
+    } else if (std.mem.eql(u8, text, "/tdlogout")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        if (telegram_user) |conn| {
+            performTdLogout(connector, a, conn, msg);
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
+        }
     } else if (std.mem.eql(u8, text, "/sendas") or std.mem.startsWith(u8, text, "/sendas ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleSendAsCommand(connector, a, config, telegram_user, msg, text);
     } else if (std.mem.eql(u8, text, "/tdchats")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleTdchatsCommand(connector, a, config, telegram_user, msg);
+    } else if (std.mem.eql(u8, text, "/tdsearch") or std.mem.startsWith(u8, text, "/tdsearch ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleTdSearchCommand(connector, a, config, telegram_user, msg, text);
     } else if (std.mem.eql(u8, text, "/tdsummary") or std.mem.startsWith(u8, text, "/tdsummary ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleTdSummaryCommand(connector, a, config, telegram_user, llm_provider, io, tool_ctx, msg, text);
@@ -4117,7 +4135,29 @@ fn handleTdloginCommand(
         return;
     }
 
-    reply(connector, a, msg.chat_id, msg.message_id, "Unknown /tdlogin subcommand — use status, phone, code, or password.");
+    if (std.mem.eql(u8, sub, "logout")) {
+        performTdLogout(connector, a, conn, msg);
+        return;
+    }
+
+    reply(connector, a, msg.chat_id, msg.message_id, "Unknown /tdlogin subcommand — use status, phone, code, password, or logout.");
+}
+
+/// Shared by `/tdlogin logout` and the standalone `/tdlogout` alias (same
+/// command, two spellings — `/tdlogout` because that's what got asked for
+/// directly, `/tdlogin logout` because it fits the existing status/phone/
+/// code/password subcommand family). `.none` is refused rather than
+/// forwarded to `conn.logOut()`: the connector's `client_id` is still null
+/// at that point (no `ensureClient()` call has run yet), and `send()`
+/// unconditionally unwraps `client_id.?` — a real crash, not just a
+/// pointless no-op, if this ever raced a fresh startup.
+fn performTdLogout(connector: iface.Connector, a: std.mem.Allocator, conn: *telegram_user_platform.TelegramUserConnector, msg: iface.Message) void {
+    if (conn.authState() == .none) {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector hasn't started yet — nothing to log out of.");
+        return;
+    }
+    conn.logOut();
+    reply(connector, a, msg.chat_id, msg.message_id, "Logging out of the personal-account session — Telegram will clear it locally and end it server-side, same as removing the device from your active sessions list. Log back in any time with /tdlogin phone <number>.");
 }
 
 /// `/sendas <chat_id> <text...>` — Phase C of the plan sent to the owner:
@@ -4164,15 +4204,142 @@ fn handleSendAsCommand(
     reply(connector, a, msg.chat_id, msg.message_id, "Sent.");
 }
 
-/// `/tdchats` — lists the personal account's known chats (id + title) so
-/// the owner can find a `/sendas` target without already knowing a raw
+/// Chats-per-page for `/tdchats`' pager and its Prev/Next buttons —
+/// direct-user-request feature (2026-08-18, an account with "dozens of
+/// chats" made the old single-message dump with a "... and N more (not
+/// shown)" tail actually lose information). 15 keeps a page's button
+/// message comfortably under Telegram's 4096-char limit even for long
+/// titles, while still fitting several pages' worth of a merely
+/// medium-sized chat list without excessive tapping.
+const tdchats_per_page = 15;
+
+/// `callback_data` prefix for a `/tdchats` pager button — see
+/// `handleTdChatsPagePicked`. The page number is everything after the
+/// colon, so `"tdchats_page:2"` means "render page index 2 (0-based)".
+const tdchats_page_prefix = "tdchats_page:";
+
+/// Builds one page's message text + Prev/Next buttons from an already-
+/// resolved chat list — shared by `/tdchats`' initial send,
+/// `handleTdChatsPagePicked`'s re-render on a button press, and (as a
+/// single un-paginated call with `page = 0`) `/tdsearch`'s typically-short
+/// result list. `chats` is assumed already sorted (see
+/// `chat_summary.allChatsSortedByTitle`) — this function only slices and
+/// renders, it never reorders.
+fn renderTdChatsPage(a: std.mem.Allocator, chat_list: []const chat_summary.ChatMatch, page: usize) struct { text: []const u8, choices: []const iface.Choice } {
+    const total_pages = if (chat_list.len == 0) 1 else std.math.divCeil(usize, chat_list.len, tdchats_per_page) catch 1;
+    const clamped_page = @min(page, total_pages - 1);
+    const start = clamped_page * tdchats_per_page;
+    const end = @min(start + tdchats_per_page, chat_list.len);
+
+    var out: Io.Writer.Allocating = .init(a);
+    out.writer.print("Known chats (id — title) — page {d}/{d}, {d} total:\n", .{ clamped_page + 1, total_pages, chat_list.len }) catch {};
+    for (chat_list[start..end]) |c| {
+        const title = if (c.title.len > 60) c.title[0..60] else c.title;
+        out.writer.print("{s} — {s}\n", .{ c.native_chat_id, title }) catch break;
+    }
+
+    var choices: std.ArrayList(iface.Choice) = .empty;
+    if (clamped_page > 0) {
+        const value = std.fmt.allocPrint(a, "{s}{d}", .{ tdchats_page_prefix, clamped_page - 1 }) catch "";
+        choices.append(a, .{ .emoji = "◀️", .label = "Prev", .value = value }) catch {};
+    }
+    if (end < chat_list.len) {
+        const value = std.fmt.allocPrint(a, "{s}{d}", .{ tdchats_page_prefix, clamped_page + 1 }) catch "";
+        choices.append(a, .{ .emoji = "▶️", .label = "Next", .value = value }) catch {};
+    }
+
+    return .{ .text = out.writer.buffered(), .choices = choices.items };
+}
+
+/// A `/tdchats` pager button press — consumed the same way
+/// `handleDraftChoicePicked` consumes a draft Approve/Discard press
+/// (checked against `msg.choice_picked` right alongside it in
+/// `handleMessage`'s dispatch, "false for anything not mine" contract).
+/// Stateless by design: the page number lives entirely in the button's own
+/// `callback_data`, so there's no per-owner pager session to expire or
+/// leak — a re-render just re-fetches and re-sorts the current chat list
+/// fresh, same as a brand new `/tdchats` would.
+fn handleTdChatsPagePicked(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    msg: iface.Message,
+    picked: iface.ChoicePicked,
+) bool {
+    if (!std.mem.startsWith(u8, picked.value, tdchats_page_prefix)) return false;
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+    const conn = telegram_user orelse return false;
+
+    const page = std.fmt.parseInt(usize, picked.value[tdchats_page_prefix.len..], 10) catch return false;
+    const chats_list = chat_summary.allChatsSortedByTitle(conn, a) catch return false;
+    const rendered = renderTdChatsPage(a, chats_list, page);
+    connector.editChoicePrompt(a, msg.chat_id, picked.prompt_message_id, rendered.text, rendered.choices) catch |err| {
+        log.warn("tdchats pagination: editChoicePrompt failed: {t}", .{err});
+    };
+    return true;
+}
+
+test "renderTdChatsPage: everything fits on one page, no buttons" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chats_list = [_]chat_summary.ChatMatch{
+        .{ .native_chat_id = "1", .title = "Alice" },
+        .{ .native_chat_id = "2", .title = "Bob" },
+    };
+    const rendered = renderTdChatsPage(a, &chats_list, 0);
+    try std.testing.expectEqual(@as(usize, 0), rendered.choices.len);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.text, "page 1/1, 2 total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.text, "Alice") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.text, "Bob") != null);
+}
+
+test "renderTdChatsPage: first/middle/last page show the right Prev/Next buttons" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var chats_list: [tdchats_per_page * 2 + 3]chat_summary.ChatMatch = undefined;
+    for (&chats_list, 0..) |*c, i| c.* = .{
+        .native_chat_id = std.fmt.allocPrint(a, "{d}", .{i}) catch unreachable,
+        .title = std.fmt.allocPrint(a, "Chat {d}", .{i}) catch unreachable,
+    };
+
+    const first = renderTdChatsPage(a, &chats_list, 0);
+    try std.testing.expectEqual(@as(usize, 1), first.choices.len);
+    try std.testing.expectEqualStrings("Next", first.choices[0].label);
+
+    const middle = renderTdChatsPage(a, &chats_list, 1);
+    try std.testing.expectEqual(@as(usize, 2), middle.choices.len);
+    try std.testing.expectEqualStrings("Prev", middle.choices[0].label);
+    try std.testing.expectEqualStrings("Next", middle.choices[1].label);
+
+    const last = renderTdChatsPage(a, &chats_list, 2);
+    try std.testing.expectEqual(@as(usize, 1), last.choices.len);
+    try std.testing.expectEqualStrings("Prev", last.choices[0].label);
+    try std.testing.expect(std.mem.indexOf(u8, last.text, "page 3/3") != null);
+}
+
+test "renderTdChatsPage: an out-of-range page clamps to the last one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chats_list = [_]chat_summary.ChatMatch{
+        .{ .native_chat_id = "1", .title = "Alice" },
+    };
+    const rendered = renderTdChatsPage(a, &chats_list, 99);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.text, "page 1/1") != null);
+}
+
+/// `/tdchats` — lists the personal account's known chats (id + title),
+/// paginated (see `tdchats_per_page`) with Prev/Next buttons, so the owner
+/// can find a `/sendas`/`/tdsummary` target without already knowing a raw
 /// TDLib chat id. Owner-only, same bar as every other `/td*`/`/sendas`
-/// command. Capped and title-truncated to stay well under Telegram's 4096-
-/// char message limit even for an account in a lot of chats — see
-/// `max_message_len` elsewhere in this file for the general shape of that
-/// concern, though this doesn't thread that value through since a fixed,
-/// conservative cap is simpler than computing an exact budget for a
-/// debugging/discovery command that isn't performance-sensitive.
+/// command. `/tdsearch <name>` (see `handleTdSearchCommand`) narrows this
+/// down directly instead of paging through it.
 fn handleTdchatsCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -4193,7 +4360,7 @@ fn handleTdchatsCommand(
         return;
     }
 
-    const chats_list = conn.knownChats(a) catch {
+    const chats_list = chat_summary.allChatsSortedByTitle(conn, a) catch {
         reply(connector, a, msg.chat_id, msg.message_id, "Failed to list chats.");
         return;
     };
@@ -4202,17 +4369,63 @@ fn handleTdchatsCommand(
         return;
     }
 
-    var out: Io.Writer.Allocating = .init(a);
-    out.writer.writeAll("Known chats (id — title):\n") catch {};
-    const max_listed = 60;
-    for (chats_list[0..@min(chats_list.len, max_listed)]) |c| {
-        const title = if (c.title.len > 60) c.title[0..60] else c.title;
-        out.writer.print("{s} — {s}\n", .{ c.chat_id, title }) catch break;
+    const rendered = renderTdChatsPage(a, chats_list, 0);
+    _ = connector.sendChoicePrompt(a, msg.chat_id, rendered.text, rendered.choices, msg.message_id) catch |err| {
+        log.warn("/tdchats: sendChoicePrompt failed, falling back to a plain message: {t}", .{err});
+        connector.sendMessage(a, msg.chat_id, rendered.text, msg.message_id);
+    };
+}
+
+/// `/tdsearch <name>` — direct-user-request companion to `/tdchats`' pager:
+/// jump straight to the chats matching a name instead of paging through
+/// everything. Deliberately un-paginated (unlike `/tdchats`) — a
+/// case-insensitive title substring is expected to narrow things down to a
+/// handful of chats, not dozens, so `renderTdChatsPage`'s single-page call
+/// here almost always has no Next button at all; a search somehow matching
+/// enough to need a second page still gets one (`renderTdChatsPage` doesn't
+/// care where its input came from), it just isn't the common case this
+/// command is built for.
+fn handleTdSearchCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can search the personal account's chats.");
+        return;
     }
-    if (chats_list.len > max_listed) {
-        out.writer.print("... and {d} more (not shown).", .{chats_list.len - max_listed}) catch {};
+    const conn = telegram_user orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
+        return;
+    };
+    if (conn.authState() != .ready) {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal account isn't logged in yet — see /tdlogin status.");
+        return;
     }
-    connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
+
+    const query = std.mem.trim(u8, text["/tdsearch".len..], " ");
+    if (query.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tdsearch <name>");
+        return;
+    }
+
+    const matches = chat_summary.searchChatsByTitle(conn, a, query) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Failed to search chats.");
+        return;
+    };
+    if (matches.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "No chats match that — try /tdchats to browse everything.");
+        return;
+    }
+
+    const rendered = renderTdChatsPage(a, matches, 0);
+    _ = connector.sendChoicePrompt(a, msg.chat_id, rendered.text, rendered.choices, msg.message_id) catch |err| {
+        log.warn("/tdsearch: sendChoicePrompt failed, falling back to a plain message: {t}", .{err});
+        connector.sendMessage(a, msg.chat_id, rendered.text, msg.message_id);
+    };
 }
 
 /// `/tdsummary <chat id or name>` — direct-user-request feature: summarize

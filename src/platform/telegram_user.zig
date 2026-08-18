@@ -547,6 +547,22 @@ pub const TelegramUserConnector = struct {
         });
     }
 
+    /// TDLib's `logOut` — clears the account's session both locally
+    /// (`session_dir` on disk) and server-side, same as removing the
+    /// device from Telegram's own "active sessions" list. Fire-and-forget,
+    /// same idiom as `submitPhoneNumber`/`submitAuthCode`/`submitPassword`
+    /// above: no `@extra` correlation needed, since the result shows up
+    /// through the normal `updateAuthorizationState` stream this connector
+    /// already handles -- `authorizationStateClosed` (already wired in
+    /// `handleAuthorizationState`) resets `client_id` to `null`, so the
+    /// very next `pollFn` cycle's `ensureClient()` call transparently spins
+    /// up a fresh client, which (session data now cleared) lands back on
+    /// `authorizationStateWaitPhoneNumber` -- ready for a normal
+    /// `/tdlogin phone <number>` with no separate "re-init" step needed.
+    pub fn logOut(self: *TelegramUserConnector) void {
+        self.send(.{ .@"@type" = "logOut" });
+    }
+
     fn sendMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to_message_id: ?[]const u8) void {
         const self: *TelegramUserConnector = @ptrCast(@alignCast(ptr));
         _ = allocator;
