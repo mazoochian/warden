@@ -69,6 +69,7 @@ const feed_watcher = @import("features/feed_watcher.zig");
 const transcribe = @import("features/transcribe.zig");
 const video_download = @import("features/video_download.zig");
 const convert_flow = @import("features/convert_flow.zig");
+const reply_drafts = @import("features/reply_drafts.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
@@ -344,6 +345,10 @@ const help_text_admin =
     \\/tdlogin -- connect Warden to your personal Telegram account
     \\/sendas <chat id> <text> -- send a message through your personal account
     \\/tdchats -- list your personal account's chats and their ids
+    \\/autonomy [off|draft|auto] | <chat id> [off|draft|auto|clear] --
+    \\  reply-on-my-behalf dial, global or per personal-account chat
+    \\/drafts, /approve <chat id>, /discard <chat id> -- review, send, or
+    \\  drop a drafted reply (reply_autonomy = draft)
 ;
 
 /// Sends `/help` as two messages (see `help_text_admin`), appending a note
@@ -519,6 +524,16 @@ pub fn main(init: std.process.Init) !void {
     var menu_sessions = menu.Sessions.init(gpa, io, config.menu_timeout_seconds);
     defer menu_sessions.deinit();
 
+    // Phase D of the plan sent to the owner: `reply_autonomy = .draft`
+    // drafts a reply through the personal-account connector but holds it
+    // here instead of sending it, until `/approve`/`/discard` (see
+    // `handleApproveCommand`/`handleDiscardCommand`). 24h, same "reasonable
+    // to reach for well after the fact" reasoning as `pending_undos` above
+    // — unlike a ban/kick confirmation, replying to a text a few hours
+    // later is completely normal for a personal account.
+    var pending_drafts = reply_drafts.PendingDrafts.init(gpa, io, 24 * 3600);
+    defer pending_drafts.deinit();
+
     var bot_view_broadcaster = bot_view.Broadcaster.init(gpa, io);
     defer bot_view_broadcaster.deinit();
 
@@ -653,6 +668,17 @@ pub fn main(init: std.process.Init) !void {
     // pointer "belongs to".
     const telegram_user_ptr: ?*telegram_user_platform.TelegramUserConnector = if (telegram_user_adapter) |*t| t else null;
 
+    // A `reply_autonomy = .draft` notification (see `pending_drafts` above)
+    // always needs to reach the owner through the Bot API chat they
+    // actually operate Warden from, regardless of which connector's poll
+    // loop is running `handleMessage` at the time — same "computed once,
+    // handed identically to every connector's poll loop" shape as
+    // `telegram_user_ptr` right above, for the same reason: the personal
+    // connector's own poll loop is exactly the one that needs this most
+    // (that's where an incoming message that might need a draft arrives),
+    // and it's never the Bot API connector's own loop.
+    const owner_notify_connector = telegram_adapter.connector();
+
     for (connectors, 0..) |connector, i| {
         const msg_pool = MessageWorkerPool.init(gpa, io, config.workers_per_platform, MessageTask.run) catch |err| {
             log.err("failed to start worker pool for {t}: {t}", .{ connector.platform(), err });
@@ -680,6 +706,8 @@ pub fn main(init: std.process.Init) !void {
             i,
             &bot_view_broadcaster,
             telegram_user_ptr,
+            &pending_drafts,
+            owner_notify_connector,
         }) catch |err| {
             log.err("failed to start poll loop thread for {t}: {t}", .{ connector.platform(), err });
             continue;
@@ -964,6 +992,8 @@ fn connectorPollLoop(
     connector_idx: usize,
     bcast: *bot_view.Broadcaster,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    pending_drafts: *reply_drafts.PendingDrafts,
+    owner_notify: iface.Connector,
 ) void {
     while (true) {
         var poll_arena = std.heap.ArenaAllocator.init(gpa);
@@ -1050,6 +1080,8 @@ fn connectorPollLoop(
                 .msg = duped_msg,
                 .bcast = bcast,
                 .telegram_user = telegram_user,
+                .pending_drafts = pending_drafts,
+                .owner_notify = owner_notify,
             }) catch |err| {
                 // Queueing itself failed (OOM growing the queue's backing
                 // array) — `processMessageTask` never got a chance to free
@@ -1137,6 +1169,8 @@ const MessageTask = struct {
     msg: iface.Message,
     bcast: *bot_view.Broadcaster,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    pending_drafts: *reply_drafts.PendingDrafts,
+    owner_notify: iface.Connector,
 
     fn run(self: MessageTask) void {
         processMessageTask(
@@ -1160,6 +1194,8 @@ const MessageTask = struct {
             self.msg,
             self.bcast,
             self.telegram_user,
+            self.pending_drafts,
+            self.owner_notify,
         );
     }
 };
@@ -1189,6 +1225,8 @@ fn processMessageTask(
     msg: iface.Message,
     bcast: *bot_view.Broadcaster,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    pending_drafts: *reply_drafts.PendingDrafts,
+    owner_notify: iface.Connector,
 ) void {
     defer {
         task_arena.deinit();
@@ -1389,7 +1427,7 @@ fn processMessageTask(
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg, false, telegram_user);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg, false, telegram_user, pending_drafts, owner_notify);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -2135,6 +2173,17 @@ fn handleMessage(
     /// (`pool`, `pending`, `digest_scheduler`, ...) already follows. Only
     /// `/tdlogin`'s handler touches this; every other command ignores it.
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    /// Phase D's `reply_autonomy = .draft` staging area — see
+    /// `reply_drafts.PendingDrafts`'s doc comment. Touched by the
+    /// `.telegram_user` auto-reply branch (`handleTelegramUserAutoReply`)
+    /// and by `/approve`/`/discard`/`/drafts`.
+    pending_drafts: *reply_drafts.PendingDrafts,
+    /// The Bot API connector to notify the owner through when a draft is
+    /// ready for review — see `main`'s `owner_notify_connector` doc comment
+    /// for why this can't just be `connector` (the connector that actually
+    /// received the message being drafted for is the *personal* one, not
+    /// the one the owner reviews drafts on).
+    owner_notify: iface.Connector,
 ) bool {
     // Coarse "does the bot even respond here" gate — checked before
     // anything else in this function (including the choice_picked/
@@ -2301,6 +2350,8 @@ fn handleMessage(
                 asRelayedMessage(msg, relay.target_native_chat_id, relay.command),
                 true,
                 telegram_user,
+                pending_drafts,
+                owner_notify,
             );
         }
     }
@@ -2504,6 +2555,8 @@ fn handleMessage(
             asRelayedMessage(msg, relay.target_native_chat_id, relay.command),
             true,
             telegram_user,
+            pending_drafts,
+            owner_notify,
         );
     } else if (std.mem.eql(u8, text, "/redact") or std.mem.startsWith(u8, text, "/redact ")) {
         // Per-mode gating happens inside handleRedactCommand itself (regex
@@ -2541,6 +2594,18 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/tdchats")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleTdchatsCommand(connector, a, config, telegram_user, msg);
+    } else if (std.mem.eql(u8, text, "/autonomy") or std.mem.startsWith(u8, text, "/autonomy ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleAutonomyCommand(connector, a, config, pool, msg, text, now);
+    } else if (std.mem.eql(u8, text, "/drafts")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleDraftsListCommand(connector, a, config, pending_drafts, msg, now);
+    } else if (std.mem.eql(u8, text, "/approve") or std.mem.startsWith(u8, text, "/approve ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleApproveCommand(connector, a, config, telegram_user, pending_drafts, msg, text, now);
+    } else if (std.mem.eql(u8, text, "/discard") or std.mem.startsWith(u8, text, "/discard ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleDiscardCommand(connector, a, config, pending_drafts, msg, text);
     } else if (std.mem.eql(u8, text, "/remind") or std.mem.startsWith(u8, text, "/remind ")) {
         if (!feature_flags.isEnabled(pool, "reminders")) return false;
         handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
@@ -2682,23 +2747,19 @@ fn handleMessage(
         // LLM as if it were a question.
         return false;
     } else if (connector.platform() == .telegram_user) {
-        // Deliberately a hard no-op, not "fall through to isAddressedToBot"
-        // — every message this connector sees looks like a private 1:1 DM
-        // to `isAddressedToBot` right now (`is_group` isn't populated yet,
-        // see `platform/telegram_user.zig`'s Phase A scope note), and DMs
-        // always get an answer there. Combined with owners bypassing the
-        // allowlist/credits gates entirely, that would mean *any* message
-        // whose sender happens to be the owner's own account — including
-        // one posted in a real group the personal account is a member of,
-        // nothing to do with Warden — would get auto-answered by the LLM
-        // and sent back through this connector, i.e. an AI reply appearing
-        // to come from the owner's real account, in a real chat, with no
-        // opt-in at all. Confirmed live (2026-08-18): this fired for real
-        // against the owner's own Saved Messages chat before this guard
-        // existed. `reply_autonomy`'s off/draft/auto dial (migration
-        // `0043_reply_autonomy.sql`) is the intended, deliberate gate for
-        // any auto-response through this connector — Phase D wires it up;
-        // until then, nothing auto-answers here at all, full stop.
+        // Phase D: `reply_autonomy` (migration `0043_reply_autonomy.sql`)
+        // is the deliberate, explicit gate for any auto-response through
+        // this connector — NOT `isAddressedToBot` (every message this
+        // connector sees looks like a private 1:1 DM to it right now, and
+        // combined with owners bypassing the allowlist/credits gates
+        // everywhere, that would mean any message from the owner's own
+        // account auto-answers with zero opt-in; confirmed live
+        // (2026-08-18) against the owner's own Saved Messages chat before
+        // this got built — see git history for that incident). `.off` is
+        // both the resolved default and a fail-closed no-op, same as
+        // before this existed; `.draft`/`.auto` are opt-in per chat or
+        // globally via `/autonomy`.
+        handleTelegramUserAutoReply(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, now, max_message_len, msg, text, owner_notify, pending_drafts);
         return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
         // One bulk dynamic_config fetch for every setting this branch
@@ -4135,6 +4196,299 @@ fn handleTdchatsCommand(
         out.writer.print("... and {d} more (not shown).", .{chats_list.len - max_listed}) catch {};
     }
     connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
+}
+
+/// The Bot API owner's own native chat id (private-chat id == user id on
+/// Telegram) — `null` if, somehow, no `.telegram` entry exists in
+/// `config.owners` (shouldn't happen: `Config.load` always adds one
+/// unconditionally from `WARDEN_TELEGRAM_OWNER_ID`).
+fn ownerTelegramNativeId(config: *const config_mod.Config) ?[]const u8 {
+    for (config.owners) |entry| {
+        if (entry.platform == .telegram) return entry.owner_id;
+    }
+    return null;
+}
+
+/// The `identities` row for the Bot API owner — the identity
+/// `user_settings.reply_autonomy_default` (the global `/autonomy` dial) and
+/// every other personal-settings row is keyed on, same identity the
+/// settings UI resolves via its own login session. Not cached: this is one
+/// cheap upsert-or-fetch, called at most once per incoming personal-account
+/// message.
+fn resolveOwnerIdentityId(pool: *store_pool.PgPool, config: *const config_mod.Config, now: i64) !i64 {
+    const native_id = ownerTelegramNativeId(config) orelse return error.NoTelegramOwnerConfigured;
+    return identities.getOrCreateMinimal(pool, .telegram, native_id, "Owner", null, false, now);
+}
+
+/// `/autonomy` — Phase D of the plan sent to the owner: the off/draft/auto
+/// dial for `reply_autonomy` (migration `0043_reply_autonomy.sql`). Three
+/// forms:
+///   `/autonomy` — shows the current global default.
+///   `/autonomy <off|draft|auto>` — sets the global default.
+///   `/autonomy <chat id> <off|draft|auto|clear>` — sets (or clears) a
+///     per-chat override. `<chat id>` is TDLib's own native chat id, the
+///     same id space `/sendas`/`/tdchats`/`/approve`/`/discard` all use —
+///     the override can only attach to a chat Warden already has a `chats`
+///     row for (see `store/chats.getByNative`), i.e. one that's exchanged
+///     at least one message with the personal account already.
+fn handleAutonomyCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    msg: iface.Message,
+    text: []const u8,
+    now: i64,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can change reply_autonomy.");
+        return;
+    }
+    const owner_identity_id = resolveOwnerIdentityId(pool, config, now) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't resolve the owner's identity — is WARDEN_TELEGRAM_OWNER_ID set?");
+        return;
+    };
+
+    const rest = std.mem.trim(u8, text["/autonomy".len..], " ");
+    if (rest.len == 0) {
+        const global = user_settings.getEffectiveReplyAutonomyDefault(pool, a, owner_identity_id);
+        const status = std.fmt.allocPrint(a, "Global reply_autonomy default: {s}\n\nUsage:\n/autonomy <off|draft|auto> — set the global default\n/autonomy <chat id> <off|draft|auto|clear> — per-chat override (see /tdchats for chat ids)", .{@tagName(global)}) catch return;
+        connector.sendMessage(a, msg.chat_id, status, msg.message_id);
+        return;
+    }
+
+    const space = std.mem.indexOfScalar(u8, rest, ' ');
+    if (space == null) {
+        const level = std.meta.stringToEnum(user_settings.ReplyAutonomy, rest) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /autonomy <off|draft|auto>, or /autonomy <chat id> <off|draft|auto|clear>.");
+            return;
+        };
+        user_settings.setReplyAutonomyDefault(pool, owner_identity_id, level) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Failed to save.");
+            return;
+        };
+        const confirmation = std.fmt.allocPrint(a, "Global reply_autonomy default set to {s}.", .{@tagName(level)}) catch return;
+        connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+        return;
+    }
+
+    const native_chat_id = rest[0..space.?];
+    const level_text = std.mem.trim(u8, rest[space.? + 1 ..], " ");
+    const target = (chats.getByNative(pool, a, .telegram_user, native_chat_id) catch null) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Unknown chat id — Warden only has an override target for a personal-account chat once a message has been exchanged with it. See /tdchats.");
+        return;
+    };
+
+    if (std.mem.eql(u8, level_text, "clear")) {
+        chat_settings.setReplyAutonomy(pool, target.id, null) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Failed to clear.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Override cleared — this chat now inherits the global default.");
+        return;
+    }
+    const level = std.meta.stringToEnum(user_settings.ReplyAutonomy, level_text) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /autonomy <chat id> <off|draft|auto|clear>.");
+        return;
+    };
+    chat_settings.setReplyAutonomy(pool, target.id, level) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Failed to save.");
+        return;
+    };
+    const confirmation = std.fmt.allocPrint(a, "reply_autonomy for chat {s} set to {s}.", .{ native_chat_id, @tagName(level) }) catch return;
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+/// `/drafts` — lists every pending `reply_autonomy = .draft` draft (see
+/// `reply_drafts.PendingDrafts`), so the owner doesn't have to remember
+/// which chats have one waiting.
+fn handleDraftsListCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pending_drafts: *reply_drafts.PendingDrafts,
+    msg: iface.Message,
+    now: i64,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can list pending drafts.");
+        return;
+    }
+    const drafts = pending_drafts.list(a, now) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Failed to list drafts.");
+        return;
+    };
+    if (drafts.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "No drafts pending.");
+        return;
+    }
+
+    var out: Io.Writer.Allocating = .init(a);
+    out.writer.writeAll("Pending drafts:\n") catch {};
+    for (drafts) |d| {
+        const preview = if (d.draft_text.len > 200) d.draft_text[0..200] else d.draft_text;
+        out.writer.print("\n{s} ({s}):\n{s}\n", .{ d.chat_title, d.native_chat_id, preview }) catch break;
+    }
+    out.writer.writeAll("\n/approve <chat id> to send, /discard <chat id> to drop.") catch {};
+    connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
+}
+
+/// `/approve <chat id>` — sends a pending `reply_autonomy = .draft` draft
+/// exactly as generated, through the personal-account connector, and
+/// removes it from `pending_drafts`. `<chat id>` is TDLib's native chat id
+/// (see /tdchats or /drafts).
+fn handleApproveCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    pending_drafts: *reply_drafts.PendingDrafts,
+    msg: iface.Message,
+    text: []const u8,
+    now: i64,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can approve a draft.");
+        return;
+    }
+    const conn = telegram_user orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
+        return;
+    };
+    const native_chat_id = std.mem.trim(u8, text["/approve".len..], " ");
+    if (native_chat_id.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /approve <chat id> — see /drafts.");
+        return;
+    }
+    const draft = pending_drafts.take(a, now, native_chat_id) orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "No pending draft for that chat (or it expired) — see /drafts.");
+        return;
+    };
+    conn.connector().sendMessage(a, native_chat_id, draft.draft_text, draft.reply_to);
+    const confirmation = std.fmt.allocPrint(a, "Sent to {s}.", .{draft.chat_title}) catch "Sent.";
+    connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
+}
+
+/// `/discard <chat id>` — drops a pending draft without sending it.
+fn handleDiscardCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pending_drafts: *reply_drafts.PendingDrafts,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can discard a draft.");
+        return;
+    }
+    const native_chat_id = std.mem.trim(u8, text["/discard".len..], " ");
+    if (native_chat_id.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /discard <chat id> — see /drafts.");
+        return;
+    }
+    if (pending_drafts.discard(native_chat_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Draft discarded.");
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, "No pending draft for that chat.");
+    }
+}
+
+/// The reply-as-me default when no per-chat `/persona` override exists for
+/// this chat — deliberately NOT `config.system_prompt`, which describes
+/// Warden the bot ("You are Warden, an assistant...") and would produce
+/// replies that out themselves as an AI. Used by
+/// `handleTelegramUserAutoReply` only.
+const default_reply_as_owner_prompt =
+    \\You are ghostwriting a reply on behalf of the owner of this Telegram
+    \\account, to one of their real contacts, in the owner's voice, as if
+    \\the owner typed it themselves. Keep it short and natural, the way a
+    \\real person texts -- no AI disclaimers, no "as an AI" framing, no
+    \\signing off with a name. If you don't have enough information to
+    \\reply confidently, say so briefly rather than guessing or inventing
+    \\details.
+;
+
+/// Owner-configured `reply_autonomy` for an incoming personal-account
+/// message (Phase D of the plan sent to the owner). `.off` (the resolved
+/// default until the owner ever touches `/autonomy`) is a pure no-op — see
+/// the `.telegram_user` dispatch branch's doc comment in `handleMessage`
+/// for exactly why this can't just fall through to `isAddressedToBot`.
+/// `.draft` generates a reply and stashes it in `pending_drafts` for
+/// `/approve`/`/discard` instead of sending it; `.auto` sends it straight
+/// back through `connector` — safe to do unconditionally here since the
+/// caller only reaches this function when `connector.platform() ==
+/// .telegram_user`.
+fn handleTelegramUserAutoReply(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    identity_id: i64,
+    llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
+    tool_ctx: tool_registry.ToolContext,
+    tools: []const tool_registry.ToolDef,
+    now: i64,
+    max_message_len: usize,
+    msg: iface.Message,
+    text: []const u8,
+    owner_notify: iface.Connector,
+    pending_drafts: *reply_drafts.PendingDrafts,
+) void {
+    const owner_identity_id = resolveOwnerIdentityId(pool, config, now) catch |err| {
+        log.err("reply_autonomy: couldn't resolve the owner's identity: {t}", .{err});
+        return;
+    };
+    const autonomy = chat_settings.resolveReplyAutonomy(pool, a, chat_id, owner_identity_id);
+    if (autonomy == .off) return;
+
+    const dyn = resolveLlmDynamicSettings(pool, a, config);
+    const answer: []const u8 = if (dyn.skip_trivial_messages and trivial_reply.isTrivialMessage(a, text))
+        trivial_reply.pickResponse(@intCast(now))
+    else blk: {
+        const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse default_reply_as_owner_prompt;
+        const asker: qa.Asker = if (msg.identity) |identity| .{
+            .display_name = identity.display_name,
+            .username = identity.username,
+            .native_id = identity.native_id,
+        } else .{
+            .display_name = msg.username orelse msg.user_id,
+            .username = msg.username,
+            .native_id = msg.user_id,
+        };
+        const enabled_tools = filterEnabledTools(pool, a, tools);
+        const raw_answer = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages) catch |err| {
+            log.err("reply_autonomy: qa.answer failed for chat {s}: {t}", .{ msg.chat_id, err });
+            return;
+        };
+        break :blk std.mem.trim(u8, raw_answer, " \t\r\n");
+    };
+    if (answer.len == 0) return;
+
+    switch (autonomy) {
+        .off => unreachable,
+        .auto => connector.sendMessage(a, msg.chat_id, answer, msg.message_id),
+        .draft => {
+            const chat_title = msg.chat_title orelse msg.chat_id;
+            pending_drafts.set(now, msg.chat_id, chat_title, text, answer, msg.message_id) catch |err| {
+                log.err("reply_autonomy: failed to stash a draft for chat {s}: {t}", .{ msg.chat_id, err });
+                return;
+            };
+            const owner_chat_id = ownerTelegramNativeId(config) orelse {
+                log.err("reply_autonomy: draft mode is on but no Bot API owner id is configured to notify", .{});
+                return;
+            };
+            const incoming_preview = if (text.len > 300) text[0..300] else text;
+            const notify_text = std.fmt.allocPrint(
+                a,
+                "\u{1f4ac} Draft reply ready\nChat: {s} ({s})\nThey said: \"{s}\"\n\nDraft: \"{s}\"\n\n/approve {s} to send as-is\n/discard {s} to drop it",
+                .{ chat_title, msg.chat_id, incoming_preview, answer, msg.chat_id, msg.chat_id },
+            ) catch return;
+            owner_notify.sendMessage(a, owner_chat_id, notify_text, null);
+        },
+    }
 }
 
 fn handleThinkingCommand(
