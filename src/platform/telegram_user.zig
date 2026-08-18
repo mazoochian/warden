@@ -82,7 +82,6 @@ pub const AuthState = enum {
 /// so `.telegram` and `.telegram_user` rows for "the same" group never
 /// collide or need reconciling), but worth knowing before assuming a chat
 /// id copied from one connector means anything to the other.
-
 /// One entry in `TelegramUserConnector.known_chats` — just enough to let an
 /// owner match a human-readable title back to the native chat id `/sendas`
 /// (and eventually anything else keyed on chat id) needs. `chat_id` is a
