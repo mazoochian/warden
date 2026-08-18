@@ -20,9 +20,18 @@ pub fn build(b: *std.Build) void {
     // reasoning/shape as the pq linkage above.
     exe_mod.linkSystemLibrary("olm", .{});
     // TDLib's JSON client (src/platform/telegram_user.zig) — same
-    // reasoning/shape as the pq linkage above. Header lives under
-    // /usr/include/td/telegram/td_json_client.h (the `tdlib-devel`/
-    // `telegram-tdlib-dev` package, depending on distro).
+    // library-path reasoning as pq above, plus an explicit *include* path
+    // this one actually needs and pq/olm don't: those two have no
+    // `@cImport` anywhere in this codebase (hand-written `extern fn`
+    // bindings instead), so they never depended on the C compiler finding
+    // a header at all. `telegram_user.zig` is the first file to
+    // `@cInclude` a system header, and the same "-Dtarget skips default
+    // search paths" gap documented above for libraries turned out to
+    // apply to header search paths too — confirmed live: this compiled
+    // fine natively (no -Dtarget) but failed
+    // `error: 'td/telegram/td_json_client.h' not found` under the Docker
+    // cross-build's `-Dtarget=x86_64-linux-musl` until this was added.
+    exe_mod.addIncludePath(.{ .cwd_relative = "/usr/include" });
     exe_mod.linkSystemLibrary("tdjson", .{});
 
     const exe = b.addExecutable(.{

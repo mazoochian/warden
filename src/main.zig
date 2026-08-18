@@ -342,6 +342,8 @@ const help_text_admin =
     \\Owner only
     \\/scraper -- configure the web-scraping backend
     \\/tdlogin -- connect Warden to your personal Telegram account
+    \\/sendas <chat id> <text> -- send a message through your personal account
+    \\/tdchats -- list your personal account's chats and their ids
 ;
 
 /// Sends `/help` as two messages (see `help_text_admin`), appending a note
@@ -437,7 +439,7 @@ pub fn main(init: std.process.Init) !void {
     // again with no re-login), so there's nothing this process needs to
     // flush on exit.
     var telegram_user_adapter: ?telegram_user_platform.TelegramUserConnector = if (config.telegram_user) |tc|
-        telegram_user_platform.TelegramUserConnector.init(gpa, tc.api_id, tc.api_hash, tc.session_dir)
+        telegram_user_platform.TelegramUserConnector.init(gpa, io, tc.api_id, tc.api_hash, tc.session_dir)
     else
         null;
 
@@ -2533,6 +2535,12 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/tdlogin") or std.mem.startsWith(u8, text, "/tdlogin ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleTdloginCommand(connector, a, config, telegram_user, msg, text);
+    } else if (std.mem.eql(u8, text, "/sendas") or std.mem.startsWith(u8, text, "/sendas ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleSendAsCommand(connector, a, config, telegram_user, msg, text);
+    } else if (std.mem.eql(u8, text, "/tdchats")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleTdchatsCommand(connector, a, config, telegram_user, msg);
     } else if (std.mem.eql(u8, text, "/remind") or std.mem.startsWith(u8, text, "/remind ")) {
         if (!feature_flags.isEnabled(pool, "reminders")) return false;
         handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
@@ -2672,6 +2680,25 @@ fn handleMessage(
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
+        return false;
+    } else if (connector.platform() == .telegram_user) {
+        // Deliberately a hard no-op, not "fall through to isAddressedToBot"
+        // — every message this connector sees looks like a private 1:1 DM
+        // to `isAddressedToBot` right now (`is_group` isn't populated yet,
+        // see `platform/telegram_user.zig`'s Phase A scope note), and DMs
+        // always get an answer there. Combined with owners bypassing the
+        // allowlist/credits gates entirely, that would mean *any* message
+        // whose sender happens to be the owner's own account — including
+        // one posted in a real group the personal account is a member of,
+        // nothing to do with Warden — would get auto-answered by the LLM
+        // and sent back through this connector, i.e. an AI reply appearing
+        // to come from the owner's real account, in a real chat, with no
+        // opt-in at all. Confirmed live (2026-08-18): this fired for real
+        // against the owner's own Saved Messages chat before this guard
+        // existed. `reply_autonomy`'s off/draft/auto dial (migration
+        // `0043_reply_autonomy.sql`) is the intended, deliberate gate for
+        // any auto-response through this connector — Phase D wires it up;
+        // until then, nothing auto-answers here at all, full stop.
         return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
         // One bulk dynamic_config fetch for every setting this branch
@@ -4013,6 +4040,101 @@ fn handleTdloginCommand(
     }
 
     reply(connector, a, msg.chat_id, msg.message_id, "Unknown /tdlogin subcommand — use status, phone, code, or password.");
+}
+
+/// `/sendas <chat_id> <text...>` — Phase C of the plan sent to the owner:
+/// a manual, owner-only command that sends a real message through the
+/// personal-account connector, proving the send path (and, longer term,
+/// rate-limiting) before any auto-drafting/autonomous send exists.
+/// `chat_id` is TDLib's own native chat id (not the Bot API's — see
+/// `Platform.telegram_user`'s doc comment on why these are different
+/// numbering schemes for "the same" real-world chat) — findable via
+/// warden-ui's admin chat list, or simply by seeing which chat a real
+/// inbound message from that contact recorded once one arrives, since
+/// `store/chats.upsertChat` runs for every connector uniformly.
+fn handleSendAsCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can send through the personal account.");
+        return;
+    }
+    const conn = telegram_user orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
+        return;
+    };
+    if (conn.authState() != .ready) {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal account isn't logged in yet — see /tdlogin status.");
+        return;
+    }
+
+    const rest = std.mem.trim(u8, text["/sendas".len..], " ");
+    const space = std.mem.indexOfScalar(u8, rest, ' ');
+    const target_chat_id = if (space) |i| rest[0..i] else rest;
+    const body = if (space) |i| std.mem.trim(u8, rest[i + 1 ..], " ") else "";
+    if (target_chat_id.len == 0 or body.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /sendas <chat id> <message>");
+        return;
+    }
+
+    conn.connector().sendMessage(a, target_chat_id, body, null);
+    reply(connector, a, msg.chat_id, msg.message_id, "Sent.");
+}
+
+/// `/tdchats` — lists the personal account's known chats (id + title) so
+/// the owner can find a `/sendas` target without already knowing a raw
+/// TDLib chat id. Owner-only, same bar as every other `/td*`/`/sendas`
+/// command. Capped and title-truncated to stay well under Telegram's 4096-
+/// char message limit even for an account in a lot of chats — see
+/// `max_message_len` elsewhere in this file for the general shape of that
+/// concern, though this doesn't thread that value through since a fixed,
+/// conservative cap is simpler than computing an exact budget for a
+/// debugging/discovery command that isn't performance-sensitive.
+fn handleTdchatsCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    msg: iface.Message,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can list the personal account's chats.");
+        return;
+    }
+    const conn = telegram_user orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
+        return;
+    };
+    if (conn.authState() != .ready) {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal account isn't logged in yet — see /tdlogin status.");
+        return;
+    }
+
+    const chats_list = conn.knownChats(a) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Failed to list chats.");
+        return;
+    };
+    if (chats_list.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "No chats known yet — TDLib populates this shortly after login; try again in a moment, or send/receive a message on the personal account first.");
+        return;
+    }
+
+    var out: Io.Writer.Allocating = .init(a);
+    out.writer.writeAll("Known chats (id — title):\n") catch {};
+    const max_listed = 60;
+    for (chats_list[0..@min(chats_list.len, max_listed)]) |c| {
+        const title = if (c.title.len > 60) c.title[0..60] else c.title;
+        out.writer.print("{s} — {s}\n", .{ c.chat_id, title }) catch break;
+    }
+    if (chats_list.len > max_listed) {
+        out.writer.print("... and {d} more (not shown).", .{chats_list.len - max_listed}) catch {};
+    }
+    connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
 }
 
 fn handleThinkingCommand(

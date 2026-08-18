@@ -76,8 +76,29 @@ pub const AuthState = enum {
 /// so `.telegram` and `.telegram_user` rows for "the same" group never
 /// collide or need reconciling), but worth knowing before assuming a chat
 /// id copied from one connector means anything to the other.
+
+/// One entry in `TelegramUserConnector.known_chats` — just enough to let an
+/// owner match a human-readable title back to the native chat id `/sendas`
+/// (and eventually anything else keyed on chat id) needs. `chat_id` is a
+/// `[]const u8` (not `i64`) for the same reason `iface.Message.chat_id` is:
+/// every other chat-id-shaped value in this codebase is a string, and
+/// keeping this one consistent avoids a parse/format round trip at every
+/// call site that wants to hand it straight to `sendMessage`.
+pub const ChatInfo = struct {
+    chat_id: []const u8,
+    title: []const u8,
+
+    fn dupe(self: ChatInfo, allocator: std.mem.Allocator) !ChatInfo {
+        return .{
+            .chat_id = try allocator.dupe(u8, self.chat_id),
+            .title = try allocator.dupe(u8, self.title),
+        };
+    }
+};
+
 pub const TelegramUserConnector = struct {
     allocator: std.mem.Allocator,
+    io: Io,
     api_id: i32,
     api_hash: []const u8,
     session_dir: []const u8,
@@ -89,13 +110,77 @@ pub const TelegramUserConnector = struct {
     unsupported_auth_type: ?[]const u8 = null,
     self_user_id: ?[]const u8 = null,
     self_username: ?[]const u8 = null,
+    /// Chat id -> title, built up from `updateNewChat`/`updateChatTitle`
+    /// updates as `pollFn` sees them (TDLib sends a burst of `updateNewChat`
+    /// for every chat it knows about shortly after login, unprompted — no
+    /// explicit `getChats` request needed to populate this). Exists purely
+    /// so an owner can find a chat's id via `/tdchats` without needing to
+    /// already know it, then pass it to `/sendas`.
+    ///
+    /// Guarded by `known_chats_mu` rather than only ever touched from one
+    /// thread: `pollFn` (the poll-loop thread) writes to it, `knownChats`
+    /// (called from a `MessageWorkerPool` command-handler thread, e.g.
+    /// `/tdchats`) reads it — genuinely two different threads, unlike
+    /// `client_id`/`auth_state`/etc., which only `pollFn` ever touches
+    /// (unless a command handler is mid-`submitX`, but those are simple
+    /// fire-and-forget `td_send` calls with no shared mutable state to
+    /// race on).
+    known_chats: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Same primitive/lock idiom `features/group_admin.zig`'s
+    /// `PendingConfirmations` and `worker_pool.zig` already use — an
+    /// `Io`-aware mutex, not `std.Thread.Mutex` (this Zig version's `Io`
+    /// rewrite folded thread synchronization into `Io` itself; see
+    /// `lockUncancelable`'s call sites here for why the "uncancelable"
+    /// variant: this critical section is a plain in-memory map mutation/
+    /// read with no cancellation point inside it, so there's nothing
+    /// meaningful to cancel out of mid-lock).
+    known_chats_mu: Io.Mutex = .init,
 
-    pub fn init(allocator: std.mem.Allocator, api_id: i32, api_hash: []const u8, session_dir: []const u8) TelegramUserConnector {
+    pub fn init(allocator: std.mem.Allocator, io: Io, api_id: i32, api_hash: []const u8, session_dir: []const u8) TelegramUserConnector {
         return .{
             .allocator = allocator,
+            .io = io,
             .api_id = api_id,
             .api_hash = api_hash,
             .session_dir = session_dir,
+        };
+    }
+
+    /// Duped copies of every currently-known (chat id, title) pair, in no
+    /// particular order — caller owns the returned slice and every string
+    /// in it. Safe to call from any thread (see `known_chats`'s doc
+    /// comment).
+    pub fn knownChats(self: *TelegramUserConnector, allocator: std.mem.Allocator) ![]ChatInfo {
+        self.known_chats_mu.lockUncancelable(self.io);
+        defer self.known_chats_mu.unlock(self.io);
+
+        var out = try std.ArrayList(ChatInfo).initCapacity(allocator, self.known_chats.count());
+        errdefer out.deinit(allocator);
+        var it = self.known_chats.iterator();
+        while (it.next()) |entry| {
+            const info = try (ChatInfo{ .chat_id = entry.key_ptr.*, .title = entry.value_ptr.* }).dupe(allocator);
+            out.appendAssumeCapacity(info);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn setKnownChatTitle(self: *TelegramUserConnector, chat_id: []const u8, title: []const u8) void {
+        self.known_chats_mu.lockUncancelable(self.io);
+        defer self.known_chats_mu.unlock(self.io);
+
+        if (self.known_chats.getEntry(chat_id)) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+            entry.value_ptr.* = self.allocator.dupe(u8, title) catch return;
+            return;
+        }
+        const owned_id = self.allocator.dupe(u8, chat_id) catch return;
+        const owned_title = self.allocator.dupe(u8, title) catch {
+            self.allocator.free(owned_id);
+            return;
+        };
+        self.known_chats.put(self.allocator, owned_id, owned_title) catch {
+            self.allocator.free(owned_id);
+            self.allocator.free(owned_title);
         };
     }
 
@@ -249,12 +334,53 @@ pub const TelegramUserConnector = struct {
                 }
                 continue;
             }
+            if (std.mem.eql(u8, type_name, "updateNewChat")) {
+                self.handleUpdateNewChat(obj);
+                continue;
+            }
+            if (std.mem.eql(u8, type_name, "updateChatTitle")) {
+                self.handleUpdateChatTitle(obj);
+                continue;
+            }
             // Every other update type (typing indicators, read receipts,
-            // chat metadata changes, ...) is silently ignored for now —
-            // Phase A scope, see the struct doc comment.
+            // ...) is silently ignored for now — Phase A scope, see the
+            // struct doc comment.
         }
 
         return try out.toOwnedSlice(allocator);
+    }
+
+    fn handleUpdateNewChat(self: *TelegramUserConnector, update: json.ObjectMap) void {
+        const chat = switch (update.get("chat") orelse return) {
+            .object => |o| o,
+            else => return,
+        };
+        const chat_id = switch (chat.get("id") orelse return) {
+            .integer => |n| n,
+            else => return,
+        };
+        const title = switch (chat.get("title") orelse return) {
+            .string => |s| s,
+            else => return,
+        };
+        if (title.len == 0) return; // e.g. a not-yet-resolved private chat
+        var buf: [32]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&buf, "{d}", .{chat_id}) catch return;
+        self.setKnownChatTitle(id_str, title);
+    }
+
+    fn handleUpdateChatTitle(self: *TelegramUserConnector, update: json.ObjectMap) void {
+        const chat_id = switch (update.get("chat_id") orelse return) {
+            .integer => |n| n,
+            else => return,
+        };
+        const title = switch (update.get("title") orelse return) {
+            .string => |s| s,
+            else => return,
+        };
+        var buf: [32]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&buf, "{d}", .{chat_id}) catch return;
+        self.setKnownChatTitle(id_str, title);
     }
 
     fn handleAuthorizationState(self: *TelegramUserConnector, update: json.ObjectMap) void {
@@ -283,6 +409,24 @@ pub const TelegramUserConnector = struct {
             self.auth_state = .ready;
             log.info("personal-account connector authenticated and ready", .{});
             self.send(.{ .@"@type" = "getMe" });
+            // Without an explicit request, TDLib only proactively pushes
+            // `updateNewChat` for however many chats it decides to eagerly
+            // load on its own (observed live: groups/channels with recent
+            // activity, but not most private chats, and not secret chats
+            // at all) -- `loadChats` is the real "load N more chats into
+            // memory" request (each one still arrives as its own
+            // `updateNewChat`, same as the ones TDLib sends unprompted;
+            // this just makes sure *all* of them eventually do, not only
+            // whichever subset TDLib would have picked on its own). Sent
+            // for both the main list and archive so `/tdchats` covers
+            // archived chats too, not just the visible chat list. A
+            // secret chat is still a regular `Chat` with
+            // `type = secretChat` from this API's point of view, so no
+            // separate request is needed for those specifically -- they
+            // load (and populate `known_chats`) the same way once their
+            // parent chat list is loaded.
+            self.send(.{ .@"@type" = "loadChats", .chat_list = .{ .@"@type" = "chatListMain" }, .limit = 200 });
+            self.send(.{ .@"@type" = "loadChats", .chat_list = .{ .@"@type" = "chatListArchive" }, .limit = 200 });
         } else if (std.mem.eql(u8, state_type, "authorizationStateLoggingOut")) {
             self.auth_state = .logging_out;
         } else if (std.mem.eql(u8, state_type, "authorizationStateClosed")) {
@@ -388,13 +532,13 @@ pub const TelegramUserConnector = struct {
 const testing = std.testing;
 
 test "AuthState starts at .none before ensureClient runs" {
-    var conn = TelegramUserConnector.init(testing.allocator, 1, "hash", "/tmp/warden-tdlib-test");
+    var conn = TelegramUserConnector.init(testing.allocator, testing.io, 1, "hash", "/tmp/warden-tdlib-test");
     try testing.expectEqual(AuthState.none, conn.authState());
     try testing.expectEqual(@as(?[]const u8, null), conn.self_user_id);
 }
 
 test "platformFn reports .telegram_user" {
-    var conn = TelegramUserConnector.init(testing.allocator, 1, "hash", "/tmp/warden-tdlib-test");
+    var conn = TelegramUserConnector.init(testing.allocator, testing.io, 1, "hash", "/tmp/warden-tdlib-test");
     const c = conn.connector();
     try testing.expectEqual(iface.Platform.telegram_user, c.platform());
 }
