@@ -54,8 +54,21 @@ jobs:
         # deal for ROADMAP.md's Phase 25 video-download feature
         # (src/features/video_download.zig) -- without it, its yt-dlp-gated
         # tests skip instead of actually exercising the binary-presence and
-        # failure-path checks.
-        run: apk add --no-cache bash git curl xz postgresql-dev olm-dev pandoc-cli yt-dlp
+        # failure-path checks. telegram-tdlib-dev is the personal-account
+        # connector's tdjson headers/link lib (src/platform/telegram_user.zig)
+        # -- missing here entirely until 2026-08-18, which is why every CI
+        # run from that connector's first commit onward failed at `zig
+        # build` with "unable to find dynamic system library 'tdjson'"
+        # (masked at the time by an unrelated `zig fmt` failure landing
+        # first in the same run). Same `-X edge/...` pattern and tradeoff
+        # as the Dockerfile's zig-build stage, which is where this was
+        # copied from -- see its own comment for why edge/testing specifically.
+        run: |
+          apk add --no-cache \
+            -X https://dl-cdn.alpinelinux.org/alpine/edge/main \
+            -X https://dl-cdn.alpinelinux.org/alpine/edge/community \
+            -X https://dl-cdn.alpinelinux.org/alpine/edge/testing \
+            bash git curl xz postgresql-dev olm-dev pandoc-cli yt-dlp telegram-tdlib-dev
 
       - uses: actions/checkout@v4
 
