@@ -25,6 +25,12 @@ const receive_timeout_seconds: f64 = 3.0;
 /// row-count ceilings).
 const drain_limit: usize = 50;
 
+/// Upper bound `waitForResponse` blocks a calling thread for a single
+/// TDLib request/response round trip (`getChat`/`getChatHistory`/
+/// `viewMessages`) — generous for an interactive owner command, not so
+/// long a genuinely wedged connector hangs the calling thread indefinitely.
+const request_timeout_seconds: f64 = 15.0;
+
 /// TDLib's own authorization-state machine (`updateAuthorizationState`,
 /// https://core.telegram.org/tdlib/getting-started#authorization) collapsed
 /// to the subset this connector actually branches on. `.ready` is the only
@@ -135,6 +141,28 @@ pub const TelegramUserConnector = struct {
     /// read with no cancellation point inside it, so there's nothing
     /// meaningful to cancel out of mid-lock).
     known_chats_mu: Io.Mutex = .init,
+    /// Every outbound request `send()` makes is fire-and-forget — TDLib's
+    /// `tdjson` stream mixes unprompted updates and request responses
+    /// together with no separate channel, and `pollFn` used to just ignore
+    /// anything it didn't recognize as an update (see the "silently
+    /// ignored" comment at its tail). `chat_summary.zig` needs real
+    /// request/response calls (`getChat`, `getChatHistory`, `viewMessages`)
+    /// to fetch and mark unread messages read, so this is the minimal
+    /// correlation mechanism for that: a request tags itself with an
+    /// integer `@extra`, TDLib echoes that verbatim on its response, and
+    /// `pollFn` (see its `@extra` branch) diverts anything carrying one
+    /// into this map instead of treating it as an update. Keyed by extra
+    /// id -> the whole raw JSON response text, `self.allocator`-duped
+    /// (survives past the arena `pollFn`'s caller frees each cycle).
+    ///
+    /// Known, accepted leak: a response for a request whose waiter already
+    /// gave up on timeout (`waitForResponse`) is never evicted — for an
+    /// interactive, owner-only command at human request rates this is at
+    /// worst a few hundred bytes sitting until the next process restart,
+    /// not worth a TTL sweep for.
+    pending_responses: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
+    pending_responses_mu: Io.Mutex = .init,
+    next_extra_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
 
     pub fn init(allocator: std.mem.Allocator, io: Io, api_id: i32, api_hash: []const u8, session_dir: []const u8) TelegramUserConnector {
         return .{
@@ -246,6 +274,249 @@ pub const TelegramUserConnector = struct {
         td.td_send(self.client_id.?, body_z.ptr);
     }
 
+    fn nextExtraId(self: *TelegramUserConnector) u64 {
+        return self.next_extra_id.fetchAdd(1, .monotonic);
+    }
+
+    fn storePendingResponse(self: *TelegramUserConnector, io: Io, extra_id: u64, raw: []const u8) void {
+        const owned = self.allocator.dupe(u8, raw) catch return;
+        self.pending_responses_mu.lockUncancelable(io);
+        defer self.pending_responses_mu.unlock(io);
+        self.pending_responses.put(self.allocator, extra_id, owned) catch self.allocator.free(owned);
+    }
+
+    /// Blocks the calling thread (never the poll-loop thread itself — a
+    /// request/response round trip is always initiated from a command
+    /// handler or tool-call thread, fulfilled by `pollFn`'s `@extra` branch
+    /// running concurrently on its own thread) polling for `extra_id`'s
+    /// response, up to `timeout_seconds`. Plain bounded `Io.sleep` polling
+    /// rather than an `Io.Condition` wait — matches this codebase's own
+    /// existing idiom for "wait on another thread's async result"
+    /// (`main.zig`'s video-download/transcription progress tickers), and
+    /// avoids needing per-request condvars for what's an infrequent,
+    /// interactive-latency operation. Returns the caller-`allocator`-owned
+    /// raw JSON response text, or `null` on timeout.
+    fn waitForResponse(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, extra_id: u64, timeout_seconds: f64) !?[]const u8 {
+        const poll_interval_ms = 50;
+        const timeout_ms: usize = @intFromFloat(timeout_seconds * 1000.0);
+        var waited_ms: usize = 0;
+        while (waited_ms < timeout_ms) : (waited_ms += poll_interval_ms) {
+            self.pending_responses_mu.lockUncancelable(io);
+            const found = self.pending_responses.fetchRemove(extra_id);
+            self.pending_responses_mu.unlock(io);
+            if (found) |entry| {
+                defer self.allocator.free(entry.value);
+                return try allocator.dupe(u8, entry.value);
+            }
+            Io.sleep(io, .fromMilliseconds(poll_interval_ms), .awake) catch break;
+        }
+        return null;
+    }
+
+    /// One chat's freshly-fetched unread state — `chat_summary.zig`'s
+    /// starting point for "what's unread in this chat right now" (asked of
+    /// TDLib directly rather than trusted from a locally cached counter,
+    /// since staleness here would mean either re-summarizing already-read
+    /// messages or, worse, marking unseen ones read without ever showing
+    /// them).
+    pub const ChatMeta = struct {
+        title: []const u8,
+        unread_count: i64,
+    };
+
+    /// `getChat` — resolves `chat_id` to its current title + unread count.
+    /// `null` on timeout/parse failure/TDLib error (logged); the caller
+    /// treats that the same as "couldn't reach the personal account right
+    /// now".
+    pub fn requestChatMeta(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, chat_id: i64) !?ChatMeta {
+        const extra_id = self.nextExtraId();
+        self.send(.{ .@"@type" = "getChat", .chat_id = chat_id, .@"@extra" = extra_id });
+        const raw = try self.waitForResponse(allocator, io, extra_id, request_timeout_seconds) orelse {
+            log.warn("requestChatMeta: getChat timed out for chat {d}", .{chat_id});
+            return null;
+        };
+        defer allocator.free(raw);
+
+        var parsed = json.parseFromSlice(json.Value, allocator, raw, .{}) catch |err| {
+            log.warn("requestChatMeta: failed to parse getChat response: {t}", .{err});
+            return null;
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return null,
+        };
+        if (obj.get("@type")) |v| if (v == .string and std.mem.eql(u8, v.string, "error")) {
+            log.warn("requestChatMeta: getChat error for chat {d}: {s}", .{ chat_id, raw });
+            return null;
+        };
+        const title = switch (obj.get("title") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        const unread_count = switch (obj.get("unread_count") orelse return null) {
+            .integer => |n| n,
+            else => return null,
+        };
+        return .{
+            .title = try allocator.dupe(u8, title),
+            .unread_count = unread_count,
+        };
+    }
+
+    pub const HistoryMessage = struct {
+        message_id: i64,
+        sender_user_id: ?i64,
+        text: []const u8,
+    };
+
+    /// TDLib itself rejects `getChatHistory`'s `limit` as invalid once it's
+    /// over 100 — not a bound this connector chose, so `requestChatHistory`
+    /// clamps to it defensively regardless of what a caller passes, on top
+    /// of `chat_summary.zig`'s own `max_fetch` already being pinned to the
+    /// same number.
+    const max_chat_history_limit: i64 = 100;
+
+    /// `getChatHistory(chat_id, from_message_id=0, limit=limit)` — with
+    /// `from_message_id=0` this returns the newest `limit` messages in the
+    /// chat, newest-first (TDLib's own order, unreversed here — callers
+    /// that want oldest-first, e.g. for a summary prompt reading top to
+    /// bottom, reverse it themselves). Non-text messages (photos, stickers,
+    /// service messages, ...) and ones with no attributable user sender
+    /// (channel posts, anonymous admins) are dropped rather than
+    /// represented some other way — same Phase A text-only scope
+    /// `convertNewMessage` already established for live messages, kept
+    /// consistent here for history reads too. `null` on timeout/parse
+    /// failure/TDLib error (logged).
+    pub fn requestChatHistory(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, chat_id: i64, limit: i64) !?[]HistoryMessage {
+        const extra_id = self.nextExtraId();
+        self.send(.{
+            .@"@type" = "getChatHistory",
+            .chat_id = chat_id,
+            .from_message_id = @as(i64, 0),
+            .offset = @as(i32, 0),
+            .limit = @min(limit, max_chat_history_limit),
+            .only_local = false,
+            .@"@extra" = extra_id,
+        });
+        const raw = try self.waitForResponse(allocator, io, extra_id, request_timeout_seconds) orelse {
+            log.warn("requestChatHistory: getChatHistory timed out for chat {d}", .{chat_id});
+            return null;
+        };
+        defer allocator.free(raw);
+
+        var parsed = json.parseFromSlice(json.Value, allocator, raw, .{}) catch |err| {
+            log.warn("requestChatHistory: failed to parse getChatHistory response: {t}", .{err});
+            return null;
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return null,
+        };
+        if (obj.get("@type")) |v| if (v == .string and std.mem.eql(u8, v.string, "error")) {
+            log.warn("requestChatHistory: getChatHistory error for chat {d}: {s}", .{ chat_id, raw });
+            return null;
+        };
+        const messages_arr = switch (obj.get("messages") orelse return null) {
+            .array => |arr| arr,
+            else => return null,
+        };
+
+        var out: std.ArrayList(HistoryMessage) = .empty;
+        errdefer out.deinit(allocator);
+        for (messages_arr.items) |item| {
+            const m = try parseHistoryMessage(allocator, item) orelse continue;
+            try out.append(allocator, m);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    fn parseHistoryMessage(allocator: std.mem.Allocator, item: json.Value) !?HistoryMessage {
+        const message = switch (item) {
+            .object => |o| o,
+            else => return null,
+        };
+        const message_id = switch (message.get("id") orelse return null) {
+            .integer => |n| n,
+            else => return null,
+        };
+        const content = switch (message.get("content") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        const content_type = switch (content.get("@type") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        if (!std.mem.eql(u8, content_type, "messageText")) return null;
+        const formatted_text = switch (content.get("text") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        const text = switch (formatted_text.get("text") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        var sender_user_id: ?i64 = null;
+        if (message.get("sender_id")) |sender_v| if (sender_v == .object) {
+            if (sender_v.object.get("user_id")) |uid_v| if (uid_v == .integer) {
+                sender_user_id = uid_v.integer;
+            };
+        };
+
+        return .{
+            .message_id = message_id,
+            .sender_user_id = sender_user_id,
+            .text = try allocator.dupe(u8, text),
+        };
+    }
+
+    /// `viewMessages(chat_id, message_ids, force_read=true)` — marks
+    /// exactly the given messages viewed. Per Telegram's own read-state
+    /// model this is a single forward-moving cursor per chat, not a
+    /// per-message flag: viewing the newest message in a contiguous unread
+    /// run implicitly marks everything older than it read too. Callers
+    /// (see `chat_summary.zig`'s capped-fetch handling) must account for
+    /// that themselves — this function does exactly what it's told and
+    /// nothing more. Returns `true` on a clean `ok` response, `false` on
+    /// timeout/error (logged either way).
+    pub fn markMessagesRead(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, chat_id: i64, message_ids: []const i64) !bool {
+        if (message_ids.len == 0) return true;
+        const extra_id = self.nextExtraId();
+        self.send(.{
+            .@"@type" = "viewMessages",
+            .chat_id = chat_id,
+            .message_ids = message_ids,
+            .force_read = true,
+            .@"@extra" = extra_id,
+        });
+        const raw = try self.waitForResponse(allocator, io, extra_id, request_timeout_seconds) orelse {
+            log.warn("markMessagesRead: viewMessages timed out for chat {d}", .{chat_id});
+            return false;
+        };
+        defer allocator.free(raw);
+
+        var parsed = json.parseFromSlice(json.Value, allocator, raw, .{}) catch |err| {
+            log.warn("markMessagesRead: failed to parse viewMessages response: {t}", .{err});
+            return false;
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return false,
+        };
+        const type_str = switch (obj.get("@type") orelse return false) {
+            .string => |s| s,
+            else => return false,
+        };
+        if (!std.mem.eql(u8, type_str, "ok")) {
+            log.warn("markMessagesRead: viewMessages error for chat {d}: {s}", .{ chat_id, raw });
+            return false;
+        }
+        return true;
+    }
+
     /// Answers `authorizationStateWaitPhoneNumber`. `phone_number` is the
     /// full international-format number (e.g. "+15551234567").
     pub fn submitPhoneNumber(self: *TelegramUserConnector, phone_number: []const u8) void {
@@ -323,6 +594,21 @@ pub const TelegramUserConnector = struct {
                 .string => |s| s,
                 else => continue,
             } else continue;
+
+            // A response to a request `send()` tagged with `.@"@extra"`
+            // (see `requestChatMeta`/`requestChatHistory`/
+            // `markMessagesRead`) — TDLib echoes it back verbatim on
+            // whatever object answers that request (including error
+            // responses), indistinguishable from an unprompted update by
+            // `@type` alone. Diverted to `pending_responses` instead of
+            // falling into the update-type dispatch below; every other
+            // request this connector sends (`getAuthorizationState`,
+            // `setTdlibParameters`, `loadChats`, `sendMessage`, ...) never
+            // sets `@extra`, so this branch never fires for them.
+            if (obj.get("@extra")) |extra_v| if (extra_v == .integer) {
+                self.storePendingResponse(self.io, @intCast(extra_v.integer), raw_slice);
+                continue;
+            };
 
             if (std.mem.eql(u8, type_name, "updateAuthorizationState")) {
                 self.handleAuthorizationState(obj);

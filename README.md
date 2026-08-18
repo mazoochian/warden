@@ -34,6 +34,7 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Group Identity: `/title <text>` renames the chat, `/description <text>` sets its description (empty clears it), `/photo` (send an image with this as its caption) sets the chat photo, `/photo remove` clears it — all admin-tier, all runnable directly in the group itself, in a bound management room, or via `/as`. Matrix maps these onto `m.room.name`/`m.room.topic`/`m.room.avatar`; XMPP has no equivalent and doesn't support them
 - Quiet Moderation: add `-s` to `/mute`, `/unmute`, `/promote`, `/demote`, `/kick`, `/ban`, `/photo`, `/title`, or `/description` to skip the in-group confirmation — a bound management room's audit log still records it in full either way. `/silent on` makes `-s` this chat's default so it doesn't need typing every time. Bot admins/owner can use `-p` (phantom) instead to skip the audit log too, not just the in-group message; anyone else's `-p` is silently treated as `-s`. `/redact` doesn't support these flags yet
 - Power Tools: `/alias add <name> <command or text>` makes `/name` re-dispatch as if you'd typed the saved expansion (a real built-in command can never be shadowed); `/template save <name> <text>` + `/template use <name> [extra]` re-asks a saved prompt through the normal Q&A path. `/joke`, `/riddle`, `/trivia` (all take an optional topic), `/wordoftheday`, and `/motivate` are quick, documented commands over what the model can already do zero-shot
+- Personal Account (Telegram, owner-only): once `WARDEN_TELEGRAM_USER_*` is configured (see below), `/tdlogin` logs Warden into the *owner's own* Telegram account via TDLib (phone number → login code → 2FA password if set), separate from the bot account every other feature uses. `/tdchats` lists that account's known chats; `/sendas <chat id> <text>` sends through it manually. `/autonomy off|draft|auto` sets the reply mode per chat: `draft` has the bot write a reply and hold it for approval — the notification comes with Approve/Discard buttons (`/approve`/`/discard <chat id>`, or `/drafts` to list, still work if typed instead), `auto` sends it immediately. `/tdsummary <chat id or name>` (or just ask, e.g. "what's unread in the Alice chat") fetches that chat's actual unread messages fresh from Telegram, has the bot summarize them, and marks them read — matching titles work as well as raw ids, and an ambiguous name lists the candidates instead of guessing
 
 # Talking to the bot
 Nobody but the owner (and any bot admins — see "Access control" below) can
@@ -390,6 +391,13 @@ shell syntax — the file gets sourced):
 # Messaging platform (required — Telegram):
 export WARDEN_TELEGRAM_BOT_TOKEN=<your_telegram_bot_token>
 export WARDEN_TELEGRAM_OWNER_ID=<your_numeric_telegram_user_id>
+
+# Personal account / TDLib (optional — see "Personal Account" above; unset
+# means it stays disabled). Get api_id/api_hash from https://my.telegram.org.
+# export WARDEN_TELEGRAM_USER_API_ID=<your api_id>
+# export WARDEN_TELEGRAM_USER_API_HASH=<your api_hash>
+# export WARDEN_TELEGRAM_USER_SESSION_DIR=/path/to/a/writable/directory
+# export WARDEN_TELEGRAM_USER_OWNER_ID=<your numeric Telegram user id>
 
 # Matrix (optional — see "Matrix" below; unset means Matrix stays disabled):
 # export WARDEN_MATRIX_HOMESERVER_URL=https://matrix.org

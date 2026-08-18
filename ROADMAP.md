@@ -88,6 +88,66 @@ Personal, a placeholder since the `/menu` pass above, now has real content
 (Timezone/Date format/Time format). `zig build` + `zig build test` green
 (381/382, 1 skipped without a local Postgres).
 
+**Also unplanned, shipped outside the phase sequence** (direct user
+request, 2026-08-17/18): a personal-account connector — TDLib (via its
+`tdjson` C interface, `platform/telegram_user.zig`) driving the owner's own
+Telegram account (MTProto), distinct from the Bot API connector every
+other feature uses, so Warden can read/send on the owner's behalf rather
+than only as its own bot identity. Landed as four sub-phases: **Phase A**
+(login — `/tdlogin`'s phone/code/2FA-password flow, both as a bot-chat
+command sequence and as warden-ui's web login form, `api/router.zig`; text-
+only message conversion, `sendMessage` the only outbound method — see the
+struct doc comment's "Phase A scope" for what's still not implemented),
+**Phase B** (chat discovery — `/tdchats` lists every known chat by id/
+title, backing `/sendas <chat id> <text>`'s manual send), **Phase C**
+(the `reply_autonomy` dial — `/autonomy off|draft|auto` per chat, backed by
+`store/migrations/0043_reply_autonomy.sql`), **Phase D** (`.draft` mode
+actually drafting a reply and staging it in `features/reply_drafts.zig`'s
+`PendingDrafts`). A same-day owner-feedback follow-up replaced the initial
+`.draft` notification's typed `/approve <chat id>`/`/discard <chat id>`
+instructions with real Telegram inline-keyboard Approve/Discard buttons
+(`iface.Connector.sendChoicePrompt`, already built for `audit_notify`'s
+"Undo" button — just not wired up here yet) — `/approve`/`/discard`/
+`/drafts` stay as a typed fallback. None of this line has README.md
+coverage yet (still only `platform/telegram_user.zig`'s own doc comments
+and this entry) — worth a real README section before calling the feature
+line done. `zig build` + `zig build test` green throughout (616/618, 2
+skipped without a local Postgres).
+
+**Also unplanned, shipped outside the phase sequence** (direct user
+request, 2026-08-18): `/tdsummary <chat id or name>` and its natural-
+language counterpart, the `summarize_unread_chat` tool — on-demand "what
+did I miss" for a personal-account chat, without waiting to actually open
+Telegram. `features/chat_summary.zig` resolves the chat (raw TDLib id, or
+a case-insensitive title substring, ambiguous matches listed back rather
+than guessed), asks TDLib fresh for that chat's real unread state
+(`getChat`, never a locally cached counter — staleness here would mean
+either re-summarizing already-read messages or, worse, marking unseen
+ones read unseen), fetches those messages (`getChatHistory`), and marks
+exactly what it fetched read (`viewMessages(force_read=true)`) — the
+LLM summarization itself reuses `features/digest.zig`'s existing
+`summarizeHistory` call rather than growing a second, subtly-divergent
+prompt. Required genuinely new TDLib plumbing: every prior request from
+this connector was fire-and-forget (`send()`, no way to correlate a
+response back to its request), so `getChat`/`getChatHistory`/
+`viewMessages` needed a first request/response mechanism —
+`TelegramUserConnector` requests now tag themselves with an integer
+`@extra`, `pollFn` diverts anything carrying one into a `pending_responses`
+map instead of the update-type dispatch, and the calling thread
+(`waitForResponse`) polls that map with bounded `Io.sleep`s rather than an
+`Io.Condition` wait — matches this codebase's existing "wait on another
+thread's async result" idiom (the video/transcription progress tickers)
+rather than adding a new synchronization primitive for what's an
+infrequent, interactive-latency operation. **Known, documented tradeoff**:
+Telegram's read state is a single forward cursor per chat, not a per-
+message flag — a backlog capped at `max_fetch` (100, TDLib's own hard
+ceiling on `getChatHistory`'s `limit`) still gets marked
+read in full when `viewMessages` is called on its newest fetched message,
+even though only the most recent `max_fetch` were ever shown to the owner;
+`UnreadSummary.capped` exists so both the command and the tool surface
+that plainly rather than let it pass as a silent, unrecoverable read-marks-
+unshown-messages bug. `zig build` + `zig build test` green.
+
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
 

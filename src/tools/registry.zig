@@ -265,6 +265,29 @@ pub const ChatHistorySink = struct {
     }
 };
 
+/// Backs the `summarize_unread_chat` tool — the personal-account (TDLib)
+/// connector's unread-messages catch-up, not this Bot-API chat's own
+/// history (that's `ChatHistorySink` above). Null whenever the
+/// personal-account connector isn't configured/logged in, same
+/// nullability convention as every other optional sink here.
+pub const ChatSummarySink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Resolves `chat_query` (a TDLib chat id, or a title substring)
+        /// and returns text ready to hand back to the model as the tool
+        /// result — already covers "no such chat"/"ambiguous, pick one"/
+        /// "N unread: <lines>", same "sink formats its own listing"
+        /// convention `ChatHistorySink`/`ReminderSink` already follow.
+        summarizeUnread: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8) anyerror![]const u8,
+    };
+
+    pub fn summarizeUnread(self: ChatSummarySink, allocator: std.mem.Allocator, chat_query: []const u8) ![]const u8 {
+        return self.vtable.summarizeUnread(self.ptr, allocator, chat_query);
+    }
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -308,6 +331,9 @@ pub const ToolContext = struct {
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `set_expense` tool.
     expenses: ?ExpenseSink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `summarize_unread_chat` tool.
+    chat_summary: ?ChatSummarySink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the

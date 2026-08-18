@@ -81,6 +81,7 @@ const group_admin = @import("features/group_admin.zig");
 const audit_notify = @import("features/audit_notify.zig");
 const wordcloud = @import("features/wordcloud.zig");
 const digest = @import("features/digest.zig");
+const chat_summary = @import("features/chat_summary.zig");
 const briefing = @import("features/briefing.zig");
 const scheduler = @import("features/scheduler.zig");
 const convert_file = @import("tools/convert_file.zig");
@@ -112,6 +113,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/catch_me_up.zig").tool,
     @import("tools/create_poll.zig").tool,
     @import("tools/set_expense.zig").tool,
+    @import("tools/summarize_unread_chat.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
@@ -1400,6 +1402,10 @@ fn processMessageTask(
         .chat_id = chat_id,
         .now = ts,
     };
+    var chat_summary_adapter: ChatSummaryToolAdapter = .{
+        .telegram_user = telegram_user,
+        .io = io,
+    };
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
         .io = io,
@@ -1422,6 +1428,7 @@ fn processMessageTask(
         .memory = if (embeddings_client != null) memory_adapter.sink() else null,
         .chat_history = chat_history_adapter.sink(),
         .expenses = expense_adapter.sink(),
+        .chat_summary = chat_summary_adapter.sink(),
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -2601,6 +2608,9 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/tdchats")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleTdchatsCommand(connector, a, config, telegram_user, msg);
+    } else if (std.mem.eql(u8, text, "/tdsummary") or std.mem.startsWith(u8, text, "/tdsummary ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleTdSummaryCommand(connector, a, config, telegram_user, llm_provider, io, tool_ctx, msg, text);
     } else if (std.mem.eql(u8, text, "/autonomy") or std.mem.startsWith(u8, text, "/autonomy ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleAutonomyCommand(connector, a, config, pool, msg, text, now);
@@ -4203,6 +4213,65 @@ fn handleTdchatsCommand(
         out.writer.print("... and {d} more (not shown).", .{chats_list.len - max_listed}) catch {};
     }
     connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
+}
+
+/// `/tdsummary <chat id or name>` — direct-user-request feature: summarize
+/// a personal-account chat's unread messages on demand and mark them read,
+/// so opening Telegram afterward shows a clean chat rather than a pile the
+/// owner already got the gist of from Warden. `<chat>` accepts the same raw
+/// TDLib id `/tdchats` prints, or (see `chat_summary.resolveChat`) any
+/// case-insensitive substring of a chat's title — ambiguous matches list
+/// their titles back rather than guessing.
+fn handleTdSummaryCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    llm_provider: llm.Provider,
+    io: Io,
+    tool_ctx: tool_registry.ToolContext,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can summarize the personal account's chats.");
+        return;
+    }
+    const conn = telegram_user orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
+        return;
+    };
+    if (conn.authState() != .ready) {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal account isn't logged in yet — see /tdlogin status.");
+        return;
+    }
+
+    const query = std.mem.trim(u8, text["/tdsummary".len..], " ");
+    if (query.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tdsummary <chat id or name>");
+        return;
+    }
+
+    const resolution = chat_summary.resolveChat(conn, a, query) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Failed to look up that chat.");
+        return;
+    };
+    switch (resolution) {
+        .none => reply(connector, a, msg.chat_id, msg.message_id, "No known chat matches that — try /tdchats to see what's known."),
+        .ambiguous => |matches| {
+            var out: Io.Writer.Allocating = .init(a);
+            out.writer.writeAll("That matches more than one chat — be more specific:\n") catch {};
+            for (matches) |m| out.writer.print("{s} — {s}\n", .{ m.native_chat_id, m.title }) catch break;
+            connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
+        },
+        .one => |m| {
+            const summary = chat_summary.summarizeChat(conn, llm_provider, a, io, tool_ctx, m.native_chat_id) catch {
+                reply(connector, a, msg.chat_id, msg.message_id, "Failed to summarize that chat.");
+                return;
+            };
+            connector.sendMessage(a, msg.chat_id, summary, msg.message_id);
+        },
+    }
 }
 
 /// The Bot API owner's own native chat id (private-chat id == user id on
@@ -8097,6 +8166,34 @@ const ChatHistoryToolAdapter = struct {
 /// own doc comment for why both bounds exist together).
 const catch_me_up_row_limit = 2000;
 
+/// Backs `summarize_unread_chat` — unlike `ChatHistoryToolAdapter` (this
+/// Bot-API chat's own logged Postgres history), this reaches the
+/// personal-account TDLib connector, which may not be configured at all on
+/// this deployment. Always constructed and always wired into `ToolContext`
+/// (never gated to `null` the way `.memory` is) so the model gets a plain
+/// explanatory string back either way — "not configured"/"not logged in
+/// yet" are normal runtime states worth relaying to the owner directly,
+/// not a raw tool error to work around.
+const ChatSummaryToolAdapter = struct {
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    io: Io,
+
+    fn sink(self: *ChatSummaryToolAdapter) tool_registry.ChatSummarySink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.ChatSummarySink.VTable = .{
+        .summarizeUnread = summarizeUnreadFn,
+    };
+
+    fn summarizeUnreadFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8) anyerror![]const u8 {
+        const self: *ChatSummaryToolAdapter = @ptrCast(@alignCast(ptr));
+        const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
+        if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
+        return chat_summary.describeUnreadForModel(conn, allocator, self.io, chat_query);
+    }
+};
+
 const memory_search_limit = 5;
 
 fn formatMemories(a: std.mem.Allocator, listed: []const memories.Memory) []const u8 {
@@ -8528,6 +8625,7 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
         .{ .name = "catch_me_up", .key = "messaging_modes" },
         .{ .name = "create_poll", .key = "polls" },
         .{ .name = "set_expense", .key = "finance" },
+        .{ .name = "summarize_unread_chat", .key = "messaging_modes" },
     };
     for (pairs) |p| {
         if (std.mem.eql(u8, p.name, name)) return p.key;

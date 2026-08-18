@@ -43,7 +43,11 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
 /// The one LLM round trip both `generate` and `summarizeWindow` make —
 /// factored out so the "group summary" surface (ROADMAP.md's Phase 16)
 /// really is the same summarizer with a different window, not a second,
-/// subtly-divergent prompt that drifts from this one over time.
+/// subtly-divergent prompt that drifts from this one over time. `pub`
+/// since `features/chat_summary.zig`'s `/tdsummary` reuses this exact
+/// same "who: text" -> prose call for the personal-account connector's
+/// unread-messages summary rather than growing its own near-duplicate
+/// prompt.
 ///
 /// Not a live chat reply anyone's watching mid-generation (no ticker/
 /// Progress consumer is wired up here anyway — `.{}` below is a no-op
@@ -54,7 +58,7 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
 /// became an explicit `toolcall.run` parameter). Returns "" on failure
 /// (already logged) rather than propagating: a digest without its summary
 /// paragraph is still worth sending, and the caller decides what to say.
-fn summarizeHistory(provider: llm.Provider, allocator: std.mem.Allocator, ctx: registry.ToolContext, history: []const u8) []const u8 {
+pub fn summarizeHistory(provider: llm.Provider, allocator: std.mem.Allocator, ctx: registry.ToolContext, history: []const u8) []const u8 {
     const prompt = std.fmt.allocPrint(
         allocator,
         "Recent chat history:\n{s}\n\nWrite the digest summary now.",
