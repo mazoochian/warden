@@ -24,6 +24,7 @@ const Identity = @import("domain/identity.zig").Identity;
 const telegram_platform = @import("platform/telegram.zig");
 const matrix_platform = @import("platform/matrix.zig");
 const xmpp_platform = @import("platform/xmpp.zig");
+const telegram_user_platform = @import("platform/telegram_user.zig");
 const reply_redirect = @import("platform/reply_redirect.zig");
 const store_pool = @import("store/pool.zig");
 const api_server = @import("api/server.zig");
@@ -340,6 +341,7 @@ const help_text_admin =
     \\
     \\Owner only
     \\/scraper -- configure the web-scraping backend
+    \\/tdlogin -- connect Warden to your personal Telegram account
 ;
 
 /// Sends `/help` as two messages (see `help_text_admin`), appending a note
@@ -428,7 +430,18 @@ pub fn main(init: std.process.Init) !void {
         null;
     defer if (xmpp_adapter) |*x| x.deinit();
 
-    var connectors_buf: [3]iface.Connector = undefined;
+    // Same shape as Matrix/XMPP above. Unlike them, there's no `deinit()`
+    // to call on a clean shutdown — TDLib persists its own session state to
+    // `session_dir` as it goes (that's the whole point: a later process
+    // restart pointed at the same directory reaches `authorizationStateReady`
+    // again with no re-login), so there's nothing this process needs to
+    // flush on exit.
+    var telegram_user_adapter: ?telegram_user_platform.TelegramUserConnector = if (config.telegram_user) |tc|
+        telegram_user_platform.TelegramUserConnector.init(gpa, tc.api_id, tc.api_hash, tc.session_dir)
+    else
+        null;
+
+    var connectors_buf: [4]iface.Connector = undefined;
     var connectors_len: usize = 0;
     connectors_buf[connectors_len] = telegram_adapter.connector();
     connectors_len += 1;
@@ -438,6 +451,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (xmpp_adapter) |*x| {
         connectors_buf[connectors_len] = x.connector();
+        connectors_len += 1;
+    }
+    if (telegram_user_adapter) |*t| {
+        connectors_buf[connectors_len] = t.connector();
         connectors_len += 1;
     }
     const connectors: []const iface.Connector = connectors_buf[0..connectors_len];
@@ -625,6 +642,15 @@ pub fn main(init: std.process.Init) !void {
     // poll thread itself. A pool that fails to start (thread-spawn
     // failure — the process is already in a bad way) skips that
     // connector's poll loop too rather than aborting every platform.
+    // Computed once, outside the loop below, and handed identically to
+    // every connector's poll loop — `/tdlogin` (see `handleTdloginCommand`)
+    // can be typed from whichever connector the owner is actually talking
+    // to the bot on (almost always the Bot API one, not the personal
+    // account itself, since driving the personal account's own login *from*
+    // the personal account makes no sense), not necessarily the one this
+    // pointer "belongs to".
+    const telegram_user_ptr: ?*telegram_user_platform.TelegramUserConnector = if (telegram_user_adapter) |*t| t else null;
+
     for (connectors, 0..) |connector, i| {
         const msg_pool = MessageWorkerPool.init(gpa, io, config.workers_per_platform, MessageTask.run) catch |err| {
             log.err("failed to start worker pool for {t}: {t}", .{ connector.platform(), err });
@@ -651,6 +677,7 @@ pub fn main(init: std.process.Init) !void {
             &heartbeat,
             i,
             &bot_view_broadcaster,
+            telegram_user_ptr,
         }) catch |err| {
             log.err("failed to start poll loop thread for {t}: {t}", .{ connector.platform(), err });
             continue;
@@ -692,6 +719,7 @@ pub fn main(init: std.process.Init) !void {
             .bot_view = &bot_view_broadcaster,
             .auth_limiter = &auth_limiter,
             .bot_view_send_limiter = &bot_view_send_limiter,
+            .telegram_user = if (telegram_user_adapter) |*t| t else null,
         };
         if (std.Thread.spawn(.{}, apiServerThread, .{ api_ctx, port, config.api_workers })) |thread| {
             thread.detach();
@@ -933,6 +961,7 @@ fn connectorPollLoop(
     heartbeat: *Heartbeat,
     connector_idx: usize,
     bcast: *bot_view.Broadcaster,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
 ) void {
     while (true) {
         var poll_arena = std.heap.ArenaAllocator.init(gpa);
@@ -1018,6 +1047,7 @@ fn connectorPollLoop(
                 .task_arena = task_arena,
                 .msg = duped_msg,
                 .bcast = bcast,
+                .telegram_user = telegram_user,
             }) catch |err| {
                 // Queueing itself failed (OOM growing the queue's backing
                 // array) — `processMessageTask` never got a chance to free
@@ -1104,6 +1134,7 @@ const MessageTask = struct {
     task_arena: *std.heap.ArenaAllocator,
     msg: iface.Message,
     bcast: *bot_view.Broadcaster,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
 
     fn run(self: MessageTask) void {
         processMessageTask(
@@ -1126,6 +1157,7 @@ const MessageTask = struct {
             self.task_arena,
             self.msg,
             self.bcast,
+            self.telegram_user,
         );
     }
 };
@@ -1154,6 +1186,7 @@ fn processMessageTask(
     task_arena: *std.heap.ArenaAllocator,
     msg: iface.Message,
     bcast: *bot_view.Broadcaster,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
 ) void {
     defer {
         task_arena.deinit();
@@ -1354,7 +1387,7 @@ fn processMessageTask(
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg, false);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg, false, telegram_user);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -2093,6 +2126,13 @@ fn handleMessage(
     /// is intentionally indistinguishable from a real one — that's the
     /// whole point of the re-dispatch).
     relayed: bool,
+    /// The personal-account connector, if `WARDEN_TELEGRAM_USER_*` is
+    /// configured — `null` otherwise. Threaded alongside `connector` rather
+    /// than reached for via `config`/a global, same "explicit dependency,
+    /// not ambient state" convention every other shared resource here
+    /// (`pool`, `pending`, `digest_scheduler`, ...) already follows. Only
+    /// `/tdlogin`'s handler touches this; every other command ignores it.
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
 ) bool {
     // Coarse "does the bot even respond here" gate — checked before
     // anything else in this function (including the choice_picked/
@@ -2258,6 +2298,7 @@ fn handleMessage(
                 max_message_len,
                 asRelayedMessage(msg, relay.target_native_chat_id, relay.command),
                 true,
+                telegram_user,
             );
         }
     }
@@ -2460,6 +2501,7 @@ fn handleMessage(
             max_message_len,
             asRelayedMessage(msg, relay.target_native_chat_id, relay.command),
             true,
+            telegram_user,
         );
     } else if (std.mem.eql(u8, text, "/redact") or std.mem.startsWith(u8, text, "/redact ")) {
         // Per-mode gating happens inside handleRedactCommand itself (regex
@@ -2488,6 +2530,9 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/scraper") or std.mem.startsWith(u8, text, "/scraper ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleScraperCommand(connector, a, pool, msg, text);
+    } else if (std.mem.eql(u8, text, "/tdlogin") or std.mem.startsWith(u8, text, "/tdlogin ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleTdloginCommand(connector, a, config, telegram_user, msg, text);
     } else if (std.mem.eql(u8, text, "/remind") or std.mem.startsWith(u8, text, "/remind ")) {
         if (!feature_flags.isEnabled(pool, "reminders")) return false;
         handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
@@ -3858,6 +3903,118 @@ fn formatTemplateList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i
 /// shown — same view-open-to-anyone/change-owner-only access model as
 /// `/persona` (a chat member flipping this is a smaller lever than a full
 /// persona rewrite, but still not something to leave open to anyone).
+/// `/tdlogin status|phone <number>|code <digits>|password <password>` —
+/// bot-chat fallback for driving the personal-account connector's login
+/// (see `platform/telegram_user.zig`'s doc comment; warden-ui's own login
+/// form at `/api/v1/telegram-user/*` is the primary path). Owner-only,
+/// checked here rather than at the dispatch site since every sibling
+/// owner-only command (`/scraper`, etc.) follows the same "check inside
+/// the handler" shape.
+///
+/// The `code` subcommand strips every non-digit character before passing
+/// the result to `submitAuthCode` — this is the obfuscation workaround
+/// itself (see `Platform.telegram_user`'s doc comment and the plan sent to
+/// the owner): Telegram's own anti-phishing detection can silently
+/// invalidate a login code the moment its bare digits appear as a message
+/// in *any* Telegram chat, including one with this bot, so the owner is
+/// expected to type it with digits separated ("1 2 3 4 5") or otherwise
+/// broken up rather than as the bare code Telegram displayed.
+fn handleTdloginCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can drive the personal-account login.");
+        return;
+    }
+    const conn = telegram_user orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment (WARDEN_TELEGRAM_USER_API_ID/_API_HASH/_SESSION_DIR/_OWNER_ID).");
+        return;
+    };
+
+    const rest = std.mem.trim(u8, text["/tdlogin".len..], " ");
+    const space = std.mem.indexOfScalar(u8, rest, ' ');
+    const sub = if (space) |i| rest[0..i] else rest;
+    const arg = if (space) |i| std.mem.trim(u8, rest[i + 1 ..], " ") else "";
+
+    if (sub.len == 0 or std.mem.eql(u8, sub, "status")) {
+        const state_text = switch (conn.authState()) {
+            .none => "not started yet (will begin automatically once the connector's first poll runs)",
+            .wait_tdlib_parameters => "starting up",
+            .wait_phone_number => "waiting for /tdlogin phone <number>",
+            .wait_code => "waiting for /tdlogin code <the digits Telegram sent, separated e.g. \"1 2 3 4 5\">",
+            .wait_password => "waiting for /tdlogin password <your 2FA password>",
+            .ready => "connected and ready",
+            .logging_out => "logging out",
+            .closed => "closed",
+            .unsupported => "stuck on a login state this bot doesn't support (QR/other-device login) — check the logs",
+        };
+        const out = std.fmt.allocPrint(a, "Personal-account login: {s}", .{state_text}) catch return;
+        connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "phone")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tdlogin phone +15551234567");
+            return;
+        }
+        if (conn.authState() != .wait_phone_number) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Not currently waiting for a phone number — check /tdlogin status.");
+            return;
+        }
+        conn.submitPhoneNumber(arg);
+        reply(connector, a, msg.chat_id, msg.message_id, "Phone number submitted. Watch this chat (or your other Telegram sessions) for the login code, then send it back with /tdlogin code — with the digits separated, e.g. \"1 2 3 4 5\", not the bare code.");
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "code")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tdlogin code 1 2 3 4 5 (digits separated — see /tdlogin status)");
+            return;
+        }
+        if (conn.authState() != .wait_code) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Not currently waiting for a login code — check /tdlogin status.");
+            return;
+        }
+        var digits_buf: [64]u8 = undefined;
+        var n: usize = 0;
+        for (arg) |c| {
+            if (std.ascii.isDigit(c) and n < digits_buf.len) {
+                digits_buf[n] = c;
+                n += 1;
+            }
+        }
+        if (n == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "That didn't contain any digits.");
+            return;
+        }
+        conn.submitAuthCode(digits_buf[0..n]);
+        reply(connector, a, msg.chat_id, msg.message_id, "Code submitted.");
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "password")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tdlogin password <your 2FA password>");
+            return;
+        }
+        if (conn.authState() != .wait_password) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Not currently waiting for a 2FA password — check /tdlogin status.");
+            return;
+        }
+        conn.submitPassword(arg);
+        reply(connector, a, msg.chat_id, msg.message_id, "Password submitted.");
+        return;
+    }
+
+    reply(connector, a, msg.chat_id, msg.message_id, "Unknown /tdlogin subcommand — use status, phone, code, or password.");
+}
+
 fn handleThinkingCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,

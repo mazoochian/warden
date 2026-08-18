@@ -1,7 +1,8 @@
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
-const ReplyAutonomy = @import("user_settings.zig").ReplyAutonomy;
+const user_settings = @import("user_settings.zig");
+const ReplyAutonomy = user_settings.ReplyAutonomy;
 
 /// Typed replacement for the old stringly-typed per-chat `chat_settings` KV
 /// table (`digest_enabled`/`last_digest_ts`/`magic_word` used to be
@@ -185,7 +186,6 @@ pub fn setReplyAutonomy(pool: *PgPool, chat_id: i64, value: ?ReplyAutonomy) !voi
 /// (which needs to show "unset, inheriting X" rather than just X) and for
 /// each other's tests.
 pub fn resolveReplyAutonomy(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, owner_identity_id: i64) ReplyAutonomy {
-    const user_settings = @import("user_settings.zig");
     if (getReplyAutonomy(pool, chat_id)) |override| return override;
     return user_settings.getEffectiveReplyAutonomyDefault(pool, allocator, owner_identity_id);
 }
@@ -286,7 +286,6 @@ const testing = std.testing;
 const test_support = @import("test_support.zig");
 const chats = @import("chats.zig");
 const identities = @import("identities.zig");
-const user_settings = @import("user_settings.zig");
 
 test "resolveReplyAutonomy: no override inherits the owner's global default, override beats it, clearing restores inheritance" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;

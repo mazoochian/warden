@@ -16,6 +16,7 @@ const WorkerPool = @import("../worker_pool.zig").WorkerPool;
 const store_pool = @import("../store/pool.zig");
 const config_mod = @import("../config.zig");
 const iface = @import("../platform/interface.zig");
+const telegram_user_platform = @import("../platform/telegram_user.zig");
 const bot_view = @import("bot_view.zig");
 const rate_limit = @import("rate_limit.zig");
 const router = @import("router.zig");
@@ -55,6 +56,15 @@ pub const ServerContext = struct {
     /// endpoint is already authenticated by the time it runs.
     auth_limiter: ?*rate_limit.Limiter = null,
     bot_view_send_limiter: ?*rate_limit.Limiter = null,
+    /// The personal-account (TDLib) connector, if `WARDEN_TELEGRAM_USER_*`
+    /// is configured — `null` otherwise, same "feature unavailable" meaning
+    /// as `bot_view` above. Distinct from `connectors` (which only carries
+    /// the generic `iface.Connector` vtable): the login-flow endpoints
+    /// (`/api/v1/telegram-user/*`) need the concrete type's
+    /// `submitPhoneNumber`/`submitAuthCode`/`submitPassword`/`authState`,
+    /// none of which are (or should be) part of the platform-agnostic
+    /// vtable every connector implements.
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector = null,
 };
 
 const ConnectionItem = struct {

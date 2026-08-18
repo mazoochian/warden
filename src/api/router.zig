@@ -19,6 +19,7 @@ const feature_flags = @import("../store/feature_flags.zig");
 const dynamic_config = @import("../store/dynamic_config.zig");
 const config_mod = @import("../config.zig");
 const iface = @import("../platform/interface.zig");
+const telegram_user_platform = @import("../platform/telegram_user.zig");
 const chats_store = @import("../store/chats.zig");
 const chat_members = @import("../store/chat_members.zig");
 const chat_settings = @import("../store/chat_settings.zig");
@@ -218,6 +219,18 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     if (std.mem.eql(u8, path, "/api/v1/me/settings")) {
         if (method == .GET) return handleGetMySettings(ctx, request);
         if (method == .PATCH) return handleSetMySettings(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/telegram-user/status")) {
+        return handleTelegramUserStatus(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/phone")) {
+        return handleTelegramUserPhone(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/code")) {
+        return handleTelegramUserCode(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/password")) {
+        return handleTelegramUserPassword(ctx, request);
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/reminders")) {
         return handleListReminders(ctx, request, target);
@@ -2101,6 +2114,122 @@ fn handleSetMySettings(ctx: *const ServerContext, request: *http.Server.Request)
 
     audit_log.record(ctx.pool, account_id, null, "me.settings.set", null, null);
 
+    return respondJson(ctx, request, .ok, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Personal-account (TDLib) connector login flow -- owner-only (not just any
+// logged-in account, unlike `/api/v1/me/settings` above): this connects
+// Warden to the operator's real Telegram account, so `handleTelegramUserX`
+// each require `roles.owner` specifically, same bar as `/api/v1/admin/*`'s
+// `requireAdmin` but *without* the `bot_admin` half of that gate -- a bot
+// admin has no business driving the owner's own personal login.
+// ---------------------------------------------------------------------------
+
+/// `null` means a response was already sent (401/403/404) -- same
+/// "caller just returns" convention as `requireAdmin`. The 404 case (no
+/// `ctx.telegram_user`) happens whenever `WARDEN_TELEGRAM_USER_*` isn't
+/// configured; treated as "no such endpoint" rather than a 5xx since from
+/// the caller's perspective this feature just doesn't exist on this
+/// deployment.
+fn requireTelegramUserConnector(ctx: *const ServerContext, request: *http.Server.Request) !?*telegram_user_platform.TelegramUserConnector {
+    const conn = ctx.telegram_user orelse {
+        try respondError(request, .not_found, "not_found", "the personal-account connector isn't configured on this deployment");
+        return null;
+    };
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        try respondError(request, .unauthorized, "unauthorized", "not logged in");
+        return null;
+    };
+    const roles = try computeRoles(ctx, account_id);
+    if (!roles.owner) {
+        try respondError(request, .forbidden, "forbidden", "owner access required");
+        return null;
+    }
+    return conn;
+}
+
+fn handleTelegramUserStatus(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    return respondJson(ctx, request, .ok, .{
+        .auth_state = @tagName(conn.authState()),
+    });
+}
+
+const PhoneNumberBody = struct { phone_number: []const u8 };
+const AuthCodeBody = struct { code: []const u8 };
+const PasswordBody = struct { password: []const u8 };
+
+fn handleTelegramUserPhone(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [512]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(512)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(PhoneNumberBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "expected {\"phone_number\": \"+...\"}");
+    };
+    if (conn.authState() != .wait_phone_number) {
+        return respondError(request, .conflict, "wrong_state", "not currently waiting for a phone number");
+    }
+    conn.submitPhoneNumber(body.phone_number);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+fn handleTelegramUserCode(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [256]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(256)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(AuthCodeBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "expected {\"code\": \"...\"}");
+    };
+    if (conn.authState() != .wait_code) {
+        return respondError(request, .conflict, "wrong_state", "not currently waiting for a login code");
+    }
+    // No obfuscation-stripping here, unlike the bot-chat command path --
+    // this is warden-ui's own HTTPS form submitting straight to this API,
+    // never a Telegram message, so there's nothing for Telegram's own
+    // phishing detector to have invalidated the code over in the first
+    // place (see `platform/interface.zig`'s `Platform.telegram_user` doc
+    // comment).
+    conn.submitAuthCode(body.code);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+fn handleTelegramUserPassword(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [512]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(512)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(PasswordBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "expected {\"password\": \"...\"}");
+    };
+    if (conn.authState() != .wait_password) {
+        return respondError(request, .conflict, "wrong_state", "not currently waiting for a 2FA password");
+    }
+    conn.submitPassword(body.password);
     return respondJson(ctx, request, .ok, .{});
 }
 

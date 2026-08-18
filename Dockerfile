@@ -9,7 +9,22 @@ ARG ZIG_VERSION=0.16.0
 # The retry loop and curl --retry exist because builds run on networks with
 # transient DNS/connection failures; downloading to a file (rather than
 # piping into tar) keeps a mid-stream retry from corrupting the extraction.
-RUN for i in 1 2 3 4 5; do apk add --no-cache curl xz postgresql-dev olm-dev && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+# telegram-tdlib-dev (src/platform/telegram_user.zig's tdjson headers/link
+# lib) only exists in Alpine's edge/testing repo, not the stable 3.22 one
+# this image is otherwise pinned to -- pulled in via -X rather than
+# appending to /etc/apk/repositories, so it (and its edge/main,edge/
+# community dependency closure) apply only to this one apk invocation and
+# never affect version resolution for anything else installed in this
+# image. Real tradeoff, not hidden: edge/testing isn't version-pinned the
+# way the stable repo is, so a rebuild months from now could pull a
+# different TDLib than what's tested today -- accepted for now, see the
+# plan sent to the owner; revisit (build TDLib from source instead) if it
+# ever actually breaks a build.
+RUN for i in 1 2 3 4 5; do apk add --no-cache \
+        -X https://dl-cdn.alpinelinux.org/alpine/edge/main \
+        -X https://dl-cdn.alpinelinux.org/alpine/edge/community \
+        -X https://dl-cdn.alpinelinux.org/alpine/edge/testing \
+        curl xz postgresql-dev olm-dev telegram-tdlib-dev && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && curl -fSL --retry 5 --retry-delay 2 --retry-all-errors -o /tmp/zig.tar.xz \
        "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
     && tar -xJf /tmp/zig.tar.xz -C /opt \
@@ -56,7 +71,13 @@ RUN cd piechart && npm ci --omit=dev
 # ROADMAP.md's Phase 25 auto-download feature (src/features/video_download.zig).
 # ---------------------------------------------------------------------------
 FROM node:22-alpine
-RUN for i in 1 2 3 4 5; do apk add --no-cache chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq olm pandoc poppler-utils imagemagick ffmpeg yt-dlp && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+# telegram-tdlib is the runtime counterpart of the build stage's
+# telegram-tdlib-dev above -- same edge/testing-only, -X-scoped caveat.
+RUN for i in 1 2 3 4 5; do apk add --no-cache \
+        -X https://dl-cdn.alpinelinux.org/alpine/edge/main \
+        -X https://dl-cdn.alpinelinux.org/alpine/edge/community \
+        -X https://dl-cdn.alpinelinux.org/alpine/edge/testing \
+        chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq olm telegram-tdlib pandoc poppler-utils imagemagick ffmpeg yt-dlp && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && test -x /usr/bin/chromium-browser
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
     PUPPETEER_SKIP_DOWNLOAD=true
