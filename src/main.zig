@@ -4482,13 +4482,13 @@ fn handleTdSummaryCommand(
         return;
     }
 
-    const query = std.mem.trim(u8, text["/tdsummary".len..], " ");
-    if (query.len == 0) {
-        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tdsummary <chat id or name>");
+    const flag = stripAllFlag(text["/tdsummary".len..]);
+    if (flag.query.len == 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /tdsummary <chat id or name> [--all]");
         return;
     }
 
-    const resolution = chat_summary.resolveChat(conn, a, query) catch {
+    const resolution = chat_summary.resolveChat(conn, a, flag.query) catch {
         reply(connector, a, msg.chat_id, msg.message_id, "Failed to look up that chat.");
         return;
     };
@@ -4501,13 +4501,46 @@ fn handleTdSummaryCommand(
             connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
         },
         .one => |m| {
-            const summary = chat_summary.summarizeChat(conn, llm_provider, a, io, tool_ctx, m.native_chat_id) catch {
+            const summary = chat_summary.summarizeChat(conn, llm_provider, a, io, tool_ctx, m.native_chat_id, flag.all) catch {
                 reply(connector, a, msg.chat_id, msg.message_id, "Failed to summarize that chat.");
                 return;
             };
             connector.sendMessage(a, msg.chat_id, summary, msg.message_id);
         },
     }
+}
+
+/// Splits a trailing `--all` token off `/tdsummary`'s argument text —
+/// direct owner request (2026-08-19) for a way to summarize the last 100
+/// messages regardless of read state instead of just unread ones. A
+/// trailing, space-separated token specifically (not a bare substring
+/// match) so a chat literally named "...--all" can't accidentally trip
+/// this — vanishingly unlikely, but free to guard against.
+fn stripAllFlag(text: []const u8) struct { query: []const u8, all: bool } {
+    const trimmed = std.mem.trim(u8, text, " ");
+    if (std.mem.eql(u8, trimmed, "--all")) return .{ .query = "", .all = true };
+    if (std.mem.endsWith(u8, trimmed, " --all")) {
+        return .{ .query = std.mem.trim(u8, trimmed[0 .. trimmed.len - " --all".len], " "), .all = true };
+    }
+    return .{ .query = trimmed, .all = false };
+}
+
+test "stripAllFlag: strips a trailing --all token, leaves a bare query alone" {
+    const with_flag = stripAllFlag("Alice Work --all");
+    try std.testing.expectEqualStrings("Alice Work", with_flag.query);
+    try std.testing.expect(with_flag.all);
+
+    const without_flag = stripAllFlag("Alice Work");
+    try std.testing.expectEqualStrings("Alice Work", without_flag.query);
+    try std.testing.expect(!without_flag.all);
+
+    const flag_only = stripAllFlag("--all");
+    try std.testing.expectEqualStrings("", flag_only.query);
+    try std.testing.expect(flag_only.all);
+
+    const embedded = stripAllFlag("chat--all");
+    try std.testing.expectEqualStrings("chat--all", embedded.query);
+    try std.testing.expect(!embedded.all);
 }
 
 /// The Bot API owner's own native chat id (private-chat id == user id on
@@ -8432,11 +8465,11 @@ const PersonalAccountToolAdapter = struct {
         .sendMessage = sendMessageFn,
     };
 
-    fn summarizeUnreadFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8) anyerror![]const u8 {
+    fn summarizeUnreadFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, all: bool) anyerror![]const u8 {
         const self: *PersonalAccountToolAdapter = @ptrCast(@alignCast(ptr));
         const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
         if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
-        return chat_summary.describeUnreadForModel(conn, allocator, self.io, chat_query);
+        return chat_summary.describeUnreadForModel(conn, allocator, self.io, chat_query, all);
     }
 
     fn listChatsFn(ptr: *anyopaque, allocator: std.mem.Allocator, query: ?[]const u8) anyerror![]const u8 {

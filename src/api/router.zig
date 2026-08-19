@@ -2276,7 +2276,7 @@ fn handleTelegramUserListChats(ctx: *const ServerContext, request: *http.Server.
     return respondJson(ctx, request, .ok, .{ .chats = chat_list });
 }
 
-const SummarizeTdChatBody = struct { chat_id: []const u8 };
+const SummarizeTdChatBody = struct { chat_id: []const u8, all: bool = false };
 
 /// `POST /api/v1/telegram-user/chats/summarize` — warden-ui's trigger for
 /// the same unread-summary-and-mark-read action `/tdsummary` performs in
@@ -2285,7 +2285,9 @@ const SummarizeTdChatBody = struct { chat_id: []const u8 };
 /// `chat_id` is expected to be an exact id from a prior `GET .../chats`
 /// response — this endpoint doesn't do `/tdsummary`'s name-substring
 /// resolution, since the client already has the exact id from the chat
-/// list it rendered.
+/// list it rendered. `all = true` is `/tdsummary <chat> --all`'s
+/// counterpart: the last 100 messages regardless of read state, no
+/// mark-as-read side effect.
 fn handleTelegramUserSummarizeChat(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const conn = try requireTelegramUserConnector(ctx, request) orelse return;
     if (conn.authState() != .ready) {
@@ -2316,7 +2318,7 @@ fn handleTelegramUserSummarizeChat(ctx: *const ServerContext, request: *http.Ser
     // actually runs against it, so every other field is fine left at its
     // zero-value default.
     const tool_ctx = tool_registry.ToolContext{ .allocator = arena, .io = ctx.io };
-    const summary = chat_summary.summarizeChat(conn, provider, arena, ctx.io, tool_ctx, body.chat_id) catch {
+    const summary = chat_summary.summarizeChat(conn, provider, arena, ctx.io, tool_ctx, body.chat_id, body.all) catch {
         return respondError(request, .internal_server_error, "internal", "failed to summarize chat");
     };
     return respondJson(ctx, request, .ok, .{ .summary = summary });

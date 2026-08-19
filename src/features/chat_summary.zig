@@ -183,6 +183,50 @@ pub fn fetchUnread(telegram_user: *TelegramUserConnector, allocator: std.mem.All
     };
 }
 
+pub const RecentSummary = struct {
+    native_chat_id: []const u8,
+    chat_title: []const u8,
+    fetched_count: usize,
+    /// "sender id: text" lines, oldest-first; empty when the fetched
+    /// messages are entirely non-text content this connector doesn't
+    /// convert (see Phase A scope in `platform/telegram_user.zig`).
+    formatted: []const u8,
+};
+
+/// Fetches the most recent `max_fetch` (100) messages in a chat, any read
+/// state — the `--all` mode's counterpart to `fetchUnread`, direct owner
+/// request (2026-08-19) for "summarize the last 100 messages" rather than
+/// only ever unread ones. Read-only: never calls `markMessagesRead`, since
+/// there's no "unread" concept driving this fetch to begin with — same
+/// "no side effects" contract `features/digest.zig`'s own
+/// `summarizeWindow` already keeps for `/summary [hours]`. Otherwise
+/// mirrors `fetchUnread`'s shape exactly (same `requestChatMeta` +
+/// `requestChatHistory` + newest-first-to-oldest-first reversal), just
+/// without the unread-count/capped bookkeeping that has no meaning here.
+/// `null` means TDLib couldn't be reached in time.
+pub fn fetchRecent(telegram_user: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, native_chat_id: []const u8) !?RecentSummary {
+    const chat_id_int = std.fmt.parseInt(i64, native_chat_id, 10) catch return null;
+    const meta = try telegram_user.requestChatMeta(allocator, io, chat_id_int) orelse return null;
+    const history = try telegram_user.requestChatHistory(allocator, io, chat_id_int, max_fetch) orelse return null;
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (history) |m| {
+        const who = if (m.sender_user_id) |uid|
+            try std.fmt.allocPrint(allocator, "{d}", .{uid})
+        else
+            try allocator.dupe(u8, "unknown");
+        try lines.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ who, m.text }));
+    }
+    std.mem.reverse([]const u8, lines.items); // TDLib returns newest-first
+
+    return RecentSummary{
+        .native_chat_id = native_chat_id,
+        .chat_title = meta.title,
+        .fetched_count = history.len,
+        .formatted = try std.mem.join(allocator, "\n", lines.items),
+    };
+}
+
 /// `/tdsummary <chat>` end to end: resolve, fetch+mark-read, then the same
 /// `digest.summarizeHistory` LLM round trip `/digest`/`/summary` already
 /// use, wrapped with the two things a chat-window summary doesn't need to
@@ -191,6 +235,9 @@ pub fn fetchUnread(telegram_user: *TelegramUserConnector, allocator: std.mem.All
 /// summarized. `null` chat_id means TDLib couldn't be reached; the caller
 /// tells the owner to try again rather than treating it as "no chat found"
 /// (that's `resolveChat`'s job, already run before this is called).
+/// `all = true` switches to `fetchRecent`/`summarizeChatAll` instead —
+/// the last 100 messages regardless of read state, no mark-as-read side
+/// effect.
 pub fn summarizeChat(
     telegram_user: *TelegramUserConnector,
     provider: llm.Provider,
@@ -198,7 +245,10 @@ pub fn summarizeChat(
     io: Io,
     ctx: registry.ToolContext,
     native_chat_id: []const u8,
+    all: bool,
 ) ![]const u8 {
+    if (all) return summarizeChatAll(telegram_user, provider, allocator, io, ctx, native_chat_id);
+
     const unread = try fetchUnread(telegram_user, allocator, io, native_chat_id) orelse
         return "Couldn't reach the personal account's Telegram session in time — try again in a moment.";
 
@@ -230,6 +280,31 @@ pub fn summarizeChat(
     return out.writer.buffered();
 }
 
+/// `summarizeChat(all = true)`'s actual implementation — split out rather
+/// than one function branching on `all` at every step, since the two modes
+/// share only `digest.summarizeHistory`'s call shape, not any of the
+/// unread-specific bookkeeping (`capped`/`marked_read`) `summarizeChat`
+/// itself has to report.
+fn summarizeChatAll(
+    telegram_user: *TelegramUserConnector,
+    provider: llm.Provider,
+    allocator: std.mem.Allocator,
+    io: Io,
+    ctx: registry.ToolContext,
+    native_chat_id: []const u8,
+) ![]const u8 {
+    const recent = try fetchRecent(telegram_user, allocator, io, native_chat_id) orelse
+        return "Couldn't reach the personal account's Telegram session in time — try again in a moment.";
+    if (recent.formatted.len == 0) {
+        return std.fmt.allocPrint(allocator, "\"{s}\" has no plain-text messages yet to summarize.", .{recent.chat_title});
+    }
+
+    const summary = digest.summarizeHistory(provider, allocator, ctx, recent.formatted);
+    if (summary.len == 0) return error.SummaryFailed;
+
+    return std.fmt.allocPrint(allocator, "\"{s}\" — last {d} message(s):\n\n{s}", .{ recent.chat_title, recent.fetched_count, summary });
+}
+
 /// Plain-text "id — title" lines, one per chat, capped at `limit` with a
 /// "...and N more" tail — the LLM-tool-facing counterpart to `main.zig`'s
 /// `renderTdChatsPage` (which builds Telegram-specific button UI instead
@@ -256,7 +331,7 @@ pub fn formatChatList(allocator: std.mem.Allocator, chat_list: []const ChatMatch
 /// a reply to the owner this turn, so a second, nested LLM round trip here
 /// would be redundant — same "just fetch, let the model summarize" shape
 /// `tools/catch_me_up.zig`'s own doc comment already establishes.
-pub fn describeUnreadForModel(telegram_user: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, query: []const u8) ![]const u8 {
+pub fn describeUnreadForModel(telegram_user: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, query: []const u8, all: bool) ![]const u8 {
     const resolution = try resolveChat(telegram_user, allocator, query);
     switch (resolution) {
         .none => return "No known chat matches that — ask again naming the chat exactly, or check /tdchats.",
@@ -267,6 +342,15 @@ pub fn describeUnreadForModel(telegram_user: *TelegramUserConnector, allocator: 
             return out.writer.buffered();
         },
         .one => |m| {
+            if (all) {
+                const recent = try fetchRecent(telegram_user, allocator, io, m.native_chat_id) orelse
+                    return "Couldn't reach the personal account's Telegram session in time — try again in a moment.";
+                if (recent.formatted.len == 0) {
+                    return std.fmt.allocPrint(allocator, "\"{s}\" has no plain-text messages yet to show.", .{recent.chat_title});
+                }
+                return std.fmt.allocPrint(allocator, "\"{s}\" — last {d} message(s):\n{s}", .{ recent.chat_title, recent.fetched_count, recent.formatted });
+            }
+
             const unread = try fetchUnread(telegram_user, allocator, io, m.native_chat_id) orelse
                 return "Couldn't reach the personal account's Telegram session in time — try again in a moment.";
             if (unread.unread_count == 0) {

@@ -284,7 +284,10 @@ pub const PersonalAccountSink = struct {
         /// result — already covers "no such chat"/"ambiguous, pick one"/
         /// "N unread: <lines>", same "sink formats its own listing"
         /// convention `ChatHistorySink`/`ReminderSink` already follow.
-        summarizeUnread: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8) anyerror![]const u8,
+        /// `all = true` summarizes the last 100 messages regardless of
+        /// read state instead of just unread ones (no mark-as-read side
+        /// effect in that mode) — see `chat_summary.fetchRecent`.
+        summarizeUnread: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, all: bool) anyerror![]const u8,
         /// Lists known chats, optionally narrowed by a title substring
         /// (`null`/empty means "every chat") — backs `list_personal_chats`.
         /// Formatted "id — title" lines, same as `/tdchats`/`/tdsearch`.
@@ -298,8 +301,8 @@ pub const PersonalAccountSink = struct {
         sendMessage: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, message: []const u8) anyerror![]const u8,
     };
 
-    pub fn summarizeUnread(self: PersonalAccountSink, allocator: std.mem.Allocator, chat_query: []const u8) ![]const u8 {
-        return self.vtable.summarizeUnread(self.ptr, allocator, chat_query);
+    pub fn summarizeUnread(self: PersonalAccountSink, allocator: std.mem.Allocator, chat_query: []const u8, all: bool) ![]const u8 {
+        return self.vtable.summarizeUnread(self.ptr, allocator, chat_query, all);
     }
 
     pub fn listChats(self: PersonalAccountSink, allocator: std.mem.Allocator, query: ?[]const u8) ![]const u8 {
