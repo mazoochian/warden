@@ -11,3 +11,5 @@ compose.override.yaml
 llama-server/models/
 whisper-server/models/
 warden.log
+
+CLAUDE.md
