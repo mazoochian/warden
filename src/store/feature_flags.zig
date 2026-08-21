@@ -84,6 +84,15 @@ pub const known_modules = [_]ModuleInfo{
     .{ .key = "finance", .label = "Finance", .category = .standalone },
     .{ .key = "power_tools", .label = "Power-User Tools", .category = .standalone },
     .{ .key = "video_download", .label = "Video Auto-Download", .category = .standalone },
+    // Gates only the periodic disk check + owner alerting (storage_sense.zig's
+    // `tick`) -- the manual `/storage` command surface always works
+    // regardless, so the owner can debug even with monitoring off. Fails
+    // open like every other module here, unlike the separate
+    // WARDEN_STORAGE_SENSE_AUTOPILOT_ENABLED dynamic_config switch (which
+    // gates the ladder's destructive actions/sleep mode and must default
+    // off -- see storage_sense.zig's doc comment for why that one isn't a
+    // feature flag).
+    .{ .key = "storage_sense_monitor", .label = "Storage Sense (monitoring + alerts)", .category = .standalone },
     .{ .key = "weather", .label = "Weather", .category = .llm_tool },
     .{ .key = "crypto_price", .label = "Crypto Prices", .category = .llm_tool },
     .{ .key = "air_quality", .label = "Air Quality", .category = .llm_tool },

@@ -292,6 +292,22 @@ pub const Config = struct {
     /// flag existing at all is a tracked TODO to remove once Phase 1's
     /// real logins land, not a permanent feature. Defaults to false.
     api_dev_login: bool = false,
+    /// Ladder tunables for `features/storage_sense.zig` -- same
+    /// "env sets the compiled default, `dynamic_config` can override live"
+    /// pattern `retention_messages` already uses. See that module's doc
+    /// comment for what each watermark actually triggers.
+    storage_sense_low_watermark_pct: i64 = default_storage_sense_low_watermark_pct,
+    storage_sense_high_watermark_pct: i64 = default_storage_sense_high_watermark_pct,
+    storage_sense_flood_watermark_pct: i64 = default_storage_sense_flood_watermark_pct,
+    storage_sense_resume_margin_pct: i64 = default_storage_sense_resume_margin_pct,
+    storage_sense_prune_age_days: i64 = default_storage_sense_prune_age_days,
+    storage_sense_resample_batch_size: i64 = default_storage_sense_resample_batch_size,
+    /// Off by default -- gates the ladder's destructive actions (prune,
+    /// resample, sleep mode), not the monitoring/alerting itself (that's
+    /// `feature_flags.zig`'s `storage_sense_monitor`, which fails open like
+    /// every other module). Stays off until the owner has watched
+    /// `/storage status` for a while and flips it on deliberately.
+    storage_sense_autopilot_enabled: bool = false,
 
     pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile, ApiEnabledWithoutSessionSecret } || std.mem.Allocator.Error;
 
@@ -472,6 +488,32 @@ pub const Config = struct {
             std.log.warn("WARDEN_API_DEV_LOGIN is set — /api/v1/auth/dev-login lets anyone become any identity by id with no real login. NEVER set this outside a contributor's own machine.", .{});
         }
 
+        const storage_sense_low_watermark_pct: i64 = if (env.get("WARDEN_STORAGE_SENSE_LOW_WATERMARK_PCT")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_storage_sense_low_watermark_pct
+        else
+            default_storage_sense_low_watermark_pct;
+        const storage_sense_high_watermark_pct: i64 = if (env.get("WARDEN_STORAGE_SENSE_HIGH_WATERMARK_PCT")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_storage_sense_high_watermark_pct
+        else
+            default_storage_sense_high_watermark_pct;
+        const storage_sense_flood_watermark_pct: i64 = if (env.get("WARDEN_STORAGE_SENSE_FLOOD_WATERMARK_PCT")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_storage_sense_flood_watermark_pct
+        else
+            default_storage_sense_flood_watermark_pct;
+        const storage_sense_resume_margin_pct: i64 = if (env.get("WARDEN_STORAGE_SENSE_RESUME_MARGIN_PCT")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_storage_sense_resume_margin_pct
+        else
+            default_storage_sense_resume_margin_pct;
+        const storage_sense_prune_age_days: i64 = if (env.get("WARDEN_STORAGE_SENSE_PRUNE_AGE_DAYS")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_storage_sense_prune_age_days
+        else
+            default_storage_sense_prune_age_days;
+        const storage_sense_resample_batch_size: i64 = if (env.get("WARDEN_STORAGE_SENSE_RESAMPLE_BATCH_SIZE")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_storage_sense_resample_batch_size
+        else
+            default_storage_sense_resample_batch_size;
+        const storage_sense_autopilot_enabled = parseBoolEnv(env, "WARDEN_STORAGE_SENSE_AUTOPILOT_ENABLED", false);
+
         return .{
             .telegram_bot_token = telegram_bot_token,
             .owners = owners,
@@ -512,6 +554,13 @@ pub const Config = struct {
             .api_workers = api_workers,
             .api_session_secret = api_session_secret,
             .api_dev_login = api_dev_login,
+            .storage_sense_low_watermark_pct = storage_sense_low_watermark_pct,
+            .storage_sense_high_watermark_pct = storage_sense_high_watermark_pct,
+            .storage_sense_flood_watermark_pct = storage_sense_flood_watermark_pct,
+            .storage_sense_resume_margin_pct = storage_sense_resume_margin_pct,
+            .storage_sense_prune_age_days = storage_sense_prune_age_days,
+            .storage_sense_resample_batch_size = storage_sense_resample_batch_size,
+            .storage_sense_autopilot_enabled = storage_sense_autopilot_enabled,
         };
     }
 
@@ -736,4 +785,16 @@ pub const Config = struct {
     /// Armin's numeric Telegram user id, as a string. Deliberately not
     /// username-based, since usernames can change.
     pub const default_telegram_owner_id: []const u8 = "101573604";
+
+    /// Elasticsearch-watermark-style thresholds for `storage_sense.zig` --
+    /// 80% starts pruning/resampling, 90% starts daily owner alerts, 95% is
+    /// the final warning + sleep mode, with a 3-point margin below flood
+    /// before it resumes (92%), so the bot doesn't flap in and out of sleep
+    /// right at the boundary.
+    pub const default_storage_sense_low_watermark_pct: i64 = 80;
+    pub const default_storage_sense_high_watermark_pct: i64 = 90;
+    pub const default_storage_sense_flood_watermark_pct: i64 = 95;
+    pub const default_storage_sense_resume_margin_pct: i64 = 3;
+    pub const default_storage_sense_prune_age_days: i64 = 180;
+    pub const default_storage_sense_resample_batch_size: i64 = 200;
 };
