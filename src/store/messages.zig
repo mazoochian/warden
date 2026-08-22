@@ -41,6 +41,155 @@ pub fn pruneKeepLast(pool: *PgPool, chat_id: i64, keep: i64) !void {
     _ = try stmt.step();
 }
 
+/// Deletes every message in `chat_id` older than `cutoff_ts` (unix seconds),
+/// regardless of `text`/`is_summary` — `storage_sense.zig`'s age-based
+/// counterpart to `pruneKeepLast`'s count-based one, backing both the
+/// watermark ladder's automatic pruning and `/storage cleanup messages
+/// --before`. A summary row aging past `cutoff_ts` is deleted the same as
+/// any other row rather than special-cased: it's already a compaction of
+/// older history, so once it's old enough itself there's nothing left worth
+/// preserving. Returns the number of rows actually deleted (via `RETURNING
+/// id`, same counting idiom `recentDeletable`'s callers use elsewhere) so
+/// callers can report a real number rather than a bare "done".
+pub fn deleteOlderThan(pool: *PgPool, chat_id: i64, cutoff_ts: i64) !i64 {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\DELETE FROM messages WHERE chat_id = $1 AND ts < to_timestamp($2) RETURNING id;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, cutoff_ts);
+
+    var count: i64 = 0;
+    while (try stmt.step()) count += 1;
+    return count;
+}
+
+pub const SummaryBatch = struct {
+    /// Oldest-first "who: text" lines, the same shape `recentFormatted`
+    /// produces — fed straight into `digest.summarizeHistory`.
+    text: []const u8,
+    min_id: i64,
+    max_id: i64,
+    /// The batch's newest message's own `ts` — `resampleOldMessages` stamps
+    /// the synthetic summary row with this instead of "now", so it sorts
+    /// into place among later real messages rather than jumping to the
+    /// front of history.
+    newest_ts: i64,
+    count: usize,
+};
+
+/// The oldest `batch_size` non-summary, texted messages in `chat_id` —
+/// `storage_sense.zig`'s `resampleOldMessages` compacts these into one LLM
+/// summary. `null` if the chat has nothing left to compact. Bounded to
+/// `[min_id, max_id]` rather than a time cutoff so the caller can delete
+/// exactly this range afterward without racing a message that arrives
+/// mid-summarization (see `replaceRangeWithSummary`).
+pub fn oldestBatchForSummary(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, batch_size: i64) !?SummaryBatch {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT m.id, COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, EXTRACT(EPOCH FROM m.ts)::BIGINT
+        \\FROM messages m JOIN identities i ON i.id = m.identity_id
+        \\WHERE m.chat_id = $1 AND m.text IS NOT NULL AND m.is_summary = false
+        \\ORDER BY m.id ASC LIMIT $2;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, batch_size);
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    var min_id: i64 = 0;
+    var max_id: i64 = 0;
+    var newest_ts: i64 = 0;
+    var count: usize = 0;
+    while (try stmt.step()) {
+        const id = stmt.columnInt64(0);
+        if (count == 0) min_id = id;
+        max_id = id;
+        newest_ts = stmt.columnInt64(3);
+        try lines.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ stmt.columnText(1), stmt.columnText(2) }));
+        count += 1;
+    }
+    if (count == 0) return null;
+    return .{
+        .text = try std.mem.join(allocator, "\n", lines.items),
+        .min_id = min_id,
+        .max_id = max_id,
+        .newest_ts = newest_ts,
+        .count = count,
+    };
+}
+
+/// Atomically replaces `[min_id, max_id]` in `chat_id` with a single
+/// `is_summary = true` row carrying `summary_text` — the id range comes
+/// from `oldestBatchForSummary`, so this only ever removes exactly the rows
+/// that were actually summarized, not "everything older than now" (which
+/// would drop a message that arrived while the LLM call was in flight).
+/// `db.zig`/`pool.zig` have no shared transaction helper yet (checked before
+/// writing this) — `BEGIN`/`COMMIT`/`ROLLBACK` run as plain statements
+/// through the same `Db.exec` every other multi-statement call here already
+/// uses, on the one connection held for the duration rather than two
+/// separate pool acquisitions.
+pub fn replaceRangeWithSummary(pool: *PgPool, chat_id: i64, identity_id: i64, min_id: i64, max_id: i64, summary_text: []const u8, ts: i64) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    try db.exec("BEGIN;");
+    errdefer db.exec("ROLLBACK;") catch |err| {
+        std.log.err("messages: rollback failed after a replaceRangeWithSummary error: {t}", .{err});
+    };
+
+    var del = try db.prepare("DELETE FROM messages WHERE chat_id = $1 AND id >= $2 AND id <= $3;");
+    del.bindInt64(1, chat_id);
+    del.bindInt64(2, min_id);
+    del.bindInt64(3, max_id);
+    _ = try del.step();
+    del.finalize();
+
+    // Reuses `min_id` (just freed by the delete above) as the summary row's
+    // own id instead of letting `BIGSERIAL` hand it a fresh one.
+    // `recentFormatted`/`recentSinceFormatted`/`pruneKeepLast` all order by
+    // `id` as a stand-in for chronological order, which holds for real
+    // messages (always inserted in arrival order) but would break here: a
+    // freshly-sequenced id is larger than every id already in the table, so
+    // a summary of the *oldest* messages would sort as the *newest* one.
+    // Claiming the just-freed `min_id` keeps it sorted exactly where the
+    // oldest message in the batch used to sit.
+    var ins = try db.prepare(
+        \\INSERT INTO messages (id, chat_id, identity_id, native_message_id, text, ts, is_summary)
+        \\VALUES ($1, $2, $3, NULL, $4, to_timestamp($5), true);
+    );
+    ins.bindInt64(1, min_id);
+    ins.bindInt64(2, chat_id);
+    ins.bindInt64(3, identity_id);
+    ins.bindText(4, summary_text);
+    ins.bindInt64(5, ts);
+    _ = try ins.step();
+    ins.finalize();
+
+    try db.exec("COMMIT;");
+}
+
+/// Renders one "who: text"/"summary: text" line — shared by `recentFormatted`
+/// and `recentSinceFormatted` so the two don't drift on how a
+/// `storage_sense.zig`-written summary row (see `0044_storage_sense.sql`'s
+/// `is_summary` column) is told apart from a real message. A summary isn't
+/// attributed to whichever identity its row happens to carry (see
+/// `storage_sense.zig`'s `resampleOldMessages` doc comment on why that's a
+/// synthetic system identity, not a real chat participant) — the LLM/
+/// `/summary` reader only needs to know this line is compacted history, not
+/// who "sent" it.
+fn formatLine(allocator: std.mem.Allocator, who: []const u8, text: []const u8, is_summary: bool) ![]const u8 {
+    return if (is_summary)
+        std.fmt.allocPrint(allocator, "summary: {s}", .{text})
+    else
+        std.fmt.allocPrint(allocator, "{s}: {s}", .{ who, text });
+}
+
 /// Renders the most recent `limit` messages in `chat_id` (oldest first) as
 /// "who: text" lines, for grounding free-form LLM questions/digests in this
 /// chat's actual local history. Prefers the sender's platform username
@@ -53,7 +202,7 @@ pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary
         \\FROM messages m JOIN identities i ON i.id = m.identity_id
         \\WHERE m.chat_id = $1 AND m.text IS NOT NULL
         \\ORDER BY m.id DESC LIMIT $2;
@@ -64,7 +213,7 @@ pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
 
     var lines: std.ArrayList([]const u8) = .empty;
     while (try stmt.step()) {
-        try lines.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ stmt.columnText(0), stmt.columnText(1) }));
+        try lines.append(allocator, try formatLine(allocator, stmt.columnText(0), stmt.columnText(1), stmt.columnBool(2)));
     }
     std.mem.reverse([]const u8, lines.items); // rows came back newest-first
     return std.mem.join(allocator, "\n", lines.items);
@@ -85,7 +234,7 @@ pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary
         \\FROM messages m JOIN identities i ON i.id = m.identity_id
         \\WHERE m.chat_id = $1 AND m.text IS NOT NULL AND m.ts >= to_timestamp($2)
         \\ORDER BY m.id DESC LIMIT $3;
@@ -97,7 +246,7 @@ pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id
 
     var lines: std.ArrayList([]const u8) = .empty;
     while (try stmt.step()) {
-        try lines.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ stmt.columnText(0), stmt.columnText(1) }));
+        try lines.append(allocator, try formatLine(allocator, stmt.columnText(0), stmt.columnText(1), stmt.columnBool(2)));
     }
     std.mem.reverse([]const u8, lines.items); // rows came back newest-first
     return std.mem.join(allocator, "\n", lines.items);
@@ -437,4 +586,84 @@ test "recentForScan excludes null-text and undeletable messages, respects scan_l
     const capped = try recentForScan(&pool, a, chat1, 1);
     try testing.expectEqual(@as(usize, 1), capped.len);
     try testing.expectEqualStrings("4", capped[0].native_message_id);
+}
+
+test "deleteOlderThan removes only messages before the cutoff, scoped to one chat" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const chat2 = try chats.upsertChat(&pool, .telegram, "2", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try insert(&pool, chat1, alice, "1", "old", 1000);
+    try insert(&pool, chat1, alice, "2", "also old", 1500);
+    try insert(&pool, chat1, alice, "3", "recent", 3000);
+    try insert(&pool, chat2, alice, "4", "unrelated chat, also old", 1000);
+
+    const deleted = try deleteOlderThan(&pool, chat1, 2000);
+    try testing.expectEqual(@as(i64, 2), deleted);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const left = try recentFormatted(&pool, a, chat1, 10);
+    try testing.expectEqualStrings("alice: recent", left);
+
+    // A different chat's messages older than the same cutoff are untouched.
+    const other = try recentFormatted(&pool, a, chat2, 10);
+    try testing.expectEqualStrings("alice: unrelated chat, also old", other);
+}
+
+test "oldestBatchForSummary returns the oldest non-summary messages as an id range, null once nothing's left" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try insert(&pool, chat1, alice, "1", "first", 1000);
+    try insert(&pool, chat1, alice, "2", "second", 1001);
+    try insert(&pool, chat1, alice, "3", "third", 1002);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const batch = (try oldestBatchForSummary(&pool, a, chat1, 2)) orelse return error.TestExpectedValue;
+    try testing.expectEqualStrings("alice: first\nalice: second", batch.text);
+    try testing.expectEqual(@as(usize, 2), batch.count);
+    try testing.expectEqual(@as(i64, 1001), batch.newest_ts);
+
+    try testing.expectEqual(@as(?SummaryBatch, null), try oldestBatchForSummary(&pool, a, 999, 2));
+}
+
+test "replaceRangeWithSummary atomically swaps an id range for one is_summary row, sorted by the batch's newest ts" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    const warden = try identities.getOrCreateMinimal(&pool, .telegram, "warden_system", "Warden", null, true, 1000);
+
+    try insert(&pool, chat1, alice, "1", "first", 1000);
+    try insert(&pool, chat1, alice, "2", "second", 1001);
+    try insert(&pool, chat1, alice, "3", "third, kept", 2000);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const batch = (try oldestBatchForSummary(&pool, a, chat1, 2)) orelse return error.TestExpectedValue;
+    try replaceRangeWithSummary(&pool, chat1, warden, batch.min_id, batch.max_id, "They discussed the first two things.", batch.newest_ts);
+
+    const history = try recentFormatted(&pool, a, chat1, 10);
+    try testing.expectEqualStrings("summary: They discussed the first two things.\nalice: third, kept", history);
 }

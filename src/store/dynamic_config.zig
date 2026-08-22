@@ -171,6 +171,19 @@ pub const known_keys = [_]KnownKey{
     // handleAdminSetConfig (needs live Config access this module doesn't
     // have), not here. See llm/dynamic_provider.zig for the runtime side.
     .{ .key = "WARDEN_LLM_PROVIDER", .label = "Active LLM provider", .kind = .string },
+    // storage_sense.zig's watermark ladder -- see its own doc comment for
+    // the full 80/90/95 progression these back. Deliberately not including
+    // WARDEN_STORAGE_SENSE_LAST_HIGH_ALERT_TS/_SLEEP_ACTIVE/
+    // _SLEEP_ENTERED_TS here: those are the ladder's own runtime
+    // bookkeeping, not an owner tunable, and keeping them off this list
+    // means the admin PATCH API can't accidentally corrupt them.
+    .{ .key = "WARDEN_STORAGE_SENSE_LOW_WATERMARK_PCT", .label = "Storage sense: low watermark % (starts pruning/resampling)", .kind = .i64 },
+    .{ .key = "WARDEN_STORAGE_SENSE_HIGH_WATERMARK_PCT", .label = "Storage sense: high watermark % (starts daily owner alerts)", .kind = .i64 },
+    .{ .key = "WARDEN_STORAGE_SENSE_FLOOD_WATERMARK_PCT", .label = "Storage sense: flood watermark % (triggers sleep mode)", .kind = .i64 },
+    .{ .key = "WARDEN_STORAGE_SENSE_RESUME_MARGIN_PCT", .label = "Storage sense: hysteresis margin below flood to resume from sleep", .kind = .i64 },
+    .{ .key = "WARDEN_STORAGE_SENSE_PRUNE_AGE_DAYS", .label = "Storage sense: prune messages older than this many days", .kind = .i64 },
+    .{ .key = "WARDEN_STORAGE_SENSE_RESAMPLE_BATCH_SIZE", .label = "Storage sense: messages compacted per resample batch", .kind = .i64 },
+    .{ .key = "WARDEN_STORAGE_SENSE_AUTOPILOT_ENABLED", .label = "Storage sense: autopilot (automatic cleanup + sleep mode)", .kind = .bool },
 };
 
 pub fn findKnownKey(key: []const u8) ?KnownKey {

@@ -2311,6 +2311,115 @@ but independently shippable feature.
   `0040_video_download.sql` at merge time, `migrate.zig`'s registration
   updated to match, no SQL content changed.
 
+### Phase 26 — Storage Sense
+*Effort: L. Status: done (2026-08-22).*
+
+Warden's own disk-usage awareness, prompted by real housekeeping debt: no
+way to control what the bot keeps (group info, logged messages, LLM
+history) short of SSH and raw SQL, and no protection against the VPS disk
+actually filling up. Modeled on Elasticsearch's own watermark ladder
+(monitor → alert → prune/resample → sleep), plus a manual admin surface for
+routine cleanup.
+
+**Done:**
+- `src/features/storage_sense.zig` (new) — the ladder's mechanics, free of
+  any `main.zig`/Telegram-specific dependency (same "pure function over
+  pool/io/config" shape `video_download.zig` uses):
+  - `checkDiskUsage` shells out to `df -kP <path>` (same "shell out, no
+    hand-rolled statvfs/statfs — Zig 0.16's std has neither, and a raw
+    libc struct risks a musl-vs-glibc ABI mismatch" tradeoff
+    `video_download.zig` already makes for `yt-dlp`/`ffmpeg`), checked
+    against `config.tmp_dir`'s mount — a bind-mounted host directory in the
+    real deployment, not a container-internal overlay path, so this
+    actually reflects host disk pressure.
+  - `classify` maps a usage percentage to `normal`/`low`/`high`/`flood`
+    against three configurable watermarks (defaults 80/90/95, matching the
+    plan sent to the owner).
+  - `pruneOldMessages`/`resampleOldMessages` are thin wrappers around
+    `messages.zig`'s new `deleteOlderThan`/`oldestBatchForSummary`/
+    `replaceRangeWithSummary` primitives (migration `0044_storage_sense.sql`
+    adds `messages.is_summary`), either scoped to one chat or run across
+    every chat via `chats.listAll`. Resampling reuses `digest.zig`'s
+    `summarizeHistory` as-is (no new LLM-calling code) and attributes the
+    synthetic summary row to a dedicated `warden_storage_sense` identity,
+    never the owner's — misattributing LLM prose as something the owner
+    actually said would be worse than the disk-space problem this solves.
+  - `sweepTmpDir` deletes stale scratch files under `tmp_dir` older than 24h
+    — real leftovers from a crashed/killed convert or video-download that
+    never reached its own `defer deleteFile`. Runs on its own 6-hour cadence
+    unconditionally (not gated by autopilot — disposable scratch space, not
+    real data).
+  - Sleep mode: `dynamic_config`-backed (`WARDEN_STORAGE_SENSE_SLEEP_ACTIVE`
+    et al — deliberately left out of `dynamic_config.known_keys` since
+    these are the ladder's own runtime bookkeeping, not an owner tunable).
+    Recovery (usage back under `flood - resume_margin`) is checked
+    unconditionally, never gated by autopilot, so turning autopilot off
+    mid-sleep can never strand the bot asleep with no way out but SSH.
+- Two independent gates, on purpose: `feature_flags.isEnabled(pool,
+  "storage_sense_monitor")` (fails open like every other flag) gates only
+  `tick`'s periodic check + alerting; a separate `dynamic_config` bool
+  `WARDEN_STORAGE_SENSE_AUTOPILOT_ENABLED` (fails *closed*, unlike a feature
+  flag — has to be `dynamic_config` specifically, since `feature_flags`'
+  whole point is "no row means enabled") gates the ladder's destructive
+  actions (prune, resample, sleep). Autopilot defaults off until the owner
+  has watched `/storage status` for a while and flips it on deliberately —
+  monitoring/alerting always run regardless.
+- `main.zig`: `storage_sense.tick` piggybacks on the existing ~30s
+  scheduler loop, same cadence as digests/briefings/reminders. A daily
+  owner alert fires once the high watermark is crossed; a final warning
+  plus sleep-mode entry fires at the flood watermark (autopilot only).
+  While asleep, `handleMessage` short-circuits after command-mention
+  normalization — no LLM replies, tool calls, or video downloads — except
+  the owner's own `/storage` commands; `processMessageTask`'s earlier
+  passive logging (`recordMessage`, keyword alerts) already ran before
+  `handleMessage` is even called, so message history keeps recording
+  through a sleep episode (cheap, worth preserving) even though everything
+  write-heavier stops. Each chat gets exactly one "paused for storage
+  maintenance" notice per sleep episode (`shouldNotifySleepOnce`), not one
+  per message.
+- `/storage` — hidden, owner-only, genuinely absent from `/help` and
+  `public_commands` (the one command in this codebase held to that bar
+  besides `/sudo`, unlike `/token`/`/adduser`/etc. which are owner-only but
+  still documented in `help_text_admin`): `/storage status`, `/storage
+  autopilot on|off`, `/storage cleanup messages [chat id] [--before
+  <date>|--keep <n>]`, `/storage cleanup resample [chat id]`, `/storage
+  cleanup tmp`. Reserved in `reserved_command_names_extra` so `/alias` can
+  never shadow it.
+- **Deliberately not built**: `/storage cleanup versions` (pruning old
+  `docker tag warden:rollback-<date>` images on the VPS, per the
+  deployment notes) — stays a host-side ops concern (a cron/script outside
+  the container), not something warden reaches for via a Docker socket it
+  deliberately doesn't have. Flagged rather than silently dropped.
+- `video_download.zig`: dropped lossy mode's `--max-filesize 500M` cap on
+  the *source* fetch (no user-facing size limit to download a video
+  anymore, beyond `compressToFit` still shrinking the *delivered* file
+  down to Telegram's real 50MB upload ceiling) and raised the lossy
+  download/compress timeouts (180s→600s, 120s→300s) to match — a longer
+  source legitimately needs more time to fetch and compress, not a bigger
+  cap to fail against. `checkVideoDownload` (`main.zig`) also now checks
+  `storage_sense`'s own low watermark before starting a download and
+  declines (best-effort, fails open on a `df` error) once the disk is
+  already under pressure — a multi-minute video fetch is exactly the kind
+  of write the ladder exists to hold back.
+- No-caching policy confirmed already correct, not newly added: every
+  `video_download.zig` download path already `defer Io.Dir.cwd().
+  deleteFile`s its tmp file immediately after reading it into memory to
+  send — nothing from a YT/IG/X download was ever left on disk after this
+  phase started, `sweepTmpDir` above exists only to catch the
+  crash-abandoned case, not the normal path.
+- A bare video link (the whole message, after trimming whitespace, is
+  exactly the matched URL) no longer also triggers a separate LLM reply in
+  `handleMessage`'s `isAddressedToBot` branch — `checkVideoDownload` already
+  handles it earlier in `processMessageTask`, so asking the model to
+  comment on a bare URL was a wasted paid API call. A link with real text
+  around it ("what do you think of this: <url>") still gets a normal
+  answer — only an exact, content-free link is skipped.
+- README's feature list updated (Video Auto-Download entry rewritten for
+  the no-cap/no-cache/no-double-LLM-call behavior above; new Storage Sense
+  entry, written the same "owner-only, hidden" way the Access Control entry
+  already documents `/adduser`/`/addadmin` despite them being off
+  `/help` too).
+
 ### Explicitly excluded
 
 Cut outright rather than phased, because they assume a product shape
