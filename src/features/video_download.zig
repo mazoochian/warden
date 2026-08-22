@@ -93,18 +93,13 @@ const lossless_timeout_seconds: i64 = 120;
 /// by `compressToFit` after download) rather than failing outright.
 const lossy_format_selector = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b";
 
-/// Safety-valve ceiling on `yt-dlp`'s own `--max-filesize` in lossy mode --
-/// NOT the delivered-size budget (that's still `max_bytes`, enforced by
-/// compression below). Purpose is only to stop a pathological multi-GB
-/// source (a long stream someone links) from being fetched at all; a
-/// generously large but bounded ceiling, since the point of lossy mode is
-/// "compress whatever a reasonable clip actually is," not "cap the source."
-const lossy_source_max_filesize_arg = "500M";
-
 /// Longer than `lossless_timeout_seconds`: even bounded to ~720p, a lossy
 /// fetch can be pulling a larger/longer source than the lossless path ever
 /// would (which fails closed immediately if no under-50MB format exists).
-const lossy_download_timeout_seconds: i64 = 180;
+/// Raised from 180s alongside dropping the source `--max-filesize` cap
+/// below (storage_sense.zig) -- a longer clip with nothing capping its
+/// source size now legitimately needs more time to fetch.
+const lossy_download_timeout_seconds: i64 = 600;
 
 /// Bounds the best-effort `estimateSize` preflight call -- must stay short
 /// since it runs before the placeholder message and progress ticker even
@@ -115,8 +110,10 @@ const preflight_timeout_seconds: i64 = 15;
 /// instantly; generous slack, not a real expected duration.
 const ffprobe_timeout_seconds: i64 = 15;
 
-/// Bounds the `ffmpeg` compression pass.
-const compress_timeout_seconds: i64 = 120;
+/// Bounds the `ffmpeg` compression pass. Raised from 120s alongside
+/// `lossy_download_timeout_seconds` -- a larger uncapped source can need
+/// more compression time too.
+const compress_timeout_seconds: i64 = 300;
 
 /// Audio bitrate `compressToFit` reserves out of the size budget before
 /// computing a video bitrate for the rest.
@@ -259,11 +256,11 @@ fn downloadLossless(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, u
     return .{ .bytes = bytes, .file_name = file_name };
 }
 
-/// Fetches a bounded/reasonable-resolution source (~720p, well under
-/// `lossy_source_max_filesize_arg`), then delivers it as-is if it already
-/// fits `max_bytes` (the common case for short clips), or compresses it
-/// down to fit via `compressToFit` otherwise. Delivered as a native video
-/// (`sendVideo`) -- see this file's module doc comment.
+/// Fetches a bounded/reasonable-resolution source (~720p, no source-size
+/// cap -- see `lossy_download_timeout_seconds`), then delivers it as-is if
+/// it already fits `max_bytes` (the common case for short clips), or
+/// compresses it down to fit via `compressToFit` otherwise. Delivered as a
+/// native video (`sendVideo`) -- see this file's module doc comment.
 fn downloadLossy(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, url: []const u8, ts: i96) !DownloadResult {
     const output_template = try std.fmt.allocPrint(allocator, "{s}/video_download_{d}.%(ext)s", .{ tmp_dir, ts });
     defer allocator.free(output_template);
@@ -276,8 +273,6 @@ fn downloadLossy(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, url:
         lossy_format_selector,
         "--merge-output-format",
         "mp4",
-        "--max-filesize",
-        lossy_source_max_filesize_arg,
         "--no-playlist",
         url,
     }, lossy_download_timeout_seconds) catch |err| {

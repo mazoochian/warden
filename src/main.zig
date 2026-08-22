@@ -68,6 +68,7 @@ const feed_watches = @import("store/feed_watches.zig");
 const feed_watcher = @import("features/feed_watcher.zig");
 const transcribe = @import("features/transcribe.zig");
 const video_download = @import("features/video_download.zig");
+const storage_sense = @import("features/storage_sense.zig");
 const convert_flow = @import("features/convert_flow.zig");
 const reply_drafts = @import("features/reply_drafts.zig");
 const llm = @import("llm/provider.zig");
@@ -124,9 +125,9 @@ const web_search_tool = @import("tools/web_search.zig").tool;
 /// instead of only working for people who already know the exact text to
 /// type — see `handleHelp`/`help_text` below for the fuller reference,
 /// including the owner/bot-admin-only `/token /credit /scraper /adduser
-/// /removeuser /allowchat /disallowchat /addadmin /removeadmin /sudo`
-/// deliberately left out of this public menu (see their own dispatch-table
-/// gates in `handleMessage`).
+/// /removeuser /allowchat /disallowchat /addadmin /removeadmin /sudo
+/// /storage` deliberately left out of this public menu (see their own
+/// dispatch-table gates in `handleMessage`).
 const public_commands = [_]iface.CommandSpec{
     .{ .name = "help", .description = "Show available commands and how to talk to Warden." },
     .{ .name = "menu", .description = "Open a button-driven menu of every module (alerts, watches, stats, admin, settings, help)." },
@@ -201,6 +202,7 @@ const public_commands = [_]iface.CommandSpec{
 const reserved_command_names_extra = [_][]const u8{
     "token",     "credit",       "scraper",  "adduser",     "removeuser",
     "allowchat", "disallowchat", "addadmin", "removeadmin", "sudo",
+    "storage",
 };
 
 /// True if `name` (no leading slash) is a real built-in command -- checked
@@ -312,7 +314,8 @@ const help_text_admin =
     \\/autopin on|off -- pin each scheduled announcement as it's posted
     \\  (only those -- I never pin anyone else's messages on my own)
     \\/videodownload on|off -- auto-download YouTube/Instagram/X video
-    \\  links posted here, under 50MB, best-effort. Off by default
+    \\  links posted here, best-effort, no source size limit. Off by
+    \\  default
     \\/videoquality lossy|lossless -- lossy (default) sends a compressed
     \\  native video; lossless keeps original quality, capped at 50MB,
     \\  sent as a file
@@ -683,6 +686,18 @@ pub fn main(init: std.process.Init) !void {
     // and it's never the Bot API connector's own loop.
     const owner_notify_connector = telegram_adapter.connector();
 
+    // `storage_sense.tick`'s notification target — resolved once here
+    // rather than per-tick, same "computed once, handed identically to
+    // every connector's poll loop" shape as `owner_notify_connector` right
+    // above. `null` only if, somehow, no `.telegram` owner entry exists
+    // (shouldn't happen -- `Config.load` always adds one); the scheduler
+    // loop below simply skips `tick` for that tick if so, logging once
+    // rather than looping a warning every ~30s forever.
+    const storage_owner_native_id = ownerTelegramNativeId(&config);
+    if (storage_owner_native_id == null) {
+        log.warn("storage sense: no telegram owner configured, disk monitoring won't run", .{});
+    }
+
     for (connectors, 0..) |connector, i| {
         const msg_pool = MessageWorkerPool.init(gpa, io, config.workers_per_platform, MessageTask.run) catch |err| {
             log.err("failed to start worker pool for {t}: {t}", .{ connector.platform(), err });
@@ -777,6 +792,15 @@ pub fn main(init: std.process.Init) !void {
         checkAndRevertExpiredPermissions(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
+        if (storage_owner_native_id) |onid| {
+            if (feature_flags.isEnabled(&pool, "storage_sense_monitor")) {
+                if (resolveOwnerIdentityId(&pool, &config, now)) |owner_identity_id| {
+                    storage_sense.tick(gpa, io, &config, &pool, llm_provider, owner_notify_connector, onid, owner_identity_id, now);
+                } else |err| {
+                    log.warn("storage sense: couldn't resolve owner identity, skipping this tick: {t}", .{err});
+                }
+            }
+        }
         pending_conversions.sweepExpired(gpa, now);
         menu_sessions.sweepExpired(connectors, now);
         checkAndPurgeLeftChats(&pool, now);
@@ -1335,7 +1359,7 @@ fn processMessageTask(
         // member posts, not just something a user asked to be notified
         // about.
         if (feature_flags.isEnabled(pool, "video_download") and chat_settings.getVideoDownloadEnabled(pool, chat_id)) {
-            if (msg.text) |t| checkVideoDownload(connector, io, config, pool, chat_id, msg, t);
+            if (msg.text) |t| checkVideoDownload(connector, a, io, config, pool, chat_id, msg, t);
         }
     }
     recordObservedUsers(pool, chat_id, msg.observed_users);
@@ -2272,6 +2296,25 @@ fn handleMessage(
     // addressed to a different bot instance sharing this chat.
     var text = normalizeCommandMention(a, raw_text, connector.selfUsername()) orelse return false;
 
+    // Storage sense's flood-watermark sleep mode (`storage_sense.zig`):
+    // pauses everything below this point except the owner's own `/storage`
+    // commands, so they can check status/disable autopilot/clean up by hand
+    // without SSH. `recordMessage`/`bcast.publish`/keyword alerts already
+    // ran in `processMessageTask` before `handleMessage` was ever called
+    // (see this function's own doc comment on the owner/allowlist gate
+    // above), so message history is preserved through a sleep episode --
+    // only the write-heavier stuff below (LLM replies, tool calls, command
+    // dispatch) is what's actually skipped.
+    if (storage_sense.isSleepModeActive(pool, a)) {
+        const is_storage_cmd = std.mem.eql(u8, text, "/storage") or std.mem.startsWith(u8, text, "/storage ");
+        if (!(is_owner and is_storage_cmd)) {
+            if (storage_sense.shouldNotifySleepOnce(io, msg.chat_id)) {
+                reply(connector, a, msg.chat_id, msg.message_id, "Temporarily paused for storage maintenance.");
+            }
+            return false;
+        }
+    }
+
     // `/sudo <command>` lets a bot admin override a platform-level
     // permission check for one command — see `auth.checkGroupAdminAccess`'s
     // doc comment for the full ladder. Rewriting `text` here (rather than
@@ -2530,6 +2573,16 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/removeadmin") or std.mem.startsWith(u8, text, "/removeadmin ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleRemoveAdminCommand(connector, a, pool, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/storage") or std.mem.startsWith(u8, text, "/storage ")) {
+        // Hidden, owner-only -- same `/sudo` pattern as
+        // `reserved_command_names_extra`'s own doc comment describes:
+        // never in `public_commands`, never in `help_text`/`help_text_admin`,
+        // reserved only so `/alias` can't shadow it. Strictly owner, not
+        // extended to bot admins/`/sudo` -- this can prune/resample real
+        // chat history and flip the ladder's autopilot switch, more
+        // consequential than anything a bot admin is trusted with elsewhere.
+        if (!is_owner) return false;
+        handleStorageCommand(connector, a, config, pool, io, llm_provider, chat_id, identity_id, msg, text, now);
     } else if (std.mem.eql(u8, text, "/whois") or std.mem.startsWith(u8, text, "/whois ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleWhoisCommand(connector, a, config, pool, now, msg, text);
@@ -2803,6 +2856,17 @@ fn handleMessage(
         handleTelegramUserAutoReply(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, now, max_message_len, msg, text, owner_notify, pending_drafts);
         return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
+        // A message that's *just* a YouTube/Instagram/X link is already
+        // handled by `checkVideoDownload` in `processMessageTask` (if
+        // enabled) -- asking the LLM to also comment on a bare URL burns a
+        // real API call for nothing. Only skips when the link IS the whole
+        // message (after trimming whitespace); a link with real commentary
+        // around it ("what do you think of this: <url>") still gets a
+        // normal answer, since that's a real question, not just a drop.
+        if (video_download.findLink(text)) |link| {
+            if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), link)) return false;
+        }
+
         // One bulk dynamic_config fetch for every setting this branch
         // reads, instead of six separate round trips -- see
         // `resolveLlmDynamicSettings`'s doc comment.
@@ -5582,6 +5646,209 @@ fn handleRemoveAdminCommand(connector: iface.Connector, a: std.mem.Allocator, po
     reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username or their user id) you want to remove as a bot admin.");
 }
 
+const storage_usage =
+    \\Usage:
+    \\/storage status
+    \\/storage autopilot on|off
+    \\/storage cleanup messages [chat id] [--before YYYY-MM-DD | --keep N]
+    \\/storage cleanup resample [chat id]
+    \\/storage cleanup tmp
+    \\Omit [chat id] for the current chat -- run /chatinfo to get another
+    \\chat's id (that's warden's own id, not the platform's).
+;
+
+/// `/storage` dispatch — hidden, owner-only (checked by the caller). See
+/// `storage_sense.zig`'s module doc comment for the ladder this manages and
+/// `storage_usage` above for the exact subcommand shapes.
+fn handleStorageCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    io: Io,
+    llm_provider: llm.Provider,
+    chat_id: i64,
+    identity_id: i64,
+    msg: iface.Message,
+    text: []const u8,
+    now: i64,
+) void {
+    const rest = std.mem.trim(u8, text["/storage".len..], " ");
+    if (rest.len == 0 or std.mem.eql(u8, rest, "status")) {
+        const report = storage_sense.buildStatusReport(a, io, config, pool) catch |err| {
+            log.err("storage: buildStatusReport failed: {t}", .{err});
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't build a status report, try again.");
+            return;
+        };
+        connector.sendMessage(a, msg.chat_id, report, msg.message_id);
+        return;
+    }
+
+    if (std.mem.startsWith(u8, rest, "autopilot")) {
+        const arg = std.mem.trim(u8, rest["autopilot".len..], " ");
+        if (std.mem.eql(u8, arg, "on")) {
+            dynamic_config.set(pool, storage_sense.autopilot_enabled_key, "true", identity_id) catch |err| {
+                log.err("storage: failed to enable autopilot: {t}", .{err});
+                reply(connector, a, msg.chat_id, msg.message_id, "Couldn't update autopilot, try again.");
+                return;
+            };
+            reply(connector, a, msg.chat_id, msg.message_id, "Autopilot on — the ladder will prune/resample and can enter sleep mode.");
+        } else if (std.mem.eql(u8, arg, "off")) {
+            dynamic_config.set(pool, storage_sense.autopilot_enabled_key, "false", identity_id) catch |err| {
+                log.err("storage: failed to disable autopilot: {t}", .{err});
+                reply(connector, a, msg.chat_id, msg.message_id, "Couldn't update autopilot, try again.");
+                return;
+            };
+            reply(connector, a, msg.chat_id, msg.message_id, "Autopilot off — monitoring/alerts stay on, but the ladder won't clean up or sleep on its own.");
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, storage_usage);
+        }
+        return;
+    }
+
+    if (std.mem.startsWith(u8, rest, "cleanup")) {
+        handleStorageCleanupCommand(connector, a, config, pool, io, llm_provider, chat_id, msg, std.mem.trim(u8, rest["cleanup".len..], " "), now);
+        return;
+    }
+
+    reply(connector, a, msg.chat_id, msg.message_id, storage_usage);
+}
+
+fn handleStorageCleanupCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    io: Io,
+    llm_provider: llm.Provider,
+    chat_id: i64,
+    msg: iface.Message,
+    rest: []const u8,
+    now: i64,
+) void {
+    // No `/storage cleanup versions` -- Docker image/build-cache cleanup
+    // stays a host-side ops concern (a cron/script outside the container),
+    // not something warden reaches for via a Docker socket it deliberately
+    // doesn't have.
+    if (std.mem.startsWith(u8, rest, "messages")) {
+        handleStorageCleanupMessages(connector, a, config, pool, chat_id, msg, std.mem.trim(u8, rest["messages".len..], " "), now);
+    } else if (std.mem.startsWith(u8, rest, "resample")) {
+        handleStorageCleanupResample(connector, a, config, pool, io, llm_provider, chat_id, msg, std.mem.trim(u8, rest["resample".len..], " "));
+    } else if (std.mem.eql(u8, rest, "tmp")) {
+        handleStorageCleanupTmp(connector, a, config, io, msg);
+    } else {
+        reply(connector, a, msg.chat_id, msg.message_id, storage_usage);
+    }
+}
+
+/// Parses an optional leading `<chat id>` token off `rest` (warden's own
+/// internal id, same convention `/manage bind`/`/chatinfo` use), defaulting
+/// to the current chat when absent — mirrors `/autonomy`'s existing
+/// "no argument means here" convention rather than inventing a `here`
+/// keyword. Returns the resolved chat id and whatever's left of `rest`.
+fn stripLeadingChatId(rest: []const u8, default_chat_id: i64) struct { chat_id: i64, rest: []const u8 } {
+    var it = std.mem.tokenizeAny(u8, rest, " \t");
+    const first = it.peek() orelse return .{ .chat_id = default_chat_id, .rest = rest };
+    const parsed = std.fmt.parseInt(i64, first, 10) catch return .{ .chat_id = default_chat_id, .rest = rest };
+    _ = it.next();
+    return .{ .chat_id = parsed, .rest = it.rest() };
+}
+
+fn handleStorageCleanupMessages(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    chat_id: i64,
+    msg: iface.Message,
+    rest: []const u8,
+    now: i64,
+) void {
+    const target = stripLeadingChatId(rest, chat_id);
+
+    if (std.mem.startsWith(u8, target.rest, "--keep")) {
+        const n_str = std.mem.trim(u8, target.rest["--keep".len..], " ");
+        const keep_n = std.fmt.parseInt(i64, n_str, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, storage_usage);
+            return;
+        };
+        messages.pruneKeepLast(pool, target.chat_id, keep_n) catch |err| {
+            log.err("storage: cleanup messages --keep failed for chat {d}: {t}", .{ target.chat_id, err });
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't prune, try again.");
+            return;
+        };
+        const reply_text = std.fmt.allocPrint(a, "Pruned chat {d}, keeping the most recent {d} messages.", .{ target.chat_id, keep_n }) catch return;
+        connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+        return;
+    }
+
+    var cutoff_ts = now - dynamic_config.getI64(pool, a, storage_sense.prune_age_days_key, config.storage_sense_prune_age_days) * 86400;
+    if (std.mem.startsWith(u8, target.rest, "--before")) {
+        const date_str = std.mem.trim(u8, target.rest["--before".len..], " ");
+        const parts = reminder_format.parseDatePart(date_str, .ymd) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that date -- use YYYY-MM-DD.");
+            return;
+        };
+        const year = parts.year orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "That date needs a year -- use YYYY-MM-DD.");
+            return;
+        };
+        cutoff_ts = civil_time.unixFromLocal(.{ .year = year, .month = parts.month, .day = parts.day }, 0);
+    } else if (target.rest.len > 0) {
+        reply(connector, a, msg.chat_id, msg.message_id, storage_usage);
+        return;
+    }
+
+    const result = storage_sense.pruneOldMessages(pool, a, target.chat_id, cutoff_ts) catch |err| {
+        log.err("storage: cleanup messages failed for chat {d}: {t}", .{ target.chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't prune, try again.");
+        return;
+    };
+    const reply_text = std.fmt.allocPrint(a, "Pruned {d} messages from chat {d}.", .{ result.rows_deleted, target.chat_id }) catch return;
+    connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+}
+
+fn handleStorageCleanupResample(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    io: Io,
+    llm_provider: llm.Provider,
+    chat_id: i64,
+    msg: iface.Message,
+    rest: []const u8,
+) void {
+    var target_chat_id = chat_id;
+    if (rest.len > 0) {
+        target_chat_id = std.fmt.parseInt(i64, rest, 10) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, storage_usage);
+            return;
+        };
+    }
+    const batch_size = dynamic_config.getI64(pool, a, storage_sense.resample_batch_size_key, config.storage_sense_resample_batch_size);
+    const result = storage_sense.resampleOldMessages(pool, a, io, llm_provider, target_chat_id, batch_size) catch |err| {
+        log.err("storage: cleanup resample failed for chat {d}: {t}", .{ target_chat_id, err });
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't resample, try again.");
+        return;
+    };
+    const reply_text = if (result.messages_compacted > 0)
+        std.fmt.allocPrint(a, "Compacted {d} messages from chat {d} into one summary.", .{ result.messages_compacted, target_chat_id }) catch return
+    else
+        std.fmt.allocPrint(a, "Nothing to resample in chat {d} (not enough old messages).", .{target_chat_id}) catch return;
+    connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+}
+
+fn handleStorageCleanupTmp(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, io: Io, msg: iface.Message) void {
+    const result = storage_sense.sweepTmpDir(io, a, config.tmp_dir, storage_sense.tmp_sweep_max_age_seconds) catch |err| {
+        log.err("storage: cleanup tmp failed: {t}", .{err});
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't sweep tmp, try again.");
+        return;
+    };
+    const reply_text = std.fmt.allocPrint(a, "Swept {d} stale files ({d} bytes freed) from {s}.", .{ result.files_deleted, result.bytes_freed, config.tmp_dir }) catch return;
+    connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
+}
+
 fn platformLabel(platform: iface.Platform) []const u8 {
     return switch (platform) {
         .telegram => "Telegram",
@@ -7018,7 +7285,7 @@ fn handleVideoDownloadCommand(
     if (arg.len == 0) {
         const reply_text = std.fmt.allocPrint(
             a,
-            "Video auto-download is {s} for this chat. When on, I try to fetch and repost YouTube/Instagram/X video links posted here (best-effort, under 50MB -- if it can't be fetched, whether it's private/age-restricted/too large or a downstream error, you'll get a short note instead of nothing). Change it with /videodownload on or /videodownload off.",
+            "Video auto-download is {s} for this chat. When on, I try to fetch and repost YouTube/Instagram/X video links posted here -- best-effort, no source size limit (a longer/larger clip just takes longer); if it can't be fetched at all, whether it's private/age-restricted or a downstream error, you'll get a short note instead of nothing. Change it with /videodownload on or /videodownload off.",
             .{if (enabled) "on" else "off"},
         ) catch return;
         connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
@@ -7042,7 +7309,7 @@ fn handleVideoDownloadCommand(
         return;
     };
     if (want) {
-        reply(connector, a, msg.chat_id, msg.message_id, "Video auto-download on — I'll try to fetch and repost YouTube/Instagram/X links posted here (best-effort, under 50MB).");
+        reply(connector, a, msg.chat_id, msg.message_id, "Video auto-download on — I'll try to fetch and repost YouTube/Instagram/X links posted here (best-effort, no source size limit).");
     } else {
         reply(connector, a, msg.chat_id, msg.message_id, "Video auto-download off.");
     }
@@ -7185,12 +7452,30 @@ fn videoProgressTickerLoop(connector: iface.Connector, chat_id: []const u8, mess
 /// delivery) is intentionally NOT gated the same way: it's strictly
 /// additive on top of this baseline check, with `videoDownloadWorker`
 /// itself falling back to `sendDocument` when a connector lacks it.
-fn checkVideoDownload(connector: iface.Connector, io: Io, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
+fn checkVideoDownload(connector: iface.Connector, a: std.mem.Allocator, io: Io, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
     const url = video_download.findLink(text) orelse return;
 
     if (connector.vtable.sendDocument == null) {
         log.info("video_download: {t} has no sendDocument support, skipping {s}", .{ connector.platform(), url });
         return;
+    }
+
+    // Reuses `storage_sense.zig` rather than a separate check: once the
+    // ladder's own low watermark is hit, a multi-minute video fetch is
+    // exactly the kind of write this shouldn't be doing. Lives here (not
+    // inside `video_download.zig`) since this call site already owns the
+    // `pool`/`dynamic_config` reads, keeping that module free of a `PgPool`
+    // dependency. Best-effort: a failed disk check doesn't block the
+    // download (same fail-open reasoning `feature_flags.isEnabled` uses) --
+    // storage pressure should degrade this feature, not a `df` hiccup.
+    if (storage_sense.checkDiskUsage(a, io, config.tmp_dir)) |usage| {
+        const low = dynamic_config.getI64(pool, a, storage_sense.low_watermark_key, config.storage_sense_low_watermark_pct);
+        if (usage.used_pct >= @as(f64, @floatFromInt(low))) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Storage is low right now, video downloads are paused.");
+            return;
+        }
+    } else |err| {
+        log.warn("video_download: disk check failed, letting the download through: {t}", .{err});
     }
 
     const quality: video_download.Quality = if (chat_settings.getVideoDownloadLossy(pool, chat_id)) .lossy else .lossless;
@@ -9773,6 +10058,7 @@ test {
     _ = @import("features/feed_parse.zig");
     _ = @import("features/transcribe.zig");
     _ = @import("features/video_download.zig");
+    _ = @import("features/storage_sense.zig");
     _ = @import("features/convert_flow.zig");
     _ = @import("tools/begin_conversion.zig");
     _ = @import("tools/find_chat_member.zig");
