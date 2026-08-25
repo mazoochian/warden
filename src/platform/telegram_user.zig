@@ -321,6 +321,14 @@ pub const TelegramUserConnector = struct {
     pub const ChatMeta = struct {
         title: []const u8,
         unread_count: i64,
+        /// The chat's newest message id, if TDLib reports one (`getChat`'s
+        /// `last_message` field — absent for a brand new chat with no
+        /// messages yet). Since Telegram's read state is a single
+        /// forward-moving cursor per chat (see `markMessagesRead`'s doc
+        /// comment), this one id is all `fetchUnread` needs to mark an
+        /// entire unread backlog read -- no need to enumerate every unread
+        /// message individually.
+        last_message_id: ?i64,
     };
 
     /// `getChat` — resolves `chat_id` to its current title + unread count.
@@ -357,117 +365,17 @@ pub const TelegramUserConnector = struct {
             .integer => |n| n,
             else => return null,
         };
+        const last_message_id: ?i64 = if (obj.get("last_message")) |lm_v| switch (lm_v) {
+            .object => |lm| switch (lm.get("id") orelse json.Value{ .null = {} }) {
+                .integer => |n| n,
+                else => null,
+            },
+            else => null,
+        } else null;
         return .{
             .title = try allocator.dupe(u8, title),
             .unread_count = unread_count,
-        };
-    }
-
-    pub const HistoryMessage = struct {
-        message_id: i64,
-        sender_user_id: ?i64,
-        text: []const u8,
-    };
-
-    /// TDLib itself rejects `getChatHistory`'s `limit` as invalid once it's
-    /// over 100 — not a bound this connector chose, so `requestChatHistory`
-    /// clamps to it defensively regardless of what a caller passes, on top
-    /// of `chat_summary.zig`'s own `max_fetch` already being pinned to the
-    /// same number.
-    const max_chat_history_limit: i64 = 100;
-
-    /// `getChatHistory(chat_id, from_message_id=0, limit=limit)` — with
-    /// `from_message_id=0` this returns the newest `limit` messages in the
-    /// chat, newest-first (TDLib's own order, unreversed here — callers
-    /// that want oldest-first, e.g. for a summary prompt reading top to
-    /// bottom, reverse it themselves). Non-text messages (photos, stickers,
-    /// service messages, ...) and ones with no attributable user sender
-    /// (channel posts, anonymous admins) are dropped rather than
-    /// represented some other way — same Phase A text-only scope
-    /// `convertNewMessage` already established for live messages, kept
-    /// consistent here for history reads too. `null` on timeout/parse
-    /// failure/TDLib error (logged).
-    pub fn requestChatHistory(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, chat_id: i64, limit: i64) !?[]HistoryMessage {
-        const extra_id = self.nextExtraId();
-        self.send(.{
-            .@"@type" = "getChatHistory",
-            .chat_id = chat_id,
-            .from_message_id = @as(i64, 0),
-            .offset = @as(i32, 0),
-            .limit = @min(limit, max_chat_history_limit),
-            .only_local = false,
-            .@"@extra" = extra_id,
-        });
-        const raw = try self.waitForResponse(allocator, io, extra_id, request_timeout_seconds) orelse {
-            log.warn("requestChatHistory: getChatHistory timed out for chat {d}", .{chat_id});
-            return null;
-        };
-        defer allocator.free(raw);
-
-        var parsed = json.parseFromSlice(json.Value, allocator, raw, .{}) catch |err| {
-            log.warn("requestChatHistory: failed to parse getChatHistory response: {t}", .{err});
-            return null;
-        };
-        defer parsed.deinit();
-        const obj = switch (parsed.value) {
-            .object => |o| o,
-            else => return null,
-        };
-        if (obj.get("@type")) |v| if (v == .string and std.mem.eql(u8, v.string, "error")) {
-            log.warn("requestChatHistory: getChatHistory error for chat {d}: {s}", .{ chat_id, raw });
-            return null;
-        };
-        const messages_arr = switch (obj.get("messages") orelse return null) {
-            .array => |arr| arr,
-            else => return null,
-        };
-
-        var out: std.ArrayList(HistoryMessage) = .empty;
-        errdefer out.deinit(allocator);
-        for (messages_arr.items) |item| {
-            const m = try parseHistoryMessage(allocator, item) orelse continue;
-            try out.append(allocator, m);
-        }
-        return try out.toOwnedSlice(allocator);
-    }
-
-    fn parseHistoryMessage(allocator: std.mem.Allocator, item: json.Value) !?HistoryMessage {
-        const message = switch (item) {
-            .object => |o| o,
-            else => return null,
-        };
-        const message_id = switch (message.get("id") orelse return null) {
-            .integer => |n| n,
-            else => return null,
-        };
-        const content = switch (message.get("content") orelse return null) {
-            .object => |o| o,
-            else => return null,
-        };
-        const content_type = switch (content.get("@type") orelse return null) {
-            .string => |s| s,
-            else => return null,
-        };
-        if (!std.mem.eql(u8, content_type, "messageText")) return null;
-        const formatted_text = switch (content.get("text") orelse return null) {
-            .object => |o| o,
-            else => return null,
-        };
-        const text = switch (formatted_text.get("text") orelse return null) {
-            .string => |s| s,
-            else => return null,
-        };
-        var sender_user_id: ?i64 = null;
-        if (message.get("sender_id")) |sender_v| if (sender_v == .object) {
-            if (sender_v.object.get("user_id")) |uid_v| if (uid_v == .integer) {
-                sender_user_id = uid_v.integer;
-            };
-        };
-
-        return .{
-            .message_id = message_id,
-            .sender_user_id = sender_user_id,
-            .text = try allocator.dupe(u8, text),
+            .last_message_id = last_message_id,
         };
     }
 
@@ -611,8 +519,8 @@ pub const TelegramUserConnector = struct {
             } else continue;
 
             // A response to a request `send()` tagged with `.@"@extra"`
-            // (see `requestChatMeta`/`requestChatHistory`/
-            // `markMessagesRead`) — TDLib echoes it back verbatim on
+            // (see `requestChatMeta`/`markMessagesRead`) — TDLib echoes it
+            // back verbatim on
             // whatever object answers that request (including error
             // responses), indistinguishable from an unprompted update by
             // `@type` alone. Diverted to `pending_responses` instead of

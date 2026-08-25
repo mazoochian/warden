@@ -208,6 +208,39 @@ pub fn getEffectiveReplyAutonomyDefault(pool: *PgPool, allocator: std.mem.Alloca
     return std.meta.stringToEnum(ReplyAutonomy, raw) orelse .off;
 }
 
+/// `get_bulletin`'s cursor: the last time a bulletin was generated for this
+/// owner, or 0 if never. Identity-scoped (not `upsertColumn`'s `i32`/text
+/// shape) since a bulletin covers every monitored chat under one owner at
+/// once — same "own get/set pair, timestamp stored via to_timestamp/
+/// EXTRACT(EPOCH...)" shape `chat_settings.getLastDigestTs`/
+/// `setLastDigestTs` already uses, just identity- rather than chat-scoped.
+/// See `0045_chat_monitoring.sql`.
+pub fn getLastBulletinTs(pool: *PgPool, identity_id: i64) i64 {
+    const db = pool.acquire() catch return 0;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT EXTRACT(EPOCH FROM last_bulletin_ts)::bigint FROM user_settings WHERE identity_id = $1;") catch return 0;
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    const has_row = stmt.step() catch return 0;
+    if (!has_row or stmt.columnIsNull(0)) return 0;
+    return stmt.columnInt64(0);
+}
+
+pub fn setLastBulletinTs(pool: *PgPool, identity_id: i64, ts: i64) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO user_settings (identity_id, last_bulletin_ts) VALUES ($1, to_timestamp($2))
+        \\ON CONFLICT (identity_id) DO UPDATE SET last_bulletin_ts = excluded.last_bulletin_ts;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64(2, ts);
+    _ = try stmt.step();
+}
+
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const identities = @import("identities.zig");
@@ -261,6 +294,19 @@ test "getEffectiveReplyAutonomyDefault defaults to .off, respects an override, c
 
     try setReplyAutonomyDefault(&pool, id, null);
     try testing.expectEqual(ReplyAutonomy.off, getEffectiveReplyAutonomyDefault(&pool, a, id));
+}
+
+test "last_bulletin_ts defaults to 0 and round trips" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const id = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
+    try testing.expectEqual(@as(i64, 0), getLastBulletinTs(&pool, id));
+
+    try setLastBulletinTs(&pool, id, 54321);
+    try testing.expectEqual(@as(i64, 54321), getLastBulletinTs(&pool, id));
 }
 
 test "getEffectiveDateFormat/getEffectiveTimeFormat default then respect an explicit setting" {

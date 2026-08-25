@@ -299,6 +299,10 @@ pub const PersonalAccountSink = struct {
         /// returns for its own unresolvable cases — never silently drops a
         /// message the caller thought was sent.
         sendMessage: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, message: []const u8) anyerror![]const u8,
+        /// Resolves `chat_query` and sends `message` as a threaded reply to
+        /// `native_message_id` — backs `reply_to_message`. Same
+        /// resolution/confirmation shape as `sendMessage` above.
+        sendReply: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, native_message_id: []const u8, message: []const u8) anyerror![]const u8,
     };
 
     pub fn summarizeUnread(self: PersonalAccountSink, allocator: std.mem.Allocator, chat_query: []const u8, all: bool) ![]const u8 {
@@ -311,6 +315,56 @@ pub const PersonalAccountSink = struct {
 
     pub fn sendMessage(self: PersonalAccountSink, allocator: std.mem.Allocator, chat_query: []const u8, message: []const u8) ![]const u8 {
         return self.vtable.sendMessage(self.ptr, allocator, chat_query, message);
+    }
+
+    pub fn sendReply(self: PersonalAccountSink, allocator: std.mem.Allocator, chat_query: []const u8, native_message_id: []const u8, message: []const u8) ![]const u8 {
+        return self.vtable.sendReply(self.ptr, allocator, chat_query, native_message_id, message);
+    }
+};
+
+/// Callback surface the `set_chat_monitoring` tool uses to set (or clear)
+/// a personal-account chat's owner-declared monitoring/importance state --
+/// same ptr+vtable boundary reasoning as `ReminderSink`/`ChatHistorySink`
+/// (`registry.zig` must never depend on the store layer directly, see
+/// `ScraperConfig`'s doc comment). `importance` is a raw string (one of
+/// "low"/"normal"/"high"/"off", matching the tool's own JSON schema enum)
+/// rather than a typed enum, so this file has no need to mirror
+/// `chat_settings.MonitorImportance` locally -- the real adapter
+/// (`main.zig`) parses/validates it against the store layer's own enum.
+pub const MonitoringSink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Resolves `chat_query` (a TDLib chat id, or a title substring) and
+        /// sets its monitoring state -- covers "no such chat"/"ambiguous,
+        /// pick one"/confirmation the same way `PersonalAccountSink.
+        /// sendMessage` already does for its own unresolvable cases.
+        setImportance: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, importance: []const u8) anyerror![]const u8,
+    };
+
+    pub fn setImportance(self: MonitoringSink, allocator: std.mem.Allocator, chat_query: []const u8, importance: []const u8) ![]const u8 {
+        return self.vtable.setImportance(self.ptr, allocator, chat_query, importance);
+    }
+};
+
+/// Callback surface the `get_bulletin` tool uses to gather raw, id-tagged
+/// message text across every monitored personal-account chat -- same
+/// ptr+vtable boundary reasoning as the sinks above.
+pub const BulletinSink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// `hours = null` uses the owner's last-bulletin cursor (or 24h if
+        /// never run) and advances that cursor as a side effect; an
+        /// explicit `hours` is a stateless ad-hoc probe that never touches
+        /// the cursor -- see `features/bulletin.zig`'s doc comment.
+        generate: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, hours: ?i64) anyerror![]const u8,
+    };
+
+    pub fn generate(self: BulletinSink, allocator: std.mem.Allocator, hours: ?i64) ![]const u8 {
+        return self.vtable.generate(self.ptr, allocator, hours);
     }
 };
 
@@ -358,9 +412,15 @@ pub const ToolContext = struct {
     /// `set_expense` tool.
     expenses: ?ExpenseSink = null,
     /// Same lifetime/nullability reasoning as `reminders` above, for the
-    /// `summarize_unread_chat`/`list_personal_chats`/`send_personal_message`
-    /// tools.
+    /// `summarize_unread_chat`/`list_personal_chats`/`send_personal_message`/
+    /// `reply_to_message` tools.
     personal_account: ?PersonalAccountSink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `set_chat_monitoring` tool.
+    monitoring: ?MonitoringSink = null,
+    /// Same lifetime/nullability reasoning as `reminders` above, for the
+    /// `get_bulletin` tool.
+    bulletin: ?BulletinSink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
     /// downloaded it — the file `convert_file` operates on. Null when the

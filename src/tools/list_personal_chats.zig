@@ -58,6 +58,7 @@ const FakeSink = struct {
         .summarizeUnread = unusedSummarizeFn,
         .listChats = listChatsFn,
         .sendMessage = unusedSendMessageFn,
+        .sendReply = unusedSendReplyFn,
     };
 
     fn listChatsFn(ptr: *anyopaque, allocator: std.mem.Allocator, query: ?[]const u8) anyerror![]const u8 {
@@ -79,6 +80,15 @@ const FakeSink = struct {
         _ = ptr;
         _ = allocator;
         _ = chat_query;
+        _ = message;
+        return error.Unsupported;
+    }
+
+    fn unusedSendReplyFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, native_message_id: []const u8, message: []const u8) anyerror![]const u8 {
+        _ = ptr;
+        _ = allocator;
+        _ = chat_query;
+        _ = native_message_id;
         _ = message;
         return error.Unsupported;
     }

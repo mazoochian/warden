@@ -252,6 +252,76 @@ pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id
     return std.mem.join(allocator, "\n", lines.items);
 }
 
+pub const HistoryRow = struct {
+    native_message_id: ?[]const u8,
+    who: []const u8,
+    text: []const u8,
+    is_summary: bool,
+};
+
+/// Same rows `recentFormatted` joins into "who: text" lines, but returned
+/// unformatted with `native_message_id` included -- for callers (the
+/// personal-account chat-summary tool, the bulletin feature) that need to
+/// let the model cite a specific message id back, which a pre-joined string
+/// can't carry. `recentFormatted`/`recentSinceFormatted` stay as they are
+/// for callers (`digest.zig`) that only ever want prose-ready text.
+pub fn recentRows(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, limit: i64) ![]HistoryRow {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary, m.native_message_id
+        \\FROM messages m JOIN identities i ON i.id = m.identity_id
+        \\WHERE m.chat_id = $1 AND m.text IS NOT NULL
+        \\ORDER BY m.id DESC LIMIT $2;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, limit);
+
+    var rows: std.ArrayList(HistoryRow) = .empty;
+    while (try stmt.step()) {
+        try rows.append(allocator, .{
+            .who = try allocator.dupe(u8, stmt.columnText(0)),
+            .text = try allocator.dupe(u8, stmt.columnText(1)),
+            .is_summary = stmt.columnBool(2),
+            .native_message_id = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
+        });
+    }
+    std.mem.reverse(HistoryRow, rows.items); // rows came back newest-first
+    return rows.toOwnedSlice(allocator);
+}
+
+/// Same time-windowed shape as `recentSinceFormatted`, unformatted -- see
+/// `recentRows`'s doc comment for why.
+pub fn recentSinceRows(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, since_ts: i64, limit: i64) ![]HistoryRow {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary, m.native_message_id
+        \\FROM messages m JOIN identities i ON i.id = m.identity_id
+        \\WHERE m.chat_id = $1 AND m.text IS NOT NULL AND m.ts >= to_timestamp($2)
+        \\ORDER BY m.id DESC LIMIT $3;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    stmt.bindInt64(2, since_ts);
+    stmt.bindInt64(3, limit);
+
+    var rows: std.ArrayList(HistoryRow) = .empty;
+    while (try stmt.step()) {
+        try rows.append(allocator, .{
+            .who = try allocator.dupe(u8, stmt.columnText(0)),
+            .text = try allocator.dupe(u8, stmt.columnText(1)),
+            .is_summary = stmt.columnBool(2),
+            .native_message_id = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
+        });
+    }
+    std.mem.reverse(HistoryRow, rows.items); // rows came back newest-first
+    return rows.toOwnedSlice(allocator);
+}
+
 pub const MessageRef = struct {
     id: i64,
     native_message_id: []const u8,
@@ -418,6 +488,64 @@ test "insert/recentFormatted/pruneKeepLast scoped correctly per chat" {
     try pruneKeepLast(&pool, chat1, 1);
     const pruned = try recentFormatted(&pool, a, chat1, 10);
     try testing.expectEqualStrings("alice: again", pruned);
+}
+
+test "recentRows returns unformatted rows oldest-first, with native_message_id carried through" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram_user, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "alice", null, false, 1000);
+
+    try insert(&pool, chat1, alice, "501", "hi", 1000);
+    try insert(&pool, chat1, alice, null, "no native id", 1001);
+    try insert(&pool, chat1, alice, "503", "again", 1002);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const rows = try recentRows(&pool, a, chat1, 10);
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqualStrings("501", rows[0].native_message_id.?);
+    try testing.expectEqualStrings("hi", rows[0].text);
+    try testing.expectEqual(@as(?[]const u8, null), rows[1].native_message_id);
+    try testing.expectEqualStrings("503", rows[2].native_message_id.?);
+
+    const limited = try recentRows(&pool, a, chat1, 1);
+    try testing.expectEqual(@as(usize, 1), limited.len);
+    try testing.expectEqualStrings("503", limited[0].native_message_id.?);
+}
+
+test "recentSinceRows windows by timestamp and marks compacted summary rows via is_summary" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram_user, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "alice", null, false, 1000);
+    const warden = try identities.getOrCreateMinimal(&pool, .telegram_user, "warden_system", "Warden", null, true, 1000);
+
+    try insert(&pool, chat1, alice, "1", "too old", 500);
+    try insert(&pool, chat1, alice, "2", "in window", 1500);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const batch = (try oldestBatchForSummary(&pool, a, chat1, 1)) orelse return error.TestExpectedValue;
+    try replaceRangeWithSummary(&pool, chat1, warden, batch.min_id, batch.max_id, "Talked about old stuff.", 600);
+
+    const windowed = try recentSinceRows(&pool, a, chat1, 400, 100);
+    try testing.expectEqual(@as(usize, 2), windowed.len);
+    try testing.expect(windowed[0].is_summary);
+    try testing.expectEqualStrings("Talked about old stuff.", windowed[0].text);
+    try testing.expectEqual(@as(?[]const u8, null), windowed[0].native_message_id);
+    try testing.expect(!windowed[1].is_summary);
+    try testing.expectEqualStrings("in window", windowed[1].text);
 }
 
 test "recentSinceFormatted windows by timestamp, respects the row limit, and returns newest-first input in oldest-first output" {

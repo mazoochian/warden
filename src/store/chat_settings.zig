@@ -3,6 +3,7 @@ const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 const user_settings = @import("user_settings.zig");
 const ReplyAutonomy = user_settings.ReplyAutonomy;
+const Platform = @import("../platform/interface.zig").Platform;
 
 /// Typed replacement for the old stringly-typed per-chat `chat_settings` KV
 /// table (`digest_enabled`/`last_digest_ts`/`magic_word` used to be
@@ -190,6 +191,77 @@ pub fn resolveReplyAutonomy(pool: *PgPool, allocator: std.mem.Allocator, chat_id
     return user_settings.getEffectiveReplyAutonomyDefault(pool, allocator, owner_identity_id);
 }
 
+/// Owner-declared, static per-chat opt-in for the `get_bulletin`/
+/// `set_chat_monitoring` feature -- deliberately NOT a classifier the bot
+/// computes by reading a chat's own content. See `0045_chat_monitoring.sql`.
+pub const MonitorImportance = enum { low, normal, high };
+
+/// This chat's monitoring state, or `null` if it isn't monitored (the
+/// default -- same "NULL means off" shape `getReplyAutonomy` already uses).
+pub fn getMonitorImportance(pool: *PgPool, chat_id: i64) ?MonitorImportance {
+    const db = pool.acquire() catch return null;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT monitor_importance FROM chat_settings WHERE chat_id = $1;") catch return null;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return null;
+    if (!has_row or stmt.columnIsNull(0)) return null;
+    return std.meta.stringToEnum(MonitorImportance, stmt.columnText(0));
+}
+
+/// `null` clears it (stops monitoring the chat).
+pub fn setMonitorImportance(pool: *PgPool, chat_id: i64, value: ?MonitorImportance) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, monitor_importance) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET monitor_importance = excluded.monitor_importance;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    if (value) |v| stmt.bindText(2, @tagName(v)) else stmt.bindNull(2);
+    _ = try stmt.step();
+}
+
+pub const MonitoredChat = struct {
+    chat_id: i64,
+    native_chat_id: []const u8,
+    title: []const u8,
+    importance: MonitorImportance,
+};
+
+/// Every monitored chat on `platform`, highest importance first (then
+/// alphabetized by title within a tier) -- `get_bulletin`'s data source. A
+/// chat with no `chats.title` yet (rare -- only before it's ever sent a
+/// message with fresh metadata) falls back to its native id so the bulletin
+/// always has something to label the chat with.
+pub fn listMonitored(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform) ![]MonitoredChat {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT c.id, c.native_chat_id, COALESCE(NULLIF(c.title, ''), c.native_chat_id), cs.monitor_importance
+        \\FROM chat_settings cs JOIN chats c ON c.id = cs.chat_id
+        \\WHERE cs.monitor_importance IS NOT NULL AND c.platform = $1
+        \\ORDER BY CASE cs.monitor_importance WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, c.title;
+    );
+    defer stmt.finalize();
+    stmt.bindText(1, @tagName(platform));
+
+    var out: std.ArrayList(MonitoredChat) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .chat_id = stmt.columnInt64(0),
+            .native_chat_id = try allocator.dupe(u8, stmt.columnText(1)),
+            .title = try allocator.dupe(u8, stmt.columnText(2)),
+            .importance = std.meta.stringToEnum(MonitorImportance, stmt.columnText(3)) orelse .normal,
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Returns the per-chat system-prompt override duped into `allocator`, or
 /// `null` if unset (the caller falls back to `config.system_prompt`) — see
 /// the `0006_persona.sql` migration comment.
@@ -312,6 +384,54 @@ test "resolveReplyAutonomy: no override inherits the owner's global default, ove
     // Clearing the override falls back to inheriting the global default again.
     try setReplyAutonomy(&pool, chat_id, null);
     try testing.expectEqual(ReplyAutonomy.draft, resolveReplyAutonomy(&pool, a, chat_id, owner_id));
+}
+
+test "monitor_importance round trips through all three tiers and clears back to null" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_id = try chats.upsertChat(&pool, .telegram_user, "1", null, null);
+
+    try testing.expectEqual(@as(?MonitorImportance, null), getMonitorImportance(&pool, chat_id));
+
+    try setMonitorImportance(&pool, chat_id, .high);
+    try testing.expectEqual(@as(?MonitorImportance, .high), getMonitorImportance(&pool, chat_id));
+
+    try setMonitorImportance(&pool, chat_id, .low);
+    try testing.expectEqual(@as(?MonitorImportance, .low), getMonitorImportance(&pool, chat_id));
+
+    try setMonitorImportance(&pool, chat_id, null);
+    try testing.expectEqual(@as(?MonitorImportance, null), getMonitorImportance(&pool, chat_id));
+}
+
+test "listMonitored returns only monitored chats on the requested platform, ordered high to low then by title" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat_a = try chats.upsertChat(&pool, .telegram_user, "1", null, "Zebras");
+    const chat_b = try chats.upsertChat(&pool, .telegram_user, "2", null, "Alpacas");
+    const chat_c = try chats.upsertChat(&pool, .telegram_user, "3", null, "Not Monitored");
+    const other_platform = try chats.upsertChat(&pool, .telegram, "4", null, "Other Platform High");
+
+    try setMonitorImportance(&pool, chat_a, .normal);
+    try setMonitorImportance(&pool, chat_b, .high);
+    try setMonitorImportance(&pool, other_platform, .high);
+    _ = chat_c;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const monitored = try listMonitored(&pool, a, .telegram_user);
+    try testing.expectEqual(@as(usize, 2), monitored.len);
+    try testing.expectEqualStrings("Alpacas", monitored[0].title);
+    try testing.expectEqual(MonitorImportance.high, monitored[0].importance);
+    try testing.expectEqualStrings("Zebras", monitored[1].title);
+    try testing.expectEqual(MonitorImportance.normal, monitored[1].importance);
 }
 
 test "digest_enabled/last_digest_ts/magic_word round trip with defaults when unset" {

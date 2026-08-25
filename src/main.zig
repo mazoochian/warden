@@ -83,6 +83,7 @@ const audit_notify = @import("features/audit_notify.zig");
 const wordcloud = @import("features/wordcloud.zig");
 const digest = @import("features/digest.zig");
 const chat_summary = @import("features/chat_summary.zig");
+const bulletin = @import("features/bulletin.zig");
 const briefing = @import("features/briefing.zig");
 const scheduler = @import("features/scheduler.zig");
 const convert_file = @import("tools/convert_file.zig");
@@ -117,6 +118,9 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/summarize_unread_chat.zig").tool,
     @import("tools/list_personal_chats.zig").tool,
     @import("tools/send_personal_message.zig").tool,
+    @import("tools/reply_to_message.zig").tool,
+    @import("tools/set_chat_monitoring.zig").tool,
+    @import("tools/get_bulletin.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
 
@@ -1431,7 +1435,17 @@ fn processMessageTask(
     };
     var personal_account_adapter: PersonalAccountToolAdapter = .{
         .telegram_user = telegram_user,
+        .pool = pool,
         .io = io,
+    };
+    var monitoring_adapter: MonitoringToolAdapter = .{
+        .telegram_user = telegram_user,
+        .pool = pool,
+    };
+    var bulletin_adapter: BulletinToolAdapter = .{
+        .pool = pool,
+        .owner_identity_id = identity_id,
+        .now = ts,
     };
     const tool_ctx = tool_registry.ToolContext{
         .allocator = a,
@@ -1456,6 +1470,8 @@ fn processMessageTask(
         .chat_history = chat_history_adapter.sink(),
         .expenses = expense_adapter.sink(),
         .personal_account = personal_account_adapter.sink(),
+        .monitoring = monitoring_adapter.sink(),
+        .bulletin = bulletin_adapter.sink(),
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -2687,7 +2703,7 @@ fn handleMessage(
         handleTdSearchCommand(connector, a, config, telegram_user, msg, text);
     } else if (std.mem.eql(u8, text, "/tdsummary") or std.mem.startsWith(u8, text, "/tdsummary ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
-        handleTdSummaryCommand(connector, a, config, telegram_user, llm_provider, io, tool_ctx, msg, text);
+        handleTdSummaryCommand(connector, a, config, pool, telegram_user, llm_provider, io, tool_ctx, msg, text);
     } else if (std.mem.eql(u8, text, "/autonomy") or std.mem.startsWith(u8, text, "/autonomy ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleAutonomyCommand(connector, a, config, pool, msg, text, now);
@@ -4526,6 +4542,7 @@ fn handleTdSummaryCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
     config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     llm_provider: llm.Provider,
     io: Io,
@@ -4565,7 +4582,7 @@ fn handleTdSummaryCommand(
             connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
         },
         .one => |m| {
-            const summary = chat_summary.summarizeChat(conn, llm_provider, a, io, tool_ctx, m.native_chat_id, flag.all) catch {
+            const summary = chat_summary.summarizeChat(conn, pool, llm_provider, a, io, tool_ctx, m.native_chat_id, flag.all) catch {
                 reply(connector, a, msg.chat_id, msg.message_id, "Failed to summarize that chat.");
                 return;
             };
@@ -8738,6 +8755,7 @@ const list_personal_chats_limit = 60;
 /// work around.
 const PersonalAccountToolAdapter = struct {
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    pool: *store_pool.PgPool,
     io: Io,
 
     fn sink(self: *PersonalAccountToolAdapter) tool_registry.PersonalAccountSink {
@@ -8748,13 +8766,14 @@ const PersonalAccountToolAdapter = struct {
         .summarizeUnread = summarizeUnreadFn,
         .listChats = listChatsFn,
         .sendMessage = sendMessageFn,
+        .sendReply = sendReplyFn,
     };
 
     fn summarizeUnreadFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, all: bool) anyerror![]const u8 {
         const self: *PersonalAccountToolAdapter = @ptrCast(@alignCast(ptr));
         const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
         if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
-        return chat_summary.describeUnreadForModel(conn, allocator, self.io, chat_query, all);
+        return chat_summary.describeUnreadForModel(conn, self.pool, allocator, self.io, chat_query, all);
     }
 
     fn listChatsFn(ptr: *anyopaque, allocator: std.mem.Allocator, query: ?[]const u8) anyerror![]const u8 {
@@ -8788,6 +8807,87 @@ const PersonalAccountToolAdapter = struct {
                 return std.fmt.allocPrint(allocator, "Sent to \"{s}\".", .{m.title});
             },
         }
+    }
+
+    fn sendReplyFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, native_message_id: []const u8, message: []const u8) anyerror![]const u8 {
+        const self: *PersonalAccountToolAdapter = @ptrCast(@alignCast(ptr));
+        const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
+        if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
+
+        const resolution = try chat_summary.resolveChat(conn, allocator, chat_query);
+        switch (resolution) {
+            .none => return "No known chat matches that — try list_personal_chats first to find the right one.",
+            .ambiguous => |matches| {
+                var out: Io.Writer.Allocating = .init(allocator);
+                try out.writer.writeAll("That matches more than one chat — ask which one, then retry with its id:\n");
+                for (matches) |m| try out.writer.print("{s} (id {s})\n", .{ m.title, m.native_chat_id });
+                return out.writer.buffered();
+            },
+            .one => |m| {
+                conn.connector().sendMessage(allocator, m.native_chat_id, message, native_message_id);
+                return std.fmt.allocPrint(allocator, "Replied to message {s} in \"{s}\".", .{ native_message_id, m.title });
+            },
+        }
+    }
+};
+
+const MonitoringToolAdapter = struct {
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    pool: *store_pool.PgPool,
+
+    fn sink(self: *MonitoringToolAdapter) tool_registry.MonitoringSink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.MonitoringSink.VTable = .{ .setImportance = setImportanceFn };
+
+    fn setImportanceFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, importance: []const u8) anyerror![]const u8 {
+        const self: *MonitoringToolAdapter = @ptrCast(@alignCast(ptr));
+        const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
+        if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
+
+        const parsed_importance = if (std.mem.eql(u8, importance, "off"))
+            null
+        else
+            std.meta.stringToEnum(chat_settings.MonitorImportance, importance) orelse
+                return "importance must be one of: low, normal, high, off.";
+
+        const resolution = try chat_summary.resolveChat(conn, allocator, chat_query);
+        switch (resolution) {
+            .none => return "No known chat matches that — try list_personal_chats first to find the right one.",
+            .ambiguous => |matches| {
+                var out: Io.Writer.Allocating = .init(allocator);
+                try out.writer.writeAll("That matches more than one chat — ask which one, then retry with its id:\n");
+                for (matches) |m| try out.writer.print("{s} (id {s})\n", .{ m.title, m.native_chat_id });
+                return out.writer.buffered();
+            },
+            .one => |m| {
+                const internal_chat = try chats.getByNative(self.pool, allocator, .telegram_user, m.native_chat_id) orelse
+                    return "Warden hasn't recorded any messages from that chat yet, so there's nothing to monitor.";
+                try chat_settings.setMonitorImportance(self.pool, internal_chat.id, parsed_importance);
+                return if (parsed_importance) |imp|
+                    std.fmt.allocPrint(allocator, "Now monitoring \"{s}\" at {s} importance.", .{ m.title, @tagName(imp) })
+                else
+                    std.fmt.allocPrint(allocator, "Stopped monitoring \"{s}\".", .{m.title});
+            },
+        }
+    }
+};
+
+const BulletinToolAdapter = struct {
+    pool: *store_pool.PgPool,
+    owner_identity_id: i64,
+    now: i64,
+
+    fn sink(self: *BulletinToolAdapter) tool_registry.BulletinSink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt: tool_registry.BulletinSink.VTable = .{ .generate = generateFn };
+
+    fn generateFn(ptr: *anyopaque, allocator: std.mem.Allocator, hours: ?i64) anyerror![]const u8 {
+        const self: *BulletinToolAdapter = @ptrCast(@alignCast(ptr));
+        return bulletin.gather(self.pool, allocator, self.owner_identity_id, hours, self.now);
     }
 };
 
