@@ -3,6 +3,23 @@ const Db = @import("db.zig").Db;
 const Stmt = @import("db.zig").Stmt;
 const PgPool = @import("pool.zig").PgPool;
 
+/// Whether `chat_id` has ever had a single message recorded — cheap
+/// existence check (no row data pulled back) for callers that just need to
+/// know whether there's any history yet, e.g. `set_chat_monitoring`
+/// warning the owner that a freshly-subscribed chat has nothing for
+/// `get_bulletin` to show until new messages actually arrive. Fails closed
+/// to `false` on a lookup error, same as this file's other boolean-return
+/// helpers.
+pub fn hasAny(pool: *PgPool, chat_id: i64) bool {
+    const db = pool.acquire() catch return false;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT 1 FROM messages WHERE chat_id = $1 LIMIT 1;") catch return false;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    return (stmt.step() catch return false);
+}
+
 /// Inserts one message row, scoped to `chat_id`/`identity_id` (the internal
 /// FK ids from `chats.upsertChat`/`identities.upsertIdentity`) — replaces
 /// the old per-chat-file `messages` table's implicit-by-filename scoping.
@@ -445,6 +462,23 @@ const testing = std.testing;
 const test_support = @import("test_support.zig");
 const chats = @import("chats.zig");
 const identities = @import("identities.zig");
+
+test "hasAny is false for a chat with no messages, true once one is inserted, scoped per chat" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram_user, "1", null, null);
+    const chat2 = try chats.upsertChat(&pool, .telegram_user, "2", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "alice", null, false, 1000);
+
+    try testing.expect(!hasAny(&pool, chat1));
+
+    try insert(&pool, chat1, alice, "1", "hi", 1000);
+    try testing.expect(hasAny(&pool, chat1));
+    try testing.expect(!hasAny(&pool, chat2));
+}
 
 test "insert/recentFormatted/pruneKeepLast scoped correctly per chat" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;

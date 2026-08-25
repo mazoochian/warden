@@ -2190,8 +2190,14 @@ fn handleTelegramUserPhone(ctx: *const ServerContext, request: *http.Server.Requ
     if (conn.authState() != .wait_phone_number) {
         return respondError(request, .conflict, "wrong_state", "not currently waiting for a phone number");
     }
-    conn.submitPhoneNumber(body.phone_number);
-    return respondJson(ctx, request, .ok, .{});
+    const outcome = conn.submitPhoneNumber(arena, ctx.io, body.phone_number) catch {
+        return respondError(request, .internal_server_error, "internal", "failed to submit the phone number");
+    };
+    switch (outcome) {
+        .ok => return respondJson(ctx, request, .ok, .{}),
+        .rejected => |why| return respondError(request, .bad_request, "rejected", why),
+        .timed_out => return respondError(request, .gateway_timeout, "timed_out", "couldn't confirm this reached Telegram in time"),
+    }
 }
 
 fn handleTelegramUserCode(ctx: *const ServerContext, request: *http.Server.Request) !void {
@@ -2218,8 +2224,14 @@ fn handleTelegramUserCode(ctx: *const ServerContext, request: *http.Server.Reque
     // phishing detector to have invalidated the code over in the first
     // place (see `platform/interface.zig`'s `Platform.telegram_user` doc
     // comment).
-    conn.submitAuthCode(body.code);
-    return respondJson(ctx, request, .ok, .{});
+    const outcome = conn.submitAuthCode(arena, ctx.io, body.code) catch {
+        return respondError(request, .internal_server_error, "internal", "failed to submit the code");
+    };
+    switch (outcome) {
+        .ok => return respondJson(ctx, request, .ok, .{}),
+        .rejected => |why| return respondError(request, .bad_request, "rejected", why),
+        .timed_out => return respondError(request, .gateway_timeout, "timed_out", "couldn't confirm this reached Telegram in time"),
+    }
 }
 
 fn handleTelegramUserPassword(ctx: *const ServerContext, request: *http.Server.Request) !void {
@@ -2240,8 +2252,14 @@ fn handleTelegramUserPassword(ctx: *const ServerContext, request: *http.Server.R
     if (conn.authState() != .wait_password) {
         return respondError(request, .conflict, "wrong_state", "not currently waiting for a 2FA password");
     }
-    conn.submitPassword(body.password);
-    return respondJson(ctx, request, .ok, .{});
+    const outcome = conn.submitPassword(arena, ctx.io, body.password) catch {
+        return respondError(request, .internal_server_error, "internal", "failed to submit the password");
+    };
+    switch (outcome) {
+        .ok => return respondJson(ctx, request, .ok, .{}),
+        .rejected => |why| return respondError(request, .bad_request, "rejected", why),
+        .timed_out => return respondError(request, .gateway_timeout, "timed_out", "couldn't confirm this reached Telegram in time"),
+    }
 }
 
 /// `GET /api/v1/telegram-user/chats[?query=...]` — warden-ui's chat

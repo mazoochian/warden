@@ -2683,7 +2683,7 @@ fn handleMessage(
         handleScraperCommand(connector, a, pool, msg, text);
     } else if (std.mem.eql(u8, text, "/tdlogin") or std.mem.startsWith(u8, text, "/tdlogin ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
-        handleTdloginCommand(connector, a, config, telegram_user, msg, text);
+        handleTdloginCommand(connector, a, config, telegram_user, io, msg, text);
     } else if (std.mem.eql(u8, text, "/tdlogout")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         if (telegram_user) |conn| {
@@ -4135,6 +4135,7 @@ fn handleTdloginCommand(
     a: std.mem.Allocator,
     config: *const config_mod.Config,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    io: Io,
     msg: iface.Message,
     text: []const u8,
 ) void {
@@ -4178,8 +4179,18 @@ fn handleTdloginCommand(
             reply(connector, a, msg.chat_id, msg.message_id, "Not currently waiting for a phone number — check /tdlogin status.");
             return;
         }
-        conn.submitPhoneNumber(arg);
-        reply(connector, a, msg.chat_id, msg.message_id, "Phone number submitted. Watch this chat (or your other Telegram sessions) for the login code, then send it back with /tdlogin code — with the digits separated, e.g. \"1 2 3 4 5\", not the bare code.");
+        const outcome = conn.submitPhoneNumber(a, io, arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't submit the phone number — try again.");
+            return;
+        };
+        switch (outcome) {
+            .ok => reply(connector, a, msg.chat_id, msg.message_id, "Phone number submitted. Watch this chat (or your other Telegram sessions) for the login code, then send it back with /tdlogin code — with the digits separated, e.g. \"1 2 3 4 5\", not the bare code."),
+            .rejected => |why| {
+                const out = std.fmt.allocPrint(a, "Telegram rejected that phone number: {s} — try /tdlogin phone again.", .{why}) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+            .timed_out => reply(connector, a, msg.chat_id, msg.message_id, "Couldn't confirm that reached Telegram in time — check /tdlogin status before retrying."),
+        }
         return;
     }
 
@@ -4204,8 +4215,18 @@ fn handleTdloginCommand(
             reply(connector, a, msg.chat_id, msg.message_id, "That didn't contain any digits.");
             return;
         }
-        conn.submitAuthCode(digits_buf[0..n]);
-        reply(connector, a, msg.chat_id, msg.message_id, "Code submitted.");
+        const outcome = conn.submitAuthCode(a, io, digits_buf[0..n]) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't submit the code — try again.");
+            return;
+        };
+        switch (outcome) {
+            .ok => reply(connector, a, msg.chat_id, msg.message_id, "Code submitted."),
+            .rejected => |why| {
+                const out = std.fmt.allocPrint(a, "Telegram rejected that code: {s} — check /tdlogin status, then send /tdlogin code again.", .{why}) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+            .timed_out => reply(connector, a, msg.chat_id, msg.message_id, "Couldn't confirm that reached Telegram in time — check /tdlogin status before retrying."),
+        }
         return;
     }
 
@@ -4218,8 +4239,18 @@ fn handleTdloginCommand(
             reply(connector, a, msg.chat_id, msg.message_id, "Not currently waiting for a 2FA password — check /tdlogin status.");
             return;
         }
-        conn.submitPassword(arg);
-        reply(connector, a, msg.chat_id, msg.message_id, "Password submitted.");
+        const outcome = conn.submitPassword(a, io, arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't submit the password — try again.");
+            return;
+        };
+        switch (outcome) {
+            .ok => reply(connector, a, msg.chat_id, msg.message_id, "Password submitted."),
+            .rejected => |why| {
+                const out = std.fmt.allocPrint(a, "Telegram rejected that password: {s} — send /tdlogin password again with the correct one.", .{why}) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+            .timed_out => reply(connector, a, msg.chat_id, msg.message_id, "Couldn't confirm that reached Telegram in time — check /tdlogin status before retrying."),
+        }
         return;
     }
 
@@ -8862,13 +8893,34 @@ const MonitoringToolAdapter = struct {
                 return out.writer.buffered();
             },
             .one => |m| {
-                const internal_chat = try chats.getByNative(self.pool, allocator, .telegram_user, m.native_chat_id) orelse
-                    return "Warden hasn't recorded any messages from that chat yet, so there's nothing to monitor.";
-                try chat_settings.setMonitorImportance(self.pool, internal_chat.id, parsed_importance);
-                return if (parsed_importance != .off)
-                    std.fmt.allocPrint(allocator, "Now monitoring \"{s}\" at {s} importance.", .{ m.title, @tagName(parsed_importance) })
-                else
-                    std.fmt.allocPrint(allocator, "Stopped monitoring \"{s}\".", .{m.title});
+                // Monitoring is forward-looking (a subscription to future
+                // messages), not a report over history that already
+                // exists -- so unlike e.g. reply_to_message (which
+                // inherently needs a real prior message to target),
+                // there's no reason to require this chat to have ever
+                // recorded one yet. `upsertChat` creates the row if it's
+                // missing rather than requiring it already exist (direct
+                // owner report, 2026-08-26: the old `getByNative`-or-fail
+                // guard here blocked subscribing to a chat with no
+                // history, which is a perfectly normal thing to want).
+                const chat_id = try chats.upsertChat(self.pool, .telegram_user, m.native_chat_id, null, m.title);
+                try chat_settings.setMonitorImportance(self.pool, chat_id, parsed_importance);
+                if (parsed_importance == .off) {
+                    return std.fmt.allocPrint(allocator, "Stopped monitoring \"{s}\".", .{m.title});
+                }
+                // The only real consequence of subscribing a chat with no
+                // recorded history yet: an immediate get_bulletin has
+                // nothing from it until a new message actually arrives --
+                // surfaced as a heads-up rather than blocking the
+                // subscription itself.
+                if (!messages.hasAny(self.pool, chat_id)) {
+                    return std.fmt.allocPrint(
+                        allocator,
+                        "Now monitoring \"{s}\" at {s} importance. Note: Warden hasn't recorded any messages from this chat yet, so a bulletin won't have anything from it until a new one arrives.",
+                        .{ m.title, @tagName(parsed_importance) },
+                    );
+                }
+                return std.fmt.allocPrint(allocator, "Now monitoring \"{s}\" at {s} importance.", .{ m.title, @tagName(parsed_importance) });
             },
         }
     }

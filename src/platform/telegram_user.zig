@@ -446,11 +446,80 @@ pub const TelegramUserConnector = struct {
 
     /// Answers `authorizationStateWaitPhoneNumber`. `phone_number` is the
     /// full international-format number (e.g. "+15551234567").
-    pub fn submitPhoneNumber(self: *TelegramUserConnector, phone_number: []const u8) void {
+    /// What answering an auth step (`submitPhoneNumber`/`submitAuthCode`/
+    /// `submitPassword`) actually did — unlike the state machine's own
+    /// `updateAuthorizationState` stream, this is specifically for
+    /// reporting a *rejected* step (wrong code, wrong 2FA password, ...)
+    /// back to whoever's driving the login, since TDLib answers those with
+    /// a request-level `error` response, not an update — nothing in
+    /// `pollFn`'s update-type dispatch would otherwise ever see it (see
+    /// `awaitAuthStep`'s doc comment for the mechanics).
+    pub const AuthStepOutcome = union(enum) {
+        /// TDLib accepted the step; the real confirmation is whatever
+        /// `updateAuthorizationState` fires next (e.g.
+        /// `authorizationStateWaitPassword`, or `authorizationStateReady`
+        /// once every step has passed).
+        ok,
+        /// TDLib rejected the step outright — the human-readable reason it
+        /// gave (e.g. "PASSWORD_HASH_INVALID"), duped onto the caller's
+        /// allocator. The auth state does *not* advance; the same step can
+        /// just be retried.
+        rejected: []const u8,
+        /// No response arrived within `request_timeout_seconds` (already
+        /// logged). Unlike `rejected`, this doesn't mean TDLib said no —
+        /// it might still be mid-flight; safest to check `/tdlogin status`
+        /// before retrying.
+        timed_out,
+    };
+
+    /// Shared response wait+classify for the three auth-step submissions
+    /// below — each sends its own request shape tagged with `extra_id`,
+    /// then hands off here rather than duplicating the parse/branch logic
+    /// `markMessagesRead`'s own ok/error check already established.
+    fn awaitAuthStep(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, extra_id: u64, what: []const u8) !AuthStepOutcome {
+        const raw = try self.waitForResponse(allocator, io, extra_id, request_timeout_seconds) orelse {
+            log.warn("{s}: timed out waiting for a response", .{what});
+            return .timed_out;
+        };
+        defer allocator.free(raw);
+
+        var parsed = json.parseFromSlice(json.Value, allocator, raw, .{}) catch |err| {
+            log.warn("{s}: failed to parse response: {t}", .{ what, err });
+            return .timed_out;
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return .timed_out,
+        };
+        const type_str = switch (obj.get("@type") orelse return .timed_out) {
+            .string => |s| s,
+            else => return .timed_out,
+        };
+        if (!std.mem.eql(u8, type_str, "error")) return .ok;
+
+        const message = switch (obj.get("message") orelse json.Value{ .null = {} }) {
+            .string => |s| s,
+            else => "unknown error",
+        };
+        log.warn("{s}: rejected: {s}", .{ what, message });
+        return .{ .rejected = try allocator.dupe(u8, message) };
+    }
+
+    /// Answers `authorizationStateWaitPhoneNumber`. Waits for TDLib's
+    /// response (unlike this connector's other simple `send()`-and-forget
+    /// requests) so a rejected phone number can be reported back to
+    /// whoever's driving the login instead of leaving them watching a
+    /// state that silently never advances — see `AuthStepOutcome`'s doc
+    /// comment for why this needed its own request/response handling.
+    pub fn submitPhoneNumber(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, phone_number: []const u8) !AuthStepOutcome {
+        const extra_id = self.nextExtraId();
         self.send(.{
             .@"@type" = "setAuthenticationPhoneNumber",
             .phone_number = phone_number,
+            .@"@extra" = extra_id,
         });
+        return self.awaitAuthStep(allocator, io, extra_id, "submitPhoneNumber");
     }
 
     /// Answers `authorizationStateWaitCode`. `code` is whatever the caller
@@ -459,27 +528,38 @@ pub const TelegramUserConnector = struct {
     /// stripping whatever obfuscation they asked the owner to type it with
     /// (see `platform/interface.zig`'s `Platform.telegram_user` doc comment
     /// and README's login-flow section) *before* calling this; this
-    /// function sends exactly the digits it's given.
-    pub fn submitAuthCode(self: *TelegramUserConnector, code: []const u8) void {
+    /// function sends exactly the digits it's given. See
+    /// `submitPhoneNumber`'s doc comment for why this waits for a response.
+    pub fn submitAuthCode(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, code: []const u8) !AuthStepOutcome {
+        const extra_id = self.nextExtraId();
         self.send(.{
             .@"@type" = "checkAuthenticationCode",
             .code = code,
+            .@"@extra" = extra_id,
         });
+        return self.awaitAuthStep(allocator, io, extra_id, "submitAuthCode");
     }
 
-    /// Answers `authorizationStateWaitPassword` (2FA).
-    pub fn submitPassword(self: *TelegramUserConnector, password: []const u8) void {
+    /// Answers `authorizationStateWaitPassword` (2FA). See
+    /// `submitPhoneNumber`'s doc comment for why this waits for a response
+    /// — this is the step that motivated adding it: a wrong password
+    /// previously failed with no feedback at all (2026-08-26, direct owner
+    /// report after a real login attempt silently stalled here).
+    pub fn submitPassword(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, password: []const u8) !AuthStepOutcome {
+        const extra_id = self.nextExtraId();
         self.send(.{
             .@"@type" = "checkAuthenticationPassword",
             .password = password,
+            .@"@extra" = extra_id,
         });
+        return self.awaitAuthStep(allocator, io, extra_id, "submitPassword");
     }
 
     /// TDLib's `logOut` — clears the account's session both locally
     /// (`session_dir` on disk) and server-side, same as removing the
-    /// device from Telegram's own "active sessions" list. Fire-and-forget,
-    /// same idiom as `submitPhoneNumber`/`submitAuthCode`/`submitPassword`
-    /// above: no `@extra` correlation needed, since the result shows up
+    /// device from Telegram's own "active sessions" list. Fire-and-forget
+    /// (unlike `submitPhoneNumber`/`submitAuthCode`/`submitPassword`
+    /// above): no `@extra` correlation needed, since the result shows up
     /// through the normal `updateAuthorizationState` stream this connector
     /// already handles -- `authorizationStateClosed` (already wired in
     /// `handleAuthorizationState`) resets `client_id` to `null`, so the
