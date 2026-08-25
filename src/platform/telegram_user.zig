@@ -379,6 +379,26 @@ pub const TelegramUserConnector = struct {
         };
     }
 
+    /// Same `viewMessages` request as `markMessagesRead`, for exactly one
+    /// message, but never waits for (or even tags) a response — no `@extra`
+    /// means `pollFn` never diverts TDLib's answer anywhere special, it
+    /// just falls through the update-type dispatch below and is silently
+    /// ignored, the same as any other update type this connector doesn't
+    /// act on. Used by `convertNewMessage` to mark every inbound message
+    /// read as it arrives, where confirming success isn't worth a blocking
+    /// round trip on the poll loop's hot path (unlike `fetchUnread`'s
+    /// deliberate, owner-initiated mark-read, which reports failure back to
+    /// the owner) — a transient failure here just leaves that one message
+    /// unread, no different from a read receipt a human might miss.
+    fn markSeenFireAndForget(self: *TelegramUserConnector, chat_id: i64, message_id: i64) void {
+        self.send(.{
+            .@"@type" = "viewMessages",
+            .chat_id = chat_id,
+            .message_ids = &[_]i64{message_id},
+            .force_read = true,
+        });
+    }
+
     /// `viewMessages(chat_id, message_ids, force_read=true)` — marks
     /// exactly the given messages viewed. Per Telegram's own read-state
     /// model this is a single forward-moving cursor per chat, not a
@@ -668,7 +688,7 @@ pub const TelegramUserConnector = struct {
     /// missing fields it needs) — same "skip, don't crash the poll loop
     /// over one unusual message" posture every other connector already
     /// takes on malformed/unexpected input.
-    fn convertNewMessage(_: *TelegramUserConnector, allocator: std.mem.Allocator, update: json.ObjectMap) !?iface.Message {
+    fn convertNewMessage(self: *TelegramUserConnector, allocator: std.mem.Allocator, update: json.ObjectMap) !?iface.Message {
         const message = switch (update.get("message") orelse return null) {
             .object => |o| o,
             else => return null,
@@ -681,6 +701,19 @@ pub const TelegramUserConnector = struct {
         const chat_id = switch (message.get("chat_id") orelse return null) {
             .integer => |n| n,
             else => return null,
+        };
+
+        // The owner reads every message through Warden, so it's already
+        // been "seen" the moment it arrives here -- mark it read on
+        // Telegram immediately rather than waiting for an explicit
+        // /tdsummary or summarize_unread_chat call to do it as a side
+        // effect (2026-08-26, direct owner request). Every message type
+        // gets this, not just the text ones this pass actually converts
+        // below -- a photo/sticker/etc. was still seen. Fire-and-forget
+        // (see `markSeenFireAndForget`'s own doc comment) so this never
+        // blocks the poll loop on a round trip.
+        if (message.get("id")) |id_v| if (id_v == .integer) {
+            self.markSeenFireAndForget(chat_id, id_v.integer);
         };
 
         const content = switch (message.get("content") orelse return null) {

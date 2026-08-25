@@ -76,6 +76,22 @@ pub const ReplyAutonomy = enum {
     auto,
 };
 
+/// A chat's monitoring level for `get_bulletin` (`chat_settings.
+/// monitor_importance`) or the owner's global default applied to every
+/// chat without its own override (`monitor_all_default` below) — see
+/// `0046_monitor_all_default.sql`. `.off` is an explicit value here (not
+/// just "unset"), same reasoning as `ReplyAutonomy.off`: a chat needs to be
+/// able to opt OUT even while the global default is "monitor everything",
+/// which a merely-absent value can't express once absence means "inherit
+/// the global default" rather than "off" (see `chat_settings.
+/// resolveMonitorImportance`).
+pub const MonitorImportance = enum {
+    off,
+    low,
+    normal,
+    high,
+};
+
 fn upsertColumn(pool: *PgPool, identity_id: i64, comptime column: []const u8, value: anytype) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -115,6 +131,16 @@ pub fn setReplyAutonomyDefault(pool: *PgPool, identity_id: i64, value: ?ReplyAut
     try upsertColumn(pool, identity_id, "reply_autonomy_default", text);
 }
 
+/// The owner's default monitoring level for every personal-account chat
+/// that has no per-chat override (`chat_settings.monitor_importance`) —
+/// `.off` (the default until the owner sets this) means only explicitly
+/// opted-in chats are monitored, same as before this setting existed.
+/// `null` clears the override (falls back to `.off`).
+pub fn setMonitorAllDefault(pool: *PgPool, identity_id: i64, value: ?MonitorImportance) !void {
+    const text: ?[]const u8 = if (value) |v| @tagName(v) else null;
+    try upsertColumn(pool, identity_id, "monitor_all_default", text);
+}
+
 fn tagForTimeFormat(f: civil_time.TimeFormat) []const u8 {
     return switch (f) {
         .h24 => "24h",
@@ -128,6 +154,7 @@ const Row = struct {
     time_format: ?[]const u8,
     language_code: ?[]const u8,
     reply_autonomy_default: ?[]const u8,
+    monitor_all_default: ?[]const u8,
 };
 
 /// One query joining `user_settings` and `telegram_profiles` — every
@@ -138,7 +165,7 @@ fn loadRow(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ?Row {
     defer pool.release(db);
 
     var stmt = db.prepare(
-        \\SELECT us.utc_offset_minutes, us.date_format, us.time_format, tp.language_code, us.reply_autonomy_default
+        \\SELECT us.utc_offset_minutes, us.date_format, us.time_format, tp.language_code, us.reply_autonomy_default, us.monitor_all_default
         \\FROM identities i
         \\LEFT JOIN user_settings us ON us.identity_id = i.id
         \\LEFT JOIN telegram_profiles tp ON tp.identity_id = i.id
@@ -154,6 +181,7 @@ fn loadRow(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ?Row {
         .time_format = if (stmt.columnIsNull(2)) null else allocator.dupe(u8, stmt.columnText(2)) catch null,
         .language_code = if (stmt.columnIsNull(3)) null else allocator.dupe(u8, stmt.columnText(3)) catch null,
         .reply_autonomy_default = if (stmt.columnIsNull(4)) null else allocator.dupe(u8, stmt.columnText(4)) catch null,
+        .monitor_all_default = if (stmt.columnIsNull(5)) null else allocator.dupe(u8, stmt.columnText(5)) catch null,
     };
 }
 
@@ -165,6 +193,7 @@ fn freeRow(allocator: std.mem.Allocator, row: Row) void {
     if (row.time_format) |v| allocator.free(v);
     if (row.language_code) |v| allocator.free(v);
     if (row.reply_autonomy_default) |v| allocator.free(v);
+    if (row.monitor_all_default) |v| allocator.free(v);
 }
 
 /// Explicit override, else a `language_code`-derived guess, else UTC (0).
@@ -206,6 +235,16 @@ pub fn getEffectiveReplyAutonomyDefault(pool: *PgPool, allocator: std.mem.Alloca
     defer freeRow(allocator, row);
     const raw = row.reply_autonomy_default orelse return .off;
     return std.meta.stringToEnum(ReplyAutonomy, raw) orelse .off;
+}
+
+/// The owner's global monitoring default — explicit override, else `.off`.
+/// `chat_settings.resolveMonitorImportance` is the per-chat combined result
+/// callers actually want (a chat's own override beats this).
+pub fn getEffectiveMonitorAllDefault(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) MonitorImportance {
+    const row = loadRow(pool, allocator, identity_id) orelse return .off;
+    defer freeRow(allocator, row);
+    const raw = row.monitor_all_default orelse return .off;
+    return std.meta.stringToEnum(MonitorImportance, raw) orelse .off;
 }
 
 /// `get_bulletin`'s cursor: the last time a bulletin was generated for this
@@ -307,6 +346,23 @@ test "last_bulletin_ts defaults to 0 and round trips" {
 
     try setLastBulletinTs(&pool, id, 54321);
     try testing.expectEqual(@as(i64, 54321), getLastBulletinTs(&pool, id));
+}
+
+test "getEffectiveMonitorAllDefault defaults to .off, respects an override, clears back to .off" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const id = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
+    try testing.expectEqual(MonitorImportance.off, getEffectiveMonitorAllDefault(&pool, a, id));
+
+    try setMonitorAllDefault(&pool, id, .normal);
+    try testing.expectEqual(MonitorImportance.normal, getEffectiveMonitorAllDefault(&pool, a, id));
+
+    try setMonitorAllDefault(&pool, id, null);
+    try testing.expectEqual(MonitorImportance.off, getEffectiveMonitorAllDefault(&pool, a, id));
 }
 
 test "getEffectiveDateFormat/getEffectiveTimeFormat default then respect an explicit setting" {

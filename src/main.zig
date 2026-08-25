@@ -120,6 +120,7 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/send_personal_message.zig").tool,
     @import("tools/reply_to_message.zig").tool,
     @import("tools/set_chat_monitoring.zig").tool,
+    @import("tools/set_default_chat_monitoring.zig").tool,
     @import("tools/get_bulletin.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
@@ -1441,6 +1442,7 @@ fn processMessageTask(
     var monitoring_adapter: MonitoringToolAdapter = .{
         .telegram_user = telegram_user,
         .pool = pool,
+        .owner_identity_id = identity_id,
     };
     var bulletin_adapter: BulletinToolAdapter = .{
         .pool = pool,
@@ -8834,23 +8836,21 @@ const PersonalAccountToolAdapter = struct {
 const MonitoringToolAdapter = struct {
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pool: *store_pool.PgPool,
+    owner_identity_id: i64,
 
     fn sink(self: *MonitoringToolAdapter) tool_registry.MonitoringSink {
         return .{ .ptr = self, .vtable = &vt };
     }
 
-    const vt: tool_registry.MonitoringSink.VTable = .{ .setImportance = setImportanceFn };
+    const vt: tool_registry.MonitoringSink.VTable = .{ .setImportance = setImportanceFn, .setDefaultImportance = setDefaultImportanceFn };
 
     fn setImportanceFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, importance: []const u8) anyerror![]const u8 {
         const self: *MonitoringToolAdapter = @ptrCast(@alignCast(ptr));
         const conn = self.telegram_user orelse return "The personal-account connector isn't configured on this deployment.";
         if (conn.authState() != .ready) return "The personal account isn't logged in yet.";
 
-        const parsed_importance = if (std.mem.eql(u8, importance, "off"))
-            null
-        else
-            std.meta.stringToEnum(chat_settings.MonitorImportance, importance) orelse
-                return "importance must be one of: low, normal, high, off.";
+        const parsed_importance = std.meta.stringToEnum(chat_settings.MonitorImportance, importance) orelse
+            return "importance must be one of: low, normal, high, off.";
 
         const resolution = try chat_summary.resolveChat(conn, allocator, chat_query);
         switch (resolution) {
@@ -8865,12 +8865,23 @@ const MonitoringToolAdapter = struct {
                 const internal_chat = try chats.getByNative(self.pool, allocator, .telegram_user, m.native_chat_id) orelse
                     return "Warden hasn't recorded any messages from that chat yet, so there's nothing to monitor.";
                 try chat_settings.setMonitorImportance(self.pool, internal_chat.id, parsed_importance);
-                return if (parsed_importance) |imp|
-                    std.fmt.allocPrint(allocator, "Now monitoring \"{s}\" at {s} importance.", .{ m.title, @tagName(imp) })
+                return if (parsed_importance != .off)
+                    std.fmt.allocPrint(allocator, "Now monitoring \"{s}\" at {s} importance.", .{ m.title, @tagName(parsed_importance) })
                 else
                     std.fmt.allocPrint(allocator, "Stopped monitoring \"{s}\".", .{m.title});
             },
         }
+    }
+
+    fn setDefaultImportanceFn(ptr: *anyopaque, allocator: std.mem.Allocator, importance: []const u8) anyerror![]const u8 {
+        const self: *MonitoringToolAdapter = @ptrCast(@alignCast(ptr));
+        const parsed_importance = std.meta.stringToEnum(chat_settings.MonitorImportance, importance) orelse
+            return "importance must be one of: low, normal, high, off.";
+        try user_settings.setMonitorAllDefault(self.pool, self.owner_identity_id, parsed_importance);
+        return if (parsed_importance != .off)
+            std.fmt.allocPrint(allocator, "Now monitoring every chat by default at {s} importance (a chat with its own setting keeps that instead).", .{@tagName(parsed_importance)})
+        else
+            std.fmt.allocPrint(allocator, "Default monitoring is off again -- only chats explicitly set with set_chat_monitoring are still monitored.", .{});
     }
 };
 

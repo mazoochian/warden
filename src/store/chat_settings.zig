@@ -191,13 +191,19 @@ pub fn resolveReplyAutonomy(pool: *PgPool, allocator: std.mem.Allocator, chat_id
     return user_settings.getEffectiveReplyAutonomyDefault(pool, allocator, owner_identity_id);
 }
 
-/// Owner-declared, static per-chat opt-in for the `get_bulletin`/
-/// `set_chat_monitoring` feature -- deliberately NOT a classifier the bot
-/// computes by reading a chat's own content. See `0045_chat_monitoring.sql`.
-pub const MonitorImportance = enum { low, normal, high };
+/// Owner-declared, static per-chat opt-in/override for the `get_bulletin`/
+/// `set_chat_monitoring`/`set_default_chat_monitoring` feature --
+/// deliberately NOT a classifier the bot computes by reading a chat's own
+/// content. See `0045_chat_monitoring.sql`/`0046_monitor_all_default.sql`.
+/// Same type as `user_settings.MonitorImportance` (aliased here so callers
+/// of this file don't need their own import of `user_settings.zig` just
+/// for the enum) -- see that type's doc comment for why `.off` is an
+/// explicit value rather than plain absence.
+pub const MonitorImportance = user_settings.MonitorImportance;
 
-/// This chat's monitoring state, or `null` if it isn't monitored (the
-/// default -- same "NULL means off" shape `getReplyAutonomy` already uses).
+/// This chat's own monitoring override, or `null` if it has none (falls
+/// back to the owner's global default -- see `resolveMonitorImportance`,
+/// the one callers outside this file/its tests should actually use).
 pub fn getMonitorImportance(pool: *PgPool, chat_id: i64) ?MonitorImportance {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -210,7 +216,8 @@ pub fn getMonitorImportance(pool: *PgPool, chat_id: i64) ?MonitorImportance {
     return std.meta.stringToEnum(MonitorImportance, stmt.columnText(0));
 }
 
-/// `null` clears it (stops monitoring the chat).
+/// `null` clears the override (falls back to inheriting the owner's global
+/// default again).
 pub fn setMonitorImportance(pool: *PgPool, chat_id: i64, value: ?MonitorImportance) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -225,6 +232,16 @@ pub fn setMonitorImportance(pool: *PgPool, chat_id: i64, value: ?MonitorImportan
     _ = try stmt.step();
 }
 
+/// The monitoring level `chat_id` actually has: its own override if it has
+/// one, else the owner's global default (`user_settings.
+/// getEffectiveMonitorAllDefault`) -- same "override beats global default"
+/// combined result `resolveReplyAutonomy` already returns for reply
+/// autonomy.
+pub fn resolveMonitorImportance(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, owner_identity_id: i64) MonitorImportance {
+    if (getMonitorImportance(pool, chat_id)) |override| return override;
+    return user_settings.getEffectiveMonitorAllDefault(pool, allocator, owner_identity_id);
+}
+
 pub const MonitoredChat = struct {
     chat_id: i64,
     native_chat_id: []const u8,
@@ -232,23 +249,35 @@ pub const MonitoredChat = struct {
     importance: MonitorImportance,
 };
 
-/// Every monitored chat on `platform`, highest importance first (then
-/// alphabetized by title within a tier) -- `get_bulletin`'s data source. A
-/// chat with no `chats.title` yet (rare -- only before it's ever sent a
-/// message with fresh metadata) falls back to its native id so the bulletin
-/// always has something to label the chat with.
-pub fn listMonitored(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform) ![]MonitoredChat {
+/// Every effectively-monitored chat on `platform` -- a chat's own override
+/// if it has one, else the owner's global default, excluding anything that
+/// resolves to `.off` either way (see `resolveMonitorImportance`) -- ordered
+/// highest importance first, then alphabetized by title within a tier.
+/// `get_bulletin`'s data source. A `LEFT JOIN` (not `chat_settings JOIN
+/// chats`) on purpose: once the global default can be non-`.off`, a chat
+/// that has never had a `chat_settings` row at all must still be able to
+/// surface here, resolved as "inherit the default" the same as an existing
+/// row whose `monitor_importance` is `NULL`. A chat with no `chats.title`
+/// yet (rare -- only before it's ever sent a message with fresh metadata)
+/// falls back to its native id so the bulletin always has something to
+/// label the chat with.
+pub fn listMonitored(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform, owner_identity_id: i64) ![]MonitoredChat {
+    const default_effective = user_settings.getEffectiveMonitorAllDefault(pool, allocator, owner_identity_id);
+
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT c.id, c.native_chat_id, COALESCE(NULLIF(c.title, ''), c.native_chat_id), cs.monitor_importance
-        \\FROM chat_settings cs JOIN chats c ON c.id = cs.chat_id
-        \\WHERE cs.monitor_importance IS NOT NULL AND c.platform = $1
-        \\ORDER BY CASE cs.monitor_importance WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, c.title;
+        \\SELECT c.id, c.native_chat_id, COALESCE(NULLIF(c.title, ''), c.native_chat_id),
+        \\       COALESCE(cs.monitor_importance, $2)
+        \\FROM chats c
+        \\LEFT JOIN chat_settings cs ON cs.chat_id = c.id
+        \\WHERE c.platform = $1 AND COALESCE(cs.monitor_importance, $2) != 'off'
+        \\ORDER BY CASE COALESCE(cs.monitor_importance, $2) WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, c.title;
     );
     defer stmt.finalize();
     stmt.bindText(1, @tagName(platform));
+    stmt.bindText(2, @tagName(default_effective));
 
     var out: std.ArrayList(MonitoredChat) = .empty;
     while (try stmt.step()) {
@@ -386,7 +415,7 @@ test "resolveReplyAutonomy: no override inherits the owner's global default, ove
     try testing.expectEqual(ReplyAutonomy.draft, resolveReplyAutonomy(&pool, a, chat_id, owner_id));
 }
 
-test "monitor_importance round trips through all three tiers and clears back to null" {
+test "monitor_importance round trips through off/low/normal/high and clears back to null" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -402,16 +431,51 @@ test "monitor_importance round trips through all three tiers and clears back to 
     try setMonitorImportance(&pool, chat_id, .low);
     try testing.expectEqual(@as(?MonitorImportance, .low), getMonitorImportance(&pool, chat_id));
 
+    try setMonitorImportance(&pool, chat_id, .off);
+    try testing.expectEqual(@as(?MonitorImportance, .off), getMonitorImportance(&pool, chat_id));
+
     try setMonitorImportance(&pool, chat_id, null);
     try testing.expectEqual(@as(?MonitorImportance, null), getMonitorImportance(&pool, chat_id));
 }
 
-test "listMonitored returns only monitored chats on the requested platform, ordered high to low then by title" {
+test "resolveMonitorImportance: no override inherits the owner's global default, override beats it either direction" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const owner_id = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
+    const chat_id = try chats.upsertChat(&pool, .telegram_user, "100", null, null);
+
+    // Nothing set anywhere -> fails closed to .off.
+    try testing.expectEqual(MonitorImportance.off, resolveMonitorImportance(&pool, a, chat_id, owner_id));
+
+    // Global default on, no per-chat override -> inherits it.
+    try user_settings.setMonitorAllDefault(&pool, owner_id, .normal);
+    try testing.expectEqual(@as(?MonitorImportance, null), getMonitorImportance(&pool, chat_id));
+    try testing.expectEqual(MonitorImportance.normal, resolveMonitorImportance(&pool, a, chat_id, owner_id));
+
+    // A chat can opt OUT even while the global default monitors everything.
+    try setMonitorImportance(&pool, chat_id, .off);
+    try testing.expectEqual(MonitorImportance.off, resolveMonitorImportance(&pool, a, chat_id, owner_id));
+
+    // A chat can also be raised above the global default.
+    try setMonitorImportance(&pool, chat_id, .high);
+    try testing.expectEqual(MonitorImportance.high, resolveMonitorImportance(&pool, a, chat_id, owner_id));
+
+    // Clearing the override falls back to inheriting the global default again.
+    try setMonitorImportance(&pool, chat_id, null);
+    try testing.expectEqual(MonitorImportance.normal, resolveMonitorImportance(&pool, a, chat_id, owner_id));
+}
+
+test "listMonitored: global default off surfaces only explicit per-chat overrides, ordered high to low then by title" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
 
+    const owner_id = try identities.getOrCreateMinimal(&pool, .telegram_user, "owner", "owner", null, false, 1000);
     const chat_a = try chats.upsertChat(&pool, .telegram_user, "1", null, "Zebras");
     const chat_b = try chats.upsertChat(&pool, .telegram_user, "2", null, "Alpacas");
     const chat_c = try chats.upsertChat(&pool, .telegram_user, "3", null, "Not Monitored");
@@ -426,11 +490,39 @@ test "listMonitored returns only monitored chats on the requested platform, orde
     defer arena.deinit();
     const a = arena.allocator();
 
-    const monitored = try listMonitored(&pool, a, .telegram_user);
+    const monitored = try listMonitored(&pool, a, .telegram_user, owner_id);
     try testing.expectEqual(@as(usize, 2), monitored.len);
     try testing.expectEqualStrings("Alpacas", monitored[0].title);
     try testing.expectEqual(MonitorImportance.high, monitored[0].importance);
     try testing.expectEqualStrings("Zebras", monitored[1].title);
+    try testing.expectEqual(MonitorImportance.normal, monitored[1].importance);
+}
+
+test "listMonitored: global default on surfaces every chat with no chat_settings row, except one explicitly opted out" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const owner_id = try identities.getOrCreateMinimal(&pool, .telegram_user, "owner", "owner", null, false, 1000);
+    // Never touched via set_chat_monitoring at all -- no chat_settings row.
+    _ = try chats.upsertChat(&pool, .telegram_user, "1", null, "Untouched");
+    const raised = try chats.upsertChat(&pool, .telegram_user, "2", null, "Raised");
+    const opted_out = try chats.upsertChat(&pool, .telegram_user, "3", null, "Opted Out");
+
+    try user_settings.setMonitorAllDefault(&pool, owner_id, .normal);
+    try setMonitorImportance(&pool, raised, .high);
+    try setMonitorImportance(&pool, opted_out, .off);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const monitored = try listMonitored(&pool, a, .telegram_user, owner_id);
+    try testing.expectEqual(@as(usize, 2), monitored.len);
+    try testing.expectEqualStrings("Raised", monitored[0].title);
+    try testing.expectEqual(MonitorImportance.high, monitored[0].importance);
+    try testing.expectEqualStrings("Untouched", monitored[1].title);
     try testing.expectEqual(MonitorImportance.normal, monitored[1].importance);
 }
 

@@ -29,7 +29,7 @@ const default_lookback_hours: i64 = 24;
 /// touches the cursor, so asking "what happened in the last 3 hours" can't
 /// disturb the next on-demand bulletin's own window.
 pub fn gather(pool: *PgPool, allocator: std.mem.Allocator, owner_identity_id: i64, hours: ?i64, now: i64) ![]const u8 {
-    const monitored = try chat_settings.listMonitored(pool, allocator, .telegram_user);
+    const monitored = try chat_settings.listMonitored(pool, allocator, .telegram_user, owner_identity_id);
     if (monitored.len == 0) {
         return "No chats are being monitored yet — ask to enable monitoring for a chat first.";
     }

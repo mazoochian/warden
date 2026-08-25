@@ -52,7 +52,7 @@ const FakeSink = struct {
     fn sink(self: *FakeSink) registry.MonitoringSink {
         return .{ .ptr = self, .vtable = &vt };
     }
-    const vt: registry.MonitoringSink.VTable = .{ .setImportance = setImportanceFn };
+    const vt: registry.MonitoringSink.VTable = .{ .setImportance = setImportanceFn, .setDefaultImportance = unusedSetDefaultImportanceFn };
 
     fn setImportanceFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, importance: []const u8) anyerror![]const u8 {
         _ = allocator;
@@ -60,6 +60,13 @@ const FakeSink = struct {
         self.requested_chat = chat_query;
         self.requested_importance = importance;
         return self.result_text;
+    }
+
+    fn unusedSetDefaultImportanceFn(ptr: *anyopaque, allocator: std.mem.Allocator, importance: []const u8) anyerror![]const u8 {
+        _ = ptr;
+        _ = allocator;
+        _ = importance;
+        return error.Unsupported;
     }
 };
 

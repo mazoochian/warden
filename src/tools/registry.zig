@@ -341,10 +341,20 @@ pub const MonitoringSink = struct {
         /// pick one"/confirmation the same way `PersonalAccountSink.
         /// sendMessage` already does for its own unresolvable cases.
         setImportance: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, importance: []const u8) anyerror![]const u8,
+        /// Sets the owner's global monitoring default, applied to every
+        /// chat with no override of its own -- backs
+        /// `set_default_chat_monitoring`. No chat to resolve, so this is
+        /// just a confirmation string, same "off" sentinel convention as
+        /// `setImportance`.
+        setDefaultImportance: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, importance: []const u8) anyerror![]const u8,
     };
 
     pub fn setImportance(self: MonitoringSink, allocator: std.mem.Allocator, chat_query: []const u8, importance: []const u8) ![]const u8 {
         return self.vtable.setImportance(self.ptr, allocator, chat_query, importance);
+    }
+
+    pub fn setDefaultImportance(self: MonitoringSink, allocator: std.mem.Allocator, importance: []const u8) ![]const u8 {
+        return self.vtable.setDefaultImportance(self.ptr, allocator, importance);
     }
 };
 
