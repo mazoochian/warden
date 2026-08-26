@@ -17,6 +17,19 @@ const max_iterations = 6;
 pub const Progress = struct {
     ptr: *anyopaque = undefined,
     onEvent: ?*const fn (ptr: *anyopaque, event: Event) void = null,
+    /// Set by callers that support cooperative cancellation (main.zig's
+    /// "🛑 Cancel" button on the thinking placeholder — see
+    /// `features/cancel_request.zig`) — `run` below checks this at each
+    /// loop-iteration boundary (before a new model call, before each tool
+    /// execution) and bails out with `error.Cancelled` as soon as it sees
+    /// it set. Deliberately *not* checked mid-flight inside a `chat`/
+    /// `chatStream` call already underway: there's nothing here to abort
+    /// that with (see `http_util.zig`'s own timeout-not-true-cancellation
+    /// tradeoff for why) — a cancel pressed while a request is in flight
+    /// takes effect only once that call returns. `null` (the default)
+    /// means "not cancellable", same as `onEvent = null` meaning "no
+    /// progress reporting".
+    cancelled: ?*const std.atomic.Value(bool) = null,
 
     pub const Event = union(enum) {
         /// About to send a request to the model (first turn or a follow-up
@@ -35,6 +48,11 @@ pub const Progress = struct {
 
     pub fn report(self: Progress, event: Event) void {
         if (self.onEvent) |f| f(self.ptr, event);
+    }
+
+    pub fn isCancelled(self: Progress) bool {
+        const flag = self.cancelled orelse return false;
+        return flag.load(.acquire);
     }
 };
 
@@ -104,6 +122,7 @@ pub fn run(
 
     var i: u32 = 0;
     while (i < max_iterations) : (i += 1) {
+        if (progress.isCancelled()) return error.Cancelled;
         progress.report(.thinking);
         const response = if (stream)
             try provider.chatStream(allocator, .{
@@ -138,6 +157,7 @@ pub fn run(
 
         var results: std.ArrayList(llm.ContentBlock) = .empty;
         for (tool_uses.items) |tu| {
+            if (progress.isCancelled()) return error.Cancelled;
             progress.report(.{ .tool_use = tu.name });
             const result_text = executeTool(ctx, tool_defs, tu) catch |err| blk: {
                 std.log.err("tool '{s}' failed: {t}", .{ tu.name, err });
@@ -305,6 +325,20 @@ test "run executes a tool call and threads its result back to the model" {
     const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false, false, false, false, 1024);
     try testing.expectEqualStrings("The answer is 4.", result);
     try testing.expectEqual(@as(u32, 2), fake.call_count);
+}
+
+test "run bails out with error.Cancelled instead of calling the model when already cancelled" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake = FakeProvider{};
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+    var cancelled = std.atomic.Value(bool).init(true);
+
+    const result = run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{ .cancelled = &cancelled }, false, false, false, false, 1024);
+    try testing.expectError(error.Cancelled, result);
+    try testing.expectEqual(@as(u32, 0), fake.call_count);
 }
 
 /// Implements `chatStream`, not just `chat` — used to confirm `run(...,
