@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
+const delegates_mod = @import("../llm/delegates.zig");
 
 /// Scraper mode/endpoint for `scrape_site`. Defined here (rather than in
 /// `store/bot_config.zig`) so `registry.zig` — imported by every tool — has
@@ -448,6 +449,12 @@ pub const ToolContext = struct {
     /// `attachmentFromMessage`), so `kind == .photo` is the only reliable
     /// "this is an image" signal for that case.
     attachment_kind: ?iface.AttachmentKind = null,
+    /// Every configured "ask another model" target for the `ask_delegate`/
+    /// `delegate_generate_image` tools — see `llm/delegates.zig`'s
+    /// `Delegate` doc comment and `config.zig`'s `Config.delegates`. Empty
+    /// (the default) rather than those tools joining `active_tools` at all
+    /// when nothing's configured — see `main.zig`'s tool-list construction.
+    delegates: []const delegates_mod.Delegate = &.{},
 };
 
 pub const ToolDef = struct {

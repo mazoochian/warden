@@ -36,6 +36,7 @@ Warden is a powerful AI-powered bot that can connect to various AI providers and
 - Power Tools: `/alias add <name> <command or text>` makes `/name` re-dispatch as if you'd typed the saved expansion (a real built-in command can never be shadowed); `/template save <name> <text>` + `/template use <name> [extra]` re-asks a saved prompt through the normal Q&A path. `/joke`, `/riddle`, `/trivia` (all take an optional topic), `/wordoftheday`, and `/motivate` are quick, documented commands over what the model can already do zero-shot
 - Storage Sense (owner-only, hidden from `/help` — a `/sudo`-style command, not a public feature): Warden watches its own disk usage roughly every 30 seconds (`storage_sense_monitor` feature flag) with an Elasticsearch-style watermark ladder. Past the high watermark (default 90%) it sends the owner a daily alert; `/storage status` reports live disk %, tier, autopilot state, and sleep state on demand. `/storage cleanup messages [chat id] [--before <date> | --keep <n>]` prunes old messages, `/storage cleanup resample [chat id]` compacts a chat's oldest messages into one LLM-written summary (so the model keeps enough context without keeping every raw message), and `/storage cleanup tmp` sweeps abandoned scratch files — all runnable by hand at any time. `/storage autopilot on` (off by default, until you've watched `/storage status` for a while) lets the ladder run these on its own once usage passes the low watermark (default 80%), and past the flood watermark (default 95%) puts the bot to sleep — no LLM replies, no tool calls, no video downloads, nothing responds but the owner's own `/storage` commands (passive message logging keeps running, since that's cheap and worth preserving) — until usage drops back below flood minus a hysteresis margin, so a nearly-full disk can't be driven the rest of the way full unattended
 - Personal Account (Telegram, owner-only): once `WARDEN_TELEGRAM_USER_*` is configured (see below), `/tdlogin` logs Warden into the *owner's own* Telegram account via TDLib (phone number → login code → 2FA password if set), separate from the bot account every other feature uses. `/tdchats` lists that account's known chats; `/sendas <chat id> <text>` sends through it manually. `/autonomy off|draft|auto` sets the reply mode per chat: `draft` has the bot write a reply and hold it for approval — the notification comes with Approve/Discard buttons (`/approve`/`/discard <chat id>`, or `/drafts` to list, still work if typed instead), `auto` sends it immediately. `/tdsummary <chat id or name>` (or just ask, e.g. "what's unread in the Alice chat") fetches that chat's actual unread messages fresh from Telegram, has the bot summarize them, and marks them read — matching titles work as well as raw ids, and an ambiguous name lists the candidates instead of guessing
+- LLM Delegation: Warden can hand a task off to another configured AI model — a second Claude persona, ChatGPT, a local model, anything speaking Anthropic's or an OpenAI-compatible API — and use its answer, entirely on the model's own initiative (ask, or just imply it in natural language: "see what ChatGPT thinks", "have GPT draw this"). Set up with `WARDEN_DELEGATES=<name>,<name>,...` plus, per name, `WARDEN_DELEGATE_<NAME>_KIND` (`anthropic` or `openai_compat`, default `openai_compat`), `_BASE_URL`, `_API_KEY`, `_MODEL`, and optionally `_IMAGE_MODEL`/`_DESCRIPTION` — see "LLM delegation" below for the full env var reference. The model may rewrite or expand the prompt it sends for a better result; the delegate never sees the rest of the conversation unless that's included in the prompt. Text tasks go through `ask_delegate` (works with any configured delegate); image generation goes through `delegate_generate_image`, which calls an OpenAI-compatible `/images/generations` endpoint directly and sends the result into the chat as a photo — this is how Warden can have ChatGPT/DALL-E draw something despite having no image-generation model of its own. Delegating a coding/analysis task this way gets you the delegate's *answer* (text, code, a plan) relayed back into chat — it does not give any delegate model actual access to run code or act against a real project; that's a deliberately separate, much bigger feature this doesn't attempt
 
 # Talking to the bot
 Nobody but the owner (and any bot admins — see "Access control" below) can
@@ -429,6 +430,26 @@ export WARDEN_ANTHROPIC_MODEL=claude-sonnet-5
 # export WARDEN_LLM_PROVIDER=openai_compat
 # export WARDEN_OPENAI_BASE_URL=http://llama-server:8090/v1
 # export WARDEN_OPENAI_MODEL=qwen3.5-4b
+
+# LLM delegation (see "LLM Delegation" above) — comma-separated delegate
+# names, then per name WARDEN_DELEGATE_<NAME>_*. Unset means the
+# ask_delegate/delegate_generate_image tools never join the tool list.
+# export WARDEN_DELEGATES=chatgpt
+# export WARDEN_DELEGATE_CHATGPT_KIND=openai_compat
+# export WARDEN_DELEGATE_CHATGPT_BASE_URL=https://api.openai.com/v1
+# export WARDEN_DELEGATE_CHATGPT_API_KEY=<key>
+# export WARDEN_DELEGATE_CHATGPT_MODEL=gpt-5
+# Optional: only set this if the delegate should also be offered for image
+# generation (calls {BASE_URL}/images/generations directly):
+# export WARDEN_DELEGATE_CHATGPT_IMAGE_MODEL=gpt-image-1
+# Optional, shown to the delegating model to help it pick a target:
+# export WARDEN_DELEGATE_CHATGPT_DESCRIPTION=OpenAI's GPT-5 -- strong at code and reasoning, can generate images
+# A second delegate, this time a second Claude persona (KIND defaults to
+# openai_compat, so an anthropic-kind delegate must say so explicitly):
+# export WARDEN_DELEGATES=chatgpt,claude2
+# export WARDEN_DELEGATE_CLAUDE2_KIND=anthropic
+# export WARDEN_DELEGATE_CLAUDE2_API_KEY=<key>
+# export WARDEN_DELEGATE_CLAUDE2_MODEL=claude-opus-5
 
 # Web search — base URL of a SearXNG instance with format=json enabled.
 # Unset disables the web_search tool. (docker compose sets this

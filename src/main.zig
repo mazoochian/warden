@@ -74,6 +74,7 @@ const reply_drafts = @import("features/reply_drafts.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
+const delegates_mod = @import("llm/delegates.zig");
 const qa = @import("features/qa.zig");
 const dynamic_provider_mod = @import("llm/dynamic_provider.zig");
 const toolcall = @import("llm/toolcall.zig");
@@ -125,6 +126,10 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/get_bulletin.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
+// Same "only join the tool list when configured" reasoning as
+// `web_search_tool` above -- see `Config.delegates`'s doc comment.
+const ask_delegate_tool = @import("tools/ask_delegate.zig").tool;
+const delegate_generate_image_tool = @import("tools/delegate_generate_image.zig").tool;
 
 /// Published via `Connector.setCommands` at startup so commands show up in
 /// the platform's own UI (Telegram's "/" autocomplete / attachment menu)
@@ -417,9 +422,39 @@ pub fn main(init: std.process.Init) !void {
     };
     log.notice("log level = {s} (set WARDEN_LOG_LEVEL to change)", .{@tagName(logging.currentLevel())});
 
-    // web_search only joins the tool list when an instance is configured,
-    // so the model never sees a tool that's guaranteed to fail.
-    var tools_buf: [base_tools.len + 1]tool_registry.ToolDef = undefined;
+    // Every configured delegate (see `Config.delegates`) gets its own
+    // always-on `llm.Provider` instance -- heap-allocated, process-lifetime
+    // singletons, same shape as `anthropic_provider`/`openai_provider`
+    // below, but never subject to `WARDEN_LLM_PROVIDER`'s hot-swap: a
+    // delegate is a fixed, explicitly-named target the model asks for by
+    // name, not "whichever provider is currently active".
+    const delegates_buf = try gpa.alloc(delegates_mod.Delegate, config.delegates.len);
+    for (config.delegates, 0..) |dc, i| {
+        const delegate_provider: llm.Provider = switch (dc.kind) {
+            .anthropic => blk: {
+                const p = try gpa.create(AnthropicProvider);
+                p.* = AnthropicProvider.init(gpa, io, dc.api_key, dc.model);
+                break :blk p.provider();
+            },
+            .openai_compat => blk: {
+                const p = try gpa.create(OpenAiCompatProvider);
+                p.* = OpenAiCompatProvider.init(gpa, io, dc.base_url, dc.api_key, dc.model);
+                break :blk p.provider();
+            },
+        };
+        delegates_buf[i] = .{
+            .name = dc.name,
+            .description = dc.description,
+            .provider = delegate_provider,
+            .image = if (dc.image_model) |im| .{ .base_url = dc.base_url, .api_key = dc.api_key, .model = im } else null,
+        };
+    }
+    const active_delegates: []const delegates_mod.Delegate = delegates_buf;
+
+    // web_search/ask_delegate/delegate_generate_image only join the tool
+    // list when their backend is actually configured, so the model never
+    // sees a tool that's guaranteed to fail.
+    var tools_buf: [base_tools.len + 3]tool_registry.ToolDef = undefined;
     @memcpy(tools_buf[0..base_tools.len], &base_tools);
     var tools_len: usize = base_tools.len;
     if (config.searxng_url != null) {
@@ -427,6 +462,20 @@ pub fn main(init: std.process.Init) !void {
         tools_len += 1;
     } else {
         log.info("web search disabled (set WARDEN_SEARXNG_URL to enable)", .{});
+    }
+    if (active_delegates.len > 0) {
+        tools_buf[tools_len] = ask_delegate_tool;
+        tools_len += 1;
+        var any_image_capable = false;
+        for (active_delegates) |d| {
+            if (d.image != null) any_image_capable = true;
+        }
+        if (any_image_capable) {
+            tools_buf[tools_len] = delegate_generate_image_tool;
+            tools_len += 1;
+        }
+    } else {
+        log.info("LLM delegation disabled (set WARDEN_DELEGATES to enable)", .{});
     }
     const active_tools = tools_buf[0..tools_len];
 
@@ -723,6 +772,7 @@ pub fn main(init: std.process.Init) !void {
             llm_provider,
             embeddings_client,
             active_tools,
+            active_delegates,
             &pending_confirmations,
             &pending_undos,
             &digest_scheduler,
@@ -1021,6 +1071,7 @@ fn connectorPollLoop(
     llm_provider: llm.Provider,
     embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
+    delegates: []const delegates_mod.Delegate,
     pending: *group_admin.PendingConfirmations,
     pending_undos: *audit_notify.PendingUndos,
     digest_scheduler: *scheduler.DigestScheduler,
@@ -1110,6 +1161,7 @@ fn connectorPollLoop(
                 .llm_provider = llm_provider,
                 .embeddings_client = embeddings_client,
                 .tools = tools,
+                .delegates = delegates,
                 .pending = pending,
                 .pending_undos = pending_undos,
                 .digest_scheduler = digest_scheduler,
@@ -1200,6 +1252,7 @@ const MessageTask = struct {
     llm_provider: llm.Provider,
     embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
+    delegates: []const delegates_mod.Delegate,
     pending: *group_admin.PendingConfirmations,
     pending_undos: *audit_notify.PendingUndos,
     digest_scheduler: *scheduler.DigestScheduler,
@@ -1226,6 +1279,7 @@ const MessageTask = struct {
             self.llm_provider,
             self.embeddings_client,
             self.tools,
+            self.delegates,
             self.pending,
             self.pending_undos,
             self.digest_scheduler,
@@ -1258,6 +1312,7 @@ fn processMessageTask(
     llm_provider: llm.Provider,
     embeddings_client: ?*embeddings.EmbeddingsClient,
     tools: []const tool_registry.ToolDef,
+    delegates: []const delegates_mod.Delegate,
     pending: *group_admin.PendingConfirmations,
     pending_undos: *audit_notify.PendingUndos,
     digest_scheduler: *scheduler.DigestScheduler,
@@ -1492,6 +1547,7 @@ fn processMessageTask(
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
+        .delegates = delegates,
     };
     const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, in_flight_requests, io, ts, max_message_len, msg, false, telegram_user, pending_drafts, owner_notify);
     if (claimed) attachment_cleanup_path = null;

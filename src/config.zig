@@ -72,6 +72,39 @@ pub const LlmConfig = union(LlmProviderKind) {
     openai_compat: OpenAiCompatConfig,
 };
 
+pub const DelegateKind = enum { anthropic, openai_compat };
+
+/// One "ask another model" target the `ask_delegate`/`delegate_generate_image`
+/// tools (see `tools/ask_delegate.zig`, `tools/delegate_generate_image.zig`)
+/// can send a task to on the delegating model's own initiative — see
+/// `loadDelegateConfigs`'s doc comment for the env var shape that produces
+/// these. Plain data, same "config struct in, real provider built in
+/// main.zig" split as `AnthropicConfig`/`OpenAiCompatConfig` above.
+pub const DelegateConfig = struct {
+    /// Case-insensitively matched against the tool call's `delegate`
+    /// argument — also what the model sees as the tool's target name, so
+    /// keep it short and recognizable ("chatgpt", "local").
+    name: []const u8,
+    kind: DelegateKind,
+    /// Required for `openai_compat`; unused for `anthropic` (which always
+    /// talks to Anthropic's own API, same as `AnthropicConfig`).
+    base_url: []const u8 = "",
+    /// Empty means no Authorization header is sent, same convention as
+    /// `OpenAiCompatConfig.api_key`.
+    api_key: []const u8 = "",
+    model: []const u8,
+    /// Set only when this delegate should also be offered for
+    /// `delegate_generate_image` — the image-generation model name to
+    /// request against `{base_url}/images/generations`. Always null for an
+    /// `anthropic`-kind delegate: neither Claude model family exposes an
+    /// image-generation endpoint.
+    image_model: ?[]const u8 = null,
+    /// Shown to the delegating model alongside `name` so it can pick the
+    /// right target for a given task, e.g. "OpenAI's GPT-4o — strong at
+    /// code and general reasoning."
+    description: []const u8 = "",
+};
+
 /// Runtime configuration, loaded from environment variables.
 ///
 /// Kept deliberately simple (env vars, not a config file) since the bot
@@ -124,6 +157,14 @@ pub const Config = struct {
     /// nothing to swap *to*.
     llm_anthropic: ?AnthropicConfig = null,
     llm_openai_compat: ?OpenAiCompatConfig = null,
+    /// Every configured "ask another model" target — see
+    /// `loadDelegateConfigs`'s doc comment for the `WARDEN_DELEGATES`/
+    /// `WARDEN_DELEGATE_<NAME>_*` env vars that populate this. Empty (the
+    /// default) means the `ask_delegate`/`delegate_generate_image` tools
+    /// never join the active tool list at all — see `main.zig`'s tool-list
+    /// construction, same "tool only joins when its backend is configured"
+    /// convention as `web_search`/`WARDEN_SEARXNG_URL`.
+    delegates: []const DelegateConfig = &.{},
     /// How long a ban/kick confirmation stays valid before expiring.
     confirm_timeout_seconds: i64,
     /// How long a pending interactive /convert flow (waiting for a file
@@ -392,6 +433,7 @@ pub const Config = struct {
             default_retention_messages;
 
         const llm_loaded = try loadLlmConfig(env);
+        const delegates = try loadDelegateConfigs(env, arena);
 
         const confirm_timeout_seconds: i64 = if (env.get("WARDEN_CONFIRM_TIMEOUT_SECONDS")) |raw|
             std.fmt.parseInt(i64, raw, 10) catch default_confirm_timeout_seconds
@@ -526,6 +568,7 @@ pub const Config = struct {
             .llm = llm_loaded.active,
             .llm_anthropic = llm_loaded.anthropic,
             .llm_openai_compat = llm_loaded.openai_compat,
+            .delegates = delegates,
             .confirm_timeout_seconds = confirm_timeout_seconds,
             .convert_timeout_seconds = convert_timeout_seconds,
             .menu_timeout_seconds = menu_timeout_seconds,
@@ -694,6 +737,79 @@ pub const Config = struct {
             return null;
         };
         return .{ .api_id = api_id, .api_hash = hash, .session_dir = dir };
+    }
+
+    /// Longest delegate `name` accepted — well past anything a real config
+    /// would use, just a sane bound on the stack buffer `loadDelegateConfigs`
+    /// upper-cases each name into to build its env var keys.
+    const max_delegate_name_len = 32;
+
+    /// Loads every delegate named in `WARDEN_DELEGATES` (a comma-separated
+    /// list, e.g. `WARDEN_DELEGATES=chatgpt,local`) from its own
+    /// `WARDEN_DELEGATE_<NAME>_*` env vars — `<NAME>` is `name` upper-cased
+    /// verbatim, so a delegate named `chatgpt` reads
+    /// `WARDEN_DELEGATE_CHATGPT_KIND`/`_BASE_URL`/`_API_KEY`/`_MODEL`/
+    /// `_IMAGE_MODEL`/`_DESCRIPTION`. `_KIND` defaults to `openai_compat`
+    /// (the common case: pointing at OpenAI itself, or any other
+    /// OpenAI-compatible API) — set it to `anthropic` for a second/different
+    /// Claude model or persona. A delegate missing a required var for its
+    /// kind is skipped (logged), same half-configured-stays-disabled
+    /// convention as `loadMatrixConfig`/`loadXmppConfig` — one bad entry
+    /// never fails the whole process. See `DelegateConfig`'s doc comment for
+    /// what each field ends up meaning, and `main.zig` for where these turn
+    /// into real `llm.Provider`s.
+    fn loadDelegateConfigs(env: *const std.process.Environ.Map, arena: std.mem.Allocator) ![]const DelegateConfig {
+        const raw = env.get("WARDEN_DELEGATES") orelse return &.{};
+
+        var list: std.ArrayList(DelegateConfig) = .empty;
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |name_raw| {
+            const name = std.mem.trim(u8, name_raw, " \t");
+            if (name.len == 0) continue;
+            if (name.len > max_delegate_name_len) {
+                std.log.err("WARDEN_DELEGATES: delegate name '{s}' is longer than {d} bytes, skipping", .{ name, max_delegate_name_len });
+                continue;
+            }
+
+            var upper_buf: [max_delegate_name_len]u8 = undefined;
+            for (name, 0..) |c, i| upper_buf[i] = std.ascii.toUpper(c);
+            const upper = upper_buf[0..name.len];
+
+            const kind_raw = env.get(try std.fmt.allocPrint(arena, "WARDEN_DELEGATE_{s}_KIND", .{upper})) orelse "openai_compat";
+            const kind: DelegateKind = if (std.mem.eql(u8, kind_raw, "anthropic")) .anthropic else .openai_compat;
+
+            const model = nonEmpty(env.get(try std.fmt.allocPrint(arena, "WARDEN_DELEGATE_{s}_MODEL", .{upper}))) orelse {
+                std.log.err("WARDEN_DELEGATE_{s}_MODEL isn't set — delegate '{s}' stays disabled", .{ upper, name });
+                continue;
+            };
+            const api_key = env.get(try std.fmt.allocPrint(arena, "WARDEN_DELEGATE_{s}_API_KEY", .{upper})) orelse "";
+
+            const base_url_raw = env.get(try std.fmt.allocPrint(arena, "WARDEN_DELEGATE_{s}_BASE_URL", .{upper})) orelse "";
+            const base_url = std.mem.trimEnd(u8, base_url_raw, "/");
+            if (kind == .openai_compat and base_url.len == 0) {
+                std.log.err("WARDEN_DELEGATE_{s}_BASE_URL isn't set — delegate '{s}' stays disabled", .{ upper, name });
+                continue;
+            }
+
+            const image_model_raw = nonEmpty(env.get(try std.fmt.allocPrint(arena, "WARDEN_DELEGATE_{s}_IMAGE_MODEL", .{upper})));
+            if (image_model_raw != null and kind == .anthropic) {
+                std.log.warn("WARDEN_DELEGATE_{s}_IMAGE_MODEL is set but the delegate's kind is anthropic — Claude has no image-generation endpoint, ignoring it", .{upper});
+            }
+            const image_model = if (kind == .openai_compat) image_model_raw else null;
+
+            const description = env.get(try std.fmt.allocPrint(arena, "WARDEN_DELEGATE_{s}_DESCRIPTION", .{upper})) orelse "";
+
+            try list.append(arena, .{
+                .name = name,
+                .kind = kind,
+                .base_url = base_url,
+                .api_key = api_key,
+                .model = model,
+                .image_model = image_model,
+                .description = description,
+            });
+        }
+        return list.toOwnedSlice(arena);
     }
 
     const LoadedLlmConfig = struct {
