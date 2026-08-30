@@ -148,6 +148,49 @@ even though only the most recent `max_fetch` were ever shown to the owner;
 that plainly rather than let it pass as a silent, unrecoverable read-marks-
 unshown-messages bug. `zig build` + `zig build test` green.
 
+**Also unplanned, shipped outside the phase sequence** (direct user
+request, 2026-08-30): LLM delegation — `ask_delegate` and
+`delegate_generate_image`, letting Warden's own model hand a task to
+another configured AI model (ChatGPT, a second Claude persona, a local
+model, anything speaking Anthropic's or an OpenAI-compatible API) entirely
+on its own initiative, the same way it already picks any other tool.
+`config.zig`'s new `Config.delegates` (`WARDEN_DELEGATES` plus per-name
+`WARDEN_DELEGATE_<NAME>_KIND`/`_BASE_URL`/`_API_KEY`/`_MODEL`/
+`_IMAGE_MODEL`/`_DESCRIPTION`) reuses the existing `AnthropicProvider`/
+`OpenAiCompatProvider` adapters rather than inventing a third — a delegate
+is just a named, always-on `llm.Provider` instance (`llm/delegates.zig`'s
+`Delegate`), built once at startup the same "heap-allocated, process-
+lifetime singleton" way as the main provider pair, but never subject to
+`WARDEN_LLM_PROVIDER`'s hot-swap. `ask_delegate` is a plain one-turn
+`Provider.chat` call, text in, text out — the delegating model may rewrite
+or expand the prompt for a better result, and the delegate never sees the
+rest of the conversation unless that's included in the prompt itself.
+`delegate_generate_image` is a separate tool since image generation is a
+different endpoint shape entirely (`{base_url}/images/generations`, not
+`chat/completions`) — it hits that endpoint directly, decodes whichever of
+`b64_json`/`url` the backend returned, and sends the image into the chat
+via `connector.sendPhoto`, same pattern `qr_code.zig`/`draw_diagram.zig`
+already use. Both tools only join the active tool list when at least one
+delegate (respectively: at least one image-capable delegate) is actually
+configured, same "never offer a tool guaranteed to fail" convention as
+`web_search`/`WARDEN_SEARXNG_URL`.
+
+**Deliberately out of scope**: actually letting a delegate model *act*
+against a real project (run code, push commits, touch files) — the request
+that prompted this was framed as "have Claude run an action against one of
+my projects," but that needs credentials, execution sandboxing, and human
+approval gates far beyond a chat tool call, and deserves its own dedicated
+design rather than being bolted onto this. What's implemented instead is
+delegated text/code generation: Warden asks a delegate for analysis, code,
+or a plan, and relays the answer back into chat.
+
+Not locally build-verified in this session — no `zig` toolchain was
+reachable from the sandbox this ran in (network policy blocked
+`ziglang.org`), so this is untested beyond careful manual review against
+the codebase's existing patterns. CI (`.github/workflows/ci.yml`) builds
+and runs `zig build test` on push; treat this phase as unverified until
+that's green.
+
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
 
