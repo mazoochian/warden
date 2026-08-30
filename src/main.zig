@@ -80,6 +80,7 @@ const toolcall = @import("llm/toolcall.zig");
 const tool_registry = @import("tools/registry.zig");
 const group_admin = @import("features/group_admin.zig");
 const audit_notify = @import("features/audit_notify.zig");
+const cancel_request = @import("features/cancel_request.zig");
 const wordcloud = @import("features/wordcloud.zig");
 const digest = @import("features/digest.zig");
 const chat_summary = @import("features/chat_summary.zig");
@@ -536,6 +537,12 @@ pub fn main(init: std.process.Init) !void {
     var menu_sessions = menu.Sessions.init(gpa, io, config.menu_timeout_seconds);
     defer menu_sessions.deinit();
 
+    // 10 minutes: a purely defensive backstop (normal flow always
+    // unregisters itself via `replyWithAnswer`'s own cleanup, well before
+    // this) — see `cancel_request.InFlightRequests`'s doc comment.
+    var in_flight_requests = cancel_request.InFlightRequests.init(gpa, io, 600);
+    defer in_flight_requests.deinit();
+
     // Phase D of the plan sent to the owner: `reply_autonomy = .draft`
     // drafts a reply through the personal-account connector but holds it
     // here instead of sending it, until `/approve`/`/discard` (see
@@ -722,6 +729,7 @@ pub fn main(init: std.process.Init) !void {
             &briefing_scheduler,
             &pending_conversions,
             &menu_sessions,
+            &in_flight_requests,
             io,
             gpa,
             max_message_len,
@@ -808,6 +816,7 @@ pub fn main(init: std.process.Init) !void {
         }
         pending_conversions.sweepExpired(gpa, now);
         menu_sessions.sweepExpired(connectors, now);
+        in_flight_requests.sweepExpired(now);
         checkAndPurgeLeftChats(&pool, now);
         heartbeat.stampScheduler(now);
         heartbeat.writeToFile(io, gpa, config.tmp_dir);
@@ -1018,6 +1027,7 @@ fn connectorPollLoop(
     briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     menu_sessions: *menu.Sessions,
+    in_flight_requests: *cancel_request.InFlightRequests,
     io: Io,
     gpa: std.mem.Allocator,
     max_message_len: usize,
@@ -1106,6 +1116,7 @@ fn connectorPollLoop(
                 .briefing_scheduler = briefing_scheduler,
                 .pending_conversions = pending_conversions,
                 .menu_sessions = menu_sessions,
+                .in_flight_requests = in_flight_requests,
                 .io = io,
                 .gpa = gpa,
                 .ts = ts,
@@ -1195,6 +1206,7 @@ const MessageTask = struct {
     briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     menu_sessions: *menu.Sessions,
+    in_flight_requests: *cancel_request.InFlightRequests,
     io: Io,
     gpa: std.mem.Allocator,
     ts: i64,
@@ -1220,6 +1232,7 @@ const MessageTask = struct {
             self.briefing_scheduler,
             self.pending_conversions,
             self.menu_sessions,
+            self.in_flight_requests,
             self.io,
             self.gpa,
             self.ts,
@@ -1251,6 +1264,7 @@ fn processMessageTask(
     briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     menu_sessions: *menu.Sessions,
+    in_flight_requests: *cancel_request.InFlightRequests,
     io: Io,
     gpa: std.mem.Allocator,
     ts: i64,
@@ -1479,7 +1493,7 @@ fn processMessageTask(
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, io, ts, max_message_len, msg, false, telegram_user, pending_drafts, owner_notify);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, in_flight_requests, io, ts, max_message_len, msg, false, telegram_user, pending_drafts, owner_notify);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -2060,6 +2074,7 @@ fn handleModeCommand(
     is_bot_admin: bool,
     msg: iface.Message,
     question: []const u8,
+    in_flight: *cancel_request.InFlightRequests,
 ) void {
     const dyn = resolveLlmDynamicSettings(pool, a, config);
     const is_privileged = is_owner or is_bot_admin;
@@ -2085,7 +2100,7 @@ fn handleModeCommand(
         .native_id = msg.user_id,
     };
     const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages);
+    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, in_flight);
 }
 
 test "splitModeArgs splits a leading modifier token from the rest, falling back to reply_to_text" {
@@ -2203,6 +2218,7 @@ fn handleMessage(
     briefing_scheduler: *scheduler.BriefingScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     menu_sessions: *menu.Sessions,
+    in_flight: *cancel_request.InFlightRequests,
     io: Io,
     now: i64,
     max_message_len: usize,
@@ -2270,6 +2286,12 @@ fn handleMessage(
         // for anything that isn't its own button, so a stray pick still
         // falls through to convert_flow/menu normally.
         if (audit_notify.handleUndoPicked(connector, a, pool, pending_undos, now, msg, picked)) {
+            return false;
+        }
+        // Same "checked on its own first, false for anything not its own"
+        // shape again — the "🛑 Cancel" button `replyWithAnswer` attaches
+        // to the thinking placeholder (see `features/cancel_request.zig`).
+        if (cancel_request.handleCancelPicked(connector, a, in_flight, now, msg, picked)) {
             return false;
         }
         // Same "checked on its own first, false for anything not its own"
@@ -2430,6 +2452,7 @@ fn handleMessage(
                 briefing_scheduler,
                 pending_conversions,
                 menu_sessions,
+                in_flight,
                 io,
                 now,
                 max_message_len,
@@ -2645,6 +2668,7 @@ fn handleMessage(
             briefing_scheduler,
             pending_conversions,
             menu_sessions,
+            in_flight,
             io,
             now,
             max_message_len,
@@ -2745,7 +2769,7 @@ fn handleMessage(
         handleAliasCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/template") or std.mem.startsWith(u8, text, "/template ")) {
         if (!feature_flags.isEnabled(pool, "power_tools")) return false;
-        handleTemplateCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, text);
+        handleTemplateCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, text, in_flight);
     } else if (std.mem.eql(u8, text, "/joke") or std.mem.startsWith(u8, text, "/joke ")) {
         if (!feature_flags.isEnabled(pool, "power_tools")) return false;
         const topic = std.mem.trim(u8, text["/joke".len..], " ");
@@ -2753,7 +2777,7 @@ fn handleMessage(
             std.fmt.allocPrint(a, "Tell a short, genuinely funny joke about {s}. Just the joke, no setup commentary.", .{topic}) catch return false
         else
             "Tell a short, genuinely funny joke. Just the joke, no setup commentary.";
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/riddle") or std.mem.startsWith(u8, text, "/riddle ")) {
         if (!feature_flags.isEnabled(pool, "power_tools")) return false;
         const topic = std.mem.trim(u8, text["/riddle".len..], " ");
@@ -2761,7 +2785,7 @@ fn handleMessage(
             std.fmt.allocPrint(a, "Give me a clever riddle about {s} and its answer, but put the answer on its own new line after \"Answer:\" so it isn't spoiled immediately.", .{topic}) catch return false
         else
             "Give me a clever riddle and its answer, but put the answer on its own new line after \"Answer:\" so it isn't spoiled immediately.";
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/trivia") or std.mem.startsWith(u8, text, "/trivia ")) {
         if (!feature_flags.isEnabled(pool, "power_tools")) return false;
         const topic = std.mem.trim(u8, text["/trivia".len..], " ");
@@ -2769,11 +2793,11 @@ fn handleMessage(
             std.fmt.allocPrint(a, "Give me one genuinely interesting trivia fact about {s}, in 1-2 sentences.", .{topic}) catch return false
         else
             "Give me one genuinely interesting trivia fact, in 1-2 sentences.";
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/wordoftheday")) {
         if (!feature_flags.isEnabled(pool, "power_tools")) return false;
         const question = "Give me an interesting, moderately advanced English word of the day: the word, a short definition, and one example sentence using it.";
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/motivate") or std.mem.startsWith(u8, text, "/motivate ")) {
         if (!feature_flags.isEnabled(pool, "power_tools")) return false;
         const context = modeArgOrReplyText(text["/motivate".len..], msg.reply_to_text);
@@ -2781,7 +2805,7 @@ fn handleMessage(
             std.fmt.allocPrint(a, "Give me a short, genuine, non-cheesy motivational message. Tailor it to this: {s}", .{c}) catch return false
         else
             "Give me a short, genuine, non-cheesy motivational message.";
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/memory") or std.mem.startsWith(u8, text, "/memory ")) {
         if (!feature_flags.isEnabled(pool, "memory")) return false;
         handleMemoryCommand(connector, a, pool, identity_id, msg, text);
@@ -2821,7 +2845,7 @@ fn handleMessage(
             return false;
         };
         const question = std.fmt.allocPrint(a, "Translate the following into {s}. Reply with only the translation, no commentary or notes:\n\n{s}", .{ split.modifier, split.text }) catch return false;
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/rewrite") or std.mem.startsWith(u8, text, "/rewrite ")) {
         if (!feature_flags.isEnabled(pool, "messaging_modes")) return false;
         const split = splitModeArgs(text["/rewrite".len..], msg.reply_to_text) orelse {
@@ -2829,7 +2853,7 @@ fn handleMessage(
             return false;
         };
         const question = std.fmt.allocPrint(a, "Rewrite the following in a {s} tone. Reply with only the rewritten text, no commentary or notes:\n\n{s}", .{ split.modifier, split.text }) catch return false;
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/eli5") or std.mem.startsWith(u8, text, "/eli5 ")) {
         if (!feature_flags.isEnabled(pool, "messaging_modes")) return false;
         const source = modeArgOrReplyText(text["/eli5".len..], msg.reply_to_text) orelse {
@@ -2837,7 +2861,7 @@ fn handleMessage(
             return false;
         };
         const question = std.fmt.allocPrint(a, "Explain the following like I'm five years old -- simple everyday language, short sentences, no jargon:\n\n{s}", .{source}) catch return false;
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/brainstorm") or std.mem.startsWith(u8, text, "/brainstorm ")) {
         if (!feature_flags.isEnabled(pool, "messaging_modes")) return false;
         const source = modeArgOrReplyText(text["/brainstorm".len..], msg.reply_to_text) orelse {
@@ -2845,7 +2869,7 @@ fn handleMessage(
             return false;
         };
         const question = std.fmt.allocPrint(a, "Brainstorm this: give a short list of concrete ideas or options. If it reads like a decision between choices, briefly weigh the trade-offs too:\n\n{s}", .{source}) catch return false;
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/poll") or std.mem.startsWith(u8, text, "/poll ")) {
         // ROADMAP.md's Phase 16: group/Telegram quality-of-life. No LLM call
         // involved (plain string splitting + a native API call), so unlike
@@ -2943,7 +2967,7 @@ fn handleMessage(
             .native_id = msg.user_id,
         };
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages);
+        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, in_flight);
     }
     return false;
 }
@@ -4004,6 +4028,7 @@ fn handleTemplateCommand(
     is_bot_admin: bool,
     msg: iface.Message,
     text: []const u8,
+    in_flight: *cancel_request.InFlightRequests,
 ) void {
     const usage = "Usage: /template save <name> <text>, /template list, /template use <name> [extra text], or /template delete <name>";
     const arg = std.mem.trim(u8, text["/template".len..], " ");
@@ -4068,7 +4093,7 @@ fn handleTemplateCommand(
             std.fmt.allocPrint(a, "{s}\n\n{s}", .{ template.text, extra }) catch return
         else
             template.text;
-        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question);
+        handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
         return;
     }
 
@@ -9191,6 +9216,12 @@ fn checkAndPurgeLeftChats(pool: *store_pool.PgPool, now: i64) void {
 /// no edit is sent at all until real progress (a tool call) has something
 /// new to show.
 const thinking_text = "🤔 Thinking...";
+/// Shown by `tickerLoop` once `TickerState.cancelled` flips, overriding
+/// whatever status was showing — the immediate feedback for a "🛑 Cancel"
+/// press, ahead of `toolcall.run` actually noticing at its next
+/// loop-iteration boundary (see `toolcall.Progress.cancelled`'s doc
+/// comment for why that can lag this).
+const cancelling_text = "🛑 Cancelling...";
 /// Telegram's edits are throttled to roughly 1/sec per chat in practice;
 /// this keeps a comfortable margin under that.
 const ticker_interval_ms: i64 = 1200;
@@ -9222,16 +9253,33 @@ const TickerState = struct {
     /// since the ticker may be wedged inside an in-flight edit call for up
     /// to its own 45s internal timeout.
     done: std.atomic.Value(bool) = .init(false),
+    /// Flipped by a "🛑 Cancel" button press, routed through
+    /// `features/cancel_request.zig`'s `InFlightRequests` from whichever
+    /// `WorkerPool` worker is handling that press — a different one than
+    /// whatever's running this request. `replyWithAnswer` points
+    /// `toolcall.Progress.cancelled` straight at this field, so `toolcall.run`
+    /// sees it too (see that field's own doc comment on when it actually
+    /// takes effect); `tickerLoop` also watches it directly for the instant
+    /// "🛑 Cancelling..." feedback.
+    cancelled: std.atomic.Value(bool) = .init(false),
     /// This platform's hard cap on a single message's text (see
-    /// `effectiveMaxMessageLength`) — a streamed `.text` status is
-    /// truncated to this before being shown, since unlike the *final*
+    /// `effectiveMaxMessageLength`) — the rendered tree (see `renderTree`)
+    /// is truncated to this before being shown, since unlike the *final*
     /// answer (routed to a file when too long via `sendTextOrFile`) the
     /// growing interim preview has no such fallback and would otherwise
-    /// eventually 400 out of `editMessage` on a long answer.
+    /// eventually 400 out of `editMessage` on a long-running request.
     max_len: usize,
     mutex: Io.Mutex = .init,
-    /// null = show the generic thinking animation; set = show this until
-    /// the model moves past the tool call that set it.
+    /// Tool names reported via `.tool_use` so far this request, oldest
+    /// first — rendered as tree-branch child lines under `thinking_text` by
+    /// `renderTree`. Only ever touched from `onProgressEvent`, which (like
+    /// this whole struct's `allocator`) runs exclusively on the main
+    /// per-message task, never the ticker thread — see this struct's own
+    /// doc comment — so it needs no mutex of its own.
+    tool_history: std.ArrayList([]const u8) = .empty,
+    /// null = show the generic thinking animation; set = show this (already
+    /// including the tree so far — see `renderTree`) until the model moves
+    /// past whatever produced it.
     status: ?[]const u8 = null,
 
     fn setStatus(self: *TickerState, text: ?[]const u8) void {
@@ -9245,19 +9293,56 @@ const TickerState = struct {
         defer self.mutex.unlock(self.io);
         return self.status;
     }
+
+    /// Builds `thinking_text` followed by one tree-branch child line per
+    /// entry in `tool_history` so far ("├── 🔧 Using x..."/"└── 🔧 Using
+    /// y..."), plus `trailing` (a streaming answer preview) as one final
+    /// child line when given. Called from `onProgressEvent` — main task
+    /// thread only, same as `tool_history` itself (see its doc comment).
+    /// Truncated to `max_len` as a whole, not just `trailing` on its own
+    /// (unlike before this tree existed): the accumulated history now
+    /// counts against the same platform message-size budget. Falls back to
+    /// the bare header on allocation failure — losing the tree for one tick
+    /// is better than failing the whole progress report over it.
+    fn renderTree(self: *TickerState, trailing: ?[]const u8) []const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        buf.appendSlice(self.allocator, thinking_text) catch return thinking_text;
+        const child_count = self.tool_history.items.len + @as(usize, if (trailing != null) 1 else 0);
+        var shown: usize = 0;
+        for (self.tool_history.items) |name| {
+            shown += 1;
+            const branch: []const u8 = if (shown == child_count) "\n└── " else "\n├── ";
+            buf.appendSlice(self.allocator, branch) catch return thinking_text;
+            buf.appendSlice(self.allocator, "🔧 Using ") catch return thinking_text;
+            buf.appendSlice(self.allocator, name) catch return thinking_text;
+            buf.appendSlice(self.allocator, "...") catch return thinking_text;
+        }
+        if (trailing) |t| {
+            buf.appendSlice(self.allocator, "\n└── ") catch return thinking_text;
+            buf.appendSlice(self.allocator, t) catch return thinking_text;
+        }
+        const rendered = buf.toOwnedSlice(self.allocator) catch return thinking_text;
+        return truncateUtf8(rendered, self.max_len);
+    }
 };
 
 fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
     const state: *TickerState = @ptrCast(@alignCast(ptr));
     switch (event) {
-        .thinking => state.setStatus(null),
+        .thinking => {
+            // Fires on every turn, including right after a tool call whose
+            // child line is already reflected in `status` (set below, by
+            // that same `.tool_use` event) — only reset to the bare header
+            // when there's no tree yet to preserve (the very first turn).
+            if (state.tool_history.items.len == 0) state.setStatus(null);
+        },
         .tool_use => |name| {
-            const text = std.fmt.allocPrint(state.allocator, "🔧 using {s}…", .{name}) catch return;
-            state.setStatus(text);
+            state.tool_history.append(state.allocator, name) catch return;
+            state.setStatus(state.renderTree(null));
         },
         .text => |text_so_far| {
             if (text_so_far.len == 0) return; // nothing to show yet, keep the thinking animation
-            state.setStatus(truncateUtf8(text_so_far, state.max_len));
+            state.setStatus(state.renderTree(text_so_far));
         },
     }
 }
@@ -9341,8 +9426,7 @@ fn tickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []con
         Io.sleep(state.io, .fromMilliseconds(ticker_interval_ms), .awake) catch return;
         if (state.stop.load(.acquire)) return;
 
-        const status = state.getStatus();
-        const text = status orelse thinking_text;
+        const text = if (state.cancelled.load(.acquire)) cancelling_text else (state.getStatus() orelse thinking_text);
 
         if (!std.mem.eql(u8, text, last_sent)) {
             connector.editMessage(std.heap.page_allocator, chat_id, message_id, text) catch |err| {
@@ -9471,6 +9555,75 @@ test "filterEnabledTools drops only tools whose module is explicitly disabled" {
     try std.testing.expectEqualStrings("air_quality", filtered[1].name);
 }
 
+/// The "🛑 Cancel" button attached to the thinking/tool-use placeholder —
+/// a single fixed choice (nothing to pick between, just one action), same
+/// shape `audit_notify`'s "Undo" button uses for its own single-choice
+/// prompt. See `features/cancel_request.zig`'s module doc comment for the
+/// register/press/cancel flow a pick of this feeds into.
+const cancel_choices = [_]iface.Choice{.{ .emoji = "🛑", .label = "Cancel", .value = cancel_request.cancel_choice_value }};
+
+/// Sends (or morphs `existing_placeholder_id` into) the thinking
+/// placeholder, attaching the Cancel button when — and only when — this
+/// connector actually implements the relevant vtable method itself.
+/// Deliberately checks `connector.vtable.*` directly rather than going
+/// through the `sendChoicePrompt`/`editChoicePrompt` wrapper methods'
+/// unconditional fallbacks (a plain-text listing send, `error.Unsupported`)
+/// — neither is the right degrade here. A platform with no button support
+/// should behave exactly like it did before this feature existed: a plain
+/// `sendMessageReturningId`/`editMessage`, or, if even that's unsupported,
+/// no placeholder at all (see `sendMessageReturningId`'s own doc comment).
+fn sendOrMorphPlaceholder(connector: iface.Connector, a: std.mem.Allocator, native_chat_id: []const u8, reply_to: ?[]const u8, existing_placeholder_id: ?[]const u8) ?[]const u8 {
+    if (existing_placeholder_id) |pid| {
+        if (connector.vtable.editChoicePrompt != null) {
+            if (connector.editChoicePrompt(a, native_chat_id, pid, thinking_text, &cancel_choices)) |_| {
+                return pid;
+            } else |err| {
+                log.warn("qa: couldn't morph the transcription placeholder with a Cancel button for chat {s}: {t}", .{ native_chat_id, err });
+            }
+        }
+        connector.editMessage(a, native_chat_id, pid, thinking_text) catch |err| {
+            log.warn("qa: couldn't morph the transcription placeholder for chat {s}: {t}", .{ native_chat_id, err });
+        };
+        return pid;
+    }
+
+    if (connector.vtable.sendChoicePrompt != null) {
+        if (connector.sendChoicePrompt(a, native_chat_id, thinking_text, &cancel_choices, reply_to) catch |err| blk: {
+            log.warn("qa: couldn't send a placeholder with a Cancel button for chat {s}: {t}", .{ native_chat_id, err });
+            break :blk null;
+        }) |id| return id;
+    }
+    return connector.sendMessageReturningId(a, native_chat_id, thinking_text, reply_to) catch |err| blk: {
+        log.warn("qa: couldn't send a placeholder for chat {s}, falling back to a plain reply: {t}", .{ native_chat_id, err });
+        break :blk null;
+    };
+}
+
+/// Replaces the placeholder's text and drops its Cancel button (a no-op
+/// button from here on — the request it controlled is already resolved),
+/// falling back the same way `sendOrMorphPlaceholder` does when this
+/// connector can't edit the keyboard, can't edit at all, or there's no
+/// placeholder to begin with.
+fn finalizePlaceholder(connector: iface.Connector, a: std.mem.Allocator, native_chat_id: []const u8, placeholder_id: ?[]const u8, reply_to: ?[]const u8, text: []const u8) void {
+    const pid = placeholder_id orelse {
+        connector.sendMessage(a, native_chat_id, text, reply_to);
+        return;
+    };
+    if (connector.vtable.editChoicePrompt != null) {
+        if (connector.editChoicePrompt(a, native_chat_id, pid, text, &.{})) |_| {
+            return;
+        } else |_| {
+            // Fall through to the plain edit below — same "log once,
+            // degrade" shape as everywhere else in this file that tries a
+            // richer send/edit first.
+        }
+    }
+    connector.editMessage(a, native_chat_id, pid, text) catch |err| {
+        log.warn("qa: couldn't finalize placeholder for chat {s}: {t}", .{ native_chat_id, err });
+        connector.sendMessage(a, native_chat_id, text, reply_to);
+    };
+}
+
 fn replyWithAnswer(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -9498,22 +9651,17 @@ fn replyWithAnswer(
     documents_enabled: bool,
     max_tokens_override: ?u32,
     history_window: i64,
+    in_flight: *cancel_request.InFlightRequests,
 ) void {
     // The placeholder + ticker only work when the platform supports
     // editing (Telegram does); anything that doesn't falls back to
     // exactly the old behavior — one blocking call, one send at the end.
     // `existing_placeholder_id` (from `resolveQuestion`'s "🎙️
     // Transcribing…" placeholder) is reused and morphed rather than
-    // sending a second message right after it.
-    const placeholder_id = if (existing_placeholder_id) |pid| blk: {
-        connector.editMessage(a, native_chat_id, pid, thinking_text) catch |err| {
-            log.warn("qa: couldn't morph the transcription placeholder for chat {s}: {t}", .{ native_chat_id, err });
-        };
-        break :blk pid;
-    } else connector.sendMessageReturningId(a, native_chat_id, thinking_text, reply_to) catch |err| blk: {
-        log.warn("qa: couldn't send a placeholder for chat {s}, falling back to a plain reply: {t}", .{ native_chat_id, err });
-        break :blk null;
-    };
+    // sending a second message right after it. See
+    // `sendOrMorphPlaceholder`'s own doc comment for the Cancel-button
+    // half of this.
+    const placeholder_id = sendOrMorphPlaceholder(connector, a, native_chat_id, reply_to, existing_placeholder_id);
     log.info("qa: placeholder for chat {s} = {?s}", .{ native_chat_id, placeholder_id });
 
     // Heap-allocated on `page_allocator`, not stack-local: `tickerLoop` runs
@@ -9534,13 +9682,25 @@ fn replyWithAnswer(
     var ticker_thread: ?std.Thread = null;
     if (placeholder_id) |pid| {
         if (state) |s| {
-            progress = .{ .ptr = s, .onEvent = onProgressEvent };
+            progress = .{ .ptr = s, .onEvent = onProgressEvent, .cancelled = &s.cancelled };
+            // Best-effort: a failure here just means the Cancel button (if
+            // shown at all) silently does nothing when pressed — not worth
+            // failing the whole answer over.
+            in_flight.register(now, native_chat_id, pid, asker.native_id, &s.cancelled) catch |err| {
+                log.warn("qa: couldn't register the Cancel button for chat {s}: {t}", .{ native_chat_id, err });
+            };
             ticker_thread = std.Thread.spawn(.{}, tickerLoop, .{ connector, native_chat_id, pid, s }) catch |err| blk: {
                 log.warn("qa: couldn't start the thinking animation for chat {s}: {t}", .{ native_chat_id, err });
                 break :blk null;
             };
         }
     }
+    // Runs on every exit path below (normal answer, error, cancelled, empty
+    // answer, overlength-to-file) — a Cancel press after this point finds
+    // nothing to act on, same as pressing it on any other already-resolved
+    // prompt. Unregistering a placeholder that was never registered (state
+    // allocation failed above) is a harmless no-op lookup miss.
+    defer if (placeholder_id) |pid| in_flight.unregister(native_chat_id, pid);
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tools);
@@ -9574,6 +9734,11 @@ fn replyWithAnswer(
     log.info("qa: model call for chat {s} returned", .{native_chat_id});
 
     const raw_answer = raw_answer_or_err catch |err| {
+        if (err == error.Cancelled) {
+            log.info("qa: request cancelled for chat {s}", .{native_chat_id});
+            finalizePlaceholder(connector, a, native_chat_id, placeholder_id, reply_to, "🛑 Cancelled.");
+            return;
+        }
         log.err("qa: failed to answer in chat {s}: {t}", .{ native_chat_id, err });
         const error_text = "Sorry, I couldn't reach the model just now.";
         if (placeholder_id) |pid| {
@@ -9617,15 +9782,13 @@ fn replyWithAnswer(
             log.warn("qa: failed to delete placeholder before file fallback for chat {s}: {t}", .{ native_chat_id, err });
         };
         sendTextOrFile(connector, a, native_chat_id, answer, reply_to, max_message_len, "answer.txt");
-    } else if (placeholder_id) |pid| {
-        if (connector.editMessage(a, native_chat_id, pid, answer)) |_| {
-            log.info("qa: final answer edited into placeholder for chat {s}", .{native_chat_id});
-        } else |err| {
-            log.warn("qa: final edit failed for chat {s}, sending a new message instead: {t}", .{ native_chat_id, err });
-            connector.sendMessage(a, native_chat_id, answer, reply_to);
-        }
     } else {
-        connector.sendMessage(a, native_chat_id, answer, reply_to);
+        // `finalizePlaceholder` also drops the Cancel button — the request
+        // it controlled is done, so a press on it from here on should find
+        // nothing (it's already unregistered above) rather than lingering
+        // as a dead-looking button.
+        finalizePlaceholder(connector, a, native_chat_id, placeholder_id, reply_to, answer);
+        if (placeholder_id != null) log.info("qa: final answer edited into placeholder for chat {s}", .{native_chat_id});
     }
 
     // Log the bot's own reply too, so follow-up questions see it in the
@@ -10237,6 +10400,7 @@ test {
     _ = @import("llm/toolcall.zig");
     _ = @import("features/group_admin.zig");
     _ = @import("features/audit_notify.zig");
+    _ = @import("features/cancel_request.zig");
     _ = @import("features/wordcloud.zig");
     _ = @import("tools/weather.zig");
     _ = @import("tools/currency.zig");
