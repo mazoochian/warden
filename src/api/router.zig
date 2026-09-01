@@ -64,8 +64,10 @@ const chats_prefix = "/api/v1/chats/";
 const chat_settings_suffix = "/settings";
 const chat_members_suffix = "/members";
 const chat_keyword_alerts_suffix = "/keyword-alerts";
+const chat_announcements_suffix = "/announcements";
 const chat_actions_infix = "/actions/";
 const keyword_alerts_prefix = "/api/v1/keyword-alerts/";
+const announcements_prefix = "/api/v1/announcements/";
 const reminders_prefix = "/api/v1/reminders/";
 const alerts_prefix = "/api/v1/alerts/";
 const watches_prefix = "/api/v1/watches/";
@@ -226,6 +228,10 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
             const id_str = rest[0 .. rest.len - chat_keyword_alerts_suffix.len];
             if (method == .GET) return handleListKeywordAlerts(ctx, request, id_str);
             if (method == .POST) return handleCreateKeywordAlert(ctx, request, id_str);
+        } else if (std.mem.endsWith(u8, rest, chat_announcements_suffix)) {
+            const id_str = rest[0 .. rest.len - chat_announcements_suffix.len];
+            if (method == .GET) return handleListAnnouncements(ctx, request, id_str);
+            if (method == .POST) return handleCreateAnnouncement(ctx, request, id_str);
         } else if (std.mem.indexOf(u8, rest, chat_actions_infix)) |idx| {
             if (method != .POST) {
                 return respondError(request, .not_found, "not_found", "no such endpoint");
@@ -312,6 +318,9 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .DELETE and std.mem.startsWith(u8, path, memory_prefix)) {
         return handleDeleteMemory(ctx, request, path[memory_prefix.len..]);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, announcements_prefix)) {
+        return handleCancelAnnouncement(ctx, request, path[announcements_prefix.len..]);
     }
     // Finance (ROADMAP.md Phase 17). `/expenses/summary` is matched before
     // the `expenses_prefix` catch-all below only incidentally -- that one
@@ -2886,6 +2895,51 @@ fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request,
     return respondJson(ctx, request, .ok, .{ .items = out });
 }
 
+/// Resolves a `ReminderWhenBody` to a concrete unix `due_at`, shared by
+/// `handleCreateReminder` and `handleCreateAnnouncement` -- the two kinds
+/// describe "when" identically (see `reminders.Kind`'s own doc comment on
+/// why the table itself doesn't distinguish them beyond that column).
+/// `null` (with a response already sent) on any validation failure.
+fn resolveWhenDueAt(ctx: *const ServerContext, request: *http.Server.Request, when: ReminderWhenBody, identity_id: i64) !?i64 {
+    if (std.mem.eql(u8, when.kind, "duration")) {
+        const seconds = when.seconds orelse {
+            try respondError(request, .bad_request, "bad_request", "when.seconds required for a duration");
+            return null;
+        };
+        if (seconds <= 0) {
+            try respondError(request, .bad_request, "bad_request", "when.seconds must be positive");
+            return null;
+        }
+        const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+        return now + seconds;
+    }
+    if (std.mem.eql(u8, when.kind, "absolute")) {
+        const year = when.year orelse {
+            try respondError(request, .bad_request, "bad_request", "when.year required for an absolute time");
+            return null;
+        };
+        const month = when.month orelse {
+            try respondError(request, .bad_request, "bad_request", "when.month required for an absolute time");
+            return null;
+        };
+        const day = when.day orelse {
+            try respondError(request, .bad_request, "bad_request", "when.day required for an absolute time");
+            return null;
+        };
+        const hour = when.hour orelse 0;
+        const minute = when.minute orelse 0;
+        const second = when.second orelse 0;
+        if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59) {
+            try respondError(request, .bad_request, "bad_request", "invalid date/time");
+            return null;
+        }
+        const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, identity_id);
+        return civil_time.unixFromLocal(.{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second }, offset_minutes);
+    }
+    try respondError(request, .bad_request, "bad_request", "when.kind must be \"duration\" or \"absolute\"");
+    return null;
+}
+
 /// `POST /api/v1/reminders` -- see API.md; `when` mirrors the `/menu`
 /// wizard's own step data (see `menu.zig`'s `ReminderDraft`) so this form
 /// and the wizard describe the same underlying moment two different ways.
@@ -2918,38 +2972,7 @@ fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request
     }
 
     const identity_id = (try resolveCreateIdentity(ctx, request, ra, body.chat_id, body.identity_id)) orelse return;
-
-    var due_at: i64 = undefined;
-    if (std.mem.eql(u8, body.when.kind, "duration")) {
-        const seconds = body.when.seconds orelse {
-            return respondError(request, .bad_request, "bad_request", "when.seconds required for a duration reminder");
-        };
-        if (seconds <= 0) {
-            return respondError(request, .bad_request, "bad_request", "when.seconds must be positive");
-        }
-        const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
-        due_at = now + seconds;
-    } else if (std.mem.eql(u8, body.when.kind, "absolute")) {
-        const year = body.when.year orelse {
-            return respondError(request, .bad_request, "bad_request", "when.year required for an absolute reminder");
-        };
-        const month = body.when.month orelse {
-            return respondError(request, .bad_request, "bad_request", "when.month required for an absolute reminder");
-        };
-        const day = body.when.day orelse {
-            return respondError(request, .bad_request, "bad_request", "when.day required for an absolute reminder");
-        };
-        const hour = body.when.hour orelse 0;
-        const minute = body.when.minute orelse 0;
-        const second = body.when.second orelse 0;
-        if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59) {
-            return respondError(request, .bad_request, "bad_request", "invalid date/time");
-        }
-        const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, identity_id);
-        due_at = civil_time.unixFromLocal(.{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second }, offset_minutes);
-    } else {
-        return respondError(request, .bad_request, "bad_request", "when.kind must be \"duration\" or \"absolute\"");
-    }
+    const due_at = (try resolveWhenDueAt(ctx, request, body.when, identity_id)) orelse return;
 
     const id = reminders.create(ctx.pool, body.chat_id, identity_id, body.message, due_at, body.recur_interval_seconds) catch |err| {
         log.err("create-reminder: failed for chat {d}: {t}", .{ body.chat_id, err });
@@ -2993,6 +3016,142 @@ fn handleCancelReminder(ctx: *const ServerContext, request: *http.Server.Request
         return respondError(request, .internal_server_error, "internal", "failed to cancel reminder");
     };
     audit_log.record(ctx.pool, ra.account_id, null, "reminder.cancel", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+// --- Announcements (ROADMAP.md Phase 16) -- chat-scoped, not identity-
+// scoped-across-chats like Reminders above: `reminders.listForIdentity`
+// is deliberately hard-filtered to `kind = 'reminder'` (see its own doc
+// comment), since a scheduled announcement is a chat-level admin object,
+// not a personal one. `reminders.listPending`, already built for
+// `/announce list`, fits this shape directly. ---
+
+const max_announcement_len = 1000;
+
+/// `GET /api/v1/chats/:id/announcements` -- mirrors `/announce list`,
+/// though gated at this endpoint's own live-group-admin tier
+/// (`requireChatAccess`) rather than open to any chat member the way the
+/// command's own `list` subcommand is -- same accepted "web slightly
+/// stricter" simplification `chat_settings.digest_enabled` already has,
+/// and this section only ever renders inside the Groups per-chat settings
+/// page, which nothing but a group admin/bot admin/owner can reach in the
+/// first place.
+fn handleListAnnouncements(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    const items = reminders.listPending(ctx.pool, ctx.allocator, chat_id, .announcement) catch |err| {
+        log.err("list-announcements: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load announcements");
+    };
+    defer {
+        for (items) |it| ctx.allocator.free(it.message);
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+const CreateAnnouncementBody = struct {
+    message: []const u8,
+    recur_interval_seconds: ?i64 = null,
+    when: ReminderWhenBody,
+};
+
+/// `POST /api/v1/chats/:id/announcements` -- mirrors `/announce at`/
+/// `/announce every`. Same live-group-admin tier as
+/// `handleListAnnouncements`, matching `checkGroupAdminAccess`'s ceiling
+/// on the command side (no token-spend fallback there either). Unlike a
+/// bare `/announce <text>` (send now, pinned), this endpoint always
+/// schedules -- an immediate send-and-pin is a connector-backed action in
+/// Bot View's territory, not a settings-page create form; deliberately
+/// out of scope here, same as ROADMAP.md's Phase 16 entry says.
+fn handleCreateAnnouncement(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+    if (!feature_flags.isEnabled(ctx.pool, "announcements")) {
+        return respondError(request, .forbidden, "forbidden", "the announcements module is disabled");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [4 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(4 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateAnnouncementBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+    if (body.message.len == 0 or body.message.len > max_announcement_len) {
+        return respondError(request, .bad_request, "bad_request", "message must be 1-1000 bytes");
+    }
+    if (body.recur_interval_seconds) |interval| {
+        if (interval <= 0) {
+            return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive");
+        }
+    }
+
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const identity_ids = accounts.listIdentityIds(ctx.pool, arena, account_id) catch |err| {
+        log.err("create-announcement: failed to list identities for account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+    };
+    const identity_id = if (identity_ids.len > 0) identity_ids[0] else {
+        return respondError(request, .forbidden, "forbidden", "no identity linked to this account");
+    };
+
+    const due_at = (try resolveWhenDueAt(ctx, request, body.when, identity_id)) orelse return;
+
+    const id = reminders.createOfKind(ctx.pool, chat_id, identity_id, body.message, due_at, body.recur_interval_seconds, .announcement) catch |err| {
+        log.err("create-announcement: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to create announcement");
+    };
+    audit_log.record(ctx.pool, account_id, null, "announcement.create", null, null);
+
+    return respondJson(ctx, request, .ok, .{ .id = id, .due_at = due_at });
+}
+
+/// `DELETE /api/v1/announcements/:id` -- mirrors `/announce cancel`.
+/// Gated at the *target chat's* live-group-admin tier, looked up from the
+/// row itself since the bare id doesn't say which chat it belongs to —
+/// same tier `checkGroupAdminAccess` gives the command.
+fn handleCancelAnnouncement(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid announcement id");
+    };
+
+    const row = (reminders.get(ctx.pool, ctx.allocator, id) catch |err| {
+        log.err("cancel-announcement: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up announcement");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such announcement");
+    };
+    defer ctx.allocator.free(row.message);
+    if (row.kind != .announcement) {
+        return respondError(request, .not_found, "not_found", "no such announcement (that id is a reminder — use DELETE /api/v1/reminders/:id)");
+    }
+
+    const chat = (try requireChatAccess(ctx, request, row.chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    reminders.cancel(ctx.pool, id) catch |err| {
+        log.err("cancel-announcement: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to cancel announcement");
+    };
+    const a = resolveAuth(ctx, request);
+    audit_log.record(ctx.pool, a.account_id, null, "announcement.cancel", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
