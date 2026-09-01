@@ -73,6 +73,10 @@ const alerts_prefix = "/api/v1/alerts/";
 const watches_prefix = "/api/v1/watches/";
 const notes_prefix = "/api/v1/notes/";
 const memory_prefix = "/api/v1/memory/";
+const telegram_user_chats_prefix = "/api/v1/telegram-user/chats/";
+const chat_autonomy_suffix = "/autonomy";
+const draft_approve_suffix = "/draft/approve";
+const draft_suffix = "/draft";
 const expenses_prefix = "/api/v1/expenses/";
 const budgets_prefix = "/api/v1/budgets/";
 const subscriptions_prefix = "/api/v1/subscriptions/";
@@ -276,6 +280,32 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/chats/send")) {
         return handleTelegramUserSendMessage(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/logout")) {
+        return handleTelegramUserLogout(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/telegram-user/autonomy")) {
+        return handleGetGlobalAutonomy(ctx, request);
+    }
+    if (method == .PATCH and std.mem.eql(u8, path, "/api/v1/telegram-user/autonomy")) {
+        return handleSetGlobalAutonomy(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/telegram-user/drafts")) {
+        return handleListDrafts(ctx, request);
+    }
+    if (std.mem.startsWith(u8, path, telegram_user_chats_prefix)) {
+        const rest = path[telegram_user_chats_prefix.len..];
+        if (std.mem.endsWith(u8, rest, chat_autonomy_suffix)) {
+            const native_id = rest[0 .. rest.len - chat_autonomy_suffix.len];
+            if (method == .GET) return handleGetChatAutonomy(ctx, request, native_id);
+            if (method == .PATCH) return handleSetChatAutonomy(ctx, request, native_id);
+        } else if (std.mem.endsWith(u8, rest, draft_approve_suffix)) {
+            const native_id = rest[0 .. rest.len - draft_approve_suffix.len];
+            if (method == .POST) return handleApproveDraft(ctx, request, native_id);
+        } else if (std.mem.endsWith(u8, rest, draft_suffix)) {
+            const native_id = rest[0 .. rest.len - draft_suffix.len];
+            if (method == .DELETE) return handleDiscardDraft(ctx, request, native_id);
+        }
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/reminders")) {
         return handleListReminders(ctx, request, target);
@@ -2713,6 +2743,219 @@ fn handleTelegramUserSendMessage(ctx: *const ServerContext, request: *http.Serve
     }
 
     conn.connector().sendMessage(arena, body.chat_id, body.message, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `POST /api/v1/telegram-user/logout` — mirrors `/tdlogout`/`/tdlogin
+/// logout`'s shared `performTdLogout` in `main.zig`. `.none` is refused
+/// rather than forwarded to `conn.logOut()` for the same reason that
+/// function documents: the connector's `client_id` is still null before
+/// any `ensureClient()` call has run, and a logout attempt would crash
+/// rather than no-op.
+fn handleTelegramUserLogout(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    if (conn.authState() == .none) {
+        return respondError(request, .conflict, "not_ready", "the personal-account connector hasn't started yet -- nothing to log out of");
+    }
+    conn.logOut();
+    const a = resolveAuth(ctx, request);
+    audit_log.record(ctx.pool, a.account_id, null, "telegram_user.logout", null, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/telegram-user/autonomy` — mirrors `/autonomy`'s no-arg
+/// form: the owner's global `reply_autonomy` default. Resolved from the
+/// caller's own logged-in identity (`callersOwnIdentity`), not
+/// `config`'s `WARDEN_TELEGRAM_OWNER_ID` the way the bot-chat command
+/// does — `requireTelegramUserConnector` already establishes the caller
+/// *is* the owner, and this is the same identity the rest of the web
+/// settings surface (`/me/settings`) already resolves via the session.
+fn handleGetGlobalAutonomy(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const identity_id = (try callersOwnIdentity(ctx, request, account_id)) orelse return;
+    const global = user_settings.getEffectiveReplyAutonomyDefault(ctx.pool, ctx.allocator, identity_id);
+    return respondJson(ctx, request, .ok, .{ .global = @tagName(global) });
+}
+
+const SetGlobalAutonomyBody = struct { global: []const u8 };
+
+/// `PATCH /api/v1/telegram-user/autonomy` — mirrors `/autonomy <off|draft|
+/// auto>`.
+fn handleSetGlobalAutonomy(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const identity_id = (try callersOwnIdentity(ctx, request, account_id)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [256]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(256)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(SetGlobalAutonomyBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+    const level = std.meta.stringToEnum(user_settings.ReplyAutonomy, body.global) orelse {
+        return respondError(request, .bad_request, "bad_request", "global must be \"off\", \"draft\", or \"auto\"");
+    };
+    user_settings.setReplyAutonomyDefault(ctx.pool, identity_id, level) catch |err| {
+        log.err("set-global-autonomy: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to save");
+    };
+    audit_log.record(ctx.pool, account_id, null, "telegram_user.autonomy.set_global", null, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/telegram-user/chats/:nativeChatId/autonomy` — mirrors
+/// `/autonomy <chat id>`'s implicit view (the command has no bare-view
+/// form for a single chat, only `list`-adjacent-via-`/tdchats`, but the
+/// override/effective split is exactly what `chat_settings.
+/// resolveReplyAutonomy`'s doc comment says the settings UI needs).
+fn handleGetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const identity_id = (try callersOwnIdentity(ctx, request, account_id)) orelse return;
+
+    const chat = (chats_store.getByNative(ctx.pool, ctx.allocator, .telegram_user, native_chat_id) catch |err| {
+        log.err("get-chat-autonomy: lookup failed for chat {s}: {t}", .{ native_chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up chat");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no chat with that id yet -- a message must be exchanged with it first");
+    };
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    const override = chat_settings.getReplyAutonomy(ctx.pool, chat.id);
+    const effective = chat_settings.resolveReplyAutonomy(ctx.pool, ctx.allocator, chat.id, identity_id);
+    return respondJson(ctx, request, .ok, .{
+        .override = if (override) |o| @tagName(o) else null,
+        .effective = @tagName(effective),
+    });
+}
+
+const SetChatAutonomyBody = struct { override: ?[]const u8 };
+
+/// `PATCH /api/v1/telegram-user/chats/:nativeChatId/autonomy` — mirrors
+/// `/autonomy <chat id> <off|draft|auto|clear>` (`override: null` is
+/// `clear`).
+fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [256]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(256)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(SetChatAutonomyBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+    const level: ?user_settings.ReplyAutonomy = if (body.override) |o|
+        std.meta.stringToEnum(user_settings.ReplyAutonomy, o) orelse {
+            return respondError(request, .bad_request, "bad_request", "override must be \"off\", \"draft\", \"auto\", or null");
+        }
+    else
+        null;
+
+    const chat = (chats_store.getByNative(ctx.pool, arena, .telegram_user, native_chat_id) catch |err| {
+        log.err("set-chat-autonomy: lookup failed for chat {s}: {t}", .{ native_chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up chat");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no chat with that id yet -- a message must be exchanged with it first");
+    };
+
+    chat_settings.setReplyAutonomy(ctx.pool, chat.id, level) catch |err| {
+        log.err("set-chat-autonomy: failed for chat {d}: {t}", .{ chat.id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to save");
+    };
+    audit_log.record(ctx.pool, account_id, null, "telegram_user.autonomy.set_chat", native_chat_id, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/telegram-user/drafts` — mirrors `/drafts`.
+fn handleListDrafts(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const pending_drafts = ctx.pending_drafts orelse {
+        return respondError(request, .internal_server_error, "internal", "drafts aren't available on this deployment");
+    };
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const items = pending_drafts.list(ctx.allocator, now) catch |err| {
+        log.err("list-drafts: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load drafts");
+    };
+    defer {
+        for (items) |it| {
+            ctx.allocator.free(it.native_chat_id);
+            ctx.allocator.free(it.chat_title);
+            ctx.allocator.free(it.draft_text);
+        }
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `POST /api/v1/telegram-user/chats/:nativeChatId/draft/approve` —
+/// mirrors `/approve <chat id>`: sends the draft exactly as generated,
+/// through the personal-account connector, no parallel send path.
+fn handleApproveDraft(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    const pending_drafts = ctx.pending_drafts orelse {
+        return respondError(request, .internal_server_error, "internal", "drafts aren't available on this deployment");
+    };
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const draft = pending_drafts.take(ctx.allocator, now, native_chat_id) orelse {
+        return respondError(request, .not_found, "not_found", "no pending draft for that chat (or it expired)");
+    };
+    defer {
+        ctx.allocator.free(draft.chat_title);
+        ctx.allocator.free(draft.incoming_text);
+        ctx.allocator.free(draft.draft_text);
+        if (draft.reply_to) |r| ctx.allocator.free(r);
+    }
+
+    conn.connector().sendMessage(ctx.allocator, native_chat_id, draft.draft_text, draft.reply_to);
+    audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.approve", native_chat_id, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `DELETE /api/v1/telegram-user/chats/:nativeChatId/draft` — mirrors
+/// `/discard <chat id>`.
+fn handleDiscardDraft(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const pending_drafts = ctx.pending_drafts orelse {
+        return respondError(request, .internal_server_error, "internal", "drafts aren't available on this deployment");
+    };
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    if (!pending_drafts.discard(native_chat_id)) {
+        return respondError(request, .not_found, "not_found", "no pending draft for that chat");
+    }
+    audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.discard", native_chat_id, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
