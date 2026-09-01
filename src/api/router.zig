@@ -30,8 +30,11 @@ const management_rooms = @import("../store/management_rooms.zig");
 const memories = @import("../store/memories.zig");
 const rate_limits = @import("../store/rate_limits.zig");
 const member_permissions = @import("../store/member_permissions.zig");
+const storage_sense = @import("../features/storage_sense.zig");
+const messages_store = @import("../store/messages.zig");
 const user_settings = @import("../store/user_settings.zig");
 const civil_time = @import("../text/civil_time.zig");
+const reminder_format = @import("../features/reminder_format.zig");
 const reminders = @import("../store/reminders.zig");
 const alert_store = @import("../store/alerts.zig");
 const feed_watches = @import("../store/feed_watches.zig");
@@ -218,6 +221,21 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .DELETE and std.mem.eql(u8, path, "/api/v1/admin/management-rooms")) {
         return handleAdminUnbindManagementRoom(ctx, request, target);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/storage/status")) {
+        return handleAdminStorageStatus(ctx, request);
+    }
+    if (method == .PATCH and std.mem.eql(u8, path, "/api/v1/admin/storage/autopilot")) {
+        return handleAdminSetStorageAutopilot(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/admin/storage/cleanup/tmp")) {
+        return handleAdminStorageCleanupTmp(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/admin/storage/cleanup/messages")) {
+        return handleAdminStorageCleanupMessages(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/admin/storage/cleanup/resample")) {
+        return handleAdminStorageCleanupResample(ctx, request);
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/chats")) {
         return handleListMyChats(ctx, request);
@@ -717,6 +735,25 @@ fn requireAdmin(ctx: *const ServerContext, request: *http.Server.Request) !?i64 
     return account_id;
 }
 
+/// Stricter than `requireAdmin`: owner only, never `bot_admin` — for
+/// Storage Sense's admin surface, which can prune/resample real chat
+/// history and flip the ladder's autopilot switch, same trust tier
+/// `handleStorageCommand` reserves for the bot-chat `/storage` command
+/// (never extended to bot admins there either).
+fn requireOwner(ctx: *const ServerContext, request: *http.Server.Request) !?i64 {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        try respondError(request, .unauthorized, "unauthorized", "not logged in");
+        return null;
+    };
+    const roles = try computeRoles(ctx, account_id);
+    if (!roles.owner) {
+        try respondError(request, .forbidden, "forbidden", "owner access required");
+        return null;
+    }
+    return account_id;
+}
+
 /// `?limit=` clamped to `[1, max_page_limit]`, defaulting to
 /// `default_page_limit`; `?cursor=` parsed as the last-seen id (`0` — the
 /// start of the table — if absent/unparseable).
@@ -1210,6 +1247,166 @@ fn handleAdminUnbindManagementRoom(ctx: *const ServerContext, request: *http.Ser
     audit_log.record(ctx.pool, account_id, null, "management_room.unbind", null, null);
 
     return respondJson(ctx, request, .ok, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Storage Sense (owner-only admin surface, ROADMAP.md Phase 14). Strictly
+// `requireOwner`, never `requireAdmin` -- same tier `handleStorageCommand`
+// reserves for `/storage` on the bot-chat side (never extended to bot
+// admins there either), since this can prune/resample real chat history
+// and flip the ladder's autopilot switch.
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/admin/storage/status` -- a structured counterpart to
+/// `/storage status`'s text report (`storage_sense.buildStatusReport`),
+/// since a web dashboard wants real fields to build tiles from, not a
+/// pre-formatted string.
+fn handleAdminStorageStatus(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireOwner(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const usage = storage_sense.checkDiskUsage(arena, ctx.io, ctx.config.tmp_dir) catch |err| {
+        log.err("admin-storage-status: checkDiskUsage failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to read disk usage");
+    };
+    const low = dynamic_config.getI64(ctx.pool, arena, storage_sense.low_watermark_key, ctx.config.storage_sense_low_watermark_pct);
+    const high = dynamic_config.getI64(ctx.pool, arena, storage_sense.high_watermark_key, ctx.config.storage_sense_high_watermark_pct);
+    const flood = dynamic_config.getI64(ctx.pool, arena, storage_sense.flood_watermark_key, ctx.config.storage_sense_flood_watermark_pct);
+    const watermark = storage_sense.classify(usage.used_pct, low, high, flood);
+    const autopilot_enabled = dynamic_config.getBool(ctx.pool, arena, storage_sense.autopilot_enabled_key, ctx.config.storage_sense_autopilot_enabled);
+    const sleep_active = storage_sense.isSleepModeActive(ctx.pool, arena);
+
+    return respondJson(ctx, request, .ok, .{
+        .used_pct = usage.used_pct,
+        .total_bytes = usage.total_bytes,
+        .available_bytes = usage.available_bytes,
+        .watermark = @tagName(watermark),
+        .low_watermark_pct = low,
+        .high_watermark_pct = high,
+        .flood_watermark_pct = flood,
+        .autopilot_enabled = autopilot_enabled,
+        .sleep_active = sleep_active,
+    });
+}
+
+const SetAutopilotBody = struct { enabled: bool };
+
+/// `PATCH /api/v1/admin/storage/autopilot` -- mirrors `/storage autopilot
+/// on|off`.
+fn handleAdminSetStorageAutopilot(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireOwner(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = (try readJsonBodyLeaky(request, arena, SetAutopilotBody, 128)) orelse return;
+    dynamic_config.set(ctx.pool, storage_sense.autopilot_enabled_key, if (body.enabled) "true" else "false", account_id) catch |err| {
+        log.err("admin-storage-autopilot: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to update autopilot");
+    };
+    audit_log.record(ctx.pool, account_id, null, "storage.autopilot.set", null, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `POST /api/v1/admin/storage/cleanup/tmp` -- mirrors `/storage cleanup
+/// tmp`.
+fn handleAdminStorageCleanupTmp(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireOwner(ctx, request)) orelse return;
+
+    const result = storage_sense.sweepTmpDir(ctx.io, ctx.allocator, ctx.config.tmp_dir, storage_sense.tmp_sweep_max_age_seconds) catch |err| {
+        log.err("admin-storage-cleanup-tmp: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to sweep tmp");
+    };
+    audit_log.record(ctx.pool, account_id, null, "storage.cleanup.tmp", null, null);
+    return respondJson(ctx, request, .ok, .{ .files_deleted = result.files_deleted, .bytes_freed = result.bytes_freed });
+}
+
+const CleanupMessagesBody = struct {
+    chat_id: ?i64 = null,
+    keep_last: ?i64 = null,
+    before: ?[]const u8 = null,
+};
+
+/// `POST /api/v1/admin/storage/cleanup/messages` -- mirrors `/storage
+/// cleanup messages`. `chat_id` omitted means every chat (the ladder's
+/// own global sweep), deliberately not "the current chat" the command
+/// defaults to, since there's no such concept over the web. `keep_last`
+/// needs a concrete `chat_id` (pruning "keep the last N" only means
+/// something per-chat); `before` (a `YYYY-MM-DD` date) or neither
+/// (falls back to the configured prune-age default) both work bot-wide
+/// or per-chat.
+fn handleAdminStorageCleanupMessages(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireOwner(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = (try readJsonBodyLeaky(request, arena, CleanupMessagesBody, 256)) orelse return;
+
+    if (body.keep_last) |keep| {
+        const chat_id = body.chat_id orelse {
+            return respondError(request, .bad_request, "bad_request", "keep_last requires a chat_id");
+        };
+        if (keep <= 0) {
+            return respondError(request, .bad_request, "bad_request", "keep_last must be positive");
+        }
+        messages_store.pruneKeepLast(ctx.pool, chat_id, keep) catch |err| {
+            log.err("admin-storage-cleanup-messages: pruneKeepLast failed for chat {d}: {t}", .{ chat_id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to prune");
+        };
+        audit_log.record(ctx.pool, account_id, null, "storage.cleanup.messages", null, null);
+        return respondJson(ctx, request, .ok, .{});
+    }
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    var cutoff_ts = now - dynamic_config.getI64(ctx.pool, arena, storage_sense.prune_age_days_key, ctx.config.storage_sense_prune_age_days) * 86400;
+    if (body.before) |date_str| {
+        const parts = reminder_format.parseDatePart(date_str, .ymd) orelse {
+            return respondError(request, .bad_request, "bad_request", "before must be YYYY-MM-DD");
+        };
+        const year = parts.year orelse {
+            return respondError(request, .bad_request, "bad_request", "before needs a year -- use YYYY-MM-DD");
+        };
+        cutoff_ts = civil_time.unixFromLocal(.{ .year = year, .month = parts.month, .day = parts.day }, 0);
+    }
+
+    const result = storage_sense.pruneOldMessages(ctx.pool, arena, body.chat_id, cutoff_ts) catch |err| {
+        log.err("admin-storage-cleanup-messages: pruneOldMessages failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to prune");
+    };
+    audit_log.record(ctx.pool, account_id, null, "storage.cleanup.messages", null, null);
+    return respondJson(ctx, request, .ok, .{ .rows_deleted = result.rows_deleted, .chats_affected = result.chats_affected });
+}
+
+const CleanupResampleBody = struct { chat_id: ?i64 = null };
+
+/// `POST /api/v1/admin/storage/cleanup/resample` -- mirrors `/storage
+/// cleanup resample`. `chat_id` omitted means every chat, same "no
+/// current chat" reasoning as cleanup/messages above.
+fn handleAdminStorageCleanupResample(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireOwner(ctx, request)) orelse return;
+    const provider = ctx.llm_provider orelse {
+        return respondError(request, .internal_server_error, "internal", "no LLM provider configured");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = (try readJsonBodyLeaky(request, arena, CleanupResampleBody, 128)) orelse return;
+    const batch_size = dynamic_config.getI64(ctx.pool, arena, storage_sense.resample_batch_size_key, ctx.config.storage_sense_resample_batch_size);
+
+    const result = storage_sense.resampleOldMessages(ctx.pool, arena, ctx.io, provider, body.chat_id, batch_size) catch |err| {
+        log.err("admin-storage-cleanup-resample: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to resample");
+    };
+    audit_log.record(ctx.pool, account_id, null, "storage.cleanup.resample", null, null);
+    return respondJson(ctx, request, .ok, .{ .messages_compacted = result.messages_compacted, .chats_affected = result.chats_affected });
 }
 
 // ---------------------------------------------------------------------------
