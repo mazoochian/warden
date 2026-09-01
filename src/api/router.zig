@@ -27,6 +27,7 @@ const chat_members = @import("../store/chat_members.zig");
 const chat_settings = @import("../store/chat_settings.zig");
 const keyword_alerts = @import("../store/keyword_alerts.zig");
 const management_rooms = @import("../store/management_rooms.zig");
+const memories = @import("../store/memories.zig");
 const user_settings = @import("../store/user_settings.zig");
 const civil_time = @import("../text/civil_time.zig");
 const reminders = @import("../store/reminders.zig");
@@ -69,6 +70,7 @@ const reminders_prefix = "/api/v1/reminders/";
 const alerts_prefix = "/api/v1/alerts/";
 const watches_prefix = "/api/v1/watches/";
 const notes_prefix = "/api/v1/notes/";
+const memory_prefix = "/api/v1/memory/";
 const expenses_prefix = "/api/v1/expenses/";
 const budgets_prefix = "/api/v1/budgets/";
 const subscriptions_prefix = "/api/v1/subscriptions/";
@@ -304,6 +306,12 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .DELETE and std.mem.startsWith(u8, path, notes_prefix)) {
         return handleDeleteNote(ctx, request, path[notes_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/memory")) {
+        return handleListMemory(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, memory_prefix)) {
+        return handleDeleteMemory(ctx, request, path[memory_prefix.len..]);
     }
     // Finance (ROADMAP.md Phase 17). `/expenses/summary` is matched before
     // the `expenses_prefix` catch-all below only incidentally -- that one
@@ -3351,6 +3359,68 @@ fn handleDeleteNote(ctx: *const ServerContext, request: *http.Server.Request, id
         return respondError(request, .internal_server_error, "internal", "failed to delete note");
     };
     audit_log.record(ctx.pool, ra.account_id, null, "note.delete", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/memory` -- mirrors `/memory list`. Strictly the caller's
+/// own identity, same as `/memory list` itself: unlike every other
+/// identity-scoped list endpoint in this file, there is deliberately
+/// **no** `?identity_id=` admin-override here. warden's own
+/// `MemoryToolAdapter.forgetFn` refuses even the bot owner permission to
+/// forget someone else's memory (`mem.identity_id != self.identity_id`,
+/// no `isOwner` fallback at all — see `main.zig`'s `/memory forget`
+/// handler) — a memory is a private fact about one person, not a shared
+/// chat record, and extending admin visibility to it over the web would
+/// be a real privacy regression beyond what the underlying feature
+/// intends, not just an inconsistency.
+fn handleListMemory(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const identity_id = (try callersOwnIdentity(ctx, request, ra.account_id)) orelse return;
+
+    const items = memories.listForIdentity(ctx.pool, ctx.allocator, identity_id) catch |err| {
+        log.err("list-memory: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load memories");
+    };
+    defer {
+        for (items) |m| ctx.allocator.free(m.text);
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `DELETE /api/v1/memory/:id` -- mirrors `/memory forget`. Same strict
+/// authorization as `MemoryToolAdapter.forgetFn`: only an identity linked
+/// to the caller's own account, never the bot owner acting on someone
+/// else's behalf (see `handleListMemory`'s doc comment for why).
+fn handleDeleteMemory(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid memory id");
+    };
+
+    const mem = (memories.get(ctx.pool, ctx.allocator, id) catch |err| {
+        log.err("delete-memory: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up memory");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such memory");
+    };
+    defer ctx.allocator.free(mem.text);
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+        log.err("delete-memory: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to check access");
+    };
+    defer ctx.allocator.free(identity_ids);
+    if (std.mem.indexOfScalar(i64, identity_ids, mem.identity_id) == null) {
+        return respondError(request, .forbidden, "forbidden", "only the person that memory belongs to can forget it");
+    }
+
+    memories.forget(ctx.pool, id) catch |err| {
+        log.err("delete-memory: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to delete memory");
+    };
+    audit_log.record(ctx.pool, ra.account_id, null, "memory.forget", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
