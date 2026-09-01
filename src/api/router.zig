@@ -28,6 +28,8 @@ const chat_settings = @import("../store/chat_settings.zig");
 const keyword_alerts = @import("../store/keyword_alerts.zig");
 const management_rooms = @import("../store/management_rooms.zig");
 const memories = @import("../store/memories.zig");
+const rate_limits = @import("../store/rate_limits.zig");
+const member_permissions = @import("../store/member_permissions.zig");
 const user_settings = @import("../store/user_settings.zig");
 const civil_time = @import("../text/civil_time.zig");
 const reminders = @import("../store/reminders.zig");
@@ -65,6 +67,7 @@ const chat_settings_suffix = "/settings";
 const chat_members_suffix = "/members";
 const chat_keyword_alerts_suffix = "/keyword-alerts";
 const chat_announcements_suffix = "/announcements";
+const chat_member_permissions_infix = "/members/";
 const chat_actions_infix = "/actions/";
 const keyword_alerts_prefix = "/api/v1/keyword-alerts/";
 const announcements_prefix = "/api/v1/announcements/";
@@ -236,6 +239,20 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
             const id_str = rest[0 .. rest.len - chat_announcements_suffix.len];
             if (method == .GET) return handleListAnnouncements(ctx, request, id_str);
             if (method == .POST) return handleCreateAnnouncement(ctx, request, id_str);
+        } else if (std.mem.indexOf(u8, rest, chat_member_permissions_infix)) |idx| {
+            const chat_id_str = rest[0..idx];
+            const after = rest[idx + chat_member_permissions_infix.len ..];
+            const slash = std.mem.indexOfScalar(u8, after, '/') orelse {
+                return respondError(request, .not_found, "not_found", "no such endpoint");
+            };
+            const identity_id_str = after[0..slash];
+            const sub = after[slash + 1 ..];
+            if (std.mem.eql(u8, sub, "permissions")) {
+                if (method == .GET) return handleGetMemberPermissions(ctx, request, chat_id_str, identity_id_str);
+                if (method == .PATCH) return handleSetMemberPermissions(ctx, request, chat_id_str, identity_id_str);
+            } else if (std.mem.eql(u8, sub, "tag")) {
+                if (method == .PATCH) return handleSetMemberTag(ctx, request, chat_id_str, identity_id_str);
+            }
         } else if (std.mem.indexOf(u8, rest, chat_actions_infix)) |idx| {
             if (method != .POST) {
                 return respondError(request, .not_found, "not_found", "no such endpoint");
@@ -1381,6 +1398,12 @@ const ChatSettingsBody = struct {
     autopin_announcements: bool,
     video_download_enabled: bool,
     video_download_lossy: bool,
+    /// `0` means off, same "0/absent both mean unset" convention
+    /// `rate_limits.zig`'s own doc comment describes -- backed by the
+    /// `rate_limits` table, not `chat_settings`, but grouped into this
+    /// same whole-object endpoint since it's just another per-chat
+    /// setting from the caller's perspective.
+    slowmode_seconds: i64,
 };
 
 /// `GET /api/v1/chats/:id/settings`.
@@ -1411,6 +1434,7 @@ fn handleGetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
         .autopin_announcements = chat_settings.getAutopinAnnouncements(ctx.pool, chat_id),
         .video_download_enabled = chat_settings.getVideoDownloadEnabled(ctx.pool, chat_id),
         .video_download_lossy = chat_settings.getVideoDownloadLossy(ctx.pool, chat_id),
+        .slowmode_seconds = rate_limits.getSlowModeSeconds(ctx.pool, chat_id),
     });
 }
 
@@ -1460,6 +1484,9 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
         if (l.len > max_default_location_len) {
             return respondError(request, .bad_request, "bad_request", "location must be at most 100 bytes");
         }
+    }
+    if (body.slowmode_seconds < 0) {
+        return respondError(request, .bad_request, "bad_request", "slowmode_seconds must be 0 (off) or positive");
     }
 
     // welcome_message/default_location are owner-only to change -- same
@@ -1521,6 +1548,10 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
     };
     chat_settings.setVideoDownloadLossy(ctx.pool, chat_id, body.video_download_lossy) catch |err| {
         log.err("set-chat-settings: video_download_lossy failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    rate_limits.setSlowModeSeconds(ctx.pool, chat_id, body.slowmode_seconds) catch |err| {
+        log.err("set-chat-settings: slowmode_seconds failed for chat {d}: {t}", .{ chat_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to update settings");
     };
 
@@ -1780,6 +1811,112 @@ fn readJsonBodyLeaky(request: *http.Server.Request, arena: std.mem.Allocator, co
         try respondError(request, .bad_request, "bad_request", "invalid request body");
         return null;
     };
+}
+
+/// `GET /api/v1/chats/:id/members/:identityId/permissions` — no bot-chat
+/// equivalent exists (there's no "view a member's current bits" command;
+/// `/permission` only ever changes them), but a checkbox-per-bit editor
+/// needs to know the starting state from somewhere. Same live-group-admin
+/// tier as `handleListChatMembers`'s own `requireChatAccess` gate.
+fn handleGetMemberPermissions(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const identity_id = std.fmt.parseInt(i64, identity_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid identity id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    const bits = member_permissions.getBits(ctx.pool, chat_id, identity_id);
+    return respondJson(ctx, request, .ok, .{ .bits = bits });
+}
+
+const SetMemberPermissionsBody = struct { bits: u32, expires_at: ?i64 = null };
+
+/// `PATCH /api/v1/chats/:id/members/:identityId/permissions` — mirrors
+/// `/permission`, except the whole resulting bitmask is set explicitly
+/// rather than applying a `+`/`-<letters>` change: a checkbox-per-bit
+/// editor already knows the mask it wants, so there's no reason to make
+/// the client compute a diff just to re-derive what it already has. Same
+/// best-effort live enforcement as the command — `error.Unsupported` (no
+/// granular permission concept on this platform) is expected and silent;
+/// the bitmask itself is saved either way.
+fn handleSetMemberPermissions(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const identity_id = std.fmt.parseInt(i64, identity_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid identity id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, SetMemberPermissionsBody, 256)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, true, "permission")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to change permissions in this chat");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, identity_id)) orelse return;
+
+    member_permissions.setBits(ctx.pool, chat_id, identity_id, body.bits, body.expires_at) catch |err| {
+        log.err("set-member-permissions: failed for identity {d} in chat {d}: {t}", .{ identity_id, chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to save permissions");
+    };
+
+    ac.connector.restrictChatMemberPermissions(arena, ac.chat.native_chat_id, target_native_id, body.bits, body.expires_at orelse 0) catch |err| {
+        if (err != error.Unsupported) {
+            log.warn("set-member-permissions: failed to enforce live restriction for {s} in chat {s}: {t}", .{ target_native_id, ac.chat.native_chat_id, err });
+        }
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.member_permissions.set", identity_id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+const SetMemberTagBody = struct { title: []const u8 };
+
+/// `PATCH /api/v1/chats/:id/members/:identityId/tag` — mirrors `/tag
+/// <@user> <text>` / `/tag <@user> off` (`title: ""` is `off`, matching
+/// the command's own empty-string-clears convention exactly, not a
+/// separate `null` case). Telegram only, and only for targets who are
+/// already chat administrators there — surfaced as a real error rather
+/// than saved-anyway, since unlike `/permission` there's no bitmask to
+/// persist independent of live enforcement; the whole point of this
+/// action is the live call.
+fn handleSetMemberTag(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const identity_id = std.fmt.parseInt(i64, identity_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid identity id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, SetMemberTagBody, 256)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, true, "tag")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to set a tag in this chat");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, identity_id)) orelse return;
+
+    ac.connector.setChatAdminTitle(arena, ac.chat.native_chat_id, target_native_id, body.title) catch |err| {
+        if (err == error.Unsupported) {
+            return respondError(request, .bad_request, "unsupported", "custom tags aren't supported on this platform");
+        }
+        log.warn("set-member-tag: failed for {s} in chat {s}: {t}", .{ target_native_id, ac.chat.native_chat_id, err });
+        return respondError(request, .bad_request, "failed", "couldn't set a tag -- the target must already be a chat administrator (and the bot needs admin rights here)");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.member_tag.set", identity_id_str, null);
+    return respondJson(ctx, request, .ok, .{});
 }
 
 const ModTargetBody = struct { identity_id: i64 };
