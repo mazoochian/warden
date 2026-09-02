@@ -105,8 +105,10 @@ Three more per-chat, per-member controls, gated the same way as `/mute`/
   configured number of seconds have passed since their last one is
   deleted right away — the deletion itself is the feedback, no extra
   "you're rate limited" reply. Admins and the owner are always exempt,
-  including from a slow mode they just set. Not enforced on XMPP (its
-  connector has no moderation vtable slots at all).
+  including from a slow mode they just set. Not enforced on XMPP — this
+  specifically needs a `deleteMessage` primitive, which XMPP still doesn't
+  have (unlike `/mute`/`/kick`/`/ban`/`/promote`/`/demote`, which are real
+  there now — see "XMPP" above).
 - **Permission model** (`/permission [<duration>] <+|-><letters> @user`,
   or reply to their message instead of `@user`) — a 14-bit per-member
   permission mask: `r`ead, `w`rite (send messages), `p`hotos, `v`ideos,
@@ -124,9 +126,12 @@ Three more per-chat, per-member controls, gated the same way as `/mute`/
   for cross-platform intent but never actually restrict anything on
   Telegram. Matrix has no granular permission object at all; only `w` is
   best-effort mapped onto the same power-level mechanism `/mute` uses,
-  everything else is stored-but-unenforced. Nothing is enforced on XMPP.
-  `/permission` with no arguments prints the full letter legend and this
-  same enforcement caveat.
+  everything else is stored-but-unenforced. XMPP's MUC affiliation/role
+  model has no granular per-bit equivalent either, so `/permission` is
+  stored but never live-enforced there — even though the plain `/mute`
+  command (not this bitmask's `-w`) does work on XMPP by setting role
+  `visitor`, see "XMPP" above. `/permission` with no arguments prints the
+  full letter legend and this same enforcement caveat.
 - **Custom tags** (`/tag @user <text>`, `/tag @user off`, or reply) —
   Telegram's `setChatAdministratorCustomTitle`, which the Bot API only
   allows on chat *administrators*; running it on an ordinary member
@@ -330,36 +335,68 @@ Authenticate with a JID + password (`WARDEN_XMPP_JID`/`WARDEN_XMPP_PASSWORD`)
 the socket you dial differs from the JID's own domain (e.g. a Docker Compose
 service name).
 
-This connector is an MVP, built and tested in one evening against a
-self-hosted Prosody instance — several things a more mature XMPP client
-would have are deliberately out of scope for now:
-- **SASL PLAIN only, no SCRAM.** This makes the connector suitable for a
-  self-hosted server you control and trust, but unsuitable against a public/
-  federated server, which will almost always refuse PLAIN. TLS is still
-  required (STARTTLS) so the password isn't sent in the clear, but there's
-  no certificate-authority verification of the server's certificate either
-  (`.no_verification` — see `xmpp/client.zig`), so this is not a hardened
-  setup for use over an untrusted network.
+This connector started as an MVP built and tested in one evening against a
+self-hosted Prosody instance, then grew connection reliability, MUC
+moderation, mention detection, SASL SCRAM, and configurable TLS
+verification in a later pass. It authenticates with SASL SCRAM-SHA-256 or
+SCRAM-SHA-1 whenever the server advertises either (falling back to PLAIN
+otherwise), verifies the server's TLS certificate by default
+(`WARDEN_XMPP_TLS_MODE`, see below), keeps the connection alive with a
+whitespace ping when idle, answers server-initiated XEP-0199 pings, and
+supports real MUC (XEP-0045) admin actions — kick, ban, mute/unmute
+(role-based), and promote/demote (affiliation-based) all work against a
+joined room, same as `/kick`/`/ban`/`/mute`/`/promote`/`/demote` on
+Telegram/Matrix. A few things a more mature XMPP client would have are
+still deliberately out of scope:
+- **No SASLprep (RFC 4013) normalization** of the SCRAM username/password —
+  works correctly for plain-ASCII JIDs/passwords, which covers essentially
+  every self-hosted Prosody/ejabberd setup; a JID or password with
+  non-ASCII characters may not authenticate correctly.
+- **No channel binding** (the "-PLUS" SCRAM variants) — this connector
+  never offers or selects one.
+- **Ban/promote/demote need the target's real JID**, which XEP-0045
+  affiliation changes require (unlike kick/mute, which only need a
+  nickname). This connector learns real JIDs from MUC presence, which a
+  room only discloses to moderators, or to everyone in a non-anonymous
+  room. In a semi-anonymous room where the bot isn't a moderator, these
+  three actions fail with a clear "unknown JID" error until the bot is
+  promoted (a manual one-time step on the server, or via `/promote` itself
+  once the bot has moderator standing another way).
 - **No end-to-end encryption (OMEMO).** Same reasoning/precedent as Matrix's
   Olm/Megolm: a real cryptographic protocol worth doing properly or not at
   all, not attempted here.
 - **No file transfer.** XMPP's mechanisms for this (XEP-0363 HTTP Upload,
   Jingle) are a separate system from a `<message>`'s `<body>`, unlike
-  Matrix's `m.image`/`m.file` msgtypes — not implemented tonight.
-- **Group chat (MUC, XEP-0045) has no admin features.** The bot can join
-  rooms (via `WARDEN_XMPP_MUC_ROOMS`) and send/receive `groupchat` messages,
-  but there's no kick/ban/affiliation support — every moderation vtable slot
-  reports "unsupported" for XMPP, same as the pre-built-out Matrix/XMPP
-  stubs used to before either connector was real. That includes `/slowmode`
-  (stored per-chat but never enforced, since there's no `deleteMessage` to
-  act on), `/permission` (the bitmask still saves, nothing is ever
-  restricted live), and `/tag` (no custom-title primitive at all).
+  Matrix's `m.image`/`m.file` msgtypes.
+- **`/permission`'s granular bitmask and `/tag` still have no XMPP
+  primitive** — MUC's affiliation/role model doesn't have anything
+  resembling either, so both remain stored-but-unenforced there (same as
+  they've always been), even though kick/ban/mute/promote/demote are now
+  real.
 - **No roster UI.** Any incoming presence-subscription request is
   auto-accepted (mirrors Matrix's auto-join-on-invite) — there's no way to
   see or manage a roster from within the bot.
-- **No mention detection in group chat.** Unlike Telegram/Matrix, an XMPP
-  MUC message doesn't get scanned for an @mention of the bot yet — it'll
-  only respond to the configured magic word in a room.
+
+## XMPP TLS verification
+`WARDEN_XMPP_TLS_MODE` picks how the server's certificate is checked
+(default `self_signed`):
+- `self_signed` (default) — the certificate must be well-formed,
+  non-expired, and match the JID's domain, but since there's no CA vouching
+  for it, this doesn't stop a determined active attacker from presenting
+  their own self-signed certificate for the same name — only a malformed or
+  wrong-domain certificate gets rejected. Matches how this connector's
+  primary use case (a self-hosted Prosody/ejabberd you already trust the
+  network path to) is usually set up, including `compose.yaml`'s `prosody`
+  dev service.
+- `bundle` — full verification against the system CA trust store plus a
+  hostname match, same as a real browser. The only mode with genuine
+  protection against a network attacker; needs a real (e.g. Let's Encrypt)
+  certificate on the server, so a self-signed dev setup will fail to
+  connect under this mode.
+- `insecure` — no certificate verification at all (the connector's original
+  behavior). STARTTLS still runs so the password isn't sent in the clear,
+  but anyone who can intercept the TCP connection can impersonate the
+  server. Escape hatch only.
 
 For local development, `compose.yaml` includes an opt-in `prosody` service
 (same not-started-by-a-plain-`up`-shape as `llama-server`/`whisper-server`)
@@ -415,6 +452,9 @@ export WARDEN_TELEGRAM_OWNER_ID=<your_numeric_telegram_user_id>
 # export WARDEN_XMPP_SERVER=prosody:5222
 # Comma-separated bare room JIDs to auto-join on connect (optional):
 # export WARDEN_XMPP_MUC_ROOMS=room1@conference.yourserver.example,room2@conference.yourserver.example
+# TLS certificate verification: self_signed (default) | bundle | insecure
+# — see "XMPP TLS verification" below:
+# export WARDEN_XMPP_TLS_MODE=self_signed
 
 # LLM provider — anthropic (default) or openai_compat:
 export WARDEN_LLM_PROVIDER=anthropic

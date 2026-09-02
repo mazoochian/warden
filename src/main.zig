@@ -494,7 +494,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Same "only join the list when configured" shape as Matrix above.
     var xmpp_adapter: ?xmpp_platform.XmppConnector = if (config.xmpp) |xc|
-        xmpp_platform.XmppConnector.init(gpa, io, xc.host, xc.port, xc.domain, xc.jid_user, xc.password, xc.muc_rooms)
+        xmpp_platform.XmppConnector.init(gpa, io, xc.host, xc.port, xc.domain, xc.jid_user, xc.password, xc.muc_rooms, switch (xc.tls_mode) {
+            .self_signed => .self_signed,
+            .bundle => .bundle,
+            .insecure => .insecure,
+        })
     else
         null;
     defer if (xmpp_adapter) |*x| x.deinit();

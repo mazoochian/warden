@@ -35,11 +35,36 @@ pub const MatrixConfig = struct {
     access_token: []const u8,
 };
 
+/// How `xmpp/client.zig`'s `startTls` verifies the server's certificate —
+/// `WARDEN_XMPP_TLS_MODE` selects one, see `loadXmppConfig`.
+pub const XmppTlsMode = enum {
+    /// Default: the certificate must be well-formed and self-consistent
+    /// (a valid self-signed cert, or a valid chain, expiry checked either
+    /// way) and its identity must match the JID's domain — but with no CA
+    /// to vouch for it, this provides no real protection against an active
+    /// attacker who can present their own self-signed cert for the same
+    /// name. Suitable for a self-hosted server reached over a network you
+    /// already trust (a Docker Compose network, a LAN, a VPN).
+    self_signed,
+    /// Full verification against the system CA trust store (loaded via
+    /// `std.crypto.Certificate.Bundle.rescan`) plus hostname match — the
+    /// only mode that actually defends against a network-level attacker.
+    /// Needs a real (e.g. Let's Encrypt) certificate on the server; a
+    /// self-hosted server with a self-signed cert will fail to connect
+    /// under this mode.
+    bundle,
+    /// No certificate verification at all — STARTTLS still runs so the
+    /// password isn't sent in cleartext, but anyone who can intercept the
+    /// TCP connection can impersonate the server. Escape hatch only, e.g.
+    /// a self-signed cert whose name doesn't match the JID's domain.
+    insecure,
+};
+
 /// XMPP connector config — `host`/`port` is the raw TCP target (may differ
 /// from `domain`, e.g. a compose service name like "prosody" vs. a JID's
-/// "localhost" domain part). Authenticates via SASL PLAIN, the only
-/// mechanism `xmpp/client.zig` implements (see its doc comment: self-
-/// hosted/trusted-server deployments only, not a public/federated server).
+/// "localhost" domain part). Authenticates via SASL SCRAM-SHA-256/-SHA-1
+/// when the server advertises either, falling back to PLAIN otherwise —
+/// see `xmpp/client.zig`'s `authScram`/`authPlain`.
 pub const XmppConfig = struct {
     host: []const u8,
     port: u16,
@@ -50,6 +75,7 @@ pub const XmppConfig = struct {
     /// Matrix-equivalent "just works once added to a group" step, so this
     /// is how the operator opts a room in.
     muc_rooms: []const []const u8,
+    tls_mode: XmppTlsMode = .self_signed,
 };
 
 /// TDLib (personal-account) connector config — the owner's own Telegram
@@ -697,6 +723,14 @@ pub const Config = struct {
             }
         }
 
+        var tls_mode: XmppTlsMode = .self_signed;
+        if (env.get("WARDEN_XMPP_TLS_MODE")) |mode_raw| {
+            tls_mode = std.meta.stringToEnum(XmppTlsMode, mode_raw) orelse blk: {
+                std.log.warn("WARDEN_XMPP_TLS_MODE '{s}' isn't one of self_signed/bundle/insecure — defaulting to self_signed", .{mode_raw});
+                break :blk .self_signed;
+            };
+        }
+
         return .{
             .host = host,
             .port = port,
@@ -704,6 +738,7 @@ pub const Config = struct {
             .jid_user = jid_user,
             .password = pw,
             .muc_rooms = try muc_rooms.toOwnedSlice(arena),
+            .tls_mode = tls_mode,
         };
     }
 
