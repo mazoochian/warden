@@ -3,6 +3,7 @@ const Identity = @import("../domain/identity.zig").Identity;
 const TelegramProfile = @import("../domain/telegram_profile.zig").TelegramProfile;
 const MatrixProfile = @import("../domain/matrix_profile.zig").MatrixProfile;
 const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
+const InstagramProfile = @import("../domain/instagram_profile.zig").InstagramProfile;
 
 /// Chat platforms Warden can be wired up to. `.telegram`/`.matrix`/`.xmpp`
 /// have implementations; `.discord`/`.whatsapp` exist so config/auth code
@@ -20,6 +21,14 @@ const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
 /// `store/chats.zig`'s `upsertChat`) — a `.telegram_user` chat/identity
 /// with the same native numeric id as a `.telegram` one is a distinct row,
 /// never collides.
+///
+/// `.instagram` is the same "personal-account connector" shape as
+/// `.telegram_user`: it logs into the owner's own Instagram account
+/// (private mobile-app API, interactive login) rather than holding a
+/// platform-issued bot credential. Unlike `.telegram_user`, Instagram has
+/// no separate bot-account concept at all — the connector's identity IS
+/// the owner's account — so `instagram/auth.zig`'s login flow is the only
+/// way this platform ever gets configured, there's no static-token path.
 pub const Platform = enum {
     telegram,
     telegram_user,
@@ -27,6 +36,7 @@ pub const Platform = enum {
     xmpp,
     discord,
     whatsapp,
+    instagram,
 };
 
 pub const AttachmentKind = enum { photo, document, voice, audio, video };
@@ -223,6 +233,11 @@ pub const Message = struct {
     /// only by the XMPP connector, null for every other platform. Same
     /// reasoning as `telegram_profile`/`matrix_profile` above.
     xmpp_profile: ?XmppProfile = null,
+    /// Instagram-specific extension of `identity` (full_name, is_private)
+    /// — populated only by the Instagram connector, null for every other
+    /// platform. Same reasoning as `telegram_profile`/`matrix_profile`/
+    /// `xmpp_profile` above.
+    instagram_profile: ?InstagramProfile = null,
     /// Set when this message carries a photo/document/voice/audio/video —
     /// see `Attachment`'s doc comment on why only metadata lives here.
     attachment: ?Attachment = null,
@@ -305,6 +320,7 @@ pub const Message = struct {
             .telegram_profile = if (self.telegram_profile) |p| try p.dupe(allocator) else null,
             .matrix_profile = if (self.matrix_profile) |p| try p.dupe(allocator) else null,
             .xmpp_profile = if (self.xmpp_profile) |p| try p.dupe(allocator) else null,
+            .instagram_profile = if (self.instagram_profile) |p| try p.dupe(allocator) else null,
             .attachment = if (self.attachment) |att| try att.dupe(allocator) else null,
             .choice_picked = if (self.choice_picked) |cp| .{
                 .prompt_message_id = try allocator.dupe(u8, cp.prompt_message_id),
@@ -765,6 +781,7 @@ test "Message.dupe passes through null optional fields as null" {
     try testing.expectEqual(@as(?[]const u8, null), dst.text);
     try testing.expectEqual(@as(?Identity, null), dst.identity);
     try testing.expectEqual(@as(?TelegramProfile, null), dst.telegram_profile);
+    try testing.expectEqual(@as(?InstagramProfile, null), dst.instagram_profile);
     try testing.expectEqual(@as(?ChoicePicked, null), dst.choice_picked);
 }
 
@@ -843,6 +860,41 @@ test "Message.dupe deep-copies identity and telegram_profile" {
     try testing.expectEqualStrings("Alice", dst.identity.?.display_name);
     try testing.expectEqualStrings("alice", dst.identity.?.username.?);
     try testing.expectEqualStrings("en", dst.telegram_profile.?.language_code.?);
+}
+
+test "Message.dupe deep-copies instagram_profile" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const src_a = arena.allocator();
+
+    const src = Message{
+        .chat_id = try src_a.dupe(u8, "1"),
+        .user_id = try src_a.dupe(u8, "42"),
+        .instagram_profile = .{
+            .identity = .{
+                .platform = .instagram,
+                .native_id = try src_a.dupe(u8, "42"),
+                .display_name = try src_a.dupe(u8, "alice"),
+                .first_seen = 1000,
+                .last_seen = 1000,
+            },
+            .full_name = try src_a.dupe(u8, "Alice Example"),
+            .is_private = true,
+        },
+    };
+
+    const dst = try src.dupe(testing.allocator);
+    defer {
+        testing.allocator.free(dst.chat_id);
+        testing.allocator.free(dst.user_id);
+        testing.allocator.free(dst.instagram_profile.?.identity.native_id);
+        testing.allocator.free(dst.instagram_profile.?.identity.display_name);
+        testing.allocator.free(dst.instagram_profile.?.full_name.?);
+    }
+
+    arena.deinit();
+
+    try testing.expectEqualStrings("Alice Example", dst.instagram_profile.?.full_name.?);
+    try testing.expect(dst.instagram_profile.?.is_private);
 }
 
 test "Message.dupe deep-copies observed_users and detaches them from the source arena" {

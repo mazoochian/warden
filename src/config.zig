@@ -1,5 +1,6 @@
 const std = @import("std");
 const Platform = @import("platform/interface.zig").Platform;
+const instagram_transport = @import("instagram/transport.zig");
 
 pub const OwnerEntry = struct {
     platform: Platform,
@@ -92,6 +93,34 @@ pub const TelegramUserConfig = struct {
     api_hash: []const u8,
     session_dir: []const u8,
 };
+
+/// Instagram (personal-account) connector config — see
+/// `platform/interface.zig`'s `Platform.instagram` doc comment for why this
+/// is login-flow-first like `TelegramUserConfig` rather than a static token
+/// like `MatrixConfig`: Instagram has no bot-token concept, and the account
+/// itself IS the owner's, so there's no separate identity to provision one
+/// for. `enabled` is the only required setting — actual login happens
+/// through the interactive `/iglogin` command
+/// (`main.zig`'s `handleIgloginCommand`), same shape as `/tdlogin`.
+pub const InstagramConfig = struct {
+    enabled: bool,
+    /// Base interval between inbox poll cycles — deliberately much longer
+    /// than a chat platform's long-poll (XMPP/Telegram effectively poll in
+    /// seconds), since Instagram's private API is unofficial and aggressive
+    /// polling is a real account-suspension risk (see the connector plan's
+    /// "Rate-limit / ban-avoidance policy" section). `instagram/policy.zig`
+    /// adds jitter on top of this, never polls faster than this floor.
+    poll_interval_ms: u32 = default_instagram_poll_interval_ms,
+    /// Reverse-engineered protocol constants Instagram rotates without
+    /// notice (see `instagram_transport.RotatingConstants`'s doc comment).
+    /// Defaults to this build's best-effort current values; override via
+    /// `WARDEN_INSTAGRAM_SIG_KEY`/`_SIG_KEY_VERSION`/`_APP_ID`/
+    /// `_CAPABILITIES`/`_APP_VERSION`/`_APP_VERSION_CODE` without a code
+    /// change when Instagram rotates them and login/requests start failing.
+    rotating: instagram_transport.RotatingConstants = .{},
+};
+
+pub const default_instagram_poll_interval_ms: u32 = 45_000;
 
 pub const LlmConfig = union(LlmProviderKind) {
     anthropic: AnthropicConfig,
@@ -328,6 +357,11 @@ pub const Config = struct {
     /// the active connector list) when this is set. See
     /// `platform/telegram_user.zig`.
     telegram_user: ?TelegramUserConfig = null,
+    /// Null when the Instagram personal-account connector isn't configured
+    /// — `main.zig` only constructs an `InstagramConnector` (and adds it to
+    /// the active connector list) when this is set. See `InstagramConfig`'s
+    /// doc comment.
+    instagram: ?InstagramConfig = null,
     /// Null (the default) means the warden-ui HTTP+WebSocket API
     /// (`src/api/`) stays entirely off — same half-configured-stays-
     /// disabled convention as `matrix`/`xmpp` above, and a deliberate
@@ -391,8 +425,9 @@ pub const Config = struct {
         const matrix_pickle_key = nonEmpty(env.get("WARDEN_MATRIX_PICKLE_KEY"));
         const xmpp = try loadXmppConfig(arena, env);
         const telegram_user = loadTelegramUserConfig(env);
+        const instagram = loadInstagramConfig(env);
 
-        var owners_buf: [4]OwnerEntry = undefined;
+        var owners_buf: [5]OwnerEntry = undefined;
         var owners_len: usize = 0;
         owners_buf[owners_len] = .{ .platform = .telegram, .owner_id = telegram_owner_id };
         owners_len += 1;
@@ -427,6 +462,20 @@ pub const Config = struct {
                 owners_len += 1;
             } else {
                 std.log.warn("WARDEN_TELEGRAM_USER_API_ID/_API_HASH/_SESSION_DIR are set but WARDEN_TELEGRAM_USER_OWNER_ID isn't — owner-gated actions will reject the personal account until it's set to its own numeric Telegram user id", .{});
+            }
+        }
+        if (instagram != null) {
+            // Same reasoning as `telegram_user` above: this connector's
+            // account IS the owner by definition (there's no bot-vs-owner
+            // distinction on a personal-account connector), but the owner id
+            // is still sourced from an explicit env var rather than resolved
+            // from the logged-in session at startup — `Config.load` runs
+            // before any connector (or login) exists.
+            if (env.get("WARDEN_INSTAGRAM_OWNER_ID")) |ig_owner_id| {
+                owners_buf[owners_len] = .{ .platform = .instagram, .owner_id = ig_owner_id };
+                owners_len += 1;
+            } else {
+                std.log.warn("WARDEN_INSTAGRAM_ENABLED is set but WARDEN_INSTAGRAM_OWNER_ID isn't — owner-gated actions will reject the Instagram account until it's set to its own numeric Instagram user id (available via /iglogin status once logged in)", .{});
             }
         }
         const owners = try arena.dupe(OwnerEntry, owners_buf[0..owners_len]);
@@ -619,6 +668,7 @@ pub const Config = struct {
             .matrix_pickle_key = matrix_pickle_key,
             .xmpp = xmpp,
             .telegram_user = telegram_user,
+            .instagram = instagram,
             .api_port = api_port,
             .api_workers = api_workers,
             .api_session_secret = api_session_secret,
@@ -772,6 +822,33 @@ pub const Config = struct {
             return null;
         };
         return .{ .api_id = api_id, .api_hash = hash, .session_dir = dir };
+    }
+
+    /// `null` unless `WARDEN_INSTAGRAM_ENABLED` is truthy — everything else
+    /// (device profile, session cookies, the account's own username) comes
+    /// from the interactive `/iglogin` flow and persisted session state, not
+    /// static env config, so there's no "half-configured" state to detect
+    /// here the way `loadMatrixConfig`/`loadXmppConfig`/
+    /// `loadTelegramUserConfig` do — just on or off.
+    fn loadInstagramConfig(env: *const std.process.Environ.Map) ?InstagramConfig {
+        if (!parseBoolEnv(env, "WARDEN_INSTAGRAM_ENABLED", false)) return null;
+
+        const poll_interval_ms: u32 = if (env.get("WARDEN_INSTAGRAM_POLL_INTERVAL_MS")) |raw|
+            std.fmt.parseInt(u32, raw, 10) catch default_instagram_poll_interval_ms
+        else
+            default_instagram_poll_interval_ms;
+
+        var rotating: instagram_transport.RotatingConstants = .{};
+        if (nonEmpty(env.get("WARDEN_INSTAGRAM_SIG_KEY"))) |v| rotating.sig_key = v;
+        if (nonEmpty(env.get("WARDEN_INSTAGRAM_SIG_KEY_VERSION"))) |v| rotating.sig_key_version = v;
+        if (nonEmpty(env.get("WARDEN_INSTAGRAM_APP_ID"))) |v| rotating.ig_app_id = v;
+        if (nonEmpty(env.get("WARDEN_INSTAGRAM_CAPABILITIES"))) |v| rotating.ig_capabilities = v;
+        if (nonEmpty(env.get("WARDEN_INSTAGRAM_APP_VERSION"))) |v| rotating.app_version = v;
+        if (nonEmpty(env.get("WARDEN_INSTAGRAM_APP_VERSION_CODE"))) |v| rotating.app_version_code = v;
+        if (nonEmpty(env.get("WARDEN_INSTAGRAM_PASSWORD_KEY_ID"))) |v| rotating.password_encryption_key_id = v;
+        if (nonEmpty(env.get("WARDEN_INSTAGRAM_PASSWORD_PUBKEY_DER_B64"))) |v| rotating.password_encryption_pubkey_der_b64 = v;
+
+        return .{ .enabled = true, .poll_interval_ms = poll_interval_ms, .rotating = rotating };
     }
 
     /// Longest delegate `name` accepted — well past anything a real config

@@ -25,6 +25,7 @@ const telegram_platform = @import("platform/telegram.zig");
 const matrix_platform = @import("platform/matrix.zig");
 const xmpp_platform = @import("platform/xmpp.zig");
 const telegram_user_platform = @import("platform/telegram_user.zig");
+const instagram_platform = @import("platform/instagram.zig");
 const reply_redirect = @import("platform/reply_redirect.zig");
 const store_pool = @import("store/pool.zig");
 const api_server = @import("api/server.zig");
@@ -514,25 +515,13 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
-    var connectors_buf: [4]iface.Connector = undefined;
-    var connectors_len: usize = 0;
-    connectors_buf[connectors_len] = telegram_adapter.connector();
-    connectors_len += 1;
-    if (matrix_adapter) |*m| {
-        connectors_buf[connectors_len] = m.connector();
-        connectors_len += 1;
-    }
-    if (xmpp_adapter) |*x| {
-        connectors_buf[connectors_len] = x.connector();
-        connectors_len += 1;
-    }
-    if (telegram_user_adapter) |*t| {
-        connectors_buf[connectors_len] = t.connector();
-        connectors_len += 1;
-    }
-    const connectors: []const iface.Connector = connectors_buf[0..connectors_len];
-    const max_message_len = effectiveMaxMessageLength(connectors);
-
+    // Hoisted above `connectors_buf` (it lived after it, right before the
+    // Matrix E2EE setup below, until this connector needed it earlier too)
+    // since this is the first connector that needs the Postgres pool
+    // already at construction time (session/device-profile persistence,
+    // see `instagram/session.zig`) -- nothing between here and its old
+    // location actually depended on connector construction happening
+    // first.
     var pool = store_pool.PgPool.init(
         gpa,
         io,
@@ -552,6 +541,40 @@ pub fn main(init: std.process.Init) !void {
             log.fatal("postgres: schema migration failed: {t}", .{err});
         };
     }
+
+    // Same "only join the list when configured" shape as every other
+    // connector above.
+    var instagram_adapter: ?instagram_platform.InstagramConnector = if (config.instagram) |ic|
+        instagram_platform.InstagramConnector.init(gpa, io, &pool, ic.poll_interval_ms, ic.rotating) catch |err| blk: {
+            log.err("failed to initialize the Instagram connector: {t}", .{err});
+            break :blk null;
+        }
+    else
+        null;
+    defer if (instagram_adapter) |*i| i.deinit();
+
+    var connectors_buf: [5]iface.Connector = undefined;
+    var connectors_len: usize = 0;
+    connectors_buf[connectors_len] = telegram_adapter.connector();
+    connectors_len += 1;
+    if (matrix_adapter) |*m| {
+        connectors_buf[connectors_len] = m.connector();
+        connectors_len += 1;
+    }
+    if (xmpp_adapter) |*x| {
+        connectors_buf[connectors_len] = x.connector();
+        connectors_len += 1;
+    }
+    if (telegram_user_adapter) |*t| {
+        connectors_buf[connectors_len] = t.connector();
+        connectors_len += 1;
+    }
+    if (instagram_adapter) |*i| {
+        connectors_buf[connectors_len] = i.connector();
+        connectors_len += 1;
+    }
+    const connectors: []const iface.Connector = connectors_buf[0..connectors_len];
+    const max_message_len = effectiveMaxMessageLength(connectors);
 
     // Device key creation/upload plus ongoing encrypt/decrypt for Matrix
     // E2E encryption (see src/matrix/olm.zig, src/matrix/crypto.zig,
@@ -740,6 +763,10 @@ pub fn main(init: std.process.Init) !void {
     // pointer "belongs to".
     const telegram_user_ptr: ?*telegram_user_platform.TelegramUserConnector = if (telegram_user_adapter) |*t| t else null;
 
+    // Same reasoning as `telegram_user_ptr` above -- `/iglogin` can be typed
+    // from whichever connector the owner is actually talking to the bot on.
+    const instagram_ptr: ?*instagram_platform.InstagramConnector = if (instagram_adapter) |*i| i else null;
+
     // A `reply_autonomy = .draft` notification (see `pending_drafts` above)
     // always needs to reach the owner through the Bot API chat they
     // actually operate Warden from, regardless of which connector's poll
@@ -794,6 +821,7 @@ pub fn main(init: std.process.Init) !void {
             telegram_user_ptr,
             &pending_drafts,
             owner_notify_connector,
+            instagram_ptr,
         }) catch |err| {
             log.err("failed to start poll loop thread for {t}: {t}", .{ connector.platform(), err });
             continue;
@@ -1093,6 +1121,7 @@ fn connectorPollLoop(
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     owner_notify: iface.Connector,
+    instagram: ?*instagram_platform.InstagramConnector,
 ) void {
     while (true) {
         var poll_arena = std.heap.ArenaAllocator.init(gpa);
@@ -1183,6 +1212,7 @@ fn connectorPollLoop(
                 .telegram_user = telegram_user,
                 .pending_drafts = pending_drafts,
                 .owner_notify = owner_notify,
+                .instagram = instagram,
             }) catch |err| {
                 // Queueing itself failed (OOM growing the queue's backing
                 // array) — `processMessageTask` never got a chance to free
@@ -1274,6 +1304,7 @@ const MessageTask = struct {
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     owner_notify: iface.Connector,
+    instagram: ?*instagram_platform.InstagramConnector,
 
     fn run(self: MessageTask) void {
         processMessageTask(
@@ -1301,6 +1332,7 @@ const MessageTask = struct {
             self.telegram_user,
             self.pending_drafts,
             self.owner_notify,
+            self.instagram,
         );
     }
 };
@@ -1334,6 +1366,7 @@ fn processMessageTask(
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     owner_notify: iface.Connector,
+    instagram: ?*instagram_platform.InstagramConnector,
 ) void {
     defer {
         task_arena.deinit();
@@ -1553,7 +1586,7 @@ fn processMessageTask(
         .attachment_kind = if (msg.attachment) |att| att.kind else null,
         .delegates = delegates,
     };
-    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, in_flight_requests, io, ts, max_message_len, msg, false, telegram_user, pending_drafts, owner_notify);
+    const claimed = handleMessage(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, pending, pending_undos, digest_scheduler, briefing_scheduler, pending_conversions, menu_sessions, in_flight_requests, io, ts, max_message_len, msg, false, telegram_user, pending_drafts, owner_notify, instagram);
     if (claimed) attachment_cleanup_path = null;
 }
 
@@ -2312,6 +2345,11 @@ fn handleMessage(
     /// received the message being drafted for is the *personal* one, not
     /// the one the owner reviews drafts on).
     owner_notify: iface.Connector,
+    /// The Instagram personal-account connector, if `WARDEN_INSTAGRAM_*` is
+    /// configured — `null` otherwise. Same "explicit dependency, threaded
+    /// alongside `connector`" reasoning as `telegram_user` above; only
+    /// `/iglogin`'s handler touches this.
+    instagram: ?*instagram_platform.InstagramConnector,
 ) bool {
     // Coarse "does the bot even respond here" gate — checked before
     // anything else in this function (including the choice_picked/
@@ -2521,6 +2559,7 @@ fn handleMessage(
                 telegram_user,
                 pending_drafts,
                 owner_notify,
+                instagram,
             );
         }
     }
@@ -2737,6 +2776,7 @@ fn handleMessage(
             telegram_user,
             pending_drafts,
             owner_notify,
+            instagram,
         );
     } else if (std.mem.eql(u8, text, "/redact") or std.mem.startsWith(u8, text, "/redact ")) {
         // Per-mode gating happens inside handleRedactCommand itself (regex
@@ -2768,6 +2808,9 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/tdlogin") or std.mem.startsWith(u8, text, "/tdlogin ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleTdloginCommand(connector, a, config, telegram_user, io, msg, text);
+    } else if (std.mem.eql(u8, text, "/iglogin") or std.mem.startsWith(u8, text, "/iglogin ")) {
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleIgloginCommand(connector, a, config, instagram, msg, text);
     } else if (std.mem.eql(u8, text, "/tdlogout")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         if (telegram_user) |conn| {
@@ -4345,6 +4388,144 @@ fn handleTdloginCommand(
     }
 
     reply(connector, a, msg.chat_id, msg.message_id, "Unknown /tdlogin subcommand — use status, phone, code, password, or logout.");
+}
+
+/// `/iglogin status|start <username> <password>|challenge <digits>|code <digits>|2fa <digits>|logout`
+/// — drives the Instagram connector's login/challenge/2FA state machine
+/// (`instagram/auth.zig`), same owner-only/bot-chat-fallback shape as
+/// `/tdlogin` above. The password is typed directly into this trusted
+/// chat (same trust boundary `/tdlogin`'s phone number and every other
+/// owner-only command already relies on) and is never logged or persisted
+/// — see `instagram/auth.zig`'s `AuthClient.login` doc comment.
+fn handleIgloginCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    instagram: ?*instagram_platform.InstagramConnector,
+    msg: iface.Message,
+    text: []const u8,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can drive the Instagram connector's login.");
+        return;
+    }
+    const conn = instagram orelse {
+        reply(connector, a, msg.chat_id, msg.message_id, "The Instagram connector isn't configured on this deployment (WARDEN_INSTAGRAM_ENABLED/_OWNER_ID).");
+        return;
+    };
+
+    const rest = std.mem.trim(u8, text["/iglogin".len..], " ");
+    const space = std.mem.indexOfScalar(u8, rest, ' ');
+    const sub = if (space) |i| rest[0..i] else rest;
+    const arg = if (space) |i| std.mem.trim(u8, rest[i + 1 ..], " ") else "";
+
+    if (sub.len == 0 or std.mem.eql(u8, sub, "status")) {
+        const state_text = switch (conn.authState()) {
+            .logged_out => "not logged in — start with /iglogin start <username> <password>",
+            .wait_challenge_choice, .wait_challenge_code => "waiting for the challenge code Instagram sent — reply with /iglogin challenge <digits>",
+            .wait_2fa_code => "waiting for a 2FA code — reply with /iglogin 2fa <digits>",
+            .ready => "connected and ready",
+        };
+        const paused_note: []const u8 = if (conn.isPaused())
+            " (polling is PAUSED — Instagram returned a challenge/checkpoint response; resolve it in the app, then /iglogin resume)"
+        else
+            "";
+        const out = std.fmt.allocPrint(a, "Instagram login: {s}{s}", .{ state_text, paused_note }) catch return;
+        connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "start")) {
+        const inner_space = std.mem.indexOfScalar(u8, arg, ' ');
+        const username = if (inner_space) |i| arg[0..i] else "";
+        const password = if (inner_space) |i| std.mem.trim(u8, arg[i + 1 ..], " ") else "";
+        if (username.len == 0 or password.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /iglogin start <username> <password>");
+            return;
+        }
+        const outcome = conn.login(username, password) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't reach Instagram to log in — try again.");
+            return;
+        };
+        switch (outcome) {
+            .ok => {
+                const state_text: []const u8 = switch (conn.authState()) {
+                    .ready => "Logged in and ready.",
+                    .wait_challenge_code, .wait_challenge_choice => "Instagram wants a challenge code (check email/SMS), then reply with /iglogin challenge <digits>.",
+                    .wait_2fa_code => "Instagram wants a 2FA code, then reply with /iglogin 2fa <digits>.",
+                    .logged_out => "Unexpected state after login — check /iglogin status.",
+                };
+                connector.sendMessage(a, msg.chat_id, state_text, msg.message_id);
+            },
+            .rejected => |why| {
+                const out = std.fmt.allocPrint(a, "Instagram rejected that login: {s}", .{why}) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+            .timed_out => reply(connector, a, msg.chat_id, msg.message_id, "Couldn't confirm that reached Instagram in time — check /iglogin status before retrying."),
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "challenge")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /iglogin challenge <digits>");
+            return;
+        }
+        const outcome = conn.submitChallengeCode(arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't submit the challenge code — try again.");
+            return;
+        };
+        switch (outcome) {
+            .ok => {
+                const state_text: []const u8 = if (conn.authState() == .ready) "Challenge passed — logged in." else "Challenge code submitted.";
+                connector.sendMessage(a, msg.chat_id, state_text, msg.message_id);
+            },
+            .rejected => |why| {
+                const out = std.fmt.allocPrint(a, "Instagram rejected that challenge code: {s}", .{why}) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+            .timed_out => reply(connector, a, msg.chat_id, msg.message_id, "Couldn't confirm that reached Instagram in time — check /iglogin status before retrying."),
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "2fa")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /iglogin 2fa <digits>");
+            return;
+        }
+        const outcome = conn.submit2faCode(arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't submit the 2FA code — try again.");
+            return;
+        };
+        switch (outcome) {
+            .ok => reply(connector, a, msg.chat_id, msg.message_id, "2FA passed — logged in."),
+            .rejected => |why| {
+                const out = std.fmt.allocPrint(a, "Instagram rejected that 2FA code: {s}", .{why}) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+            .timed_out => reply(connector, a, msg.chat_id, msg.message_id, "Couldn't confirm that reached Instagram in time — check /iglogin status before retrying."),
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "resume")) {
+        if (!conn.isPaused()) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Polling isn't paused.");
+            return;
+        }
+        conn.resumePolling();
+        reply(connector, a, msg.chat_id, msg.message_id, "Resumed polling.");
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "logout")) {
+        conn.logOut();
+        reply(connector, a, msg.chat_id, msg.message_id, "Logged out of the Instagram connector. Log back in any time with /iglogin start <username> <password>.");
+        return;
+    }
+
+    reply(connector, a, msg.chat_id, msg.message_id, "Unknown /iglogin subcommand — use status, start, challenge, 2fa, resume, or logout.");
 }
 
 /// Shared by `/tdlogin logout` and the standalone `/tdlogout` alias (same
@@ -5992,6 +6173,7 @@ fn platformLabel(platform: iface.Platform) []const u8 {
         .xmpp => "XMPP",
         .discord => "Discord",
         .whatsapp => "WhatsApp",
+        .instagram => "Instagram",
     };
 }
 
@@ -10500,6 +10682,16 @@ test {
     _ = @import("xmpp/types.zig");
     _ = @import("xmpp/client.zig");
     _ = @import("domain/xmpp_profile.zig");
+    _ = @import("domain/instagram_profile.zig");
+    _ = @import("instagram/crypto.zig");
+    _ = @import("instagram/transport.zig");
+    _ = @import("instagram/auth.zig");
+    _ = @import("instagram/session.zig");
+    _ = @import("instagram/direct.zig");
+    _ = @import("instagram/media.zig");
+    _ = @import("instagram/policy.zig");
+    _ = @import("platform/instagram.zig");
+    _ = @import("store/instagram_sessions.zig");
     _ = @import("worker_pool.zig");
     _ = @import("store/db.zig");
 }

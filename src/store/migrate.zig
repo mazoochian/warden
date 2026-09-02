@@ -58,6 +58,7 @@ const migrations = [_]Migration{
     .{ .version = 44, .name = "0044_storage_sense", .sql = @embedFile("migrations/0044_storage_sense.sql") },
     .{ .version = 45, .name = "0045_chat_monitoring", .sql = @embedFile("migrations/0045_chat_monitoring.sql") },
     .{ .version = 46, .name = "0046_monitor_all_default", .sql = @embedFile("migrations/0046_monitor_all_default.sql") },
+    .{ .version = 47, .name = "0047_instagram_sessions", .sql = @embedFile("migrations/0047_instagram_sessions.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each
