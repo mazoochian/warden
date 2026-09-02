@@ -3,9 +3,7 @@ const llm = @import("../llm/provider.zig");
 const toolcall = @import("../llm/toolcall.zig");
 const registry = @import("../tools/registry.zig");
 const PgPool = @import("../store/pool.zig").PgPool;
-const messages = @import("../store/messages.zig");
-const civil_time = @import("../text/civil_time.zig");
-const memories = @import("../store/memories.zig");
+const context_assembly = @import("context_assembly.zig");
 const embeddings = @import("../llm/embeddings.zig");
 
 /// Used when the operator hasn't provided their own prompt via
@@ -97,12 +95,6 @@ const thinking_token_reserve: u32 = 4000;
 /// generous than strictly necessary, not that a real answer gets cut short.
 const min_chars_per_token: usize = 3;
 
-/// How many memories `answer`'s retrieval step pulls in per question — see
-/// `store/memories.zig`'s `search`. Small on purpose: this is a short
-/// "what you remember about this person" prompt addition, not a full
-/// memory dump.
-const memory_search_limit: u32 = 5;
-
 /// `max_tokens` for a request whose visible answer is capped at
 /// `max_answer_len` characters (the active platform's message-size limit,
 /// see `main.zig`'s `effectiveMaxMessageLength`) — covers both that answer
@@ -166,68 +158,39 @@ pub fn answer(
     max_tokens_override: ?u32,
     history_window: i64,
 ) ![]const u8 {
-    const history = try messages.recentFormatted(pool, allocator, chat_id, history_window);
-
-    // Long-term memory retrieval (ROADMAP.md's Phase 12) — `hasAny` is a
-    // cheap existence check so an identity that's never used `remember_memory`
-    // never pays the embed-and-search round trip on every single question.
-    // Any failure here (embeddings API down, search error) just means no
-    // memory block gets added, same "soft failure, never block the answer"
-    // convention `resolveQuestion`'s voice transcription already uses.
-    const memories_block: []const u8 = blk: {
-        const client = embeddings_client orelse break :blk "";
-        if (!(memories.hasAny(pool, asker_identity_id) catch false)) break :blk "";
-        const query_vector = client.embed(allocator, question) catch |err| {
-            std.log.warn("qa: memory embed failed for identity {d}: {t}", .{ asker_identity_id, err });
-            break :blk "";
-        };
-        const results = memories.search(pool, allocator, asker_identity_id, query_vector, memory_search_limit) catch |err| {
-            std.log.warn("qa: memory search failed for identity {d}: {t}", .{ asker_identity_id, err });
-            break :blk "";
-        };
-        if (results.len == 0) break :blk "";
-        var buf: std.Io.Writer.Allocating = .init(allocator);
-        buf.writer.print("\n\nWhat you remember about {s}:\n", .{asker.display_name}) catch break :blk "";
-        for (results) |m| buf.writer.print("- {s}\n", .{m.text}) catch break :blk "";
-        break :blk buf.writer.buffered();
-    };
+    // ROADMAP.md's memory-layer phase: pinned/ranked facts, ranked/recent
+    // daily digests, and recent chat history, all budget-capped in code —
+    // see `context_assembly.zig`'s module doc comment. Never fails the
+    // caller; a retrieval problem just drops that section from the prompt.
+    const context = try context_assembly.assemble(
+        pool,
+        allocator,
+        embeddings_client,
+        chat_id,
+        asker_identity_id,
+        asker.display_name,
+        question,
+        ctx.now,
+        history_window,
+        context_assembly.default_budget,
+    );
 
     const asker_line = if (asker.username) |u|
         try std.fmt.allocPrint(allocator, "{s} (@{s}, platform id {s})", .{ asker.display_name, u, asker.native_id })
     else
         try std.fmt.allocPrint(allocator, "{s} (platform id {s})", .{ asker.display_name, asker.native_id });
 
-    // The model has no reliable notion of "today" on its own (training
-    // data goes stale, and it has no clock) — spelling out the weekday
-    // here, not just the date, is what lets it get "remind me this
-    // Friday"/"what's today" right instead of guessing. `set_reminder`'s
-    // own weekday-name support (`reminder_format.parseWeekdayWhen`)
-    // resolves the actual reminder server-side rather than trusting the
-    // model's day-of-week arithmetic, but this still helps for anything
-    // date-related that isn't that one tool call. Naive UTC, same
-    // tradeoff `ctx.now`'s other consumers already make.
-    const now_local = civil_time.localFromUnix(ctx.now, 0);
-    const now_line = try std.fmt.allocPrint(
-        allocator,
-        "{s}, {s} {s} UTC",
-        .{
-            civil_time.weekdayName(civil_time.weekdayFromDays(@divFloor(ctx.now, 86400))),
-            civil_time.formatDate(allocator, now_local, .ymd),
-            civil_time.formatTime(allocator, now_local, .h24),
-        },
-    );
-
     const user_content = if (replied_to) |earlier|
         try std.fmt.allocPrint(
             allocator,
-            "Current date/time: {s}\n\nRecent chat history:\n{s}\n\nThis message is from: {s}{s}\n\nThe user is replying to this earlier message of yours:\n\"{s}\"\n\nTheir reply: {s}",
-            .{ now_line, history, asker_line, memories_block, earlier, question },
+            "{s}\nThis message is from: {s}\n\nThe user is replying to this earlier message of yours:\n\"{s}\"\n\nTheir reply: {s}",
+            .{ context, asker_line, earlier, question },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "Current date/time: {s}\n\nRecent chat history:\n{s}\n\nThis message is from: {s}{s}\n\nQuestion: {s}",
-            .{ now_line, history, asker_line, memories_block, question },
+            "{s}\nThis message is from: {s}\n\nQuestion: {s}",
+            .{ context, asker_line, question },
         );
 
     const effective_max_tokens = max_tokens_override orelse answerMaxTokens(max_answer_len);

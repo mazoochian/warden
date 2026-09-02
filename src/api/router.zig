@@ -27,7 +27,7 @@ const chat_members = @import("../store/chat_members.zig");
 const chat_settings = @import("../store/chat_settings.zig");
 const keyword_alerts = @import("../store/keyword_alerts.zig");
 const management_rooms = @import("../store/management_rooms.zig");
-const memories = @import("../store/memories.zig");
+const facts = @import("../store/facts.zig");
 const rate_limits = @import("../store/rate_limits.zig");
 const member_permissions = @import("../store/member_permissions.zig");
 const storage_sense = @import("../features/storage_sense.zig");
@@ -4114,7 +4114,7 @@ fn handleListMemory(ctx: *const ServerContext, request: *http.Server.Request) !v
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const identity_id = (try callersOwnIdentity(ctx, request, ra.account_id)) orelse return;
 
-    const items = memories.listForIdentity(ctx.pool, ctx.allocator, identity_id) catch |err| {
+    const items = facts.listForIdentity(ctx.pool, ctx.allocator, identity_id) catch |err| {
         log.err("list-memory: failed for identity {d}: {t}", .{ identity_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load memories");
     };
@@ -4135,7 +4135,7 @@ fn handleDeleteMemory(ctx: *const ServerContext, request: *http.Server.Request, 
         return respondError(request, .bad_request, "bad_request", "invalid memory id");
     };
 
-    const mem = (memories.get(ctx.pool, ctx.allocator, id) catch |err| {
+    const mem = (facts.get(ctx.pool, ctx.allocator, id) catch |err| {
         log.err("delete-memory: lookup failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to look up memory");
     }) orelse {
@@ -4152,7 +4152,7 @@ fn handleDeleteMemory(ctx: *const ServerContext, request: *http.Server.Request, 
         return respondError(request, .forbidden, "forbidden", "only the person that memory belongs to can forget it");
     }
 
-    memories.forget(ctx.pool, id) catch |err| {
+    facts.forget(ctx.pool, id) catch |err| {
         log.err("delete-memory: failed for id {d}: {t}", .{ id, err });
         return respondError(request, .internal_server_error, "internal", "failed to delete memory");
     };

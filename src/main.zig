@@ -60,7 +60,7 @@ const budgets = @import("store/budgets.zig");
 const subscriptions = @import("store/subscriptions.zig");
 const command_aliases = @import("store/command_aliases.zig");
 const prompt_templates = @import("store/prompt_templates.zig");
-const memories = @import("store/memories.zig");
+const facts = @import("store/facts.zig");
 const embeddings = @import("llm/embeddings.zig");
 const reminder_format = @import("features/reminder_format.zig");
 const alert_store = @import("store/alerts.zig");
@@ -8391,7 +8391,7 @@ fn handleMemoryCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *
     const sub = it.first();
 
     if (std.mem.eql(u8, sub, "list")) {
-        const listed = memories.listForIdentity(pool, a, identity_id) catch |err| {
+        const listed = facts.listForIdentity(pool, a, identity_id) catch |err| {
             log.err("memory: list failed for identity {d}: {t}", .{ identity_id, err });
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't load memories, try again.");
             return;
@@ -8406,7 +8406,7 @@ fn handleMemoryCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *
             reply(connector, a, msg.chat_id, msg.message_id, "Usage: /memory forget <id> (see /memory list for ids).");
             return;
         };
-        const mem = (memories.get(pool, a, id) catch |err| {
+        const mem = (facts.get(pool, a, id) catch |err| {
             log.err("memory: lookup failed for id {d}: {t}", .{ id, err });
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look up that memory, try again.");
             return;
@@ -8418,7 +8418,7 @@ fn handleMemoryCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *
             reply(connector, a, msg.chat_id, msg.message_id, "Only the person that memory belongs to can forget it.");
             return;
         }
-        memories.forget(pool, id) catch |err| {
+        facts.forget(pool, id) catch |err| {
             log.err("memory: forget failed for id {d}: {t}", .{ id, err });
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't forget that memory, try again.");
             return;
@@ -9224,7 +9224,7 @@ const BulletinToolAdapter = struct {
 
 const memory_search_limit = 5;
 
-fn formatMemories(a: std.mem.Allocator, listed: []const memories.Memory) []const u8 {
+fn formatMemories(a: std.mem.Allocator, listed: []const facts.Memory) []const u8 {
     if (listed.len == 0) return "No memories yet. I'll remember things worth keeping as we talk.";
 
     var buf: std.Io.Writer.Allocating = .init(a);
@@ -9266,20 +9266,20 @@ const MemoryToolAdapter = struct {
         const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
         const client = self.embeddings_client orelse return error.EmbeddingsNotConfigured;
         const vector = try client.embed(allocator, text);
-        return memories.remember(self.pool, allocator, self.identity_id, text, vector, self.now);
+        return facts.remember(self.pool, allocator, self.identity_id, text, vector, self.now);
     }
 
     fn forgetFn(ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!tool_registry.MemorySink.ForgetResult {
         const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
-        const mem = (try memories.get(self.pool, allocator, id)) orelse return .not_found;
+        const mem = (try facts.get(self.pool, allocator, id)) orelse return .not_found;
         if (mem.identity_id != self.identity_id) return .not_authorized;
-        try memories.forget(self.pool, id);
+        try facts.forget(self.pool, id);
         return .forgotten;
     }
 
     fn listAllFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8 {
         const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
-        const listed = try memories.listForIdentity(self.pool, allocator, self.identity_id);
+        const listed = try facts.listForIdentity(self.pool, allocator, self.identity_id);
         return formatMemories(allocator, listed);
     }
 };
@@ -10611,7 +10611,9 @@ test {
     _ = @import("store/subscriptions.zig");
     _ = @import("store/command_aliases.zig");
     _ = @import("store/prompt_templates.zig");
-    _ = @import("store/memories.zig");
+    _ = @import("store/facts.zig");
+    _ = @import("store/daily_digests.zig");
+    _ = @import("features/context_assembly.zig");
     _ = @import("features/qa.zig");
     _ = @import("features/reminder_format.zig");
     _ = @import("tools/remind.zig");

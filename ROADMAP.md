@@ -191,6 +191,50 @@ the codebase's existing patterns. CI (`.github/workflows/ci.yml`) builds
 and runs `zig build test` on push; treat this phase as unverified until
 that's green.
 
+**Also unplanned, shipped outside the phase sequence** (direct user
+request, 2026-09-02): first slice of a memory-layer rebuild — the old flat,
+explicit-remember-only `memories` table becomes `facts`
+(`src/store/facts.zig`, migration `0048_memory_layer.sql`): bitemporal
+(`valid_from`/`valid_to`/`superseded_by`), `status` (`tentative` → `stable`
+→ `pinned`, or `retired`), `confirmations`/`last_confirmed_at`, and a
+partial unique index enforcing at most one currently-true row per
+`(identity, predicate, object)` — the schema-level fix for silently
+coexisting contradictions. `forget` now retires-and-tombstones
+(`fact_tombstones`) instead of hard-deleting, so a future auto-extraction
+pass can't resurrect something a person explicitly asked to forget. New
+per-chat episodic layer (`daily_digests`, `period_rollups` —
+`src/store/daily_digests.zig`) gives `digest.zig`'s previously ephemeral,
+unsaved summaries somewhere to persist, though nothing writes to it yet
+(no nightly job in this slice). New `features/context_assembly.zig`
+replaces `qa.zig`'s old inline history+memories-block string concatenation
+with `assembleContext`: pinned/ranked facts, ranked/recent digests, and
+recent chat history, each under its own hard character budget enforced in
+code (not left to the model), with tentative facts suppressed to a small
+top-ranked set under their own "may be stale" heading rather than blended
+in as settled fact. Ranking is a hybrid score (vector cosine similarity +
+Postgres full-text `ts_rank_cd` as a practical BM25 stand-in + scope-
+dependent recency decay + a confirmations/status-derived salience term),
+computed in one SQL query per call rather than pulled back and blended in
+Zig. Scoping decisions: facts stay identity-scoped (a fact follows a
+person across chats, matching the old table's convention); digests are
+per-chat (matching `digest.zig`/`storage_sense.zig`'s existing
+convention) — both deliberately diverge from the originating design
+brief's single-user assumption. No HNSW/GIN vector indexes yet, same
+"a personal bot's row counts don't need one" reasoning `0025_memories.sql`
+already used. **Explicitly deferred to a later slice**: the extractor
+(auto-generating candidate facts from conversation, with confirm/
+supersede/promote-to-stable logic), the nightly digest/rollup job itself,
+`lookup_conversations`/explicit `remember`/`forget` tools beyond what
+`remember_memory` already exposes, and the eval harness — `daily_digests`
+exists and is fully retrievable but nothing populates it in production
+yet. Found and fixed two real bugs during this pass: the test harness's
+hardcoded `TRUNCATE TABLE` list still named the old `memories` table
+(silent failure once the table was renamed), and Zig's `{d:0>N}` format
+specifier reserves a sign column even for an unsigned-valued signed
+integer, emitting `+2026-04-14` into a date column and failing every digest
+insert — fixed by formatting the year as unsigned. `zig build` and
+`zig build test` green (741/745, 4 skipped).
+
 ## Phase 1 — Land the in-flight work
 *Effort: S. Dependencies: none.*
 
