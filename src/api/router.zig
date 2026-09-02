@@ -25,8 +25,16 @@ const tool_registry = @import("../tools/registry.zig");
 const chats_store = @import("../store/chats.zig");
 const chat_members = @import("../store/chat_members.zig");
 const chat_settings = @import("../store/chat_settings.zig");
+const keyword_alerts = @import("../store/keyword_alerts.zig");
+const management_rooms = @import("../store/management_rooms.zig");
+const memories = @import("../store/memories.zig");
+const rate_limits = @import("../store/rate_limits.zig");
+const member_permissions = @import("../store/member_permissions.zig");
+const storage_sense = @import("../features/storage_sense.zig");
+const messages_store = @import("../store/messages.zig");
 const user_settings = @import("../store/user_settings.zig");
 const civil_time = @import("../text/civil_time.zig");
+const reminder_format = @import("../features/reminder_format.zig");
 const reminders = @import("../store/reminders.zig");
 const alert_store = @import("../store/alerts.zig");
 const feed_watches = @import("../store/feed_watches.zig");
@@ -60,11 +68,21 @@ const admin_config_prefix = "/api/v1/admin/config/";
 const chats_prefix = "/api/v1/chats/";
 const chat_settings_suffix = "/settings";
 const chat_members_suffix = "/members";
+const chat_keyword_alerts_suffix = "/keyword-alerts";
+const chat_announcements_suffix = "/announcements";
+const chat_member_permissions_infix = "/members/";
 const chat_actions_infix = "/actions/";
+const keyword_alerts_prefix = "/api/v1/keyword-alerts/";
+const announcements_prefix = "/api/v1/announcements/";
 const reminders_prefix = "/api/v1/reminders/";
 const alerts_prefix = "/api/v1/alerts/";
 const watches_prefix = "/api/v1/watches/";
 const notes_prefix = "/api/v1/notes/";
+const memory_prefix = "/api/v1/memory/";
+const telegram_user_chats_prefix = "/api/v1/telegram-user/chats/";
+const chat_autonomy_suffix = "/autonomy";
+const draft_approve_suffix = "/draft/approve";
+const draft_suffix = "/draft";
 const expenses_prefix = "/api/v1/expenses/";
 const budgets_prefix = "/api/v1/budgets/";
 const subscriptions_prefix = "/api/v1/subscriptions/";
@@ -96,6 +114,12 @@ const max_expense_category_len = 64;
 const max_expense_description_len = 500;
 const max_subscription_name_len = 128;
 const max_currency_len = 8;
+/// Matches `/welcome`'s own `max_welcome_len` in `main.zig`.
+const max_welcome_message_len = 1000;
+/// Matches `/location`'s own `max_location_len` in `main.zig`.
+const max_default_location_len = 100;
+/// Matches `/keyword add`'s own `max_keyword_len` in `main.zig`.
+const max_keyword_alert_len = 100;
 
 /// A hard ceiling on any single stored amount, in cents -- ~$1 trillion,
 /// far above any plausible real entry while still leaving `i64` arithmetic
@@ -189,6 +213,30 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/audit-log")) {
         return handleAdminAuditLog(ctx, request, target);
     }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/management-rooms")) {
+        return handleAdminListManagementRooms(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/admin/management-rooms")) {
+        return handleAdminBindManagementRoom(ctx, request);
+    }
+    if (method == .DELETE and std.mem.eql(u8, path, "/api/v1/admin/management-rooms")) {
+        return handleAdminUnbindManagementRoom(ctx, request, target);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/admin/storage/status")) {
+        return handleAdminStorageStatus(ctx, request);
+    }
+    if (method == .PATCH and std.mem.eql(u8, path, "/api/v1/admin/storage/autopilot")) {
+        return handleAdminSetStorageAutopilot(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/admin/storage/cleanup/tmp")) {
+        return handleAdminStorageCleanupTmp(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/admin/storage/cleanup/messages")) {
+        return handleAdminStorageCleanupMessages(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/admin/storage/cleanup/resample")) {
+        return handleAdminStorageCleanupResample(ctx, request);
+    }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/chats")) {
         return handleListMyChats(ctx, request);
     }
@@ -201,6 +249,28 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
         } else if (std.mem.endsWith(u8, rest, chat_members_suffix)) {
             const id_str = rest[0 .. rest.len - chat_members_suffix.len];
             if (method == .GET) return handleListChatMembers(ctx, request, id_str);
+        } else if (std.mem.endsWith(u8, rest, chat_keyword_alerts_suffix)) {
+            const id_str = rest[0 .. rest.len - chat_keyword_alerts_suffix.len];
+            if (method == .GET) return handleListKeywordAlerts(ctx, request, id_str);
+            if (method == .POST) return handleCreateKeywordAlert(ctx, request, id_str);
+        } else if (std.mem.endsWith(u8, rest, chat_announcements_suffix)) {
+            const id_str = rest[0 .. rest.len - chat_announcements_suffix.len];
+            if (method == .GET) return handleListAnnouncements(ctx, request, id_str);
+            if (method == .POST) return handleCreateAnnouncement(ctx, request, id_str);
+        } else if (std.mem.indexOf(u8, rest, chat_member_permissions_infix)) |idx| {
+            const chat_id_str = rest[0..idx];
+            const after = rest[idx + chat_member_permissions_infix.len ..];
+            const slash = std.mem.indexOfScalar(u8, after, '/') orelse {
+                return respondError(request, .not_found, "not_found", "no such endpoint");
+            };
+            const identity_id_str = after[0..slash];
+            const sub = after[slash + 1 ..];
+            if (std.mem.eql(u8, sub, "permissions")) {
+                if (method == .GET) return handleGetMemberPermissions(ctx, request, chat_id_str, identity_id_str);
+                if (method == .PATCH) return handleSetMemberPermissions(ctx, request, chat_id_str, identity_id_str);
+            } else if (std.mem.eql(u8, sub, "tag")) {
+                if (method == .PATCH) return handleSetMemberTag(ctx, request, chat_id_str, identity_id_str);
+            }
         } else if (std.mem.indexOf(u8, rest, chat_actions_infix)) |idx| {
             if (method != .POST) {
                 return respondError(request, .not_found, "not_found", "no such endpoint");
@@ -217,6 +287,9 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
             if (std.mem.eql(u8, action, "unpin")) return handleChatActionUnpin(ctx, request, id_str);
             if (std.mem.eql(u8, action, "redact")) return handleChatActionRedact(ctx, request, id_str);
         }
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, keyword_alerts_prefix)) {
+        return handleDeleteKeywordAlert(ctx, request, path[keyword_alerts_prefix.len..]);
     }
     if (std.mem.eql(u8, path, "/api/v1/me/settings")) {
         if (method == .GET) return handleGetMySettings(ctx, request);
@@ -242,6 +315,32 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/chats/send")) {
         return handleTelegramUserSendMessage(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/telegram-user/logout")) {
+        return handleTelegramUserLogout(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/telegram-user/autonomy")) {
+        return handleGetGlobalAutonomy(ctx, request);
+    }
+    if (method == .PATCH and std.mem.eql(u8, path, "/api/v1/telegram-user/autonomy")) {
+        return handleSetGlobalAutonomy(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/telegram-user/drafts")) {
+        return handleListDrafts(ctx, request);
+    }
+    if (std.mem.startsWith(u8, path, telegram_user_chats_prefix)) {
+        const rest = path[telegram_user_chats_prefix.len..];
+        if (std.mem.endsWith(u8, rest, chat_autonomy_suffix)) {
+            const native_id = rest[0 .. rest.len - chat_autonomy_suffix.len];
+            if (method == .GET) return handleGetChatAutonomy(ctx, request, native_id);
+            if (method == .PATCH) return handleSetChatAutonomy(ctx, request, native_id);
+        } else if (std.mem.endsWith(u8, rest, draft_approve_suffix)) {
+            const native_id = rest[0 .. rest.len - draft_approve_suffix.len];
+            if (method == .POST) return handleApproveDraft(ctx, request, native_id);
+        } else if (std.mem.endsWith(u8, rest, draft_suffix)) {
+            const native_id = rest[0 .. rest.len - draft_suffix.len];
+            if (method == .DELETE) return handleDiscardDraft(ctx, request, native_id);
+        }
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/reminders")) {
         return handleListReminders(ctx, request, target);
@@ -278,6 +377,15 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .DELETE and std.mem.startsWith(u8, path, notes_prefix)) {
         return handleDeleteNote(ctx, request, path[notes_prefix.len..]);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/memory")) {
+        return handleListMemory(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, memory_prefix)) {
+        return handleDeleteMemory(ctx, request, path[memory_prefix.len..]);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, announcements_prefix)) {
+        return handleCancelAnnouncement(ctx, request, path[announcements_prefix.len..]);
     }
     // Finance (ROADMAP.md Phase 17). `/expenses/summary` is matched before
     // the `expenses_prefix` catch-all below only incidentally -- that one
@@ -622,6 +730,25 @@ fn requireAdmin(ctx: *const ServerContext, request: *http.Server.Request) !?i64 
     const roles = try computeRoles(ctx, account_id);
     if (!roles.owner and !roles.bot_admin) {
         try respondError(request, .forbidden, "forbidden", "admin access required");
+        return null;
+    }
+    return account_id;
+}
+
+/// Stricter than `requireAdmin`: owner only, never `bot_admin` — for
+/// Storage Sense's admin surface, which can prune/resample real chat
+/// history and flip the ladder's autopilot switch, same trust tier
+/// `handleStorageCommand` reserves for the bot-chat `/storage` command
+/// (never extended to bot admins there either).
+fn requireOwner(ctx: *const ServerContext, request: *http.Server.Request) !?i64 {
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        try respondError(request, .unauthorized, "unauthorized", "not logged in");
+        return null;
+    };
+    const roles = try computeRoles(ctx, account_id);
+    if (!roles.owner) {
+        try respondError(request, .forbidden, "forbidden", "owner access required");
         return null;
     }
     return account_id;
@@ -1013,6 +1140,275 @@ fn handleAdminAuditLog(ctx: *const ServerContext, request: *http.Server.Request,
     return respondJson(ctx, request, .ok, .{ .items = entries, .next_cursor = next_cursor });
 }
 
+/// `GET /api/v1/admin/management-rooms` — every binding bot-wide.
+/// Admin-only: warden's own `/manage` command instead authorizes bind/
+/// unbind against the *target* chat's live admin status (no bot_admin/
+/// owner requirement), but this admin overview page deliberately takes the
+/// simpler, stricter tier every other `/admin/*` endpoint already uses,
+/// same accepted simplification as `chat_settings`'s `digest_enabled`
+/// field being admin-gated over the web despite `/digest` itself being
+/// open to any chat member.
+fn handleAdminListManagementRooms(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireAdmin(ctx, request)) orelse return;
+
+    const items = management_rooms.listAll(ctx.pool, ctx.allocator) catch |err| {
+        log.err("admin-list-management-rooms: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load management rooms");
+    };
+    defer {
+        for (items) |b| {
+            ctx.allocator.free(b.control_native_chat_id);
+            ctx.allocator.free(b.target_native_chat_id);
+            if (b.control_title) |t| ctx.allocator.free(t);
+            if (b.target_title) |t| ctx.allocator.free(t);
+        }
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+const ManagementRoomBody = struct { control_chat_id: i64, target_chat_id: i64 };
+
+/// `POST /api/v1/admin/management-rooms` — mirrors `/manage bind`. Same
+/// cross-platform guard as the command (a control room can't watch a chat
+/// on a different platform); binding is otherwise a plain upsert (1:1 as
+/// of warden's Phase 20 — rebinding either side moves it, doesn't error).
+fn handleAdminBindManagementRoom(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireAdmin(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(ManagementRoomBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    const control = (chats_store.getById(ctx.pool, arena, body.control_chat_id) catch |err| {
+        log.err("admin-bind-management-room: failed to load control chat {d}: {t}", .{ body.control_chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up control chat");
+    }) orelse return respondError(request, .not_found, "not_found", "no such control chat");
+    const target = (chats_store.getById(ctx.pool, arena, body.target_chat_id) catch |err| {
+        log.err("admin-bind-management-room: failed to load target chat {d}: {t}", .{ body.target_chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up target chat");
+    }) orelse return respondError(request, .not_found, "not_found", "no such target chat");
+    if (control.platform != target.platform) {
+        return respondError(request, .bad_request, "bad_request", "the control room and target chat must be on the same platform");
+    }
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, arena, account_id) catch |err| {
+        log.err("admin-bind-management-room: failed to list identities for account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+    };
+    const bound_by = if (identity_ids.len > 0) identity_ids[0] else {
+        return respondError(request, .forbidden, "forbidden", "no identity linked to this account");
+    };
+
+    management_rooms.bind(ctx.pool, body.control_chat_id, body.target_chat_id, bound_by) catch |err| {
+        log.err("admin-bind-management-room: failed (control {d}, target {d}): {t}", .{ body.control_chat_id, body.target_chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to bind");
+    };
+    audit_log.record(ctx.pool, account_id, null, "management_room.bind", null, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `DELETE /api/v1/admin/management-rooms?control_chat_id=&target_chat_id=`
+/// — mirrors `/manage unbind`. Both ids are required in the query string
+/// since a binding has no single surrogate id exposed over this API
+/// (`management_room_bindings.id` is internal-only, same as every other
+/// composite-keyed row in this codebase).
+fn handleAdminUnbindManagementRoom(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
+    const account_id = (try requireAdmin(ctx, request)) orelse return;
+
+    const control_chat_id = std.fmt.parseInt(i64, queryParam(target, "control_chat_id") orelse {
+        return respondError(request, .bad_request, "bad_request", "control_chat_id is required");
+    }, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid control_chat_id");
+    };
+    const target_chat_id = std.fmt.parseInt(i64, queryParam(target, "target_chat_id") orelse {
+        return respondError(request, .bad_request, "bad_request", "target_chat_id is required");
+    }, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid target_chat_id");
+    };
+
+    const removed = management_rooms.unbind(ctx.pool, control_chat_id, target_chat_id) catch |err| {
+        log.err("admin-unbind-management-room: failed (control {d}, target {d}): {t}", .{ control_chat_id, target_chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to unbind");
+    };
+    if (!removed) {
+        return respondError(request, .not_found, "not_found", "that chat wasn't bound to that room");
+    }
+    audit_log.record(ctx.pool, account_id, null, "management_room.unbind", null, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+// ---------------------------------------------------------------------------
+// Storage Sense (owner-only admin surface, ROADMAP.md Phase 14). Strictly
+// `requireOwner`, never `requireAdmin` -- same tier `handleStorageCommand`
+// reserves for `/storage` on the bot-chat side (never extended to bot
+// admins there either), since this can prune/resample real chat history
+// and flip the ladder's autopilot switch.
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/admin/storage/status` -- a structured counterpart to
+/// `/storage status`'s text report (`storage_sense.buildStatusReport`),
+/// since a web dashboard wants real fields to build tiles from, not a
+/// pre-formatted string.
+fn handleAdminStorageStatus(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireOwner(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const usage = storage_sense.checkDiskUsage(arena, ctx.io, ctx.config.tmp_dir) catch |err| {
+        log.err("admin-storage-status: checkDiskUsage failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to read disk usage");
+    };
+    const low = dynamic_config.getI64(ctx.pool, arena, storage_sense.low_watermark_key, ctx.config.storage_sense_low_watermark_pct);
+    const high = dynamic_config.getI64(ctx.pool, arena, storage_sense.high_watermark_key, ctx.config.storage_sense_high_watermark_pct);
+    const flood = dynamic_config.getI64(ctx.pool, arena, storage_sense.flood_watermark_key, ctx.config.storage_sense_flood_watermark_pct);
+    const watermark = storage_sense.classify(usage.used_pct, low, high, flood);
+    const autopilot_enabled = dynamic_config.getBool(ctx.pool, arena, storage_sense.autopilot_enabled_key, ctx.config.storage_sense_autopilot_enabled);
+    const sleep_active = storage_sense.isSleepModeActive(ctx.pool, arena);
+
+    return respondJson(ctx, request, .ok, .{
+        .used_pct = usage.used_pct,
+        .total_bytes = usage.total_bytes,
+        .available_bytes = usage.available_bytes,
+        .watermark = @tagName(watermark),
+        .low_watermark_pct = low,
+        .high_watermark_pct = high,
+        .flood_watermark_pct = flood,
+        .autopilot_enabled = autopilot_enabled,
+        .sleep_active = sleep_active,
+    });
+}
+
+const SetAutopilotBody = struct { enabled: bool };
+
+/// `PATCH /api/v1/admin/storage/autopilot` -- mirrors `/storage autopilot
+/// on|off`.
+fn handleAdminSetStorageAutopilot(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireOwner(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = (try readJsonBodyLeaky(request, arena, SetAutopilotBody, 128)) orelse return;
+    dynamic_config.set(ctx.pool, storage_sense.autopilot_enabled_key, if (body.enabled) "true" else "false", account_id) catch |err| {
+        log.err("admin-storage-autopilot: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to update autopilot");
+    };
+    audit_log.record(ctx.pool, account_id, null, "storage.autopilot.set", null, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `POST /api/v1/admin/storage/cleanup/tmp` -- mirrors `/storage cleanup
+/// tmp`.
+fn handleAdminStorageCleanupTmp(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireOwner(ctx, request)) orelse return;
+
+    const result = storage_sense.sweepTmpDir(ctx.io, ctx.allocator, ctx.config.tmp_dir, storage_sense.tmp_sweep_max_age_seconds) catch |err| {
+        log.err("admin-storage-cleanup-tmp: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to sweep tmp");
+    };
+    audit_log.record(ctx.pool, account_id, null, "storage.cleanup.tmp", null, null);
+    return respondJson(ctx, request, .ok, .{ .files_deleted = result.files_deleted, .bytes_freed = result.bytes_freed });
+}
+
+const CleanupMessagesBody = struct {
+    chat_id: ?i64 = null,
+    keep_last: ?i64 = null,
+    before: ?[]const u8 = null,
+};
+
+/// `POST /api/v1/admin/storage/cleanup/messages` -- mirrors `/storage
+/// cleanup messages`. `chat_id` omitted means every chat (the ladder's
+/// own global sweep), deliberately not "the current chat" the command
+/// defaults to, since there's no such concept over the web. `keep_last`
+/// needs a concrete `chat_id` (pruning "keep the last N" only means
+/// something per-chat); `before` (a `YYYY-MM-DD` date) or neither
+/// (falls back to the configured prune-age default) both work bot-wide
+/// or per-chat.
+fn handleAdminStorageCleanupMessages(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireOwner(ctx, request)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = (try readJsonBodyLeaky(request, arena, CleanupMessagesBody, 256)) orelse return;
+
+    if (body.keep_last) |keep| {
+        const chat_id = body.chat_id orelse {
+            return respondError(request, .bad_request, "bad_request", "keep_last requires a chat_id");
+        };
+        if (keep <= 0) {
+            return respondError(request, .bad_request, "bad_request", "keep_last must be positive");
+        }
+        messages_store.pruneKeepLast(ctx.pool, chat_id, keep) catch |err| {
+            log.err("admin-storage-cleanup-messages: pruneKeepLast failed for chat {d}: {t}", .{ chat_id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to prune");
+        };
+        audit_log.record(ctx.pool, account_id, null, "storage.cleanup.messages", null, null);
+        return respondJson(ctx, request, .ok, .{});
+    }
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    var cutoff_ts = now - dynamic_config.getI64(ctx.pool, arena, storage_sense.prune_age_days_key, ctx.config.storage_sense_prune_age_days) * 86400;
+    if (body.before) |date_str| {
+        const parts = reminder_format.parseDatePart(date_str, .ymd) orelse {
+            return respondError(request, .bad_request, "bad_request", "before must be YYYY-MM-DD");
+        };
+        const year = parts.year orelse {
+            return respondError(request, .bad_request, "bad_request", "before needs a year -- use YYYY-MM-DD");
+        };
+        cutoff_ts = civil_time.unixFromLocal(.{ .year = year, .month = parts.month, .day = parts.day }, 0);
+    }
+
+    const result = storage_sense.pruneOldMessages(ctx.pool, arena, body.chat_id, cutoff_ts) catch |err| {
+        log.err("admin-storage-cleanup-messages: pruneOldMessages failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to prune");
+    };
+    audit_log.record(ctx.pool, account_id, null, "storage.cleanup.messages", null, null);
+    return respondJson(ctx, request, .ok, .{ .rows_deleted = result.rows_deleted, .chats_affected = result.chats_affected });
+}
+
+const CleanupResampleBody = struct { chat_id: ?i64 = null };
+
+/// `POST /api/v1/admin/storage/cleanup/resample` -- mirrors `/storage
+/// cleanup resample`. `chat_id` omitted means every chat, same "no
+/// current chat" reasoning as cleanup/messages above.
+fn handleAdminStorageCleanupResample(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const account_id = (try requireOwner(ctx, request)) orelse return;
+    const provider = ctx.llm_provider orelse {
+        return respondError(request, .internal_server_error, "internal", "no LLM provider configured");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = (try readJsonBodyLeaky(request, arena, CleanupResampleBody, 128)) orelse return;
+    const batch_size = dynamic_config.getI64(ctx.pool, arena, storage_sense.resample_batch_size_key, ctx.config.storage_sense_resample_batch_size);
+
+    const result = storage_sense.resampleOldMessages(ctx.pool, arena, ctx.io, provider, body.chat_id, batch_size) catch |err| {
+        log.err("admin-storage-cleanup-resample: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to resample");
+    };
+    audit_log.record(ctx.pool, account_id, null, "storage.cleanup.resample", null, null);
+    return respondJson(ctx, request, .ok, .{ .messages_compacted = result.messages_compacted, .chats_affected = result.chats_affected });
+}
+
 // ---------------------------------------------------------------------------
 // Groups (Phase 4) — chat-scoped, gated to owner/bot_admin or a *live*
 // platform admin of that specific chat, per ARCHITECTURE.md §7 tier 3.
@@ -1193,6 +1589,18 @@ const ChatSettingsBody = struct {
     magic_word: ?[]const u8,
     digest_enabled: bool,
     thinking_override: ?bool,
+    briefing_enabled: bool,
+    default_location: ?[]const u8,
+    welcome_message: ?[]const u8,
+    autopin_announcements: bool,
+    video_download_enabled: bool,
+    video_download_lossy: bool,
+    /// `0` means off, same "0/absent both mean unset" convention
+    /// `rate_limits.zig`'s own doc comment describes -- backed by the
+    /// `rate_limits` table, not `chat_settings`, but grouped into this
+    /// same whole-object endpoint since it's just another per-chat
+    /// setting from the caller's perspective.
+    slowmode_seconds: i64,
 };
 
 /// `GET /api/v1/chats/:id/settings`.
@@ -1207,13 +1615,35 @@ fn handleGetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
     defer if (persona) |p| ctx.allocator.free(p);
     const magic_word = chat_settings.getMagicWord(ctx.pool, ctx.allocator, chat_id);
     defer if (magic_word) |m| ctx.allocator.free(m);
+    const default_location = chat_settings.getDefaultLocation(ctx.pool, ctx.allocator, chat_id);
+    defer if (default_location) |l| ctx.allocator.free(l);
+    const welcome_message = chat_settings.getWelcomeMessage(ctx.pool, ctx.allocator, chat_id);
+    defer if (welcome_message) |w| ctx.allocator.free(w);
 
     return respondJson(ctx, request, .ok, ChatSettingsBody{
         .persona = persona,
         .magic_word = magic_word,
         .digest_enabled = chat_settings.getDigestEnabled(ctx.pool, chat_id),
         .thinking_override = chat_settings.getShowThinkingOverride(ctx.pool, chat_id),
+        .briefing_enabled = chat_settings.getBriefingEnabled(ctx.pool, chat_id),
+        .default_location = default_location,
+        .welcome_message = welcome_message,
+        .autopin_announcements = chat_settings.getAutopinAnnouncements(ctx.pool, chat_id),
+        .video_download_enabled = chat_settings.getVideoDownloadEnabled(ctx.pool, chat_id),
+        .video_download_lossy = chat_settings.getVideoDownloadLossy(ctx.pool, chat_id),
+        .slowmode_seconds = rate_limits.getSlowModeSeconds(ctx.pool, chat_id),
     });
+}
+
+/// `true` if `next` differs from `current` -- used by `handleSetChatSettings`
+/// to tell "this owner-gated field is actually changing" from "the
+/// whole-object PATCH just echoed back what was already there," since a
+/// group admin submitting the rest of the form shouldn't get rejected for
+/// fields they never touched.
+fn optionalStringChanged(current: ?[]const u8, next: ?[]const u8) bool {
+    if (current == null and next == null) return false;
+    if (current == null or next == null) return true;
+    return !std.mem.eql(u8, current.?, next.?);
 }
 
 /// `PATCH /api/v1/chats/:id/settings` — body is the *entire* settings
@@ -1242,6 +1672,40 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
     const body = std.json.parseFromSliceLeaky(ChatSettingsBody, arena, raw, .{}) catch {
         return respondError(request, .bad_request, "bad_request", "expected the full chat settings object");
     };
+    if (body.welcome_message) |w| {
+        if (w.len > max_welcome_message_len) {
+            return respondError(request, .bad_request, "bad_request", "welcome message must be at most 1000 bytes");
+        }
+    }
+    if (body.default_location) |l| {
+        if (l.len > max_default_location_len) {
+            return respondError(request, .bad_request, "bad_request", "location must be at most 100 bytes");
+        }
+    }
+    if (body.slowmode_seconds < 0) {
+        return respondError(request, .bad_request, "bad_request", "slowmode_seconds must be 0 (off) or positive");
+    }
+
+    // welcome_message/default_location are owner-only to change -- same
+    // tier as persona -- everything else in this object is fine at
+    // requireChatAccess's own live-group-admin tier. Only gated when the
+    // submitted value actually differs from what's stored (see
+    // `optionalStringChanged`'s doc comment).
+    const current_welcome = chat_settings.getWelcomeMessage(ctx.pool, arena, chat_id);
+    const current_location = chat_settings.getDefaultLocation(ctx.pool, arena, chat_id);
+    if (optionalStringChanged(current_welcome, body.welcome_message) or optionalStringChanged(current_location, body.default_location)) {
+        const owner_check = resolveAuth(ctx, request);
+        const owner_account_id = owner_check.account_id orelse {
+            return respondError(request, .unauthorized, "unauthorized", "not logged in");
+        };
+        const owner_roles = computeRoles(ctx, owner_account_id) catch |err| {
+            log.err("set-chat-settings: failed to check owner status for account {d}: {t}", .{ owner_account_id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to check access");
+        };
+        if (!owner_roles.owner) {
+            return respondError(request, .forbidden, "forbidden", "only the bot owner can change the welcome message or default location");
+        }
+    }
 
     chat_settings.setSystemPromptOverride(ctx.pool, chat_id, body.persona) catch |err| {
         log.err("set-chat-settings: persona failed for chat {d}: {t}", .{ chat_id, err });
@@ -1257,6 +1721,34 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
     };
     chat_settings.setShowThinkingOverride(ctx.pool, chat_id, body.thinking_override) catch |err| {
         log.err("set-chat-settings: thinking_override failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setBriefingEnabled(ctx.pool, chat_id, body.briefing_enabled) catch |err| {
+        log.err("set-chat-settings: briefing_enabled failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setDefaultLocation(ctx.pool, chat_id, body.default_location) catch |err| {
+        log.err("set-chat-settings: default_location failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setWelcomeMessage(ctx.pool, chat_id, body.welcome_message) catch |err| {
+        log.err("set-chat-settings: welcome_message failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setAutopinAnnouncements(ctx.pool, chat_id, body.autopin_announcements) catch |err| {
+        log.err("set-chat-settings: autopin_announcements failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setVideoDownloadEnabled(ctx.pool, chat_id, body.video_download_enabled) catch |err| {
+        log.err("set-chat-settings: video_download_enabled failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    chat_settings.setVideoDownloadLossy(ctx.pool, chat_id, body.video_download_lossy) catch |err| {
+        log.err("set-chat-settings: video_download_lossy failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to update settings");
+    };
+    rate_limits.setSlowModeSeconds(ctx.pool, chat_id, body.slowmode_seconds) catch |err| {
+        log.err("set-chat-settings: slowmode_seconds failed for chat {d}: {t}", .{ chat_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to update settings");
     };
 
@@ -1287,6 +1779,113 @@ fn handleListChatMembers(ctx: *const ServerContext, request: *http.Server.Reques
     }
 
     return respondJson(ctx, request, .ok, .{ .items = members });
+}
+
+/// `GET /api/v1/chats/:id/keyword-alerts` -- open to any chat member, same
+/// view tier as `/keyword list` (unlike `handleListChatMembers` above,
+/// which needs live-admin access).
+fn handleListKeywordAlerts(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!try requireChatMember(ctx, request, ra, chat_id)) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const items = keyword_alerts.listForChat(ctx.pool, arena, chat_id) catch |err| {
+        log.err("list-keyword-alerts: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load keyword alerts");
+    };
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+const CreateKeywordAlertBody = struct { keyword: []const u8, identity_id: ?i64 = null };
+
+/// `POST /api/v1/chats/:id/keyword-alerts` -- mirrors `/keyword add
+/// <word>`, open to any chat member (same `resolveCreateIdentity`
+/// authorization as reminders/alerts/notes/expenses) -- deliberately not
+/// admin-gated, matching `handleKeywordCommand`'s own doc comment on why
+/// this differs from `/watch`'s "anyone" removal model only on delete, not
+/// create.
+fn handleCreateKeywordAlert(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    if (!feature_flags.isEnabled(ctx.pool, "keyword_alerts")) {
+        return respondError(request, .forbidden, "forbidden", "the keyword alerts module is disabled");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateKeywordAlertBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+    if (body.keyword.len == 0 or body.keyword.len > max_keyword_alert_len) {
+        return respondError(request, .bad_request, "bad_request", "keyword must be 1-100 bytes");
+    }
+
+    const identity_id = (try resolveCreateIdentity(ctx, request, ra, chat_id, body.identity_id)) orelse return;
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const result = keyword_alerts.add(ctx.pool, arena, chat_id, identity_id, body.keyword, now) catch |err| {
+        log.err("create-keyword-alert: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to save keyword alert");
+    };
+    switch (result) {
+        .already_tracked => return respondError(request, .conflict, "already_tracked", "that keyword is already tracked in this chat"),
+        .added => |id| {
+            audit_log.record(ctx.pool, ra.account_id, null, "keyword_alert.create", id_str, null);
+            return respondJson(ctx, request, .ok, .{ .id = id });
+        },
+    }
+}
+
+/// `DELETE /api/v1/keyword-alerts/:id` -- same authorization as `/keyword
+/// remove`: whoever added it, or the bot owner.
+fn handleDeleteKeywordAlert(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid keyword alert id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const alert = (keyword_alerts.get(ctx.pool, arena, id) catch |err| {
+        log.err("delete-keyword-alert: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up keyword alert");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such keyword alert");
+    };
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, arena, ra.account_id) catch |err| {
+        log.err("delete-keyword-alert: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to check access");
+    };
+    const is_creator = std.mem.indexOfScalar(i64, identity_ids, alert.identity_id) != null;
+    if (!is_creator and !ra.roles.owner) {
+        return respondError(request, .forbidden, "forbidden", "only whoever added this keyword alert, or the owner, can remove it");
+    }
+
+    keyword_alerts.remove(ctx.pool, id) catch |err| {
+        log.err("delete-keyword-alert: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to delete keyword alert");
+    };
+    audit_log.record(ctx.pool, ra.account_id, null, "keyword_alert.delete", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,6 +2008,112 @@ fn readJsonBodyLeaky(request: *http.Server.Request, arena: std.mem.Allocator, co
         try respondError(request, .bad_request, "bad_request", "invalid request body");
         return null;
     };
+}
+
+/// `GET /api/v1/chats/:id/members/:identityId/permissions` — no bot-chat
+/// equivalent exists (there's no "view a member's current bits" command;
+/// `/permission` only ever changes them), but a checkbox-per-bit editor
+/// needs to know the starting state from somewhere. Same live-group-admin
+/// tier as `handleListChatMembers`'s own `requireChatAccess` gate.
+fn handleGetMemberPermissions(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const identity_id = std.fmt.parseInt(i64, identity_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid identity id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    const bits = member_permissions.getBits(ctx.pool, chat_id, identity_id);
+    return respondJson(ctx, request, .ok, .{ .bits = bits });
+}
+
+const SetMemberPermissionsBody = struct { bits: u32, expires_at: ?i64 = null };
+
+/// `PATCH /api/v1/chats/:id/members/:identityId/permissions` — mirrors
+/// `/permission`, except the whole resulting bitmask is set explicitly
+/// rather than applying a `+`/`-<letters>` change: a checkbox-per-bit
+/// editor already knows the mask it wants, so there's no reason to make
+/// the client compute a diff just to re-derive what it already has. Same
+/// best-effort live enforcement as the command — `error.Unsupported` (no
+/// granular permission concept on this platform) is expected and silent;
+/// the bitmask itself is saved either way.
+fn handleSetMemberPermissions(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const identity_id = std.fmt.parseInt(i64, identity_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid identity id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, SetMemberPermissionsBody, 256)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, true, "permission")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to change permissions in this chat");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, identity_id)) orelse return;
+
+    member_permissions.setBits(ctx.pool, chat_id, identity_id, body.bits, body.expires_at) catch |err| {
+        log.err("set-member-permissions: failed for identity {d} in chat {d}: {t}", .{ identity_id, chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to save permissions");
+    };
+
+    ac.connector.restrictChatMemberPermissions(arena, ac.chat.native_chat_id, target_native_id, body.bits, body.expires_at orelse 0) catch |err| {
+        if (err != error.Unsupported) {
+            log.warn("set-member-permissions: failed to enforce live restriction for {s} in chat {s}: {t}", .{ target_native_id, ac.chat.native_chat_id, err });
+        }
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.member_permissions.set", identity_id_str, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+const SetMemberTagBody = struct { title: []const u8 };
+
+/// `PATCH /api/v1/chats/:id/members/:identityId/tag` — mirrors `/tag
+/// <@user> <text>` / `/tag <@user> off` (`title: ""` is `off`, matching
+/// the command's own empty-string-clears convention exactly, not a
+/// separate `null` case). Telegram only, and only for targets who are
+/// already chat administrators there — surfaced as a real error rather
+/// than saved-anyway, since unlike `/permission` there's no bitmask to
+/// persist independent of live enforcement; the whole point of this
+/// action is the live call.
+fn handleSetMemberTag(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const identity_id = std.fmt.parseInt(i64, identity_id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid identity id");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
+    const body = (try readJsonBodyLeaky(request, arena, SetMemberTagBody, 256)) orelse return;
+
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, true, "tag")) {
+        return respondError(request, .forbidden, "forbidden", "not authorized to set a tag in this chat");
+    }
+    const target_native_id = (try resolveTargetNativeId(ctx, request, arena, identity_id)) orelse return;
+
+    ac.connector.setChatAdminTitle(arena, ac.chat.native_chat_id, target_native_id, body.title) catch |err| {
+        if (err == error.Unsupported) {
+            return respondError(request, .bad_request, "unsupported", "custom tags aren't supported on this platform");
+        }
+        log.warn("set-member-tag: failed for {s} in chat {s}: {t}", .{ target_native_id, ac.chat.native_chat_id, err });
+        return respondError(request, .bad_request, "failed", "couldn't set a tag -- the target must already be a chat administrator (and the bot needs admin rights here)");
+    };
+
+    audit_log.record(ctx.pool, ac.ra.account_id, null, "chat.member_tag.set", identity_id_str, null);
+    return respondJson(ctx, request, .ok, .{});
 }
 
 const ModTargetBody = struct { identity_id: i64 };
@@ -2375,6 +3080,219 @@ fn handleTelegramUserSendMessage(ctx: *const ServerContext, request: *http.Serve
     return respondJson(ctx, request, .ok, .{});
 }
 
+/// `POST /api/v1/telegram-user/logout` — mirrors `/tdlogout`/`/tdlogin
+/// logout`'s shared `performTdLogout` in `main.zig`. `.none` is refused
+/// rather than forwarded to `conn.logOut()` for the same reason that
+/// function documents: the connector's `client_id` is still null before
+/// any `ensureClient()` call has run, and a logout attempt would crash
+/// rather than no-op.
+fn handleTelegramUserLogout(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    if (conn.authState() == .none) {
+        return respondError(request, .conflict, "not_ready", "the personal-account connector hasn't started yet -- nothing to log out of");
+    }
+    conn.logOut();
+    const a = resolveAuth(ctx, request);
+    audit_log.record(ctx.pool, a.account_id, null, "telegram_user.logout", null, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/telegram-user/autonomy` — mirrors `/autonomy`'s no-arg
+/// form: the owner's global `reply_autonomy` default. Resolved from the
+/// caller's own logged-in identity (`callersOwnIdentity`), not
+/// `config`'s `WARDEN_TELEGRAM_OWNER_ID` the way the bot-chat command
+/// does — `requireTelegramUserConnector` already establishes the caller
+/// *is* the owner, and this is the same identity the rest of the web
+/// settings surface (`/me/settings`) already resolves via the session.
+fn handleGetGlobalAutonomy(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const identity_id = (try callersOwnIdentity(ctx, request, account_id)) orelse return;
+    const global = user_settings.getEffectiveReplyAutonomyDefault(ctx.pool, ctx.allocator, identity_id);
+    return respondJson(ctx, request, .ok, .{ .global = @tagName(global) });
+}
+
+const SetGlobalAutonomyBody = struct { global: []const u8 };
+
+/// `PATCH /api/v1/telegram-user/autonomy` — mirrors `/autonomy <off|draft|
+/// auto>`.
+fn handleSetGlobalAutonomy(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const identity_id = (try callersOwnIdentity(ctx, request, account_id)) orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [256]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(256)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(SetGlobalAutonomyBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+    const level = std.meta.stringToEnum(user_settings.ReplyAutonomy, body.global) orelse {
+        return respondError(request, .bad_request, "bad_request", "global must be \"off\", \"draft\", or \"auto\"");
+    };
+    user_settings.setReplyAutonomyDefault(ctx.pool, identity_id, level) catch |err| {
+        log.err("set-global-autonomy: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to save");
+    };
+    audit_log.record(ctx.pool, account_id, null, "telegram_user.autonomy.set_global", null, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/telegram-user/chats/:nativeChatId/autonomy` — mirrors
+/// `/autonomy <chat id>`'s implicit view (the command has no bare-view
+/// form for a single chat, only `list`-adjacent-via-`/tdchats`, but the
+/// override/effective split is exactly what `chat_settings.
+/// resolveReplyAutonomy`'s doc comment says the settings UI needs).
+fn handleGetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const identity_id = (try callersOwnIdentity(ctx, request, account_id)) orelse return;
+
+    const chat = (chats_store.getByNative(ctx.pool, ctx.allocator, .telegram_user, native_chat_id) catch |err| {
+        log.err("get-chat-autonomy: lookup failed for chat {s}: {t}", .{ native_chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up chat");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no chat with that id yet -- a message must be exchanged with it first");
+    };
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    const override = chat_settings.getReplyAutonomy(ctx.pool, chat.id);
+    const effective = chat_settings.resolveReplyAutonomy(ctx.pool, ctx.allocator, chat.id, identity_id);
+    return respondJson(ctx, request, .ok, .{
+        .override = if (override) |o| @tagName(o) else null,
+        .effective = @tagName(effective),
+    });
+}
+
+const SetChatAutonomyBody = struct { override: ?[]const u8 };
+
+/// `PATCH /api/v1/telegram-user/chats/:nativeChatId/autonomy` — mirrors
+/// `/autonomy <chat id> <off|draft|auto|clear>` (`override: null` is
+/// `clear`).
+fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [256]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(256)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(SetChatAutonomyBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+    const level: ?user_settings.ReplyAutonomy = if (body.override) |o|
+        std.meta.stringToEnum(user_settings.ReplyAutonomy, o) orelse {
+            return respondError(request, .bad_request, "bad_request", "override must be \"off\", \"draft\", \"auto\", or null");
+        }
+    else
+        null;
+
+    const chat = (chats_store.getByNative(ctx.pool, arena, .telegram_user, native_chat_id) catch |err| {
+        log.err("set-chat-autonomy: lookup failed for chat {s}: {t}", .{ native_chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up chat");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no chat with that id yet -- a message must be exchanged with it first");
+    };
+
+    chat_settings.setReplyAutonomy(ctx.pool, chat.id, level) catch |err| {
+        log.err("set-chat-autonomy: failed for chat {d}: {t}", .{ chat.id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to save");
+    };
+    audit_log.record(ctx.pool, account_id, null, "telegram_user.autonomy.set_chat", native_chat_id, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `GET /api/v1/telegram-user/drafts` — mirrors `/drafts`.
+fn handleListDrafts(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const pending_drafts = ctx.pending_drafts orelse {
+        return respondError(request, .internal_server_error, "internal", "drafts aren't available on this deployment");
+    };
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const items = pending_drafts.list(ctx.allocator, now) catch |err| {
+        log.err("list-drafts: failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load drafts");
+    };
+    defer {
+        for (items) |it| {
+            ctx.allocator.free(it.native_chat_id);
+            ctx.allocator.free(it.chat_title);
+            ctx.allocator.free(it.draft_text);
+        }
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `POST /api/v1/telegram-user/chats/:nativeChatId/draft/approve` —
+/// mirrors `/approve <chat id>`: sends the draft exactly as generated,
+/// through the personal-account connector, no parallel send path.
+fn handleApproveDraft(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    const pending_drafts = ctx.pending_drafts orelse {
+        return respondError(request, .internal_server_error, "internal", "drafts aren't available on this deployment");
+    };
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const draft = pending_drafts.take(ctx.allocator, now, native_chat_id) orelse {
+        return respondError(request, .not_found, "not_found", "no pending draft for that chat (or it expired)");
+    };
+    defer {
+        ctx.allocator.free(draft.chat_title);
+        ctx.allocator.free(draft.incoming_text);
+        ctx.allocator.free(draft.draft_text);
+        if (draft.reply_to) |r| ctx.allocator.free(r);
+    }
+
+    conn.connector().sendMessage(ctx.allocator, native_chat_id, draft.draft_text, draft.reply_to);
+    audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.approve", native_chat_id, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `DELETE /api/v1/telegram-user/chats/:nativeChatId/draft` — mirrors
+/// `/discard <chat id>`.
+fn handleDiscardDraft(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
+    const pending_drafts = ctx.pending_drafts orelse {
+        return respondError(request, .internal_server_error, "internal", "drafts aren't available on this deployment");
+    };
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    if (!pending_drafts.discard(native_chat_id)) {
+        return respondError(request, .not_found, "not_found", "no pending draft for that chat");
+    }
+    audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.discard", native_chat_id, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
 // ---------------------------------------------------------------------------
 // Reminders / Alerts / Watches (Phase 5a) -- chat-scoped like Groups above,
 // but "open to anyone actually in the chat" like `/remind`/`/alert`/`/watch`
@@ -2554,6 +3472,51 @@ fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request,
     return respondJson(ctx, request, .ok, .{ .items = out });
 }
 
+/// Resolves a `ReminderWhenBody` to a concrete unix `due_at`, shared by
+/// `handleCreateReminder` and `handleCreateAnnouncement` -- the two kinds
+/// describe "when" identically (see `reminders.Kind`'s own doc comment on
+/// why the table itself doesn't distinguish them beyond that column).
+/// `null` (with a response already sent) on any validation failure.
+fn resolveWhenDueAt(ctx: *const ServerContext, request: *http.Server.Request, when: ReminderWhenBody, identity_id: i64) !?i64 {
+    if (std.mem.eql(u8, when.kind, "duration")) {
+        const seconds = when.seconds orelse {
+            try respondError(request, .bad_request, "bad_request", "when.seconds required for a duration");
+            return null;
+        };
+        if (seconds <= 0) {
+            try respondError(request, .bad_request, "bad_request", "when.seconds must be positive");
+            return null;
+        }
+        const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+        return now + seconds;
+    }
+    if (std.mem.eql(u8, when.kind, "absolute")) {
+        const year = when.year orelse {
+            try respondError(request, .bad_request, "bad_request", "when.year required for an absolute time");
+            return null;
+        };
+        const month = when.month orelse {
+            try respondError(request, .bad_request, "bad_request", "when.month required for an absolute time");
+            return null;
+        };
+        const day = when.day orelse {
+            try respondError(request, .bad_request, "bad_request", "when.day required for an absolute time");
+            return null;
+        };
+        const hour = when.hour orelse 0;
+        const minute = when.minute orelse 0;
+        const second = when.second orelse 0;
+        if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59) {
+            try respondError(request, .bad_request, "bad_request", "invalid date/time");
+            return null;
+        }
+        const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, identity_id);
+        return civil_time.unixFromLocal(.{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second }, offset_minutes);
+    }
+    try respondError(request, .bad_request, "bad_request", "when.kind must be \"duration\" or \"absolute\"");
+    return null;
+}
+
 /// `POST /api/v1/reminders` -- see API.md; `when` mirrors the `/menu`
 /// wizard's own step data (see `menu.zig`'s `ReminderDraft`) so this form
 /// and the wizard describe the same underlying moment two different ways.
@@ -2586,38 +3549,7 @@ fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request
     }
 
     const identity_id = (try resolveCreateIdentity(ctx, request, ra, body.chat_id, body.identity_id)) orelse return;
-
-    var due_at: i64 = undefined;
-    if (std.mem.eql(u8, body.when.kind, "duration")) {
-        const seconds = body.when.seconds orelse {
-            return respondError(request, .bad_request, "bad_request", "when.seconds required for a duration reminder");
-        };
-        if (seconds <= 0) {
-            return respondError(request, .bad_request, "bad_request", "when.seconds must be positive");
-        }
-        const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
-        due_at = now + seconds;
-    } else if (std.mem.eql(u8, body.when.kind, "absolute")) {
-        const year = body.when.year orelse {
-            return respondError(request, .bad_request, "bad_request", "when.year required for an absolute reminder");
-        };
-        const month = body.when.month orelse {
-            return respondError(request, .bad_request, "bad_request", "when.month required for an absolute reminder");
-        };
-        const day = body.when.day orelse {
-            return respondError(request, .bad_request, "bad_request", "when.day required for an absolute reminder");
-        };
-        const hour = body.when.hour orelse 0;
-        const minute = body.when.minute orelse 0;
-        const second = body.when.second orelse 0;
-        if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 59) {
-            return respondError(request, .bad_request, "bad_request", "invalid date/time");
-        }
-        const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, identity_id);
-        due_at = civil_time.unixFromLocal(.{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second }, offset_minutes);
-    } else {
-        return respondError(request, .bad_request, "bad_request", "when.kind must be \"duration\" or \"absolute\"");
-    }
+    const due_at = (try resolveWhenDueAt(ctx, request, body.when, identity_id)) orelse return;
 
     const id = reminders.create(ctx.pool, body.chat_id, identity_id, body.message, due_at, body.recur_interval_seconds) catch |err| {
         log.err("create-reminder: failed for chat {d}: {t}", .{ body.chat_id, err });
@@ -2661,6 +3593,142 @@ fn handleCancelReminder(ctx: *const ServerContext, request: *http.Server.Request
         return respondError(request, .internal_server_error, "internal", "failed to cancel reminder");
     };
     audit_log.record(ctx.pool, ra.account_id, null, "reminder.cancel", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
+// --- Announcements (ROADMAP.md Phase 16) -- chat-scoped, not identity-
+// scoped-across-chats like Reminders above: `reminders.listForIdentity`
+// is deliberately hard-filtered to `kind = 'reminder'` (see its own doc
+// comment), since a scheduled announcement is a chat-level admin object,
+// not a personal one. `reminders.listPending`, already built for
+// `/announce list`, fits this shape directly. ---
+
+const max_announcement_len = 1000;
+
+/// `GET /api/v1/chats/:id/announcements` -- mirrors `/announce list`,
+/// though gated at this endpoint's own live-group-admin tier
+/// (`requireChatAccess`) rather than open to any chat member the way the
+/// command's own `list` subcommand is -- same accepted "web slightly
+/// stricter" simplification `chat_settings.digest_enabled` already has,
+/// and this section only ever renders inside the Groups per-chat settings
+/// page, which nothing but a group admin/bot admin/owner can reach in the
+/// first place.
+fn handleListAnnouncements(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    const items = reminders.listPending(ctx.pool, ctx.allocator, chat_id, .announcement) catch |err| {
+        log.err("list-announcements: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load announcements");
+    };
+    defer {
+        for (items) |it| ctx.allocator.free(it.message);
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+const CreateAnnouncementBody = struct {
+    message: []const u8,
+    recur_interval_seconds: ?i64 = null,
+    when: ReminderWhenBody,
+};
+
+/// `POST /api/v1/chats/:id/announcements` -- mirrors `/announce at`/
+/// `/announce every`. Same live-group-admin tier as
+/// `handleListAnnouncements`, matching `checkGroupAdminAccess`'s ceiling
+/// on the command side (no token-spend fallback there either). Unlike a
+/// bare `/announce <text>` (send now, pinned), this endpoint always
+/// schedules -- an immediate send-and-pin is a connector-backed action in
+/// Bot View's territory, not a settings-page create form; deliberately
+/// out of scope here, same as ROADMAP.md's Phase 16 entry says.
+fn handleCreateAnnouncement(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid chat id");
+    };
+    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+    if (!feature_flags.isEnabled(ctx.pool, "announcements")) {
+        return respondError(request, .forbidden, "forbidden", "the announcements module is disabled");
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [4 * 1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(4 * 1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(CreateAnnouncementBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+    if (body.message.len == 0 or body.message.len > max_announcement_len) {
+        return respondError(request, .bad_request, "bad_request", "message must be 1-1000 bytes");
+    }
+    if (body.recur_interval_seconds) |interval| {
+        if (interval <= 0) {
+            return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive");
+        }
+    }
+
+    const a = resolveAuth(ctx, request);
+    const account_id = a.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+    const identity_ids = accounts.listIdentityIds(ctx.pool, arena, account_id) catch |err| {
+        log.err("create-announcement: failed to list identities for account {d}: {t}", .{ account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+    };
+    const identity_id = if (identity_ids.len > 0) identity_ids[0] else {
+        return respondError(request, .forbidden, "forbidden", "no identity linked to this account");
+    };
+
+    const due_at = (try resolveWhenDueAt(ctx, request, body.when, identity_id)) orelse return;
+
+    const id = reminders.createOfKind(ctx.pool, chat_id, identity_id, body.message, due_at, body.recur_interval_seconds, .announcement) catch |err| {
+        log.err("create-announcement: failed for chat {d}: {t}", .{ chat_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to create announcement");
+    };
+    audit_log.record(ctx.pool, account_id, null, "announcement.create", null, null);
+
+    return respondJson(ctx, request, .ok, .{ .id = id, .due_at = due_at });
+}
+
+/// `DELETE /api/v1/announcements/:id` -- mirrors `/announce cancel`.
+/// Gated at the *target chat's* live-group-admin tier, looked up from the
+/// row itself since the bare id doesn't say which chat it belongs to —
+/// same tier `checkGroupAdminAccess` gives the command.
+fn handleCancelAnnouncement(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid announcement id");
+    };
+
+    const row = (reminders.get(ctx.pool, ctx.allocator, id) catch |err| {
+        log.err("cancel-announcement: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up announcement");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such announcement");
+    };
+    defer ctx.allocator.free(row.message);
+    if (row.kind != .announcement) {
+        return respondError(request, .not_found, "not_found", "no such announcement (that id is a reminder — use DELETE /api/v1/reminders/:id)");
+    }
+
+    const chat = (try requireChatAccess(ctx, request, row.chat_id)) orelse return;
+    defer ctx.allocator.free(chat.native_chat_id);
+
+    reminders.cancel(ctx.pool, id) catch |err| {
+        log.err("cancel-announcement: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to cancel announcement");
+    };
+    const a = resolveAuth(ctx, request);
+    audit_log.record(ctx.pool, a.account_id, null, "announcement.cancel", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3031,6 +4099,68 @@ fn handleDeleteNote(ctx: *const ServerContext, request: *http.Server.Request, id
     return respondJson(ctx, request, .ok, .{});
 }
 
+/// `GET /api/v1/memory` -- mirrors `/memory list`. Strictly the caller's
+/// own identity, same as `/memory list` itself: unlike every other
+/// identity-scoped list endpoint in this file, there is deliberately
+/// **no** `?identity_id=` admin-override here. warden's own
+/// `MemoryToolAdapter.forgetFn` refuses even the bot owner permission to
+/// forget someone else's memory (`mem.identity_id != self.identity_id`,
+/// no `isOwner` fallback at all — see `main.zig`'s `/memory forget`
+/// handler) — a memory is a private fact about one person, not a shared
+/// chat record, and extending admin visibility to it over the web would
+/// be a real privacy regression beyond what the underlying feature
+/// intends, not just an inconsistency.
+fn handleListMemory(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const identity_id = (try callersOwnIdentity(ctx, request, ra.account_id)) orelse return;
+
+    const items = memories.listForIdentity(ctx.pool, ctx.allocator, identity_id) catch |err| {
+        log.err("list-memory: failed for identity {d}: {t}", .{ identity_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to load memories");
+    };
+    defer {
+        for (items) |m| ctx.allocator.free(m.text);
+        ctx.allocator.free(items);
+    }
+    return respondJson(ctx, request, .ok, .{ .items = items });
+}
+
+/// `DELETE /api/v1/memory/:id` -- mirrors `/memory forget`. Same strict
+/// authorization as `MemoryToolAdapter.forgetFn`: only an identity linked
+/// to the caller's own account, never the bot owner acting on someone
+/// else's behalf (see `handleListMemory`'s doc comment for why).
+fn handleDeleteMemory(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const id = std.fmt.parseInt(i64, id_str, 10) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid memory id");
+    };
+
+    const mem = (memories.get(ctx.pool, ctx.allocator, id) catch |err| {
+        log.err("delete-memory: lookup failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to look up memory");
+    }) orelse {
+        return respondError(request, .not_found, "not_found", "no such memory");
+    };
+    defer ctx.allocator.free(mem.text);
+
+    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+        log.err("delete-memory: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to check access");
+    };
+    defer ctx.allocator.free(identity_ids);
+    if (std.mem.indexOfScalar(i64, identity_ids, mem.identity_id) == null) {
+        return respondError(request, .forbidden, "forbidden", "only the person that memory belongs to can forget it");
+    }
+
+    memories.forget(ctx.pool, id) catch |err| {
+        log.err("delete-memory: failed for id {d}: {t}", .{ id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to delete memory");
+    };
+    audit_log.record(ctx.pool, ra.account_id, null, "memory.forget", id_str, null);
+
+    return respondJson(ctx, request, .ok, .{});
+}
+
 // --- Finance: expenses, budgets, subscriptions (ROADMAP.md Phase 17) ---
 
 /// Percent-decodes a query-parameter value into `arena`. `queryParam`
@@ -3073,9 +4203,10 @@ fn percentDecode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Chat-scoped *read* access for the finance endpoints: true if the caller
-/// is a member of `chat_id` through any of their linked identities, or is
-/// owner/bot_admin. `false` means a response was already sent.
+/// Chat-scoped *read* access, reused by the finance endpoints and
+/// `handleListKeywordAlerts`: true if the caller is a member of `chat_id`
+/// through any of their linked identities, or is owner/bot_admin. `false`
+/// means a response was already sent.
 ///
 /// Deliberately **not** `requireChatAccess` -- that one means "live
 /// platform admin of this chat," the right bar for changing a chat's

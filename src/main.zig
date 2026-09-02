@@ -865,6 +865,7 @@ pub fn main(init: std.process.Init) !void {
             .bot_view_send_limiter = &bot_view_send_limiter,
             .telegram_user = if (telegram_user_adapter) |*t| t else null,
             .llm_provider = llm_provider,
+            .pending_drafts = &pending_drafts,
         };
         if (std.Thread.spawn(.{}, apiServerThread, .{ api_ctx, port, config.api_workers })) |thread| {
             thread.detach();

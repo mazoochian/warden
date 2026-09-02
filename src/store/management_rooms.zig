@@ -153,6 +153,56 @@ pub fn listTargets(pool: *PgPool, allocator: std.mem.Allocator, control_chat_id:
     return out.toOwnedSlice(allocator);
 }
 
+pub const Binding = struct {
+    control_chat_id: i64,
+    control_native_chat_id: []const u8,
+    control_platform: Platform,
+    control_title: ?[]const u8,
+    target_chat_id: i64,
+    target_native_chat_id: []const u8,
+    target_platform: Platform,
+    target_title: ?[]const u8,
+    bound_by_identity_id: i64,
+    created_at: i64,
+};
+
+/// Every management-room binding bot-wide, most recently created first --
+/// backs warden-ui's admin overview page. None of the per-room queries
+/// above fit that shape: an admin browsing a bindings list doesn't already
+/// know a specific `control_chat_id` to ask `listTargets` about.
+pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]Binding {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT m.control_chat_id, cc.native_chat_id, cc.platform, cc.title,
+        \\       m.target_chat_id, ct.native_chat_id, ct.platform, ct.title,
+        \\       m.bound_by_identity_id, EXTRACT(EPOCH FROM m.created_at)::bigint
+        \\FROM management_room_bindings m
+        \\JOIN chats cc ON cc.id = m.control_chat_id
+        \\JOIN chats ct ON ct.id = m.target_chat_id
+        \\ORDER BY m.created_at DESC;
+    );
+    defer stmt.finalize();
+
+    var out: std.ArrayList(Binding) = .empty;
+    while (try stmt.step()) {
+        try out.append(allocator, .{
+            .control_chat_id = stmt.columnInt64(0),
+            .control_native_chat_id = try allocator.dupe(u8, stmt.columnText(1)),
+            .control_platform = std.meta.stringToEnum(Platform, stmt.columnText(2)) orelse .telegram,
+            .control_title = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
+            .target_chat_id = stmt.columnInt64(4),
+            .target_native_chat_id = try allocator.dupe(u8, stmt.columnText(5)),
+            .target_platform = std.meta.stringToEnum(Platform, stmt.columnText(6)) orelse .telegram,
+            .target_title = if (stmt.columnIsNull(7)) null else try allocator.dupe(u8, stmt.columnText(7)),
+            .bound_by_identity_id = stmt.columnInt64(8),
+            .created_at = stmt.columnInt64(9),
+        });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const identities = @import("identities.zig");
@@ -179,6 +229,37 @@ test "bind is idempotent, isBound reflects state, unbind reports whether a row e
     try testing.expect(try unbind(&pool, control, target));
     try testing.expect(!try isBound(&pool, control, target));
     try testing.expect(!try unbind(&pool, control, target));
+}
+
+test "listAll returns every binding bot-wide with both sides' titles, most recent first" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const control1 = try chats.upsertChat(&pool, .telegram, "control1", null, "Control Room");
+    const target1 = try chats.upsertChat(&pool, .telegram, "target1", null, "Target Channel");
+    const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try bind(&pool, control1, target1, identity_id);
+
+    const found = try listAll(&pool, a);
+    defer {
+        for (found) |b| {
+            a.free(b.control_native_chat_id);
+            a.free(b.target_native_chat_id);
+            if (b.control_title) |t| a.free(t);
+            if (b.target_title) |t| a.free(t);
+        }
+        a.free(found);
+    }
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqual(control1, found[0].control_chat_id);
+    try testing.expectEqual(target1, found[0].target_chat_id);
+    try testing.expectEqualStrings("Control Room", found[0].control_title.?);
+    try testing.expectEqualStrings("Target Channel", found[0].target_title.?);
+    try testing.expectEqual(identity_id, found[0].bound_by_identity_id);
 }
 
 test "listTargets returns the one chat bound to that control room" {

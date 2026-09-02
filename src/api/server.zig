@@ -17,6 +17,7 @@ const store_pool = @import("../store/pool.zig");
 const config_mod = @import("../config.zig");
 const iface = @import("../platform/interface.zig");
 const telegram_user_platform = @import("../platform/telegram_user.zig");
+const reply_drafts = @import("../features/reply_drafts.zig");
 const bot_view = @import("bot_view.zig");
 const llm = @import("../llm/provider.zig");
 const rate_limit = @import("rate_limit.zig");
@@ -74,6 +75,14 @@ pub const ServerContext = struct {
     /// endpoint, same "safe-for-tests default" convention every other
     /// optional field on this struct already follows.
     llm_provider: ?llm.Provider = null,
+    /// Phase D's pending "reply on my behalf" drafts (see
+    /// `reply_drafts.PendingDrafts`'s own doc comment) — the same
+    /// process-lifetime, mutex-guarded instance `/drafts`/`/approve`/
+    /// `/discard` already share with the message-processing path. `null`
+    /// in every test that doesn't specifically exercise the
+    /// `/api/v1/telegram-user/drafts*` endpoints, same "feature
+    /// unavailable" meaning as `telegram_user` above.
+    pending_drafts: ?*reply_drafts.PendingDrafts = null,
 };
 
 const ConnectionItem = struct {

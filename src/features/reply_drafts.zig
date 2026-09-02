@@ -193,7 +193,13 @@ test "PendingDrafts: take past the timeout returns null" {
     defer pending.deinit();
 
     try pending.set(1000, "chat-1", "Alice", "hey", "hi!", null);
-    try testing.expectEqual(@as(?struct { chat_title: []const u8, incoming_text: []const u8, draft_text: []const u8, reply_to: ?[]const u8 }, null), pending.take(testing.allocator, 1061, "chat-1"));
+    // Not `expectEqual(@as(?struct{...}, null), ...)` -- that anonymous
+    // struct type is nominally distinct from `take`'s own return type at
+    // this declaration site, and only happened to type-check before this
+    // file was reachable from the API server's test graph (see
+    // `api/server.zig`'s `pending_drafts` field). A plain null check needs
+    // no matching type at all.
+    try testing.expect(pending.take(testing.allocator, 1061, "chat-1") == null);
 }
 
 test "PendingDrafts: discard removes a pending draft, reporting whether one existed" {
