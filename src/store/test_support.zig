@@ -24,7 +24,7 @@ fn truncateAll(db: *Db) !void {
         \\  bot_admins, bot_allowed_users, bot_allowed_chats, bot_pending_grants,
         \\  accounts, oauth_providers, management_room_bindings, notes,
         \\  facts, fact_tombstones, daily_digests, period_rollups, retrieval_log,
-        \\  instagram_sessions, instagram_thread_watermarks
+        \\  instagram_sessions, instagram_thread_watermarks, reply_drafts
         \\  RESTART IDENTITY CASCADE;
     );
 }

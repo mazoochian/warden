@@ -625,9 +625,12 @@ pub fn main(init: std.process.Init) !void {
     // `handleApproveCommand`/`handleDiscardCommand`). 24h, same "reasonable
     // to reach for well after the fact" reasoning as `pending_undos` above
     // — unlike a ban/kick confirmation, replying to a text a few hours
-    // later is completely normal for a personal account.
-    var pending_drafts = reply_drafts.PendingDrafts.init(gpa, io, 24 * 3600);
-    defer pending_drafts.deinit();
+    // later is completely normal for a personal account. Backed by the
+    // `reply_drafts` table rather than memory precisely because of that
+    // window: a restart or deploy inside it used to silently drop every
+    // pending draft the owner had been notified about (see
+    // `reply_drafts.PendingDrafts`'s doc comment).
+    var pending_drafts = reply_drafts.PendingDrafts.init(&pool, 24 * 3600);
 
     var bot_view_broadcaster = bot_view.Broadcaster.init(gpa, io);
     defer bot_view_broadcaster.deinit();
@@ -2290,6 +2293,103 @@ test "parsePollCommand rejects more than 10 options" {
     try std.testing.expect(many == .err);
 }
 
+/// Which of `handleMessage`'s intake paths an incoming message takes.
+pub const Route = enum {
+    /// Straight to `reply_autonomy` (`handleTelegramUserAutoReply`), never
+    /// the command dispatcher.
+    personal_account_autonomy,
+    /// The normal command + Q&A dispatch chain.
+    command_and_qa,
+    /// Nothing happens (the sender isn't allowed to make the bot act here).
+    ignored,
+};
+
+/// The single decision about how far an incoming message gets, extracted
+/// from `handleMessage` so it can actually be tested — the bug it encodes
+/// the fix for was invisible precisely because it lived inline in a
+/// 600-line dispatch function and failed silently.
+///
+/// The personal-account connector is the special case, and both halves of
+/// how it's special matter:
+///
+///   * **It never takes `command_and_qa`.** `telegram_user.convertNewMessage`
+///     drops the account's own outgoing messages, so every message that
+///     connector delivers is from *someone else*. A contact who DM'd the
+///     owner typing `/stats` (or `/kick`, or `/sudo ...`) must not have it
+///     dispatched as a command, because any reply would be composed and sent
+///     out under the owner's own identity.
+///   * **It never takes `ignored` on allowlist grounds either.** That same
+///     "never the owner" property means `auth.isOwner` — which compares
+///     `msg.user_id` against `WARDEN_TELEGRAM_USER_OWNER_ID`, the owner's
+///     *own* id — can never match here, and neither can `bot_admins`/the
+///     allowlist for a contact who was never explicitly added. Routing this
+///     through the normal gate therefore dropped every single
+///     personal-account message on the floor, which silently made
+///     `reply_autonomy` dead code: `/autonomy draft` and `/autonomy auto`
+///     stored and read back fine and then never once fired. Fixed
+///     2026-09-03.
+///
+/// Skipping the allowlist is safe here and only here, because
+/// `reply_autonomy` is its own deliberate opt-in and is fail-closed (`.off`
+/// resolves until the owner turns a chat on). That is emphatically not true
+/// of a bot connector, where the allowlist is the only thing between a
+/// stranger and the LLM — which is why this tests for `.telegram_user`
+/// specifically rather than "is a personal-account platform": the Instagram
+/// connector has no `reply_autonomy` path, so exempting it would just hand
+/// its DMs straight to `isAddressedToBot`.
+pub fn routeIncoming(
+    platform: iface.Platform,
+    is_owner: bool,
+    is_bot_admin: bool,
+    allowlisted: bool,
+) Route {
+    if (platform == .telegram_user) return .personal_account_autonomy;
+    if (is_owner or is_bot_admin or allowlisted) return .command_and_qa;
+    return .ignored;
+}
+
+test "routeIncoming: a personal-account message reaches autonomy even though nothing about its sender is allowed" {
+    // The exact shape of the bug: an inbound DM on the owner's personal
+    // account is always from someone else, so is_owner/is_bot_admin/
+    // allowlisted are all false -- and it must STILL be routed to the
+    // autonomy path rather than dropped. Routing it through the normal gate
+    // is what made draft/auto mode silently do nothing.
+    try std.testing.expectEqual(
+        Route.personal_account_autonomy,
+        routeIncoming(.telegram_user, false, false, false),
+    );
+}
+
+test "routeIncoming: a personal-account message is never dispatched as a command, whoever it looks like it's from" {
+    // A contact DMing the personal account must never reach the command
+    // chain: a reply to `/stats` there would go out under the owner's own
+    // identity. True for every combination, including the ones that would
+    // grant full access on any other platform.
+    for ([_]bool{ false, true }) |is_owner| {
+        for ([_]bool{ false, true }) |is_bot_admin| {
+            for ([_]bool{ false, true }) |allowlisted| {
+                try std.testing.expectEqual(
+                    Route.personal_account_autonomy,
+                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted),
+                );
+            }
+        }
+    }
+}
+
+test "routeIncoming: bot connectors keep the allowlist gate exactly as it was" {
+    // Every non-personal platform: owner, bot admin, or explicitly
+    // allowlisted gets through; a stranger doesn't. The personal-account
+    // carve-out must not have loosened this for anyone else -- Instagram
+    // especially, since it has no reply_autonomy path of its own.
+    for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, true, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, true, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, true));
+        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false));
+    }
+}
+
 /// Returns whether this message's attachment (if any) was claimed by the
 /// interactive `/convert` flow — `processMessageTask` must not delete a
 /// claimed file via its own attachment-cleanup `defer` (see
@@ -2352,17 +2452,21 @@ fn handleMessage(
     /// `/iglogin`'s handler touches this.
     instagram: ?*instagram_platform.InstagramConnector,
 ) bool {
-    // Coarse "does the bot even respond here" gate — checked before
-    // anything else in this function (including the choice_picked/
-    // attachment-continuation paths below, for uniformity: a disallowed
-    // sender gets no action taken on any kind of message, not just slash
-    // commands). Owners and bot admins bypass unconditionally; everyone
+    // Coarse "how far does this message get" gate, checked before anything
+    // else in this function (including the choice_picked/attachment-
+    // continuation paths below, for uniformity: a disallowed sender gets no
+    // action taken on any kind of message, not just slash commands).
+    // `routeIncoming` owns the decision and documents the reasoning,
+    // including why the personal-account connector skips both the allowlist
+    // and the command chain entirely.
+    //
+    // Owners and bot admins bypass the allowlist unconditionally; everyone
     // else needs their own identity or their current chat explicitly
     // allowed. Silent — this is "will the bot talk here at all", not a
     // moderation decision, so it doesn't announce itself. Message
     // recording/stats (`recordMessage`/`recordObservedUsers`) already ran
     // earlier in `processMessageTask`, before `handleMessage`, and are
-    // unaffected by this gate.
+    // unaffected by any of this.
     const is_owner = auth.isOwner(config, connector.platform(), msg.user_id);
     // The owner is the highest privilege there is and shouldn't need a
     // redundant `bot_admins` row on top of that — before this, `is_bot_admin`
@@ -2371,8 +2475,31 @@ fn handleMessage(
     // recognize them as one. `or` short-circuits, so the owner's messages
     // never even pay for the `bot_admins` query.
     const is_bot_admin = is_owner or bot_admins.isBotAdmin(pool, identity_id);
-    if (!is_owner and !is_bot_admin) {
-        if (!(bot_allowlist.isUserAllowed(pool, identity_id) or bot_allowlist.isChatAllowed(pool, chat_id))) return false;
+    const platform = connector.platform();
+    switch (routeIncoming(
+        platform,
+        is_owner,
+        is_bot_admin,
+        // `and` short-circuits, so the allowlist is only actually queried
+        // for a non-owner, non-admin on a bot connector — the same messages
+        // that paid for these two lookups before. The leading platform check
+        // keeps them off the personal-account path, whose route ignores this
+        // argument entirely.
+        platform != .telegram_user and !is_owner and !is_bot_admin and
+            (bot_allowlist.isUserAllowed(pool, identity_id) or bot_allowlist.isChatAllowed(pool, chat_id)),
+    )) {
+        .ignored => return false,
+        .personal_account_autonomy => {
+            const incoming = msg.text orelse return false;
+            if (incoming.len == 0) return false;
+            // Storage sense's flood-watermark sleep still applies, same as
+            // it does to the LLM paths below — a nearly-full disk shouldn't
+            // be spending LLM calls drafting replies either.
+            if (storage_sense.isSleepModeActive(pool, a)) return false;
+            handleTelegramUserAutoReply(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, msg, incoming, owner_notify, pending_drafts, telegram_user);
+            return false;
+        },
+        .command_and_qa => {},
     }
 
     // A button press / reaction pick has neither text nor an attachment of
@@ -2397,7 +2524,7 @@ fn handleMessage(
         // shape as the Undo button above — the Approve/Discard buttons on a
         // `reply_autonomy = .draft` notification (see
         // `handleTelegramUserAutoReply`/`handleDraftChoicePicked`).
-        if (handleDraftChoicePicked(connector, a, telegram_user, pending_drafts, now, msg, picked)) {
+        if (handleDraftChoicePicked(connector, a, io, telegram_user, pending_drafts, now, msg, picked)) {
             return false;
         }
         // Same shape again — `/tdchats`' Prev/Next pager buttons. Checked
@@ -2842,10 +2969,10 @@ fn handleMessage(
         handleDraftsListCommand(connector, a, config, pending_drafts, msg, now);
     } else if (std.mem.eql(u8, text, "/approve") or std.mem.startsWith(u8, text, "/approve ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
-        handleApproveCommand(connector, a, config, telegram_user, pending_drafts, msg, text, now);
+        handleApproveCommand(connector, a, config, telegram_user, pending_drafts, msg, text, now, io);
     } else if (std.mem.eql(u8, text, "/discard") or std.mem.startsWith(u8, text, "/discard ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
-        handleDiscardCommand(connector, a, config, pending_drafts, msg, text);
+        handleDiscardCommand(connector, a, config, telegram_user, pending_drafts, msg, text, io);
     } else if (std.mem.eql(u8, text, "/remind") or std.mem.startsWith(u8, text, "/remind ")) {
         if (!feature_flags.isEnabled(pool, "reminders")) return false;
         handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
@@ -2985,21 +3112,6 @@ fn handleMessage(
     } else if (text.len > 0 and text[0] == '/') {
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
-        return false;
-    } else if (connector.platform() == .telegram_user) {
-        // Phase D: `reply_autonomy` (migration `0043_reply_autonomy.sql`)
-        // is the deliberate, explicit gate for any auto-response through
-        // this connector — NOT `isAddressedToBot` (every message this
-        // connector sees looks like a private 1:1 DM to it right now, and
-        // combined with owners bypassing the allowlist/credits gates
-        // everywhere, that would mean any message from the owner's own
-        // account auto-answers with zero opt-in; confirmed live
-        // (2026-08-18) against the owner's own Saved Messages chat before
-        // this got built — see git history for that incident). `.off` is
-        // both the resolved default and a fail-closed no-op, same as
-        // before this existed; `.draft`/`.auto` are opt-in per chat or
-        // globally via `/autonomy`.
-        handleTelegramUserAutoReply(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, now, max_message_len, msg, text, owner_notify, pending_drafts);
         return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
         // A message that's *just* a YouTube/Instagram/X link is already
@@ -4978,7 +5090,7 @@ fn handleAutonomyCommand(
     const rest = std.mem.trim(u8, text["/autonomy".len..], " ");
     if (rest.len == 0) {
         const global = user_settings.getEffectiveReplyAutonomyDefault(pool, a, owner_identity_id);
-        const status = std.fmt.allocPrint(a, "Global reply_autonomy default: {s}\n\nUsage:\n/autonomy <off|draft|auto> — set the global default\n/autonomy <chat id> <off|draft|auto|clear> — per-chat override (see /tdchats for chat ids)", .{@tagName(global)}) catch return;
+        const status = std.fmt.allocPrint(a, "Global reply_autonomy default: {s}\n\nUsage:\n/autonomy <off|draft|auto> — set the global default\n/autonomy <chat id> <off|draft|auto|clear> — per-chat override (see /tdchats for chat ids)\n/autonomy <chat id> prompt [<text>|off] — that chat's ghostwriter voice", .{@tagName(global)}) catch return;
         connector.sendMessage(a, msg.chat_id, status, msg.message_id);
         return;
     }
@@ -5013,8 +5125,38 @@ fn handleAutonomyCommand(
         reply(connector, a, msg.chat_id, msg.message_id, "Override cleared — this chat now inherits the global default.");
         return;
     }
+
+    // `/autonomy <chat id> prompt [<text>]` — this chat's ghostwriter voice.
+    // Separate from `/persona`, which styles Warden answering as *itself*;
+    // see `chat_settings.getReplyAutonomyPrompt` for why sharing one setting
+    // was a bug. No argument shows the current one; `off` clears it.
+    if (std.mem.eql(u8, level_text, "prompt") or std.mem.startsWith(u8, level_text, "prompt ")) {
+        const prompt_arg = std.mem.trim(u8, level_text["prompt".len..], " ");
+        if (prompt_arg.len == 0) {
+            const current = chat_settings.getReplyAutonomyPrompt(pool, a, target.id);
+            const status = if (current) |c|
+                std.fmt.allocPrint(a, "Ghostwriter prompt for chat {s}:\n\n{s}\n\n/autonomy {s} prompt off to clear it.", .{ native_chat_id, c, native_chat_id }) catch return
+            else
+                std.fmt.allocPrint(a, "Chat {s} uses the built-in ghostwriter prompt (write in your voice, no AI framing). Set your own with /autonomy {s} prompt <text>.", .{ native_chat_id, native_chat_id }) catch return;
+            connector.sendMessage(a, msg.chat_id, status, msg.message_id);
+            return;
+        }
+        const new_prompt: ?[]const u8 = if (std.mem.eql(u8, prompt_arg, "off")) null else prompt_arg;
+        chat_settings.setReplyAutonomyPrompt(pool, target.id, new_prompt) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Failed to save.");
+            return;
+        };
+        // `reply` takes its text comptime, so this is two calls rather
+        // than one with a runtime-selected string.
+        if (new_prompt == null) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Ghostwriter prompt cleared — back to the built-in one.");
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, "Ghostwriter prompt set for this chat.");
+        }
+        return;
+    }
     const level = std.meta.stringToEnum(user_settings.ReplyAutonomy, level_text) orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /autonomy <chat id> <off|draft|auto|clear>.");
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /autonomy <chat id> <off|draft|auto|clear>, or /autonomy <chat id> prompt [<text>|off].");
         return;
     };
     chat_settings.setReplyAutonomy(pool, target.id, level) catch {
@@ -5050,12 +5192,17 @@ fn handleDraftsListCommand(
     }
 
     var out: Io.Writer.Allocating = .init(a);
-    out.writer.writeAll("Pending drafts:\n") catch {};
+    out.writer.writeAll("Pending drafts (each one is also sitting in that chat's Telegram composer):\n") catch {};
     for (drafts) |d| {
         const preview = if (d.draft_text.len > 200) d.draft_text[0..200] else d.draft_text;
         out.writer.print("\n{s} ({s}):\n{s}\n", .{ d.chat_title, d.native_chat_id, preview }) catch break;
+        // Only ever set when prefilling actually overwrote something the
+        // owner had typed, so this stays out of the way in the normal case.
+        if (d.replaced_draft) |r| {
+            out.writer.print("  \u{26a0}\u{fe0f} replaced what you'd typed there: {s}\n", .{r}) catch break;
+        }
     }
-    out.writer.writeAll("\n/approve <chat id> to send, /discard <chat id> to drop.") catch {};
+    out.writer.writeAll("\n/approve <chat id> to send, /discard <chat id> to drop — either way the composer is cleared.") catch {};
     connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
 }
 
@@ -5072,6 +5219,7 @@ fn handleApproveCommand(
     msg: iface.Message,
     text: []const u8,
     now: i64,
+    io: Io,
 ) void {
     if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
         reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can approve a draft.");
@@ -5091,6 +5239,9 @@ fn handleApproveCommand(
         return;
     };
     conn.connector().sendMessage(a, native_chat_id, draft.draft_text, draft.reply_to);
+    // Same reasoning as the Approve button's own call — see
+    // `handleDraftChoicePicked`.
+    telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
     const confirmation = std.fmt.allocPrint(a, "Sent to {s}.", .{draft.chat_title}) catch "Sent.";
     connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
 }
@@ -5100,9 +5251,11 @@ fn handleDiscardCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
     config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     msg: iface.Message,
     text: []const u8,
+    io: Io,
 ) void {
     if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
         reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can discard a draft.");
@@ -5114,6 +5267,7 @@ fn handleDiscardCommand(
         return;
     }
     if (pending_drafts.discard(native_chat_id)) {
+        telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
         reply(connector, a, msg.chat_id, msg.message_id, "Draft discarded.");
     } else {
         reply(connector, a, msg.chat_id, msg.message_id, "No pending draft for that chat.");
@@ -5163,12 +5317,14 @@ fn handleTelegramUserAutoReply(
     embeddings_client: ?*embeddings.EmbeddingsClient,
     tool_ctx: tool_registry.ToolContext,
     tools: []const tool_registry.ToolDef,
+    io: Io,
     now: i64,
     max_message_len: usize,
     msg: iface.Message,
     text: []const u8,
     owner_notify: iface.Connector,
     pending_drafts: *reply_drafts.PendingDrafts,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
 ) void {
     const owner_identity_id = resolveOwnerIdentityId(pool, config, now) catch |err| {
         log.err("reply_autonomy: couldn't resolve the owner's identity: {t}", .{err});
@@ -5181,7 +5337,14 @@ fn handleTelegramUserAutoReply(
     const answer: []const u8 = if (dyn.skip_trivial_messages and trivial_reply.isTrivialMessage(a, text))
         trivial_reply.pickResponse(@intCast(now))
     else blk: {
-        const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse default_reply_as_owner_prompt;
+        // `reply_autonomy`'s own per-chat prompt override, NOT `/persona`'s.
+        // These read as the same thing and want opposite outcomes: `/persona`
+        // styles *Warden answering as itself* in a chat, while this path is
+        // ghostwriting as the owner, where sounding like a bot persona is
+        // exactly the failure mode `default_reply_as_owner_prompt` exists to
+        // prevent. Sharing one column meant setting a persona on a chat
+        // silently made its ghostwritten replies out themselves as an AI.
+        const system_prompt = chat_settings.getReplyAutonomyPrompt(pool, a, chat_id) orelse default_reply_as_owner_prompt;
         const asker: qa.Asker = if (msg.identity) |identity| .{
             .display_name = identity.display_name,
             .username = identity.username,
@@ -5205,7 +5368,39 @@ fn handleTelegramUserAutoReply(
         .auto => connector.sendMessage(a, msg.chat_id, answer, msg.message_id),
         .draft => {
             const chat_title = msg.chat_title orelse msg.chat_id;
-            pending_drafts.set(now, msg.chat_id, chat_title, text, answer, msg.message_id) catch |err| {
+
+            // Write the draft straight into that chat's Telegram composer,
+            // so opening the conversation on any device shows it already
+            // typed and ready to edit or send — the whole point of `draft`
+            // mode being "have something waiting for me", rather than
+            // "send me a notification I then have to act on elsewhere".
+            //
+            // Whatever the owner had already typed there is read first and
+            // carried into the notification (and the drafts page) instead of
+            // being silently destroyed: overwriting is deliberate — the AI
+            // draft should definitely be there when the chat is opened — but
+            // losing a half-typed message with no trace is not.
+            var replaced_draft: ?[]const u8 = null;
+            if (telegram_user) |tu| {
+                if (std.fmt.parseInt(i64, msg.chat_id, 10)) |native_id| {
+                    replaced_draft = tu.fetchComposerDraft(a, io, native_id) catch |err| blk_draft: {
+                        log.warn("reply_autonomy: couldn't read the existing composer draft for chat {s}: {t}", .{ msg.chat_id, err });
+                        break :blk_draft null;
+                    };
+                    if (!tu.setChatDraft(a, io, native_id, answer, now)) {
+                        // The notification and the drafts page below still
+                        // work, so this degrades rather than fails: the
+                        // owner just has to approve from one of those
+                        // instead of finding the text pre-typed.
+                        log.warn("reply_autonomy: couldn't prefill the composer for chat {s}; falling back to notification-only", .{msg.chat_id});
+                        replaced_draft = null;
+                    }
+                } else |_| {
+                    log.warn("reply_autonomy: chat id {s} isn't a TDLib chat id, skipping composer prefill", .{msg.chat_id});
+                }
+            }
+
+            pending_drafts.set(now, msg.chat_id, chat_title, text, answer, msg.message_id, replaced_draft) catch |err| {
                 log.err("reply_autonomy: failed to stash a draft for chat {s}: {t}", .{ msg.chat_id, err });
                 return;
             };
@@ -5214,10 +5409,14 @@ fn handleTelegramUserAutoReply(
                 return;
             };
             const incoming_preview = if (text.len > 300) text[0..300] else text;
+            const replaced_note = if (replaced_draft) |r|
+                std.fmt.allocPrint(a, "\n\n\u{26a0}\u{fe0f} This replaced what you'd already typed there: \"{s}\"", .{r}) catch ""
+            else
+                "";
             const notify_text = std.fmt.allocPrint(
                 a,
-                "\u{1f4ac} Draft reply ready\nChat: {s} ({s})\nThey said: \"{s}\"\n\nDraft: \"{s}\"",
-                .{ chat_title, msg.chat_id, incoming_preview, answer },
+                "\u{1f4ac} Draft reply ready\nChat: {s} ({s})\nThey said: \"{s}\"\n\nDraft: \"{s}\"{s}",
+                .{ chat_title, msg.chat_id, incoming_preview, answer, replaced_note },
             ) catch return;
             // Buttons, not "type /approve <chat id>" — see
             // `handleDraftChoicePicked` for what picking one does.
@@ -5250,6 +5449,7 @@ fn handleTelegramUserAutoReply(
 fn handleDraftChoicePicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
+    io: Io,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     now: i64,
@@ -5267,6 +5467,10 @@ fn handleDraftChoicePicked(
             return true;
         };
         conn.connector().sendMessage(a, native_chat_id, draft.draft_text, draft.reply_to);
+        // The composer still holds this exact text (that's how the owner
+        // saw it in the first place) -- leaving it there after sending
+        // invites sending the same message twice.
+        telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
         const confirmation = std.fmt.allocPrint(a, "Sent to {s}.", .{draft.chat_title}) catch "Sent.";
         connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
         return true;
@@ -5274,6 +5478,7 @@ fn handleDraftChoicePicked(
     if (std.mem.startsWith(u8, picked.value, draft_discard_prefix)) {
         const native_chat_id = picked.value[draft_discard_prefix.len..];
         if (pending_drafts.discard(native_chat_id)) {
+            telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
             connector.sendMessage(a, msg.chat_id, "Draft discarded.", msg.message_id);
         } else {
             connector.sendMessage(a, msg.chat_id, "That draft is already gone.", msg.message_id);

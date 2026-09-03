@@ -191,6 +191,20 @@ pub const TelegramUserConnector = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    /// This chat's title from the `updateNewChat`/`updateChatTitle` cache,
+    /// duped onto `allocator`, or `null` if TDLib hasn't told us about the
+    /// chat yet. Cache-only by design: `convertNewMessage` calls this on the
+    /// poll loop's hot path, where a blocking `getChat` round trip per
+    /// inbound message would be exactly the stall `markSeenFireAndForget`
+    /// goes out of its way to avoid.
+    fn knownChatTitle(self: *TelegramUserConnector, allocator: std.mem.Allocator, chat_id: []const u8) ?[]const u8 {
+        self.known_chats_mu.lockUncancelable(self.io);
+        defer self.known_chats_mu.unlock(self.io);
+
+        const title = self.known_chats.get(chat_id) orelse return null;
+        return allocator.dupe(u8, title) catch null;
+    }
+
     fn setKnownChatTitle(self: *TelegramUserConnector, chat_id: []const u8, title: []const u8) void {
         self.known_chats_mu.lockUncancelable(self.io);
         defer self.known_chats_mu.unlock(self.io);
@@ -439,6 +453,144 @@ pub const TelegramUserConnector = struct {
         };
         if (!std.mem.eql(u8, type_str, "ok")) {
             log.warn("markMessagesRead: viewMessages error for chat {d}: {s}", .{ chat_id, raw });
+            return false;
+        }
+        return true;
+    }
+
+    /// Reads whatever is currently sitting in `chat_id`'s Telegram composer
+    /// — the per-chat draft Telegram itself syncs across the account's
+    /// devices (`getChat` -> `draft_message.input_message_text.text.text`).
+    /// `null` for an empty composer, a non-text draft (a draft photo
+    /// caption, say — nothing this connector should be second-guessing), or
+    /// any failure; the caller treats all three the same way, as "nothing of
+    /// the owner's to preserve here".
+    ///
+    /// Deliberately a separate round trip rather than a field bolted onto
+    /// `requestChatMeta`'s `ChatMeta`: that one is called on the
+    /// summarize/unread path where the draft is irrelevant, and this one on
+    /// the draft path where the unread count is.
+    pub fn fetchComposerDraft(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, chat_id: i64) !?[]const u8 {
+        const extra_id = self.nextExtraId();
+        self.send(.{ .@"@type" = "getChat", .chat_id = chat_id, .@"@extra" = extra_id });
+        const raw = try self.waitForResponse(allocator, io, extra_id, request_timeout_seconds) orelse {
+            log.warn("fetchComposerDraft: getChat timed out for chat {d}", .{chat_id});
+            return null;
+        };
+        defer allocator.free(raw);
+
+        var parsed = json.parseFromSlice(json.Value, allocator, raw, .{}) catch |err| {
+            log.warn("fetchComposerDraft: failed to parse getChat response: {t}", .{err});
+            return null;
+        };
+        defer parsed.deinit();
+
+        // getChat -> chat.draft_message.input_message_text.text.text, with
+        // every level optional: no draft at all, a draft whose content isn't
+        // `inputMessageText`, or an `error` response all land on `null`.
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return null,
+        };
+        const draft = switch (obj.get("draft_message") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        const input = switch (draft.get("input_message_text") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        if (input.get("@type")) |v| if (!(v == .string and std.mem.eql(u8, v.string, "inputMessageText"))) return null;
+        const formatted = switch (input.get("text") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        const text = switch (formatted.get("text") orelse return null) {
+            .string => |s| s,
+            else => return null,
+        };
+        if (text.len == 0) return null;
+        return try allocator.dupe(u8, text);
+    }
+
+    /// Writes `text` into `chat_id`'s Telegram composer as a draft, so
+    /// opening that chat in any Telegram client shows it already typed and
+    /// ready to edit or send. This is real Telegram draft sync — it
+    /// propagates to the account's phone and desktop, not just wherever
+    /// Warden happens to run.
+    ///
+    /// Every field TDLib defaults sensibly is omitted rather than spelled
+    /// out (`reply_to`, `link_preview_options`, `clear_draft`, `entities`,
+    /// `message_thread_id`): td_json fills in defaults for absent fields,
+    /// and the codebase already sends partial request objects everywhere
+    /// else (`getChat` above sends two fields).
+    ///
+    /// Returns whether TDLib acknowledged it. Waits for that answer rather
+    /// than firing and forgetting (unlike `markSeenFireAndForget`) because
+    /// this one is user-visible: the owner is about to be told "there's a
+    /// draft waiting in that chat", and being wrong about that is worse
+    /// than a missed read receipt.
+    pub fn setChatDraft(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, chat_id: i64, text: []const u8, date: i64) bool {
+        const extra_id = self.nextExtraId();
+        self.send(.{
+            .@"@type" = "setChatDraftMessage",
+            .chat_id = chat_id,
+            .draft_message = .{
+                .@"@type" = "draftMessage",
+                .date = @as(i32, @truncate(date)),
+                .input_message_text = .{
+                    .@"@type" = "inputMessageText",
+                    .text = .{ .@"@type" = "formattedText", .text = text },
+                },
+            },
+            .@"@extra" = extra_id,
+        });
+        return self.awaitOk(allocator, io, extra_id, "setChatDraftMessage", chat_id);
+    }
+
+    /// Empties `chat_id`'s Telegram composer (`draft_message: null`) — used
+    /// once an AI draft has been approved and sent, or discarded, so the
+    /// text doesn't linger in the composer where it could be sent a second
+    /// time by accident.
+    pub fn clearChatDraft(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, chat_id: i64) bool {
+        const extra_id = self.nextExtraId();
+        self.send(.{
+            .@"@type" = "setChatDraftMessage",
+            .chat_id = chat_id,
+            .draft_message = @as(?u8, null),
+            .@"@extra" = extra_id,
+        });
+        return self.awaitOk(allocator, io, extra_id, "setChatDraftMessage(clear)", chat_id);
+    }
+
+    /// Shared tail of the two composer-draft writes: waits for `extra_id`'s
+    /// response and reports whether it was a plain `ok`, logging anything
+    /// else. Same response shape `markMessagesRead` checks by hand.
+    fn awaitOk(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, extra_id: u64, what: []const u8, chat_id: i64) bool {
+        const raw = (self.waitForResponse(allocator, io, extra_id, request_timeout_seconds) catch |err| {
+            log.warn("{s}: waiting for a response failed for chat {d}: {t}", .{ what, chat_id, err });
+            return false;
+        }) orelse {
+            log.warn("{s}: timed out for chat {d}", .{ what, chat_id });
+            return false;
+        };
+        defer allocator.free(raw);
+
+        var parsed = json.parseFromSlice(json.Value, allocator, raw, .{}) catch |err| {
+            log.warn("{s}: failed to parse response for chat {d}: {t}", .{ what, chat_id, err });
+            return false;
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return false,
+        };
+        const type_str = switch (obj.get("@type") orelse return false) {
+            .string => |s| s,
+            else => return false,
+        };
+        if (!std.mem.eql(u8, type_str, "ok")) {
+            log.warn("{s}: error for chat {d}: {s}", .{ what, chat_id, raw });
             return false;
         }
         return true;
@@ -829,11 +981,20 @@ pub const TelegramUserConnector = struct {
             else => null,
         };
 
+        const chat_id_str = try std.fmt.allocPrint(allocator, "{d}", .{chat_id});
         return .{
-            .chat_id = try std.fmt.allocPrint(allocator, "{d}", .{chat_id}),
+            .chat_id = chat_id_str,
             .message_id = if (message_id) |m| try std.fmt.allocPrint(allocator, "{d}", .{m}) else null,
             .user_id = try std.fmt.allocPrint(allocator, "{d}", .{user_id}),
             .text = try allocator.dupe(u8, text),
+            // Left null before this, which meant everything downstream fell
+            // back to the raw numeric chat id -- a `reply_autonomy = .draft`
+            // notification read "Chat: -100123... (-100123...)" instead of
+            // naming the person. TDLib volunteers `updateNewChat` for every
+            // chat it knows shortly after login, so the cache is populated
+            // by the time real messages arrive; `null` here just restores
+            // the old fallback for the rare chat it hasn't mentioned yet.
+            .chat_title = self.knownChatTitle(allocator, chat_id_str),
             // Private-chat vs. group/channel isn't distinguished yet — see
             // the struct doc comment's Phase A scope note. Always reported
             // as a 1:1 chat for now, meaning every message gets treated as
@@ -850,6 +1011,26 @@ pub const TelegramUserConnector = struct {
         };
     }
 };
+
+/// Best-effort "empty this chat's Telegram composer", tolerant of every
+/// reason it might not be possible: no personal-account connector configured
+/// on this deployment, or a `native_chat_id` that isn't a TDLib chat id.
+/// Shared by every place a draft stops being pending — the Approve/Discard
+/// buttons, `/approve`//`/discard`, and the web API's own two handlers — so
+/// the composer never keeps text the owner has already acted on.
+///
+/// Deliberately silent about failure beyond a log line: the draft has
+/// already been sent or discarded by the time this runs, and telling the
+/// owner "…but I couldn't clear the composer" would be noise about
+/// something they're about to see for themselves.
+pub fn clearComposerDraftFor(conn: ?*TelegramUserConnector, allocator: std.mem.Allocator, io: Io, native_chat_id: []const u8) void {
+    const c = conn orelse return;
+    const chat_id = std.fmt.parseInt(i64, native_chat_id, 10) catch {
+        log.warn("clearComposerDraftFor: not a numeric TDLib chat id: {s}", .{native_chat_id});
+        return;
+    };
+    _ = c.clearChatDraft(allocator, io, chat_id);
+}
 
 const testing = std.testing;
 

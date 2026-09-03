@@ -3172,13 +3172,35 @@ fn handleGetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
 
     const override = chat_settings.getReplyAutonomy(ctx.pool, chat.id);
     const effective = chat_settings.resolveReplyAutonomy(ctx.pool, ctx.allocator, chat.id, identity_id);
+    // This chat's ghostwriter prompt override -- deliberately its own
+    // setting rather than `/persona`'s `system_prompt`, see
+    // `chat_settings.getReplyAutonomyPrompt`. `null` means "use the
+    // built-in write-as-the-owner prompt".
+    const prompt = chat_settings.getReplyAutonomyPrompt(ctx.pool, ctx.allocator, chat.id);
+    defer if (prompt) |pr| ctx.allocator.free(pr);
     return respondJson(ctx, request, .ok, .{
         .override = if (override) |o| @tagName(o) else null,
         .effective = @tagName(effective),
+        .prompt = prompt,
     });
 }
 
-const SetChatAutonomyBody = struct { override: ?[]const u8 };
+/// `prompt` needs three states — leave alone / clear / set — but only has
+/// two available, so the empty string is the "clear" sentinel:
+///
+///   * absent (or JSON `null`) — leave the ghostwriter prompt untouched, so
+///     a caller flipping only the autonomy level never clobbers it.
+///   * `""` — clear it, going back to the built-in ghostwriter prompt.
+///   * any other string — set it.
+///
+/// Not `??[]const u8`, which looks like it would express this and doesn't:
+/// std.json parses a present JSON `null` into the *outer* null, exactly like
+/// an absent field, so both collapse to the same value and "clear" would
+/// silently no-op. Verified against std.json rather than assumed.
+const SetChatAutonomyBody = struct {
+    override: ?[]const u8 = null,
+    prompt: ?[]const u8 = null,
+};
 
 /// `PATCH /api/v1/telegram-user/chats/:nativeChatId/autonomy` — mirrors
 /// `/autonomy <chat id> <off|draft|auto|clear>` (`override: null` is
@@ -3193,9 +3215,12 @@ fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var buf: [256]u8 = undefined;
+    // Roomier than the 256 bytes this used to take: the body now also
+    // carries an optional free-text ghostwriter prompt, which is easily
+    // longer than that.
+    var buf: [4096]u8 = undefined;
     const reader = request.readerExpectNone(&buf);
-    const raw = reader.allocRemaining(arena, .limited(256)) catch {
+    const raw = reader.allocRemaining(arena, .limited(4096)) catch {
         return respondError(request, .bad_request, "bad_request", "failed to read body");
     };
     const body = std.json.parseFromSliceLeaky(SetChatAutonomyBody, arena, raw, .{}) catch {
@@ -3219,6 +3244,16 @@ fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
         log.err("set-chat-autonomy: failed for chat {d}: {t}", .{ chat.id, err });
         return respondError(request, .internal_server_error, "internal", "failed to save");
     };
+    if (body.prompt) |prompt| {
+        // Present and non-null means the caller is deliberately setting or
+        // clearing it; an all-whitespace value is a clear, same as `""` --
+        // see SetChatAutonomyBody's doc comment.
+        const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+        chat_settings.setReplyAutonomyPrompt(ctx.pool, chat.id, if (trimmed.len == 0) null else trimmed) catch |err| {
+            log.err("set-chat-autonomy: failed to save the prompt for chat {d}: {t}", .{ chat.id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to save");
+        };
+    }
     audit_log.record(ctx.pool, account_id, null, "telegram_user.autonomy.set_chat", native_chat_id, null);
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3238,7 +3273,9 @@ fn handleListDrafts(ctx: *const ServerContext, request: *http.Server.Request) !v
         for (items) |it| {
             ctx.allocator.free(it.native_chat_id);
             ctx.allocator.free(it.chat_title);
+            ctx.allocator.free(it.incoming_text);
             ctx.allocator.free(it.draft_text);
+            if (it.replaced_draft) |r| ctx.allocator.free(r);
         }
         ctx.allocator.free(items);
     }
@@ -3267,9 +3304,15 @@ fn handleApproveDraft(ctx: *const ServerContext, request: *http.Server.Request, 
         ctx.allocator.free(draft.incoming_text);
         ctx.allocator.free(draft.draft_text);
         if (draft.reply_to) |r| ctx.allocator.free(r);
+        if (draft.replaced_draft) |r| ctx.allocator.free(r);
     }
 
     conn.connector().sendMessage(ctx.allocator, native_chat_id, draft.draft_text, draft.reply_to);
+    // Approving from the web UI has to clear the Telegram composer just
+    // like approving from a button or `/approve` does -- the draft was
+    // written into it when it was created, and leaving it there after
+    // sending invites sending the same message twice.
+    telegram_user_platform.clearComposerDraftFor(ctx.telegram_user, ctx.allocator, ctx.io, native_chat_id);
     audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.approve", native_chat_id, null);
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3289,6 +3332,7 @@ fn handleDiscardDraft(ctx: *const ServerContext, request: *http.Server.Request, 
     if (!pending_drafts.discard(native_chat_id)) {
         return respondError(request, .not_found, "not_found", "no pending draft for that chat");
     }
+    telegram_user_platform.clearComposerDraftFor(ctx.telegram_user, ctx.allocator, ctx.io, native_chat_id);
     audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.discard", native_chat_id, null);
     return respondJson(ctx, request, .ok, .{});
 }

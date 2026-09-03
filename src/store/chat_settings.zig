@@ -294,6 +294,44 @@ pub fn listMonitored(pool: *PgPool, allocator: std.mem.Allocator, platform: Plat
 /// Returns the per-chat system-prompt override duped into `allocator`, or
 /// `null` if unset (the caller falls back to `config.system_prompt`) — see
 /// the `0006_persona.sql` migration comment.
+/// `reply_autonomy`'s own per-chat system-prompt override — the
+/// ghostwriter voice used when drafting/auto-sending a reply *as the owner*
+/// through the personal-account connector.
+///
+/// Deliberately NOT `getSystemPromptOverride` (`/persona`), which the
+/// autonomy path used to read: `/persona` configures how Warden answers as
+/// *itself* in a chat, while this configures how it impersonates the owner,
+/// and the two want opposite things. Sharing one column meant that setting
+/// a persona anywhere silently made that chat's ghostwritten replies sound
+/// like a bot. `null` = use `main.zig`'s `default_reply_as_owner_prompt`.
+pub fn getReplyAutonomyPrompt(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ?[]const u8 {
+    const db = pool.acquire() catch return null;
+    defer pool.release(db);
+
+    var stmt = db.prepare("SELECT reply_autonomy_prompt FROM chat_settings WHERE chat_id = $1;") catch return null;
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    const has_row = stmt.step() catch return null;
+    if (!has_row or stmt.columnIsNull(0)) return null;
+    return allocator.dupe(u8, stmt.columnText(0)) catch null;
+}
+
+/// `null` clears the override, falling back to the built-in ghostwriter
+/// prompt.
+pub fn setReplyAutonomyPrompt(pool: *PgPool, chat_id: i64, prompt: ?[]const u8) !void {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\INSERT INTO chat_settings (chat_id, reply_autonomy_prompt) VALUES ($1, $2)
+        \\ON CONFLICT (chat_id) DO UPDATE SET reply_autonomy_prompt = excluded.reply_autonomy_prompt;
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    if (prompt) |p| stmt.bindText(2, p) else stmt.bindNull(2);
+    _ = try stmt.step();
+}
+
 pub fn getSystemPromptOverride(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ?[]const u8 {
     const db = pool.acquire() catch return null;
     defer pool.release(db);

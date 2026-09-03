@@ -114,6 +114,67 @@ and this entry) — worth a real README section before calling the feature
 line done. `zig build` + `zig build test` green throughout (616/618, 2
 skipped without a local Postgres).
 
+**Phase D was, in fact, unreachable dead code from the day it shipped
+until 2026-09-03** — worth recording in full, because everything about it
+tested green and looked correct in isolation, and the failure was
+completely silent. `handleMessage`'s coarse allowlist gate ran before the
+`.telegram_user` dispatch branch and could never pass for this connector:
+`convertNewMessage` drops the account's own outgoing messages, so every
+message this connector delivers is from *someone else*, which means
+`msg.user_id` is never the owner's and `auth.isOwner` — which compares
+exactly that against `WARDEN_TELEGRAM_USER_OWNER_ID`, the owner's own id —
+can never match. A contact who was never explicitly `/adduser`'d failed the
+allowlist too (and `/adduser` typed to the bot couldn't have helped anyway:
+it records the grant against `connector.platform()`, so it allowlists a
+`telegram` identity, a different `identities` row from the `telegram_user`
+one an inbound DM resolves). So `handleMessage` returned `false` for every
+single personal-account message and `handleTelegramUserAutoReply` was never
+once called. `/autonomy draft` and `/autonomy auto` both wrote and read
+back their settings correctly and then did nothing: no drafts, no
+auto-replies, no errors, an empty `/drafts` and an empty web drafts page.
+
+The fix extracts that decision into `routeIncoming` — a pure function with
+real tests, precisely because the bug was invisible while the logic lived
+inline in a 600-line dispatch chain — and routes `.telegram_user` straight
+to `reply_autonomy`, bypassing both the allowlist and the command
+dispatcher. Bypassing the allowlist is safe *here and only here* because
+`reply_autonomy` is itself the deliberate opt-in and is fail-closed
+(`.off` until the owner turns a chat on); bypassing the command dispatcher
+is mandatory for the same "never the owner typing" reason that broke the
+gate, since otherwise a contact typing `/stats` into the owner's DMs would
+get a reply composed and sent under the owner's own identity. The check
+stays `.telegram_user`-specific rather than "is a personal account": the
+Instagram connector has no `reply_autonomy` path, so exempting it would
+hand its DMs straight to `isAddressedToBot`.
+
+Three further defects behind that one, fixed in the same pass:
+`PendingDrafts` was an in-memory map, so every restart or deploy silently
+dropped every pending draft the owner had been notified about — now the
+`reply_drafts` table (`0049_reply_drafts.sql`), which also removed the need
+for its mutex since Postgres serializes the concurrent access.
+`convertNewMessage` never populated `chat_title`, so draft notifications
+named chats by raw numeric id — now filled from the `updateNewChat` cache
+(no extra round trip on the poll loop). And the autonomy path read
+`/persona`'s `system_prompt` override, which quietly made ghostwritten
+replies sound like a configured bot persona — exactly what
+`default_reply_as_owner_prompt` exists to prevent — so it now has its own
+`chat_settings.reply_autonomy_prompt` (`/autonomy <chat id> prompt`, and
+the web UI's per-chat card).
+
+Also shipped here, and the part the owner actually asked for: a `.draft`
+reply is now written **into the chat's real Telegram composer** via TDLib
+`setChatDraftMessage`, so opening that conversation on any device shows the
+AI text already typed. Telegram syncs drafts across the account's own
+devices, so this reaches the phone where the message is actually read.
+Prefill deliberately overwrites whatever was in the composer (the draft
+should definitely be there) but never silently: the replaced text is read
+first via `getChat`, stored on the draft row, quoted back in the
+notification, and shown on the drafts page. Approve and Discard both clear
+the composer, so an acted-on draft can't sit there waiting to be sent a
+second time. No Matrix/XMPP counterpart is possible or planned — neither
+protocol has a server-side draft concept, and both are bot connectors where
+ghostwriting-as-the-owner doesn't apply in the first place.
+
 **Also unplanned, shipped outside the phase sequence** (direct user
 request, 2026-08-18): `/tdsummary <chat id or name>` and its natural-
 language counterpart, the `summarize_unread_chat` tool — on-demand "what
