@@ -10,6 +10,7 @@ const store_pool = @import("../store/pool.zig");
 const Identity = @import("../domain/identity.zig").Identity;
 const MatrixProfile = @import("../domain/matrix_profile.zig").MatrixProfile;
 const log = @import("../log.zig").scoped("matrix");
+const llm = @import("../llm/provider.zig");
 
 /// Matrix implementation of `platform.Connector`, backed by `/sync`
 /// long-polling — same shape as `telegram.zig`'s `TelegramConnector`, just
@@ -62,6 +63,20 @@ pub const MatrixConnector = struct {
     /// concurrently across per-message tasks.
     encrypted_rooms: std.StringHashMapUnmanaged(void) = .empty,
     encrypted_rooms_mutex: Io.Mutex = .init,
+    /// room id -> `m.room.name`, so a room can be shown by name instead of
+    /// its raw `!abc:server` id. Before this, the Matrix connector never
+    /// set `chat_title` at all, so every Matrix room reached
+    /// `chats.upsertChat` with a null title and was displayed by id
+    /// everywhere.
+    ///
+    /// Cached because reading it is a real HTTP round trip and this is
+    /// consulted per message. A room with no name caches the *absence*
+    /// (`null`) too, so an unnamed DM doesn't re-ask on every message.
+    /// Never evicted: a rename is rare enough that picking it up on the
+    /// next restart is an acceptable trade for not re-fetching forever.
+    /// Same mutex reasoning as `encrypted_rooms`.
+    room_names: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    room_names_mutex: Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, homeserver_url: []const u8, access_token: []const u8) MatrixConnector {
         return .{ .client = raw.Client.init(allocator, io, homeserver_url, access_token) };
@@ -74,6 +89,33 @@ pub const MatrixConnector = struct {
         self.crypto = try matrix_crypto.State.load(allocator, io, pool, pickle_key, &self.client);
     }
 
+    /// This room's display name, or `null` to fall back to the raw room id.
+    /// Cached (including negative results) — see `room_names`.
+    fn roomTitle(self: *MatrixConnector, allocator: std.mem.Allocator, io: Io, room_id: []const u8) ?[]const u8 {
+        {
+            self.room_names_mutex.lockUncancelable(io);
+            defer self.room_names_mutex.unlock(io);
+            if (self.room_names.get(room_id)) |cached| {
+                return if (cached) |name| (allocator.dupe(u8, name) catch null) else null;
+            }
+        }
+
+        const fetched = self.client.roomName(self.client.allocator, room_id) catch |err| blk: {
+            log.warn("matrix: couldn't read the name of {s}: {t}", .{ room_id, err });
+            break :blk null;
+        };
+
+        self.room_names_mutex.lockUncancelable(io);
+        defer self.room_names_mutex.unlock(io);
+        const owned_id = self.client.allocator.dupe(u8, room_id) catch return null;
+        self.room_names.put(self.client.allocator, owned_id, fetched) catch {
+            self.client.allocator.free(owned_id);
+            if (fetched) |f| self.client.allocator.free(f);
+            return null;
+        };
+        return if (fetched) |name| (allocator.dupe(u8, name) catch null) else null;
+    }
+
     pub fn deinit(self: *MatrixConnector) void {
         if (self.since) |s| self.client.allocator.free(s);
         if (self.self_user_id) |s| self.client.allocator.free(s);
@@ -81,6 +123,12 @@ pub const MatrixConnector = struct {
         var room_it = self.encrypted_rooms.keyIterator();
         while (room_it.next()) |k| self.client.allocator.free(k.*);
         self.encrypted_rooms.deinit(self.client.allocator);
+        var name_it = self.room_names.iterator();
+        while (name_it.next()) |entry| {
+            self.client.allocator.free(entry.key_ptr.*);
+            if (entry.value_ptr.*) |name| self.client.allocator.free(name);
+        }
+        self.room_names.deinit(self.client.allocator);
         self.client.deinit();
     }
 
@@ -477,6 +525,7 @@ pub const MatrixConnector = struct {
             // doc comment.
             .is_group = true,
             .chat_type = "room",
+            .chat_title = self.roomTitle(allocator, self.client.io, chat_id),
             .reply_to_is_me = reply_to_is_me,
             .mentions_me = mentions_me,
             .identity = identity,
@@ -609,7 +658,12 @@ pub const MatrixConnector = struct {
 
     fn sendMessageReturningIdFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to_message_id: ?[]const u8) anyerror![]const u8 {
         const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
-        const payload = try buildJson(allocator, raw.Client.MessagePayload{ .body = text, .@"m.relates_to" = raw.Client.replyRelation(reply_to_message_id) });
+        // Matrix has no expandable-blockquote equivalent to Telegram's, but
+        // chain-of-thought markers are control bytes and must not go out
+        // raw — render them as a 💭 paragraph instead. See
+        // `llm.renderThinkingPlain`.
+        const body = llm.renderThinkingPlain(allocator, text) catch text;
+        const payload = try buildJson(allocator, raw.Client.MessagePayload{ .body = body, .@"m.relates_to" = raw.Client.replyRelation(reply_to_message_id) });
         defer allocator.free(payload);
         return self.sendEvent(allocator, chat_id, "m.room.message", payload);
     }

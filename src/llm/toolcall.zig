@@ -35,8 +35,12 @@ pub const Progress = struct {
         /// About to send a request to the model (first turn or a follow-up
         /// after tool results).
         thinking,
-        /// About to execute a tool the model asked for.
-        tool_use: []const u8,
+        /// About to execute a tool the model asked for. `input_digest`
+        /// fingerprints the arguments (see `hashToolInput`) so a caller
+        /// rendering these can tell a genuinely different call apart from
+        /// the same one being reported again — the model re-issuing an
+        /// identical call shouldn't look like new activity.
+        tool_use: struct { name: []const u8, input_digest: u64 },
         /// Cumulative visible answer text generated so far *this turn* (not
         /// a delta) — reported repeatedly as a streaming provider produces
         /// more of it; the last report for a given turn equals that turn's
@@ -44,6 +48,13 @@ pub const Progress = struct {
         /// next turn (e.g. after a tool call), same as `tool_use` simply
         /// replacing whatever status was shown before it.
         text: []const u8,
+        /// A model call failed with something worth retrying and another
+        /// attempt is about to be made after a backoff — reported so the
+        /// caller can say so instead of leaving the user watching an
+        /// unexplained pause (see `callProviderWithRetry`). `attempt` is
+        /// 1-based and counts retries, not total calls, so the first one
+        /// reads "1/3".
+        retry: struct { attempt: u32, max: u32, err: anyerror },
     };
 
     pub fn report(self: Progress, event: Event) void {
@@ -55,6 +66,92 @@ pub const Progress = struct {
         return flag.load(.acquire);
     }
 };
+
+/// Order-stable fingerprint of a tool call's arguments, for telling "the
+/// model called web_search again, for something else" apart from "the model
+/// re-issued the same web_search". Serialised rather than hashed field by
+/// field so nested objects/arrays are covered without walking them here;
+/// `std.json.Stringify` preserves object key order as parsed, which is
+/// stable for a given provider response, and a hash collision would only
+/// ever cost a duplicate line in a progress display.
+///
+/// Falls back to a random-ish constant on serialisation failure, so a
+/// failure never makes two different calls *look* identical.
+fn hashToolInput(allocator: std.mem.Allocator, input: std.json.Value) u64 {
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    std.json.Stringify.value(input, .{}, &out.writer) catch return std.math.maxInt(u64);
+    return std.hash.Wyhash.hash(0, out.writer.buffered());
+}
+
+/// Base backoff before the first retry; doubles each further attempt (1s,
+/// 2s, 4s with the default of 3). Short enough that a transient blip
+/// resolves well inside a chat message's useful lifetime, long enough to
+/// actually let a congested endpoint recover rather than hammering it.
+const retry_backoff_base_ms: u64 = 1000;
+
+/// Whether a failed model call is worth trying again. Deliberately a small
+/// allowlist rather than "anything that isn't cancellation": these are the
+/// transport- and API-level failures that congestion produces (timeouts,
+/// dropped connections, 429/5xx collapsed into one provider error, an empty
+/// response body), and retrying anything else — a malformed request, a bad
+/// key — just burns the same failure three more times.
+///
+/// `error.Cancelled` is never retryable: the user pressed the button.
+fn isRetryable(err: anyerror) bool {
+    return switch (err) {
+        error.HttpRequestFailed,
+        error.RequestTimedOut,
+        error.AnthropicApiError,
+        error.OpenAiCompatApiError,
+        error.OpenAiCompatEmptyResponse,
+        => true,
+        else => false,
+    };
+}
+
+/// One model call, retried up to `max_retries` times on a transient
+/// failure with exponential backoff.
+///
+/// Before this, a single failed call ended the whole request with "Sorry, I
+/// couldn't reach the model just now" — which during a provider's busy
+/// hours meant routine, self-correcting blips surfaced as hard failures.
+///
+/// Retrying here (per model call) rather than around the whole of `run` is
+/// what makes it safe: `run`'s conversation may be several turns deep with
+/// tools already executed, and restarting that would re-run those tools —
+/// re-sending a message, re-charging an expense. Only the failed HTTP call
+/// is repeated; the conversation state is untouched.
+fn callProviderWithRetry(
+    provider: llm.Provider,
+    allocator: std.mem.Allocator,
+    io: Io,
+    request: llm.ChatRequest,
+    stream: bool,
+    sink: llm.StreamSink,
+    progress: Progress,
+    max_retries: u32,
+) !llm.ChatResponse {
+    var attempt: u32 = 0;
+    while (true) {
+        if (progress.isCancelled()) return error.Cancelled;
+        const attempted = if (stream)
+            provider.chatStream(allocator, request, sink)
+        else
+            provider.chat(allocator, request);
+        return attempted catch |err| {
+            if (attempt >= max_retries or !isRetryable(err)) return err;
+            attempt += 1;
+            std.log.warn("model call failed ({t}), retrying {d}/{d}", .{ err, attempt, max_retries });
+            progress.report(.{ .retry = .{ .attempt = attempt, .max = max_retries, .err = err } });
+            const delay_ms: i64 = @intCast(retry_backoff_base_ms * (@as(u64, 1) << @intCast(attempt - 1)));
+            // A failed sleep means the task is going away; surface the
+            // original model error rather than the sleep's.
+            Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch return err;
+            continue;
+        };
+    }
+}
 
 /// Drives one provider-agnostic conversation: sends `user_message`, and as
 /// long as the model keeps asking for tools, executes them against
@@ -88,6 +185,10 @@ pub fn run(
     vision_enabled: bool,
     documents_enabled: bool,
     max_tokens: u32,
+    /// How many times a *transient* model-call failure is retried before
+    /// the request gives up (see `callProviderWithRetry`). 0 restores the
+    /// old single-attempt behaviour.
+    max_retries: u32,
 ) ![]const u8 {
     const llm_tools = try toLlmTools(allocator, tool_defs);
 
@@ -124,22 +225,13 @@ pub fn run(
     while (i < max_iterations) : (i += 1) {
         if (progress.isCancelled()) return error.Cancelled;
         progress.report(.thinking);
-        const response = if (stream)
-            try provider.chatStream(allocator, .{
-                .system = system,
-                .messages = messages.items,
-                .tools = llm_tools,
-                .show_thinking = show_thinking,
-                .max_tokens = max_tokens,
-            }, stream_bridge.sink())
-        else
-            try provider.chat(allocator, .{
-                .system = system,
-                .messages = messages.items,
-                .tools = llm_tools,
-                .show_thinking = show_thinking,
-                .max_tokens = max_tokens,
-            });
+        const response = try callProviderWithRetry(provider, allocator, ctx.io, .{
+            .system = system,
+            .messages = messages.items,
+            .tools = llm_tools,
+            .show_thinking = show_thinking,
+            .max_tokens = max_tokens,
+        }, stream, stream_bridge.sink(), progress, max_retries);
 
         try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
@@ -158,7 +250,7 @@ pub fn run(
         var results: std.ArrayList(llm.ContentBlock) = .empty;
         for (tool_uses.items) |tu| {
             if (progress.isCancelled()) return error.Cancelled;
-            progress.report(.{ .tool_use = tu.name });
+            progress.report(.{ .tool_use = .{ .name = tu.name, .input_digest = hashToolInput(allocator, tu.input) } });
             const result_text = executeTool(ctx, tool_defs, tu) catch |err| blk: {
                 std.log.err("tool '{s}' failed: {t}", .{ tu.name, err });
                 break :blk try std.fmt.allocPrint(allocator, "tool error: {t}", .{err});
@@ -177,22 +269,13 @@ pub fn run(
     try messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(llm.ContentBlock, &.{
         .{ .text = "You have reached the tool-call limit. Do not call any more tools — give your final answer now using what you already have, and say plainly what you couldn't complete." },
     }) });
-    const response = if (stream)
-        try provider.chatStream(allocator, .{
-            .system = system,
-            .messages = messages.items,
-            .tools = llm_tools,
-            .show_thinking = show_thinking,
-            .max_tokens = max_tokens,
-        }, stream_bridge.sink())
-    else
-        try provider.chat(allocator, .{
-            .system = system,
-            .messages = messages.items,
-            .tools = llm_tools,
-            .show_thinking = show_thinking,
-            .max_tokens = max_tokens,
-        });
+    const response = try callProviderWithRetry(provider, allocator, ctx.io, .{
+        .system = system,
+        .messages = messages.items,
+        .tools = llm_tools,
+        .show_thinking = show_thinking,
+        .max_tokens = max_tokens,
+    }, stream, stream_bridge.sink(), progress, max_retries);
     const text = try llm.textOf(allocator, response.content);
     if (text.len > 0) return text;
     return error.ToolCallLoopExceeded;
@@ -322,7 +405,7 @@ test "run executes a tool call and threads its result back to the model" {
     var fake = FakeProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false, false, false, false, 1024);
+    const result = try run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false, false, false, false, 1024, 0);
     try testing.expectEqualStrings("The answer is 4.", result);
     try testing.expectEqual(@as(u32, 2), fake.call_count);
 }
@@ -336,7 +419,7 @@ test "run bails out with error.Cancelled instead of calling the model when alrea
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
     var cancelled = std.atomic.Value(bool).init(true);
 
-    const result = run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{ .cancelled = &cancelled }, false, false, false, false, 1024);
+    const result = run(fake.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{ .cancelled = &cancelled }, false, false, false, false, 1024, 0);
     try testing.expectError(error.Cancelled, result);
     try testing.expectEqual(@as(u32, 0), fake.call_count);
 }
@@ -395,7 +478,7 @@ test "run(..., true) uses chatStream, reporting .text progress events" {
     defer reports.deinit(testing.allocator);
     const progress = Progress{ .ptr = &reports, .onEvent = Recorder.onEvent };
 
-    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, progress, true, false, false, false, 1024);
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, progress, true, false, false, false, 1024, 0);
     try testing.expectEqualStrings("Hello", result);
     try testing.expectEqual(@as(u32, 1), fake.call_count);
     try testing.expectEqual(@as(usize, 2), reports.items.len);
@@ -447,7 +530,7 @@ test "run salvages a final answer when the tool-call cap is hit" {
     var fake = InsatiableProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{}, false, false, false, false, 1024);
+    const result = try run(fake.provider(), a, ctx, "system", "loop forever", &.{calculator.tool}, .{}, false, false, false, false, 1024, 0);
     try testing.expectEqualStrings("best effort answer", result);
     // max_iterations tool turns plus the final wrap-up call.
     try testing.expectEqual(@as(u32, 7), fake.call_count);
@@ -475,7 +558,7 @@ test "run returns the model's answer directly when it never calls a tool" {
     var fake = NoToolProvider{};
     const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
 
-    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, false, false, 1024);
+    const result = try run(fake.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, false, false, 1024, 0);
     try testing.expectEqualStrings("no tools needed", result);
 }
 
@@ -515,11 +598,11 @@ test "run attaches an image block to the first message when vision_enabled and t
     };
 
     var vision_on = BlockCountingProvider{};
-    _ = try run(vision_on.provider(), a, ctx, null, "what's this?", &.{}, .{}, false, false, true, false, 1024);
+    _ = try run(vision_on.provider(), a, ctx, null, "what's this?", &.{}, .{}, false, false, true, false, 1024, 0);
     try testing.expectEqual(@as(usize, 2), vision_on.seen_block_count);
 
     var vision_off = BlockCountingProvider{};
-    _ = try run(vision_off.provider(), a, ctx, null, "what's this?", &.{}, .{}, false, false, false, false, 1024);
+    _ = try run(vision_off.provider(), a, ctx, null, "what's this?", &.{}, .{}, false, false, false, false, 1024, 0);
     try testing.expectEqual(@as(usize, 1), vision_off.seen_block_count);
 }
 
@@ -586,20 +669,114 @@ test "run attaches a document block only when documents_enabled -- vision_enable
 
     // documents on -> the PDF rides along as a real document block.
     var docs_on = BlockProbe{};
-    _ = try run(docs_on.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, false, true, 1024);
+    _ = try run(docs_on.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, false, true, 1024, 0);
     try testing.expectEqual(@as(usize, 2), docs_on.seen_block_count);
     try testing.expect(docs_on.saw_document);
 
     // documents off -> text only.
     var docs_off = BlockProbe{};
-    _ = try run(docs_off.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, false, false, 1024);
+    _ = try run(docs_off.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, false, false, 1024, 0);
     try testing.expectEqual(@as(usize, 1), docs_off.seen_block_count);
     try testing.expect(!docs_off.saw_document);
 
     // The two flags are genuinely independent: an owner who enabled vision
     // for a model that can't read PDFs must not get one attached anyway.
     var vision_only = BlockProbe{};
-    _ = try run(vision_only.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, true, false, 1024);
+    _ = try run(vision_only.provider(), a, ctx, null, "summarise", &.{}, .{}, false, false, true, false, 1024, 0);
     try testing.expectEqual(@as(usize, 1), vision_only.seen_block_count);
     try testing.expect(!vision_only.saw_document);
+}
+
+/// Fails its first `fail_times` calls with `err`, then succeeds — for
+/// exercising `callProviderWithRetry` without a real endpoint.
+const FlakyProvider = struct {
+    call_count: u32 = 0,
+    fail_times: u32,
+    err: anyerror,
+
+    fn provider(self: *FlakyProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn };
+
+    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        _ = request;
+        const self: *FlakyProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        if (self.call_count <= self.fail_times) return self.err;
+        return .{
+            .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = "recovered" }}),
+            .stop_reason = .end_turn,
+        };
+    }
+};
+
+/// Records every progress event, so a test can assert on what the user
+/// would have been shown.
+const RetryRecorder = struct {
+    retries: std.ArrayList(struct { attempt: u32, max: u32 }) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn progress(self: *RetryRecorder) Progress {
+        return .{ .ptr = self, .onEvent = onEvent };
+    }
+
+    fn onEvent(ptr: *anyopaque, event: Progress.Event) void {
+        const self: *RetryRecorder = @ptrCast(@alignCast(ptr));
+        switch (event) {
+            .retry => |r| self.retries.append(self.allocator, .{ .attempt = r.attempt, .max = r.max }) catch {},
+            else => {},
+        }
+    }
+};
+
+test "run: a transient model failure is retried and reported, not surfaced as an error" {
+    // The reported bug: one failed call ended the whole request with
+    // "Sorry, I couldn't reach the model just now", which during a
+    // provider's busy hours turned routine blips into hard failures.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var flaky = FlakyProvider{ .fail_times = 2, .err = error.RequestTimedOut };
+    var recorder = RetryRecorder{ .allocator = a };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    const result = try run(flaky.provider(), a, ctx, null, "hi", &.{}, recorder.progress(), false, false, false, false, 1024, 3);
+    try testing.expectEqualStrings("recovered", result);
+    try testing.expectEqual(@as(u32, 3), flaky.call_count); // two failures, then success
+
+    // ...and the user was told, rather than just watching a long pause.
+    try testing.expectEqual(@as(usize, 2), recorder.retries.items.len);
+    try testing.expectEqual(@as(u32, 1), recorder.retries.items[0].attempt);
+    try testing.expectEqual(@as(u32, 3), recorder.retries.items[0].max);
+    try testing.expectEqual(@as(u32, 2), recorder.retries.items[1].attempt);
+}
+
+test "run: retries are exhausted rather than infinite, and give up with the real error" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var flaky = FlakyProvider{ .fail_times = 99, .err = error.RequestTimedOut };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    try testing.expectError(error.RequestTimedOut, run(flaky.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, false, false, 1024, 2));
+    // The initial attempt plus exactly two retries.
+    try testing.expectEqual(@as(u32, 3), flaky.call_count);
+}
+
+test "run: a non-transient failure is not retried at all" {
+    // Retrying a malformed request or a bad key just burns the same
+    // failure again -- only transport/congestion failures are retryable.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var flaky = FlakyProvider{ .fail_times = 99, .err = error.SomethingUnretryable };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    try testing.expectError(error.SomethingUnretryable, run(flaky.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, false, false, 1024, 3));
+    try testing.expectEqual(@as(u32, 1), flaky.call_count);
 }

@@ -60,6 +60,9 @@ const migrations = [_]Migration{
     .{ .version = 46, .name = "0046_monitor_all_default", .sql = @embedFile("migrations/0046_monitor_all_default.sql") },
     .{ .version = 47, .name = "0047_instagram_sessions", .sql = @embedFile("migrations/0047_instagram_sessions.sql") },
     .{ .version = 48, .name = "0048_memory_layer", .sql = @embedFile("migrations/0048_memory_layer.sql") },
+    .{ .version = 49, .name = "0049_reply_drafts", .sql = @embedFile("migrations/0049_reply_drafts.sql") },
+    .{ .version = 50, .name = "0050_optional_embeddings", .sql = @embedFile("migrations/0050_optional_embeddings.sql") },
+    .{ .version = 51, .name = "0051_curated_feed", .sql = @embedFile("migrations/0051_curated_feed.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each

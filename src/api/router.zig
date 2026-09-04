@@ -21,6 +21,8 @@ const config_mod = @import("../config.zig");
 const iface = @import("../platform/interface.zig");
 const telegram_user_platform = @import("../platform/telegram_user.zig");
 const chat_summary = @import("../features/chat_summary.zig");
+const curated_feed = @import("../features/curated_feed.zig");
+const feed_store = @import("../store/feed.zig");
 const tool_registry = @import("../tools/registry.zig");
 const chats_store = @import("../store/chats.zig");
 const chat_members = @import("../store/chat_members.zig");
@@ -81,6 +83,7 @@ const notes_prefix = "/api/v1/notes/";
 const memory_prefix = "/api/v1/memory/";
 const telegram_user_chats_prefix = "/api/v1/telegram-user/chats/";
 const chat_autonomy_suffix = "/autonomy";
+const feed_source_prefix = "/api/v1/feed/sources/";
 const draft_approve_suffix = "/draft/approve";
 const draft_suffix = "/draft";
 const expenses_prefix = "/api/v1/expenses/";
@@ -324,6 +327,21 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     }
     if (method == .PATCH and std.mem.eql(u8, path, "/api/v1/telegram-user/autonomy")) {
         return handleSetGlobalAutonomy(ctx, request);
+    }
+    if (method == .GET and std.mem.eql(u8, path, "/api/v1/feed")) {
+        return handleGetFeed(ctx, request);
+    }
+    if (method == .PATCH and std.mem.eql(u8, path, "/api/v1/feed")) {
+        return handleSetFeed(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/feed/sources")) {
+        return handleAddFeedSource(ctx, request);
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/feed/run")) {
+        return handleRunFeed(ctx, request);
+    }
+    if (method == .DELETE and std.mem.startsWith(u8, path, feed_source_prefix)) {
+        return handleDeleteFeedSource(ctx, request, path[feed_source_prefix.len..]);
     }
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/telegram-user/drafts")) {
         return handleListDrafts(ctx, request);
@@ -1035,6 +1053,7 @@ fn defaultForKnownKey(a: std.mem.Allocator, config: *const config_mod.Config, ke
     if (std.mem.eql(u8, key, "WARDEN_LLM_MAX_TOKENS")) return std.fmt.allocPrint(a, "{d}", .{config.llm_max_tokens_override orelse 0});
     if (std.mem.eql(u8, key, "WARDEN_LLM_HISTORY_MESSAGES")) return std.fmt.allocPrint(a, "{d}", .{config.llm_history_messages});
     if (std.mem.eql(u8, key, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES")) return std.fmt.allocPrint(a, "{}", .{config.skip_trivial_messages});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_MAX_RETRIES")) return std.fmt.allocPrint(a, "{d}", .{config.llm_max_retries});
     if (std.mem.eql(u8, key, "WARDEN_LLM_PROVIDER")) return a.dupe(u8, if (config.llm == .openai_compat) "openai_compat" else "anthropic");
     return a.dupe(u8, "");
 }
@@ -3172,13 +3191,35 @@ fn handleGetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
 
     const override = chat_settings.getReplyAutonomy(ctx.pool, chat.id);
     const effective = chat_settings.resolveReplyAutonomy(ctx.pool, ctx.allocator, chat.id, identity_id);
+    // This chat's ghostwriter prompt override -- deliberately its own
+    // setting rather than `/persona`'s `system_prompt`, see
+    // `chat_settings.getReplyAutonomyPrompt`. `null` means "use the
+    // built-in write-as-the-owner prompt".
+    const prompt = chat_settings.getReplyAutonomyPrompt(ctx.pool, ctx.allocator, chat.id);
+    defer if (prompt) |pr| ctx.allocator.free(pr);
     return respondJson(ctx, request, .ok, .{
         .override = if (override) |o| @tagName(o) else null,
         .effective = @tagName(effective),
+        .prompt = prompt,
     });
 }
 
-const SetChatAutonomyBody = struct { override: ?[]const u8 };
+/// `prompt` needs three states — leave alone / clear / set — but only has
+/// two available, so the empty string is the "clear" sentinel:
+///
+///   * absent (or JSON `null`) — leave the ghostwriter prompt untouched, so
+///     a caller flipping only the autonomy level never clobbers it.
+///   * `""` — clear it, going back to the built-in ghostwriter prompt.
+///   * any other string — set it.
+///
+/// Not `??[]const u8`, which looks like it would express this and doesn't:
+/// std.json parses a present JSON `null` into the *outer* null, exactly like
+/// an absent field, so both collapse to the same value and "clear" would
+/// silently no-op. Verified against std.json rather than assumed.
+const SetChatAutonomyBody = struct {
+    override: ?[]const u8 = null,
+    prompt: ?[]const u8 = null,
+};
 
 /// `PATCH /api/v1/telegram-user/chats/:nativeChatId/autonomy` — mirrors
 /// `/autonomy <chat id> <off|draft|auto|clear>` (`override: null` is
@@ -3193,9 +3234,12 @@ fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var buf: [256]u8 = undefined;
+    // Roomier than the 256 bytes this used to take: the body now also
+    // carries an optional free-text ghostwriter prompt, which is easily
+    // longer than that.
+    var buf: [4096]u8 = undefined;
     const reader = request.readerExpectNone(&buf);
-    const raw = reader.allocRemaining(arena, .limited(256)) catch {
+    const raw = reader.allocRemaining(arena, .limited(4096)) catch {
         return respondError(request, .bad_request, "bad_request", "failed to read body");
     };
     const body = std.json.parseFromSliceLeaky(SetChatAutonomyBody, arena, raw, .{}) catch {
@@ -3219,11 +3263,200 @@ fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
         log.err("set-chat-autonomy: failed for chat {d}: {t}", .{ chat.id, err });
         return respondError(request, .internal_server_error, "internal", "failed to save");
     };
+    if (body.prompt) |prompt| {
+        // Present and non-null means the caller is deliberately setting or
+        // clearing it; an all-whitespace value is a clear, same as `""` --
+        // see SetChatAutonomyBody's doc comment.
+        const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+        chat_settings.setReplyAutonomyPrompt(ctx.pool, chat.id, if (trimmed.len == 0) null else trimmed) catch |err| {
+            log.err("set-chat-autonomy: failed to save the prompt for chat {d}: {t}", .{ chat.id, err });
+            return respondError(request, .internal_server_error, "internal", "failed to save");
+        };
+    }
     audit_log.record(ctx.pool, account_id, null, "telegram_user.autonomy.set_chat", native_chat_id, null);
     return respondJson(ctx, request, .ok, .{});
 }
 
 /// `GET /api/v1/telegram-user/drafts` — mirrors `/drafts`.
+/// `GET /api/v1/feed` — the curated feed's settings plus its source list,
+/// mirroring `/feed`'s status output. `runnable` is the same
+/// `Settings.isRunnable` the scheduler checks, so the UI can say "enabled
+/// but not configured" without re-deriving the rule.
+fn handleGetFeed(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    _ = (try requireLoggedIn(ctx, request)) orelse return;
+
+    const settings = feed_store.getSettings(ctx.pool, ctx.allocator) catch |err| {
+        log.err("get-feed: settings failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load feed settings");
+    };
+    defer {
+        if (settings.target_native_chat_id) |t| ctx.allocator.free(t);
+        if (settings.policy) |p| ctx.allocator.free(p);
+    }
+    const sources = feed_store.listSources(ctx.pool, ctx.allocator, false) catch |err| {
+        log.err("get-feed: sources failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load feed sources");
+    };
+    defer {
+        for (sources) |src| {
+            ctx.allocator.free(src.native_chat_id);
+            ctx.allocator.free(src.title);
+        }
+        ctx.allocator.free(sources);
+    }
+
+    return respondJson(ctx, request, .ok, .{
+        .enabled = settings.enabled,
+        .runnable = settings.isRunnable(),
+        .target_native_chat_id = settings.target_native_chat_id,
+        .policy = settings.policy,
+        .interval_seconds = settings.interval_seconds,
+        .last_run_at = settings.last_run_at,
+        .sources = sources,
+    });
+}
+
+/// Every field optional so the UI can PATCH one dial without resending the
+/// rest. `target_native_chat_id` and `policy` accept `""` to clear, for the
+/// same reason the per-chat autonomy prompt does: std.json can't
+/// distinguish an explicit JSON null from an absent field, so a null would
+/// silently mean "leave alone" rather than "clear".
+const SetFeedBody = struct {
+    enabled: ?bool = null,
+    target_native_chat_id: ?[]const u8 = null,
+    policy: ?[]const u8 = null,
+    interval_seconds: ?i64 = null,
+};
+
+fn handleSetFeed(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const account_id = ra.account_id;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [4096]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(4096)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(SetFeedBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    if (body.enabled) |on| feed_store.setEnabled(ctx.pool, on) catch |err| {
+        log.err("set-feed: enabled failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to save");
+    };
+    if (body.target_native_chat_id) |t| {
+        const trimmed = std.mem.trim(u8, t, " \t\r\n");
+        feed_store.setTarget(ctx.pool, if (trimmed.len == 0) null else trimmed) catch |err| {
+            log.err("set-feed: target failed: {t}", .{err});
+            return respondError(request, .internal_server_error, "internal", "failed to save");
+        };
+    }
+    if (body.policy) |p| {
+        const trimmed = std.mem.trim(u8, p, " \t\r\n");
+        feed_store.setPolicy(ctx.pool, if (trimmed.len == 0) null else trimmed) catch |err| {
+            log.err("set-feed: policy failed: {t}", .{err});
+            return respondError(request, .internal_server_error, "internal", "failed to save");
+        };
+    }
+    if (body.interval_seconds) |secs| {
+        // Same floor the /feed command enforces: below this a "digest" is
+        // just a stream, and an expensive one.
+        if (secs < 300) return respondError(request, .bad_request, "bad_request", "interval_seconds must be at least 300");
+        feed_store.setIntervalSeconds(ctx.pool, secs) catch |err| {
+            log.err("set-feed: interval failed: {t}", .{err});
+            return respondError(request, .internal_server_error, "internal", "failed to save");
+        };
+    }
+    audit_log.record(ctx.pool, account_id, null, "feed.settings.set", null, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+const AddFeedSourceBody = struct { query: []const u8 };
+
+/// `POST /api/v1/feed/sources` — `{query}` is a TDLib chat id or a chat
+/// name, resolved the same way `/feed add` resolves it, so the UI doesn't
+/// have to make the user find a numeric id first.
+fn handleAddFeedSource(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const conn = try requireTelegramUserConnector(ctx, request) orelse return;
+    const ra = resolveAuth(ctx, request);
+    const account_id = ra.account_id orelse {
+        return respondError(request, .unauthorized, "unauthorized", "not logged in");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [1024]u8 = undefined;
+    const reader = request.readerExpectNone(&buf);
+    const raw = reader.allocRemaining(arena, .limited(1024)) catch {
+        return respondError(request, .bad_request, "bad_request", "failed to read body");
+    };
+    const body = std.json.parseFromSliceLeaky(AddFeedSourceBody, arena, raw, .{}) catch {
+        return respondError(request, .bad_request, "bad_request", "invalid request body");
+    };
+
+    const resolution = chat_summary.resolveChat(conn, arena, body.query) catch |err| {
+        log.err("add-feed-source: resolve failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to look up that chat");
+    };
+    switch (resolution) {
+        .none => return respondError(request, .not_found, "not_found", "no chat matches that"),
+        .ambiguous => return respondError(request, .bad_request, "ambiguous", "that matches more than one chat -- use its id"),
+        .one => |match| {
+            _ = feed_store.addSource(ctx.pool, match.native_chat_id, match.title) catch |err| {
+                log.err("add-feed-source: save failed: {t}", .{err});
+                return respondError(request, .internal_server_error, "internal", "failed to save");
+            };
+            audit_log.record(ctx.pool, account_id, null, "feed.source.add", match.native_chat_id, null);
+            return respondJson(ctx, request, .ok, .{ .native_chat_id = match.native_chat_id, .title = match.title });
+        },
+    }
+}
+
+fn handleDeleteFeedSource(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const account_id = ra.account_id;
+    const removed = feed_store.removeSource(ctx.pool, native_chat_id) catch false;
+    if (!removed) return respondError(request, .not_found, "not_found", "that channel isn't in the feed");
+    audit_log.record(ctx.pool, account_id, null, "feed.source.remove", native_chat_id, null);
+    return respondJson(ctx, request, .ok, .{});
+}
+
+/// `POST /api/v1/feed/run` — one pass right now, mirroring `/feed run`.
+/// Synchronous: a pass is bounded (see `curated_feed`'s per-pass ceilings)
+/// and the caller wants to know what it produced.
+fn handleRunFeed(ctx: *const ServerContext, request: *http.Server.Request) !void {
+    const ra = (try requireLoggedIn(ctx, request)) orelse return;
+    const account_id = ra.account_id;
+    const provider = ctx.llm_provider orelse {
+        return respondError(request, .internal_server_error, "internal", "no LLM provider configured");
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const settings = feed_store.getSettings(ctx.pool, arena) catch |err| {
+        log.err("run-feed: settings failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "failed to load feed settings");
+    };
+    if (!settings.isRunnable()) {
+        return respondError(request, .bad_request, "not_configured", "the feed needs a target and a policy first");
+    }
+
+    const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
+    const posted = curated_feed.runOnce(ctx.pool, arena, ctx.io, provider, ctx.telegram_user, 3, now) catch |err| {
+        log.err("run-feed: pass failed: {t}", .{err});
+        return respondError(request, .internal_server_error, "internal", "that pass failed");
+    };
+    audit_log.record(ctx.pool, account_id, null, "feed.run", null, null);
+    return respondJson(ctx, request, .ok, .{ .posted = posted });
+}
+
 fn handleListDrafts(ctx: *const ServerContext, request: *http.Server.Request) !void {
     _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
     const pending_drafts = ctx.pending_drafts orelse {
@@ -3238,7 +3471,9 @@ fn handleListDrafts(ctx: *const ServerContext, request: *http.Server.Request) !v
         for (items) |it| {
             ctx.allocator.free(it.native_chat_id);
             ctx.allocator.free(it.chat_title);
+            ctx.allocator.free(it.incoming_text);
             ctx.allocator.free(it.draft_text);
+            if (it.replaced_draft) |r| ctx.allocator.free(r);
         }
         ctx.allocator.free(items);
     }
@@ -3267,9 +3502,15 @@ fn handleApproveDraft(ctx: *const ServerContext, request: *http.Server.Request, 
         ctx.allocator.free(draft.incoming_text);
         ctx.allocator.free(draft.draft_text);
         if (draft.reply_to) |r| ctx.allocator.free(r);
+        if (draft.replaced_draft) |r| ctx.allocator.free(r);
     }
 
     conn.connector().sendMessage(ctx.allocator, native_chat_id, draft.draft_text, draft.reply_to);
+    // Approving from the web UI has to clear the Telegram composer just
+    // like approving from a button or `/approve` does -- the draft was
+    // written into it when it was created, and leaving it there after
+    // sending invites sending the same message twice.
+    telegram_user_platform.clearComposerDraftFor(ctx.telegram_user, ctx.allocator, ctx.io, native_chat_id);
     audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.approve", native_chat_id, null);
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3289,6 +3530,7 @@ fn handleDiscardDraft(ctx: *const ServerContext, request: *http.Server.Request, 
     if (!pending_drafts.discard(native_chat_id)) {
         return respondError(request, .not_found, "not_found", "no pending draft for that chat");
     }
+    telegram_user_platform.clearComposerDraftFor(ctx.telegram_user, ctx.allocator, ctx.io, native_chat_id);
     audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.discard", native_chat_id, null);
     return respondJson(ctx, request, .ok, .{});
 }

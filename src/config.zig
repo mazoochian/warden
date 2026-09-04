@@ -330,6 +330,11 @@ pub const Config = struct {
     /// that). Smaller means less context (cheaper, faster) at the cost of
     /// the model potentially missing something further back.
     llm_history_messages: i64 = default_llm_history_messages,
+    /// How many times a failed model call is retried before the request
+    /// gives up — see `llm/toolcall.zig`'s `callProviderWithRetry`.
+    /// Overridable at runtime via the `WARDEN_LLM_MAX_RETRIES` dynamic
+    /// config key, same as the other LLM dials.
+    llm_max_retries: i64 = default_llm_max_retries,
     /// Whether a message that's addressed to the bot but is essentially
     /// just a greeting/acknowledgement/sign-off ("hi", "thanks", "lol", ...)
     /// gets an instant canned reply instead of a real (paid) LLM call —
@@ -585,6 +590,10 @@ pub const Config = struct {
             std.fmt.parseInt(i64, raw, 10) catch default_llm_history_messages
         else
             default_llm_history_messages;
+        const llm_max_retries: i64 = if (env.get("WARDEN_LLM_MAX_RETRIES")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_llm_max_retries
+        else
+            default_llm_max_retries;
         const skip_trivial_messages = parseBoolEnv(env, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", default_skip_trivial_messages);
 
         const api_port: ?u16 = if (env.get("WARDEN_API_PORT")) |raw|
@@ -663,6 +672,7 @@ pub const Config = struct {
             .llm_documents_enabled = llm_documents_enabled,
             .llm_max_tokens_override = llm_max_tokens_override,
             .llm_history_messages = llm_history_messages,
+            .llm_max_retries = llm_max_retries,
             .skip_trivial_messages = skip_trivial_messages,
             .matrix = matrix,
             .matrix_pickle_key = matrix_pickle_key,
@@ -1007,6 +1017,12 @@ pub const Config = struct {
     /// configurable — existing behavior by default, override via
     /// `WARDEN_LLM_HISTORY_MESSAGES` for a cheaper/smaller context window.
     pub const default_llm_history_messages: i64 = 200;
+    /// Retries per model call on a *transient* failure (see
+    /// `llm/toolcall.zig`'s `isRetryable`). 3 because a single attempt
+    /// turned every routine blip during a provider's busy hours into a
+    /// user-visible "Sorry, I couldn't reach the model just now"; 0
+    /// restores that old single-attempt behaviour.
+    pub const default_llm_max_retries: i64 = 3;
     pub const default_skip_trivial_messages: bool = true;
     pub const default_xmpp_port: u16 = 5222;
 

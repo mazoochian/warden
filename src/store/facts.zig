@@ -35,23 +35,35 @@ pub const RankedFact = struct {
 /// the way an auto-extracted fact eventually will (ROADMAP.md's memory-layer
 /// phase, extractor slice) — `scope='preference'` for the same reason: a
 /// reasonable default until real scope classification exists.
-pub fn remember(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, text: []const u8, embedding: []const f32, created_at: i64) !i64 {
+/// `embedding` is optional: a fact is worth storing whether or not this
+/// deployment has an embeddings endpoint configured. Without one the row
+/// simply has no vector, and the 0.40 similarity term of the hybrid score
+/// drops out for it (see `hybrid_score_expr`) -- it stays findable by
+/// keyword, recency and salience, and `pinnedForIdentity` (which is what
+/// an explicitly-remembered fact goes into) never needed a vector at all.
+///
+/// This used to take a non-optional `[]const f32`, which combined with the
+/// column's NOT NULL and `main.zig` only wiring the memory tool when an
+/// embeddings client existed meant that remembering anything was silently
+/// impossible without WARDEN_EMBEDDINGS_URL. See
+/// `0050_optional_embeddings.sql`.
+pub fn remember(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, text: []const u8, embedding: ?[]const f32, created_at: i64) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
 
-    const vec_literal = try embeddings.formatVectorLiteral(allocator, embedding);
-    defer allocator.free(vec_literal);
+    const vec_literal: ?[]const u8 = if (embedding) |e| try embeddings.formatVectorLiteral(allocator, e) else null;
+    defer if (vec_literal) |v| allocator.free(v);
 
     var stmt = try db.prepare(
         \\INSERT INTO facts (identity_id, scope, predicate, object, statement, valid_from, recorded_at, last_confirmed_at, status, embedding)
-        \\VALUES ($1, 'preference', 'remembers', $2, $2, to_timestamp($3), to_timestamp($3), to_timestamp($3), 'pinned', $4)
+        \\VALUES ($1, 'preference', 'remembers', $2, $2, to_timestamp($3), to_timestamp($3), to_timestamp($3), 'pinned', $4::vector)
         \\RETURNING id;
     );
     defer stmt.finalize();
     stmt.bindInt64(1, identity_id);
     stmt.bindText(2, text);
     stmt.bindInt64(3, created_at);
-    stmt.bindText(4, vec_literal);
+    if (vec_literal) |v| stmt.bindText(4, v) else stmt.bindNull(4);
     _ = try stmt.step();
     return stmt.columnInt64(0);
 }
@@ -75,6 +87,7 @@ pub fn search(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, que
         \\SELECT id, statement, EXTRACT(EPOCH FROM recorded_at)::bigint
         \\FROM facts
         \\WHERE identity_id = $1 AND valid_to IS NULL AND status != 'retired'
+        \\  AND embedding IS NOT NULL
         \\ORDER BY embedding <=> $2
         \\LIMIT $3;
     );
@@ -239,8 +252,19 @@ fn collectRanked(stmt: *@import("db.zig").Stmt, allocator: std.mem.Allocator) ![
 /// decay; projects decay fastest) and salience blends confirmation count
 /// with a status multiplier, both computed in SQL rather than pulled back
 /// and blended in Zig, since Postgres already has every input in scope.
+/// The vector term is COALESCEd to 0 rather than used bare, which covers
+/// both ways it can now be absent: a *row* with no embedding (stored on a
+/// deployment with no embeddings endpoint -- see `remember`) and a *query*
+/// with none (`$2` bound NULL for the same reason). Either makes `<=>`
+/// yield NULL, which without this would poison the whole sum to NULL and
+/// sort that row arbitrarily. Contributing 0 instead means such rows rank
+/// on keyword, recency and salience alone. When no query vector is given at
+/// all the term is 0 for every row uniformly, and since this is only ever
+/// used for `ORDER BY score DESC`, dropping a constant from every row
+/// leaves the ordering untouched -- no renormalising of the other weights
+/// needed.
 const hybrid_score_expr =
-    \\(0.40 * (1 - (embedding <=> $2))
+    \\(0.40 * COALESCE(1 - (embedding <=> $2::vector), 0)
     \\ + 0.25 * ts_rank_cd(to_tsvector('english', statement), plainto_tsquery('english', $3))
     \\ + 0.20 * exp(-EXTRACT(EPOCH FROM (to_timestamp($5) - valid_from)) / 86400.0 /
     \\     (CASE scope WHEN 'identity' THEN 36500.0 WHEN 'project' THEN 30.0 ELSE 90.0 END))
@@ -252,7 +276,7 @@ const hybrid_score_expr =
 /// Top-`limit` `status='stable'` facts by hybrid score — the design brief's
 /// "Retrieved facts" budget block, rendered alongside pinned facts under one
 /// "About (stable)" heading by `context_assembly.zig`.
-pub fn rankedStable(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: []const f32, query_text: []const u8, limit: u32, now: i64) ![]RankedFact {
+pub fn rankedStable(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: ?[]const f32, query_text: []const u8, limit: u32, now: i64) ![]RankedFact {
     return rankedByStatus(pool, allocator, identity_id, query_embedding, query_text, "stable", limit, now);
 }
 
@@ -262,16 +286,16 @@ pub fn rankedStable(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i6
 /// one-off remark that already ranks in the top few for *this* question ever
 /// enters the prompt, under its own "possibly relevant, may be stale"
 /// heading rather than blended in as settled fact (failure mode 3).
-pub fn rankedTentative(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: []const f32, query_text: []const u8, limit: u32, now: i64) ![]RankedFact {
+pub fn rankedTentative(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: ?[]const f32, query_text: []const u8, limit: u32, now: i64) ![]RankedFact {
     return rankedByStatus(pool, allocator, identity_id, query_embedding, query_text, "tentative", limit, now);
 }
 
-fn rankedByStatus(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: []const f32, query_text: []const u8, status: []const u8, limit: u32, now: i64) ![]RankedFact {
+fn rankedByStatus(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: ?[]const f32, query_text: []const u8, status: []const u8, limit: u32, now: i64) ![]RankedFact {
     const db = try pool.acquire();
     defer pool.release(db);
 
-    const vec_literal = try embeddings.formatVectorLiteral(allocator, query_embedding);
-    defer allocator.free(vec_literal);
+    const vec_literal: ?[]const u8 = if (query_embedding) |q| try embeddings.formatVectorLiteral(allocator, q) else null;
+    defer if (vec_literal) |v| allocator.free(v);
 
     const sql = try std.fmt.allocPrintSentinel(
         allocator,
@@ -289,7 +313,7 @@ fn rankedByStatus(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64,
     var stmt = try db.prepare(sql);
     defer stmt.finalize();
     stmt.bindInt64(1, identity_id);
-    stmt.bindText(2, vec_literal);
+    if (vec_literal) |v| stmt.bindText(2, v) else stmt.bindNull(2);
     stmt.bindText(3, query_text);
     stmt.bindInt64(4, limit);
     stmt.bindInt64(5, now);
@@ -524,4 +548,89 @@ test "rankedStable/rankedTentative split by status and rank by hybrid score" {
     }
     try testing.expectEqual(@as(usize, 1), tentative_results.len);
     try testing.expectEqualStrings("Considered switching to Dagster", tentative_results[0].statement);
+}
+
+test "remember works with no embedding at all, and the fact stays listable and rankable" {
+    // The regression this guards: memory used to require an embeddings
+    // endpoint. `remember` took a non-optional vector, the column was NOT
+    // NULL, and `main.zig` only wired the tool up when a client existed --
+    // so with no WARDEN_EMBEDDINGS_URL nothing could ever be stored, and
+    // nothing said so. Storing a fact must not depend on that endpoint.
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const alice = try testIdentity(&pool, "1");
+    const id = try remember(&pool, a, alice, "prefers concise answers", null, 1000);
+    try testing.expect(id > 0);
+    try testing.expect(try hasAny(&pool, alice));
+
+    const listed = try listForIdentity(&pool, a, alice);
+    defer {
+        for (listed) |m| a.free(m.text);
+        a.free(listed);
+    }
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqualStrings("prefers concise answers", listed[0].text);
+
+    // remember() stores as 'pinned', which is the block an explicitly
+    // remembered fact is meant to land in for prompt assembly.
+    const pinned = try pinnedForIdentity(&pool, a, alice);
+    defer {
+        for (pinned) |f| {
+            a.free(f.statement);
+            a.free(f.status);
+        }
+        a.free(pinned);
+    }
+    try testing.expectEqual(@as(usize, 1), pinned.len);
+    try testing.expectEqualStrings("prefers concise answers", pinned[0].statement);
+}
+
+test "ranking works with no query vector, and with rows that have no embedding" {
+    // Both halves of "the vector is optional": a null query embedding (no
+    // endpoint configured) and rows stored without one. Either makes the
+    // `<=>` term NULL, which before the COALESCE in hybrid_score_expr would
+    // have made the whole score NULL and ordered these rows arbitrarily --
+    // here they must still come back, ranked on the remaining terms.
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const alice = try testIdentity(&pool, "1");
+
+    var stmt = try db.prepare(
+        \\INSERT INTO facts (identity_id, scope, predicate, object, statement, valid_from, recorded_at, last_confirmed_at, status, embedding)
+        \\VALUES ($1, 'preference', 'likes', 'zig', 'writes Zig daily', to_timestamp(1000), to_timestamp(1000), to_timestamp(1000), 'stable', NULL);
+    );
+    defer stmt.finalize();
+    stmt.bindInt64(1, alice);
+    _ = try stmt.step();
+
+    const stable = try rankedStable(&pool, a, alice, null, "what language do they use", 5, 2000);
+    defer {
+        for (stable) |f| {
+            a.free(f.statement);
+            a.free(f.status);
+        }
+        a.free(stable);
+    }
+    try testing.expectEqual(@as(usize, 1), stable.len);
+    try testing.expectEqualStrings("writes Zig daily", stable[0].statement);
+
+    // A query vector against rows that have none must behave the same way
+    // rather than dropping them.
+    const with_vector = try rankedStable(&pool, a, alice, &testVector(0), "what language do they use", 5, 2000);
+    defer {
+        for (with_vector) |f| {
+            a.free(f.statement);
+            a.free(f.status);
+        }
+        a.free(with_vector);
+    }
+    try testing.expectEqual(@as(usize, 1), with_vector.len);
 }

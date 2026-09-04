@@ -93,6 +93,12 @@ pub const known_modules = [_]ModuleInfo{
     // off -- see storage_sense.zig's doc comment for why that one isn't a
     // feature flag).
     .{ .key = "storage_sense_monitor", .label = "Storage Sense (monitoring + alerts)", .category = .standalone },
+    // The curated feed reads channels through the personal account and
+    // spends model calls filtering them, so it is worth being able to stop
+    // it from the modules page without unsetting its target or policy. It
+    // is inert until a target *and* a policy are set regardless (see
+    // store/feed.zig's Settings.isRunnable), so failing open here is safe.
+    .{ .key = "curated_feed", .label = "Curated feed (channel reader)", .category = .standalone },
     .{ .key = "weather", .label = "Weather", .category = .llm_tool },
     .{ .key = "crypto_price", .label = "Crypto Prices", .category = .llm_tool },
     .{ .key = "air_quality", .label = "Air Quality", .category = .llm_tool },

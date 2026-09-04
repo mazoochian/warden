@@ -6,6 +6,7 @@ const json = std.json;
 const types = @import("types.zig");
 const http_util = @import("../http_util.zig");
 const markdown_html = @import("markdown_html.zig");
+const llm = @import("../llm/provider.zig");
 
 /// Thin wrapper around the Telegram Bot API. Uses long polling (`getUpdates`)
 /// rather than webhooks, since Warden runs local/dev without a public HTTPS
@@ -98,7 +99,16 @@ pub const Client = struct {
     /// plain on failure" retry (see e.g. `sendMessageErr` below) drives.
     /// Caller owns the returned body.
     fn postSendMessage(self: *Client, allocator: std.mem.Allocator, url: []const u8, chat_id: i64, text: []const u8, reply_parameters: ?ReplyParameters, html: bool) ![]u8 {
-        const send_text = if (html) markdown_html.toHtml(allocator, text) catch text else text;
+        // The plain branch is a fallback, not a "no formatting needed"
+        // path: it is taken when Telegram rejected the HTML attempt, and
+        // the text may still carry chain-of-thought markers. Those are
+        // control bytes, so passing them through unrendered is what made a
+        // rejected message show its thinking as ordinary prose with the 💭
+        // missing (see `llm.renderThinkingPlain`).
+        const send_text = if (html)
+            markdown_html.toHtml(allocator, text) catch text
+        else
+            llm.renderThinkingPlain(allocator, text) catch text;
         const parse_mode: ?[]const u8 = if (html) "HTML" else null;
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);

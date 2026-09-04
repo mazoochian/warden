@@ -72,6 +72,8 @@ const video_download = @import("features/video_download.zig");
 const storage_sense = @import("features/storage_sense.zig");
 const convert_flow = @import("features/convert_flow.zig");
 const reply_drafts = @import("features/reply_drafts.zig");
+const curated_feed = @import("features/curated_feed.zig");
+const feed_store = @import("store/feed.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
@@ -214,7 +216,7 @@ const public_commands = [_]iface.CommandSpec{
 const reserved_command_names_extra = [_][]const u8{
     "token",     "credit",       "scraper",  "adduser",     "removeuser",
     "allowchat", "disallowchat", "addadmin", "removeadmin", "sudo",
-    "storage",
+    "storage",   "feed",
 };
 
 /// True if `name` (no leading slash) is a real built-in command -- checked
@@ -625,9 +627,12 @@ pub fn main(init: std.process.Init) !void {
     // `handleApproveCommand`/`handleDiscardCommand`). 24h, same "reasonable
     // to reach for well after the fact" reasoning as `pending_undos` above
     // — unlike a ban/kick confirmation, replying to a text a few hours
-    // later is completely normal for a personal account.
-    var pending_drafts = reply_drafts.PendingDrafts.init(gpa, io, 24 * 3600);
-    defer pending_drafts.deinit();
+    // later is completely normal for a personal account. Backed by the
+    // `reply_drafts` table rather than memory precisely because of that
+    // window: a restart or deploy inside it used to silently drop every
+    // pending draft the owner had been notified about (see
+    // `reply_drafts.PendingDrafts`'s doc comment).
+    var pending_drafts = reply_drafts.PendingDrafts.init(&pool, 24 * 3600);
 
     var bot_view_broadcaster = bot_view.Broadcaster.init(gpa, io);
     defer bot_view_broadcaster.deinit();
@@ -691,6 +696,13 @@ pub fn main(init: std.process.Init) !void {
         const ec = try gpa.create(embeddings.EmbeddingsClient);
         ec.* = embeddings.EmbeddingsClient.init(gpa, io, url, config.embeddings_api_key, config.embeddings_model);
         embeddings_client = ec;
+    } else {
+        // Say so out loud. Memory works either way now, but which mode it's
+        // in is otherwise invisible, and the previous behaviour here
+        // (no endpoint => the remember_memory tool silently not existing)
+        // was undiagnosable from the outside: the model would agree to
+        // remember something and nothing was ever stored.
+        log.info("memory: WARDEN_EMBEDDINGS_URL isn't set — long-term memory still records and recalls facts, ranked by keyword/recency/salience; semantic (meaning-based) recall is off until an embeddings endpoint is configured", .{});
     }
 
     log.info("warden started, {d} connector(s), {d} owner(s) configured", .{ connectors.len, config.owners.len });
@@ -888,6 +900,7 @@ pub fn main(init: std.process.Init) !void {
         checkAndRevertExpiredPermissions(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
+        checkCuratedFeed(gpa, io, &pool, llm_provider, telegram_user_ptr, &config, now);
         if (storage_owner_native_id) |onid| {
             if (feature_flags.isEnabled(&pool, "storage_sense_monitor")) {
                 if (resolveOwnerIdentityId(&pool, &config, now)) |owner_identity_id| {
@@ -1575,7 +1588,11 @@ fn processMessageTask(
         // `?Sink = null` field's own "absent means the tool can't run"
         // convention, rather than surfacing a runtime error from inside
         // the tool for something that's a deploy-time config choice.
-        .memory = if (embeddings_client != null) memory_adapter.sink() else null,
+        // Always wired, unlike before: memory no longer requires an
+        // embeddings endpoint (see `MemoryToolAdapter.createFn`), and
+        // gating the tool on one was what made remembering silently
+        // impossible without it.
+        .memory = memory_adapter.sink(),
         .chat_history = chat_history_adapter.sink(),
         .expenses = expense_adapter.sink(),
         .personal_account = personal_account_adapter.sink(),
@@ -1863,6 +1880,45 @@ fn checkSlowMode(connector: iface.Connector, a: std.mem.Allocator, config: *cons
 /// Rebuilds the in-memory enabled-chat set from every known chat's
 /// persisted `chat_settings.digest_enabled` — so digests opted into before
 /// a restart keep firing rather than silently going quiet.
+/// One curated-feed tick (see `features/curated_feed.zig`). Its own
+/// interval, stored with the feed's settings rather than taken from the
+/// scheduler loop's cadence: reading channels and summarising them is far
+/// more expensive than the other checks in this loop, and an hourly digest
+/// is the point of the feature — running it every loop iteration would be
+/// both useless and costly.
+///
+/// Its own arena, freed each tick: a pass allocates every post, prompt and
+/// summary it touches, none of which outlives the digest it produces.
+fn checkCuratedFeed(
+    gpa: std.mem.Allocator,
+    io: Io,
+    pool: *store_pool.PgPool,
+    llm_provider: llm.Provider,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    config: *const config_mod.Config,
+    now: i64,
+) void {
+    if (!feature_flags.isEnabled(pool, "curated_feed")) return;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = feed_store.getSettings(pool, a) catch |err| {
+        log.err("curated feed: couldn't read settings: {t}", .{err});
+        return;
+    };
+    if (!settings.isRunnable()) return;
+    if (now - settings.last_run_at < settings.interval_seconds) return;
+
+    const dyn = resolveLlmDynamicSettings(pool, a, config);
+    const posted = curated_feed.runOnce(pool, a, io, llm_provider, telegram_user, dyn.max_retries, now) catch |err| {
+        log.err("curated feed: pass failed: {t}", .{err});
+        return;
+    };
+    if (posted > 0) log.info("curated feed: posted {d} item(s)", .{posted});
+}
+
 fn loadDigestScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, digest_scheduler: *scheduler.DigestScheduler) void {
     const refs = chats.listAll(pool, gpa) catch |err| {
         log.err("digest: failed to scan existing chats: {t}", .{err});
@@ -2061,6 +2117,7 @@ const LlmDynamicSettings = struct {
     skip_trivial_messages: bool,
     vision_enabled: bool,
     documents_enabled: bool,
+    max_retries: u32,
 };
 
 /// One `dynamic_config.listAll` fetch instead of six separate
@@ -2097,6 +2154,13 @@ fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, con
         .skip_trivial_messages = dynamic_config.findBool(rows, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", config.skip_trivial_messages),
         .vision_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_VISION", config.llm_vision_enabled),
         .documents_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_DOCUMENTS", config.llm_documents_enabled),
+        // Clamped rather than trusted: a negative value would wrap when
+        // cast to u32 and turn "no retries" into billions of them, and an
+        // absurd positive one would keep a dead request alive for hours.
+        .max_retries = blk: {
+            const raw = dynamic_config.findI64(rows, "WARDEN_LLM_MAX_RETRIES", config.llm_max_retries);
+            break :blk @intCast(std.math.clamp(raw, 0, 10));
+        },
     };
 }
 
@@ -2194,7 +2258,7 @@ fn handleModeCommand(
         .native_id = msg.user_id,
     };
     const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, in_flight);
+    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries, in_flight);
 }
 
 test "splitModeArgs splits a leading modifier token from the rest, falling back to reply_to_text" {
@@ -2290,6 +2354,103 @@ test "parsePollCommand rejects more than 10 options" {
     try std.testing.expect(many == .err);
 }
 
+/// Which of `handleMessage`'s intake paths an incoming message takes.
+pub const Route = enum {
+    /// Straight to `reply_autonomy` (`handleTelegramUserAutoReply`), never
+    /// the command dispatcher.
+    personal_account_autonomy,
+    /// The normal command + Q&A dispatch chain.
+    command_and_qa,
+    /// Nothing happens (the sender isn't allowed to make the bot act here).
+    ignored,
+};
+
+/// The single decision about how far an incoming message gets, extracted
+/// from `handleMessage` so it can actually be tested — the bug it encodes
+/// the fix for was invisible precisely because it lived inline in a
+/// 600-line dispatch function and failed silently.
+///
+/// The personal-account connector is the special case, and both halves of
+/// how it's special matter:
+///
+///   * **It never takes `command_and_qa`.** `telegram_user.convertNewMessage`
+///     drops the account's own outgoing messages, so every message that
+///     connector delivers is from *someone else*. A contact who DM'd the
+///     owner typing `/stats` (or `/kick`, or `/sudo ...`) must not have it
+///     dispatched as a command, because any reply would be composed and sent
+///     out under the owner's own identity.
+///   * **It never takes `ignored` on allowlist grounds either.** That same
+///     "never the owner" property means `auth.isOwner` — which compares
+///     `msg.user_id` against `WARDEN_TELEGRAM_USER_OWNER_ID`, the owner's
+///     *own* id — can never match here, and neither can `bot_admins`/the
+///     allowlist for a contact who was never explicitly added. Routing this
+///     through the normal gate therefore dropped every single
+///     personal-account message on the floor, which silently made
+///     `reply_autonomy` dead code: `/autonomy draft` and `/autonomy auto`
+///     stored and read back fine and then never once fired. Fixed
+///     2026-09-03.
+///
+/// Skipping the allowlist is safe here and only here, because
+/// `reply_autonomy` is its own deliberate opt-in and is fail-closed (`.off`
+/// resolves until the owner turns a chat on). That is emphatically not true
+/// of a bot connector, where the allowlist is the only thing between a
+/// stranger and the LLM — which is why this tests for `.telegram_user`
+/// specifically rather than "is a personal-account platform": the Instagram
+/// connector has no `reply_autonomy` path, so exempting it would just hand
+/// its DMs straight to `isAddressedToBot`.
+pub fn routeIncoming(
+    platform: iface.Platform,
+    is_owner: bool,
+    is_bot_admin: bool,
+    allowlisted: bool,
+) Route {
+    if (platform == .telegram_user) return .personal_account_autonomy;
+    if (is_owner or is_bot_admin or allowlisted) return .command_and_qa;
+    return .ignored;
+}
+
+test "routeIncoming: a personal-account message reaches autonomy even though nothing about its sender is allowed" {
+    // The exact shape of the bug: an inbound DM on the owner's personal
+    // account is always from someone else, so is_owner/is_bot_admin/
+    // allowlisted are all false -- and it must STILL be routed to the
+    // autonomy path rather than dropped. Routing it through the normal gate
+    // is what made draft/auto mode silently do nothing.
+    try std.testing.expectEqual(
+        Route.personal_account_autonomy,
+        routeIncoming(.telegram_user, false, false, false),
+    );
+}
+
+test "routeIncoming: a personal-account message is never dispatched as a command, whoever it looks like it's from" {
+    // A contact DMing the personal account must never reach the command
+    // chain: a reply to `/stats` there would go out under the owner's own
+    // identity. True for every combination, including the ones that would
+    // grant full access on any other platform.
+    for ([_]bool{ false, true }) |is_owner| {
+        for ([_]bool{ false, true }) |is_bot_admin| {
+            for ([_]bool{ false, true }) |allowlisted| {
+                try std.testing.expectEqual(
+                    Route.personal_account_autonomy,
+                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted),
+                );
+            }
+        }
+    }
+}
+
+test "routeIncoming: bot connectors keep the allowlist gate exactly as it was" {
+    // Every non-personal platform: owner, bot admin, or explicitly
+    // allowlisted gets through; a stranger doesn't. The personal-account
+    // carve-out must not have loosened this for anyone else -- Instagram
+    // especially, since it has no reply_autonomy path of its own.
+    for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, true, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, true, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, true));
+        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false));
+    }
+}
+
 /// Returns whether this message's attachment (if any) was claimed by the
 /// interactive `/convert` flow — `processMessageTask` must not delete a
 /// claimed file via its own attachment-cleanup `defer` (see
@@ -2352,17 +2513,21 @@ fn handleMessage(
     /// `/iglogin`'s handler touches this.
     instagram: ?*instagram_platform.InstagramConnector,
 ) bool {
-    // Coarse "does the bot even respond here" gate — checked before
-    // anything else in this function (including the choice_picked/
-    // attachment-continuation paths below, for uniformity: a disallowed
-    // sender gets no action taken on any kind of message, not just slash
-    // commands). Owners and bot admins bypass unconditionally; everyone
+    // Coarse "how far does this message get" gate, checked before anything
+    // else in this function (including the choice_picked/attachment-
+    // continuation paths below, for uniformity: a disallowed sender gets no
+    // action taken on any kind of message, not just slash commands).
+    // `routeIncoming` owns the decision and documents the reasoning,
+    // including why the personal-account connector skips both the allowlist
+    // and the command chain entirely.
+    //
+    // Owners and bot admins bypass the allowlist unconditionally; everyone
     // else needs their own identity or their current chat explicitly
     // allowed. Silent — this is "will the bot talk here at all", not a
     // moderation decision, so it doesn't announce itself. Message
     // recording/stats (`recordMessage`/`recordObservedUsers`) already ran
     // earlier in `processMessageTask`, before `handleMessage`, and are
-    // unaffected by this gate.
+    // unaffected by any of this.
     const is_owner = auth.isOwner(config, connector.platform(), msg.user_id);
     // The owner is the highest privilege there is and shouldn't need a
     // redundant `bot_admins` row on top of that — before this, `is_bot_admin`
@@ -2371,8 +2536,31 @@ fn handleMessage(
     // recognize them as one. `or` short-circuits, so the owner's messages
     // never even pay for the `bot_admins` query.
     const is_bot_admin = is_owner or bot_admins.isBotAdmin(pool, identity_id);
-    if (!is_owner and !is_bot_admin) {
-        if (!(bot_allowlist.isUserAllowed(pool, identity_id) or bot_allowlist.isChatAllowed(pool, chat_id))) return false;
+    const platform = connector.platform();
+    switch (routeIncoming(
+        platform,
+        is_owner,
+        is_bot_admin,
+        // `and` short-circuits, so the allowlist is only actually queried
+        // for a non-owner, non-admin on a bot connector — the same messages
+        // that paid for these two lookups before. The leading platform check
+        // keeps them off the personal-account path, whose route ignores this
+        // argument entirely.
+        platform != .telegram_user and !is_owner and !is_bot_admin and
+            (bot_allowlist.isUserAllowed(pool, identity_id) or bot_allowlist.isChatAllowed(pool, chat_id)),
+    )) {
+        .ignored => return false,
+        .personal_account_autonomy => {
+            const incoming = msg.text orelse return false;
+            if (incoming.len == 0) return false;
+            // Storage sense's flood-watermark sleep still applies, same as
+            // it does to the LLM paths below — a nearly-full disk shouldn't
+            // be spending LLM calls drafting replies either.
+            if (storage_sense.isSleepModeActive(pool, a)) return false;
+            handleTelegramUserAutoReply(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, msg, incoming, owner_notify, pending_drafts, telegram_user);
+            return false;
+        },
+        .command_and_qa => {},
     }
 
     // A button press / reaction pick has neither text nor an attachment of
@@ -2397,7 +2585,7 @@ fn handleMessage(
         // shape as the Undo button above — the Approve/Discard buttons on a
         // `reply_autonomy = .draft` notification (see
         // `handleTelegramUserAutoReply`/`handleDraftChoicePicked`).
-        if (handleDraftChoicePicked(connector, a, telegram_user, pending_drafts, now, msg, picked)) {
+        if (handleDraftChoicePicked(connector, a, io, telegram_user, pending_drafts, now, msg, picked)) {
             return false;
         }
         // Same shape again — `/tdchats`' Prev/Next pager buttons. Checked
@@ -2837,15 +3025,19 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/autonomy") or std.mem.startsWith(u8, text, "/autonomy ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleAutonomyCommand(connector, a, config, pool, msg, text, now);
+    } else if (std.mem.eql(u8, text, "/feed") or std.mem.startsWith(u8, text, "/feed ")) {
+        if (!feature_flags.isEnabled(pool, "curated_feed")) return false;
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleFeedCommand(connector, a, config, pool, io, llm_provider, telegram_user, msg, text, now);
     } else if (std.mem.eql(u8, text, "/drafts")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleDraftsListCommand(connector, a, config, pending_drafts, msg, now);
     } else if (std.mem.eql(u8, text, "/approve") or std.mem.startsWith(u8, text, "/approve ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
-        handleApproveCommand(connector, a, config, telegram_user, pending_drafts, msg, text, now);
+        handleApproveCommand(connector, a, config, telegram_user, pending_drafts, msg, text, now, io);
     } else if (std.mem.eql(u8, text, "/discard") or std.mem.startsWith(u8, text, "/discard ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
-        handleDiscardCommand(connector, a, config, pending_drafts, msg, text);
+        handleDiscardCommand(connector, a, config, telegram_user, pending_drafts, msg, text, io);
     } else if (std.mem.eql(u8, text, "/remind") or std.mem.startsWith(u8, text, "/remind ")) {
         if (!feature_flags.isEnabled(pool, "reminders")) return false;
         handleRemindCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text);
@@ -2986,21 +3178,6 @@ fn handleMessage(
         // Unrecognized slash command: ignore rather than forwarding to the
         // LLM as if it were a question.
         return false;
-    } else if (connector.platform() == .telegram_user) {
-        // Phase D: `reply_autonomy` (migration `0043_reply_autonomy.sql`)
-        // is the deliberate, explicit gate for any auto-response through
-        // this connector — NOT `isAddressedToBot` (every message this
-        // connector sees looks like a private 1:1 DM to it right now, and
-        // combined with owners bypassing the allowlist/credits gates
-        // everywhere, that would mean any message from the owner's own
-        // account auto-answers with zero opt-in; confirmed live
-        // (2026-08-18) against the owner's own Saved Messages chat before
-        // this got built — see git history for that incident). `.off` is
-        // both the resolved default and a fail-closed no-op, same as
-        // before this existed; `.draft`/`.auto` are opt-in per chat or
-        // globally via `/autonomy`.
-        handleTelegramUserAutoReply(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, now, max_message_len, msg, text, owner_notify, pending_drafts);
-        return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
         // A message that's *just* a YouTube/Instagram/X link is already
         // handled by `checkVideoDownload` in `processMessageTask` (if
@@ -3071,7 +3248,7 @@ fn handleMessage(
             .native_id = msg.user_id,
         };
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, in_flight);
+        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries, in_flight);
     }
     return false;
 }
@@ -4978,7 +5155,7 @@ fn handleAutonomyCommand(
     const rest = std.mem.trim(u8, text["/autonomy".len..], " ");
     if (rest.len == 0) {
         const global = user_settings.getEffectiveReplyAutonomyDefault(pool, a, owner_identity_id);
-        const status = std.fmt.allocPrint(a, "Global reply_autonomy default: {s}\n\nUsage:\n/autonomy <off|draft|auto> — set the global default\n/autonomy <chat id> <off|draft|auto|clear> — per-chat override (see /tdchats for chat ids)", .{@tagName(global)}) catch return;
+        const status = std.fmt.allocPrint(a, "Global reply_autonomy default: {s}\n\nUsage:\n/autonomy <off|draft|auto> — set the global default\n/autonomy <chat id> <off|draft|auto|clear> — per-chat override (see /tdchats for chat ids)\n/autonomy <chat id> prompt [<text>|off] — that chat's ghostwriter voice", .{@tagName(global)}) catch return;
         connector.sendMessage(a, msg.chat_id, status, msg.message_id);
         return;
     }
@@ -5013,8 +5190,38 @@ fn handleAutonomyCommand(
         reply(connector, a, msg.chat_id, msg.message_id, "Override cleared — this chat now inherits the global default.");
         return;
     }
+
+    // `/autonomy <chat id> prompt [<text>]` — this chat's ghostwriter voice.
+    // Separate from `/persona`, which styles Warden answering as *itself*;
+    // see `chat_settings.getReplyAutonomyPrompt` for why sharing one setting
+    // was a bug. No argument shows the current one; `off` clears it.
+    if (std.mem.eql(u8, level_text, "prompt") or std.mem.startsWith(u8, level_text, "prompt ")) {
+        const prompt_arg = std.mem.trim(u8, level_text["prompt".len..], " ");
+        if (prompt_arg.len == 0) {
+            const current = chat_settings.getReplyAutonomyPrompt(pool, a, target.id);
+            const status = if (current) |c|
+                std.fmt.allocPrint(a, "Ghostwriter prompt for chat {s}:\n\n{s}\n\n/autonomy {s} prompt off to clear it.", .{ native_chat_id, c, native_chat_id }) catch return
+            else
+                std.fmt.allocPrint(a, "Chat {s} uses the built-in ghostwriter prompt (write in your voice, no AI framing). Set your own with /autonomy {s} prompt <text>.", .{ native_chat_id, native_chat_id }) catch return;
+            connector.sendMessage(a, msg.chat_id, status, msg.message_id);
+            return;
+        }
+        const new_prompt: ?[]const u8 = if (std.mem.eql(u8, prompt_arg, "off")) null else prompt_arg;
+        chat_settings.setReplyAutonomyPrompt(pool, target.id, new_prompt) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Failed to save.");
+            return;
+        };
+        // `reply` takes its text comptime, so this is two calls rather
+        // than one with a runtime-selected string.
+        if (new_prompt == null) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Ghostwriter prompt cleared — back to the built-in one.");
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, "Ghostwriter prompt set for this chat.");
+        }
+        return;
+    }
     const level = std.meta.stringToEnum(user_settings.ReplyAutonomy, level_text) orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /autonomy <chat id> <off|draft|auto|clear>.");
+        reply(connector, a, msg.chat_id, msg.message_id, "Usage: /autonomy <chat id> <off|draft|auto|clear>, or /autonomy <chat id> prompt [<text>|off].");
         return;
     };
     chat_settings.setReplyAutonomy(pool, target.id, level) catch {
@@ -5028,6 +5235,241 @@ fn handleAutonomyCommand(
 /// `/drafts` — lists every pending `reply_autonomy = .draft` draft (see
 /// `reply_drafts.PendingDrafts`), so the owner doesn't have to remember
 /// which chats have one waiting.
+/// `/feed` — the curated-feed control surface (see
+/// `features/curated_feed.zig`). Owner-only throughout: it reads channels
+/// through the owner's personal account and posts under their identity.
+///
+///   /feed                      — status
+///   /feed add <chat id|name>   — watch a channel
+///   /feed remove <chat id>     — stop watching one
+///   /feed list                 — what's watched
+///   /feed target <chat id>     — where digests go
+///   /feed policy <text>        — the natural-language filter
+///   /feed every <duration>     — how often a digest is posted
+///   /feed on | /feed off       — enable/disable
+///   /feed run                  — run a pass right now
+fn handleFeedCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    io: Io,
+    llm_provider: llm.Provider,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    msg: iface.Message,
+    text: []const u8,
+    now: i64,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can manage the curated feed.");
+        return;
+    }
+
+    const rest = std.mem.trim(u8, text["/feed".len..], " ");
+    if (rest.len == 0) {
+        feedStatus(connector, a, pool, msg);
+        return;
+    }
+
+    const space = std.mem.indexOfScalar(u8, rest, ' ');
+    const sub = if (space) |i| rest[0..i] else rest;
+    const arg = if (space) |i| std.mem.trim(u8, rest[i + 1 ..], " ") else "";
+
+    if (std.mem.eql(u8, sub, "list")) {
+        const sources = feed_store.listSources(pool, a, false) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't load the source list.");
+            return;
+        };
+        if (sources.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No sources yet. Add one with /feed add <chat id or name> — see /tdchats for ids.");
+            return;
+        }
+        var out: Io.Writer.Allocating = .init(a);
+        out.writer.writeAll("Feed sources:\n") catch {};
+        for (sources) |src| {
+            out.writer.print("\n{s} ({s}){s}", .{ src.title, src.native_chat_id, if (src.enabled) "" else " — paused" }) catch break;
+        }
+        connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "add")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed add <chat id or name> — see /tdchats for ids.");
+            return;
+        }
+        const conn = telegram_user orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
+            return;
+        };
+        // Same resolver /tdsummary uses, so a channel can be named rather
+        // than looked up as a raw id, and an ambiguous name lists the
+        // candidates instead of silently picking one.
+        const resolution = chat_summary.resolveChat(conn, a, arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that chat up.");
+            return;
+        };
+        switch (resolution) {
+            .none => reply(connector, a, msg.chat_id, msg.message_id, "No chat matches that — see /tdchats."),
+            .ambiguous => |candidates| {
+                const listed = chat_summary.formatChatList(a, candidates, 10) catch return;
+                const out = std.fmt.allocPrint(a, "That matches more than one chat:\n\n{s}", .{listed}) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+            .one => |match| {
+                _ = feed_store.addSource(pool, match.native_chat_id, match.title) catch {
+                    reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that source.");
+                    return;
+                };
+                const out = std.fmt.allocPrint(a, "Watching \"{s}\" ({s}). Its existing posts are skipped — only new ones from here on will be considered.", .{ match.title, match.native_chat_id }) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "remove")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed remove <chat id> — see /feed list.");
+            return;
+        }
+        const removed = feed_store.removeSource(pool, arg) catch false;
+        if (removed) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Stopped watching that channel.");
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, "That channel isn't in the feed — see /feed list.");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "target")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed target <chat id> — where digests get posted.");
+            return;
+        }
+        feed_store.setTarget(pool, arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that.");
+            return;
+        };
+        const out = std.fmt.allocPrint(a, "Digests will be posted to {s}.", .{arg}) catch return;
+        connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "policy")) {
+        if (arg.len == 0) {
+            const settings = feed_store.getSettings(pool, a) catch {
+                reply(connector, a, msg.chat_id, msg.message_id, "Couldn't read the policy.");
+                return;
+            };
+            const out = if (settings.policy) |p|
+                std.fmt.allocPrint(a, "Current policy:\n\n{s}", .{p}) catch return
+            else
+                std.fmt.allocPrint(a, "No policy set. Set one with /feed policy <what you want>, e.g. \"international news, not crypto price talk\".", .{}) catch return;
+            connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            return;
+        }
+        feed_store.setPolicy(pool, arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Policy saved.");
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "every")) {
+        const seconds = reminder_format.parseDuration(arg) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed every <duration>, e.g. /feed every 1h.");
+            return;
+        };
+        // A digest every few seconds would be a stream, not a digest, and
+        // would spend model calls faster than anyone could read them.
+        if (seconds < 300) {
+            reply(connector, a, msg.chat_id, msg.message_id, "That's too frequent — five minutes is the shortest useful digest interval.");
+            return;
+        }
+        feed_store.setIntervalSeconds(pool, seconds) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that.");
+            return;
+        };
+        const out = std.fmt.allocPrint(a, "A digest will be posted at most every {d} seconds.", .{seconds}) catch return;
+        connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "on") or std.mem.eql(u8, sub, "off")) {
+        const on = std.mem.eql(u8, sub, "on");
+        feed_store.setEnabled(pool, on) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that.");
+            return;
+        };
+        if (on) {
+            // Enabling without a target or policy does nothing, so say so
+            // rather than letting it look like it's running.
+            const settings = feed_store.getSettings(pool, a) catch {
+                reply(connector, a, msg.chat_id, msg.message_id, "Feed enabled.");
+                return;
+            };
+            if (settings.target_native_chat_id == null) {
+                reply(connector, a, msg.chat_id, msg.message_id, "Feed enabled — but it won't run until you set where digests go: /feed target <chat id>.");
+            } else if (settings.policy == null) {
+                reply(connector, a, msg.chat_id, msg.message_id, "Feed enabled — but it won't run until you set what you want: /feed policy <text>.");
+            } else {
+                reply(connector, a, msg.chat_id, msg.message_id, "Feed enabled.");
+            }
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, "Feed disabled. Sources and policy are kept.");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "run")) {
+        const settings = feed_store.getSettings(pool, a) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't read the feed settings.");
+            return;
+        };
+        if (!settings.isRunnable()) {
+            reply(connector, a, msg.chat_id, msg.message_id, "The feed isn't fully set up yet — see /feed.");
+            return;
+        }
+        const dyn = resolveLlmDynamicSettings(pool, a, config);
+        const posted = curated_feed.runOnce(pool, a, io, llm_provider, telegram_user, dyn.max_retries, now) catch |err| {
+            log.err("curated feed: manual run failed: {t}", .{err});
+            reply(connector, a, msg.chat_id, msg.message_id, "That pass failed — see the server log.");
+            return;
+        };
+        const out = if (posted == 0)
+            std.fmt.allocPrint(a, "Nothing new matched the policy.", .{}) catch return
+        else
+            std.fmt.allocPrint(a, "Posted a digest with {d} item(s).", .{posted}) catch return;
+        connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+        return;
+    }
+
+    reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed [add|remove|list|target|policy|every|on|off|run]");
+}
+
+fn feedStatus(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, msg: iface.Message) void {
+    const settings = feed_store.getSettings(pool, a) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't read the feed settings.");
+        return;
+    };
+    const sources = feed_store.listSources(pool, a, false) catch &.{};
+
+    const out = std.fmt.allocPrint(
+        a,
+        "Curated feed: {s}\nSources: {d}\nTarget: {s}\nInterval: {d}s\nPolicy: {s}\n\n/feed add <chat id or name>, /feed target <chat id>, /feed policy <text>, /feed every <duration>, /feed on, /feed run",
+        .{
+            if (settings.isRunnable()) "on" else if (settings.enabled) "enabled but not configured" else "off",
+            sources.len,
+            settings.target_native_chat_id orelse "(not set)",
+            settings.interval_seconds,
+            settings.policy orelse "(not set)",
+        },
+    ) catch return;
+    connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+}
+
 fn handleDraftsListCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5050,12 +5492,17 @@ fn handleDraftsListCommand(
     }
 
     var out: Io.Writer.Allocating = .init(a);
-    out.writer.writeAll("Pending drafts:\n") catch {};
+    out.writer.writeAll("Pending drafts (each one is also sitting in that chat's Telegram composer):\n") catch {};
     for (drafts) |d| {
         const preview = if (d.draft_text.len > 200) d.draft_text[0..200] else d.draft_text;
         out.writer.print("\n{s} ({s}):\n{s}\n", .{ d.chat_title, d.native_chat_id, preview }) catch break;
+        // Only ever set when prefilling actually overwrote something the
+        // owner had typed, so this stays out of the way in the normal case.
+        if (d.replaced_draft) |r| {
+            out.writer.print("  \u{26a0}\u{fe0f} replaced what you'd typed there: {s}\n", .{r}) catch break;
+        }
     }
-    out.writer.writeAll("\n/approve <chat id> to send, /discard <chat id> to drop.") catch {};
+    out.writer.writeAll("\n/approve <chat id> to send, /discard <chat id> to drop — either way the composer is cleared.") catch {};
     connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
 }
 
@@ -5072,6 +5519,7 @@ fn handleApproveCommand(
     msg: iface.Message,
     text: []const u8,
     now: i64,
+    io: Io,
 ) void {
     if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
         reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can approve a draft.");
@@ -5091,6 +5539,9 @@ fn handleApproveCommand(
         return;
     };
     conn.connector().sendMessage(a, native_chat_id, draft.draft_text, draft.reply_to);
+    // Same reasoning as the Approve button's own call — see
+    // `handleDraftChoicePicked`.
+    telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
     const confirmation = std.fmt.allocPrint(a, "Sent to {s}.", .{draft.chat_title}) catch "Sent.";
     connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
 }
@@ -5100,9 +5551,11 @@ fn handleDiscardCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
     config: *const config_mod.Config,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     msg: iface.Message,
     text: []const u8,
+    io: Io,
 ) void {
     if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
         reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can discard a draft.");
@@ -5114,6 +5567,7 @@ fn handleDiscardCommand(
         return;
     }
     if (pending_drafts.discard(native_chat_id)) {
+        telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
         reply(connector, a, msg.chat_id, msg.message_id, "Draft discarded.");
     } else {
         reply(connector, a, msg.chat_id, msg.message_id, "No pending draft for that chat.");
@@ -5163,12 +5617,14 @@ fn handleTelegramUserAutoReply(
     embeddings_client: ?*embeddings.EmbeddingsClient,
     tool_ctx: tool_registry.ToolContext,
     tools: []const tool_registry.ToolDef,
+    io: Io,
     now: i64,
     max_message_len: usize,
     msg: iface.Message,
     text: []const u8,
     owner_notify: iface.Connector,
     pending_drafts: *reply_drafts.PendingDrafts,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
 ) void {
     const owner_identity_id = resolveOwnerIdentityId(pool, config, now) catch |err| {
         log.err("reply_autonomy: couldn't resolve the owner's identity: {t}", .{err});
@@ -5181,7 +5637,14 @@ fn handleTelegramUserAutoReply(
     const answer: []const u8 = if (dyn.skip_trivial_messages and trivial_reply.isTrivialMessage(a, text))
         trivial_reply.pickResponse(@intCast(now))
     else blk: {
-        const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse default_reply_as_owner_prompt;
+        // `reply_autonomy`'s own per-chat prompt override, NOT `/persona`'s.
+        // These read as the same thing and want opposite outcomes: `/persona`
+        // styles *Warden answering as itself* in a chat, while this path is
+        // ghostwriting as the owner, where sounding like a bot persona is
+        // exactly the failure mode `default_reply_as_owner_prompt` exists to
+        // prevent. Sharing one column meant setting a persona on a chat
+        // silently made its ghostwritten replies out themselves as an AI.
+        const system_prompt = chat_settings.getReplyAutonomyPrompt(pool, a, chat_id) orelse default_reply_as_owner_prompt;
         const asker: qa.Asker = if (msg.identity) |identity| .{
             .display_name = identity.display_name,
             .username = identity.username,
@@ -5192,7 +5655,7 @@ fn handleTelegramUserAutoReply(
             .native_id = msg.user_id,
         };
         const enabled_tools = filterEnabledTools(pool, a, tools);
-        const raw_answer = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages) catch |err| {
+        const raw_answer = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries) catch |err| {
             log.err("reply_autonomy: qa.answer failed for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
@@ -5205,7 +5668,39 @@ fn handleTelegramUserAutoReply(
         .auto => connector.sendMessage(a, msg.chat_id, answer, msg.message_id),
         .draft => {
             const chat_title = msg.chat_title orelse msg.chat_id;
-            pending_drafts.set(now, msg.chat_id, chat_title, text, answer, msg.message_id) catch |err| {
+
+            // Write the draft straight into that chat's Telegram composer,
+            // so opening the conversation on any device shows it already
+            // typed and ready to edit or send — the whole point of `draft`
+            // mode being "have something waiting for me", rather than
+            // "send me a notification I then have to act on elsewhere".
+            //
+            // Whatever the owner had already typed there is read first and
+            // carried into the notification (and the drafts page) instead of
+            // being silently destroyed: overwriting is deliberate — the AI
+            // draft should definitely be there when the chat is opened — but
+            // losing a half-typed message with no trace is not.
+            var replaced_draft: ?[]const u8 = null;
+            if (telegram_user) |tu| {
+                if (std.fmt.parseInt(i64, msg.chat_id, 10)) |native_id| {
+                    replaced_draft = tu.fetchComposerDraft(a, io, native_id) catch |err| blk_draft: {
+                        log.warn("reply_autonomy: couldn't read the existing composer draft for chat {s}: {t}", .{ msg.chat_id, err });
+                        break :blk_draft null;
+                    };
+                    if (!tu.setChatDraft(a, io, native_id, answer, now)) {
+                        // The notification and the drafts page below still
+                        // work, so this degrades rather than fails: the
+                        // owner just has to approve from one of those
+                        // instead of finding the text pre-typed.
+                        log.warn("reply_autonomy: couldn't prefill the composer for chat {s}; falling back to notification-only", .{msg.chat_id});
+                        replaced_draft = null;
+                    }
+                } else |_| {
+                    log.warn("reply_autonomy: chat id {s} isn't a TDLib chat id, skipping composer prefill", .{msg.chat_id});
+                }
+            }
+
+            pending_drafts.set(now, msg.chat_id, chat_title, text, answer, msg.message_id, replaced_draft) catch |err| {
                 log.err("reply_autonomy: failed to stash a draft for chat {s}: {t}", .{ msg.chat_id, err });
                 return;
             };
@@ -5214,10 +5709,14 @@ fn handleTelegramUserAutoReply(
                 return;
             };
             const incoming_preview = if (text.len > 300) text[0..300] else text;
+            const replaced_note = if (replaced_draft) |r|
+                std.fmt.allocPrint(a, "\n\n\u{26a0}\u{fe0f} This replaced what you'd already typed there: \"{s}\"", .{r}) catch ""
+            else
+                "";
             const notify_text = std.fmt.allocPrint(
                 a,
-                "\u{1f4ac} Draft reply ready\nChat: {s} ({s})\nThey said: \"{s}\"\n\nDraft: \"{s}\"",
-                .{ chat_title, msg.chat_id, incoming_preview, answer },
+                "\u{1f4ac} Draft reply ready\nChat: {s} ({s})\nThey said: \"{s}\"\n\nDraft: \"{s}\"{s}",
+                .{ chat_title, msg.chat_id, incoming_preview, answer, replaced_note },
             ) catch return;
             // Buttons, not "type /approve <chat id>" — see
             // `handleDraftChoicePicked` for what picking one does.
@@ -5250,6 +5749,7 @@ fn handleTelegramUserAutoReply(
 fn handleDraftChoicePicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
+    io: Io,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     now: i64,
@@ -5267,6 +5767,10 @@ fn handleDraftChoicePicked(
             return true;
         };
         conn.connector().sendMessage(a, native_chat_id, draft.draft_text, draft.reply_to);
+        // The composer still holds this exact text (that's how the owner
+        // saw it in the first place) -- leaving it there after sending
+        // invites sending the same message twice.
+        telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
         const confirmation = std.fmt.allocPrint(a, "Sent to {s}.", .{draft.chat_title}) catch "Sent.";
         connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
         return true;
@@ -5274,6 +5778,7 @@ fn handleDraftChoicePicked(
     if (std.mem.startsWith(u8, picked.value, draft_discard_prefix)) {
         const native_chat_id = picked.value[draft_discard_prefix.len..];
         if (pending_drafts.discard(native_chat_id)) {
+            telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
             connector.sendMessage(a, msg.chat_id, "Draft discarded.", msg.message_id);
         } else {
             connector.sendMessage(a, msg.chat_id, "That draft is already gone.", msg.message_id);
@@ -9240,12 +9745,12 @@ fn formatMemories(a: std.mem.Allocator, listed: []const facts.Memory) []const u8
 /// `NoteToolAdapter`, except scoped to `identity_id` alone (no `chat_id`/
 /// `is_owner` — see `registry.zig`'s `MemorySink` doc comment for why
 /// there's no "or the owner" escape hatch here). `embeddings_client` is
-/// `null` exactly when `config.embeddings_url` is unset; `tool_ctx.memory`
-/// itself is only ever set to this adapter's sink when it's non-null (see
-/// `processMessageTask`), so `createFn` finding it null here would only
-/// ever indicate a wiring bug, not a normal "feature disabled" path — it
-/// still fails safely rather than asserting, since a tool executing is
-/// never a place to crash the whole message-processing task over.
+/// `null` exactly when `config.embeddings_url` is unset — which is now a
+/// fully supported way to run: the fact is stored without a vector and
+/// ranked on keyword/recency/salience instead. `tool_ctx.memory` is
+/// therefore always wired to this adapter's sink (it used to be wired only
+/// when an embeddings client existed, which is what made remembering
+/// silently impossible without one).
 const MemoryToolAdapter = struct {
     pool: *store_pool.PgPool,
     identity_id: i64,
@@ -9264,8 +9769,25 @@ const MemoryToolAdapter = struct {
 
     fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror!i64 {
         const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
-        const client = self.embeddings_client orelse return error.EmbeddingsNotConfigured;
-        const vector = try client.embed(allocator, text);
+        // An embedding is an enhancement, not a prerequisite. This used to
+        // `return error.EmbeddingsNotConfigured` here, and the sink wasn't
+        // even wired up without a client (see `processMessageTask`), so on
+        // a deployment with no WARDEN_EMBEDDINGS_URL the `remember_memory`
+        // tool simply didn't exist: the model would say it had remembered
+        // something and nothing was ever written, with nothing anywhere to
+        // say why. Storing the fact matters more than being able to rank it
+        // by cosine distance later.
+        //
+        // A configured-but-failing endpoint degrades the same way rather
+        // than losing the fact -- logged, since that one IS a
+        // misconfiguration worth seeing, unlike simply not having one.
+        const vector: ?[]const f32 = if (self.embeddings_client) |client|
+            client.embed(allocator, text) catch |err| blk: {
+                log.warn("memory: embedding failed, storing without a vector (semantic recall will skip it): {t}", .{err});
+                break :blk null;
+            }
+        else
+            null;
         return facts.remember(self.pool, allocator, self.identity_id, text, vector, self.now);
     }
 
@@ -9484,6 +10006,58 @@ const ticker_interval_ms: i64 = 1200;
 /// let the ticker thread outlive `replyWithAnswer`'s own stack frame when
 /// it can't be joined promptly (see `tickerLoop`'s doc comment), so nothing
 /// referencing `state` may be on that frame.
+/// One child line under the "🤔 Thinking..." header. A union rather than a
+/// bare tool name so the tree can also carry non-tool progress (a retry),
+/// and so a repeated tool call can be collapsed into a count instead of
+/// stacking identical lines.
+const TreeEntry = union(enum) {
+    /// `input_digest` is the fingerprint of the most recent call's
+    /// arguments (see `toolcall.hashToolInput`) — kept so the *next*
+    /// report for the same tool can tell "same call again" (ignore it)
+    /// from "different arguments" (bump `count`).
+    tool: struct { name: []const u8, input_digest: u64, count: u32 },
+    retry: struct { attempt: u32, max: u32 },
+};
+
+/// Per-tool icon for the progress tree, falling back to the generic wrench
+/// for anything not listed (including a tool added later and not mapped
+/// here yet — a missing icon should never be a missing line). Grouped by
+/// what the tool *does* rather than one arbitrary glyph each, so a family
+/// of related tools reads as a family.
+fn toolEmoji(name: []const u8) []const u8 {
+    const table = .{
+        // Reaching out to the network
+        .{ "web_search", "🌐" },       .{ "scrape_site", "🪒" },
+        .{ "fetch_url", "🔗" },        .{ "hackernews_search", "📰" },
+        // Asking another model
+        .{ "ask_delegate", "🧠" },     .{ "delegate_generate_image", "🎨" },
+        // Reference lookups
+        .{ "dictionary", "📖" },       .{ "urban_dictionary", "🗣" },
+        .{ "calculator", "🧮" },       .{ "currency_convert", "💱" },
+        .{ "crypto_price", "🪙" },     .{ "weather", "🌦" },
+        .{ "air_quality", "🌫" },
+        // Producing something
+        .{ "qr_code", "🔳" },          .{ "draw_diagram", "📐" },
+        .{ "word_cloud", "☁️" },        .{ "create_poll", "📊" },
+        .{ "convert_file", "🔁" },     .{ "begin_file_conversion", "🔁" },
+        // Remembering / recalling
+        .{ "remember_memory", "🧷" },  .{ "set_note", "📝" },
+        .{ "catch_me_up", "📚" },      .{ "get_bulletin", "🗞" },
+        // Scheduling and watching
+        .{ "set_reminder", "⏰" },     .{ "set_alert", "🔔" },
+        .{ "set_expense", "💰" },
+        // The personal account
+        .{ "list_personal_chats", "👥" },     .{ "send_personal_message", "✉️" },
+        .{ "reply_to_message", "↩️" },        .{ "summarize_unread_chat", "📬" },
+        .{ "set_chat_monitoring", "👀" },     .{ "set_default_chat_monitoring", "👀" },
+        .{ "find_chat_member", "🔎" },
+    };
+    inline for (table) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
+    return "🔧";
+}
+
 const TickerState = struct {
     io: Io,
     allocator: std.mem.Allocator,
@@ -9513,13 +10087,13 @@ const TickerState = struct {
     /// eventually 400 out of `editMessage` on a long-running request.
     max_len: usize,
     mutex: Io.Mutex = .init,
-    /// Tool names reported via `.tool_use` so far this request, oldest
-    /// first — rendered as tree-branch child lines under `thinking_text` by
-    /// `renderTree`. Only ever touched from `onProgressEvent`, which (like
-    /// this whole struct's `allocator`) runs exclusively on the main
-    /// per-message task, never the ticker thread — see this struct's own
-    /// doc comment — so it needs no mutex of its own.
-    tool_history: std.ArrayList([]const u8) = .empty,
+    /// What's happened this request, oldest first — rendered as tree-branch
+    /// child lines under `thinking_text` by `renderTree`. Only ever touched
+    /// from `onProgressEvent`, which (like this whole struct's `allocator`)
+    /// runs exclusively on the main per-message task, never the ticker
+    /// thread — see this struct's own doc comment — so it needs no mutex of
+    /// its own.
+    tool_history: std.ArrayList(TreeEntry) = .empty,
     /// null = show the generic thinking animation; set = show this (already
     /// including the tree so far — see `renderTree`) until the model moves
     /// past whatever produced it.
@@ -9552,13 +10126,29 @@ const TickerState = struct {
         buf.appendSlice(self.allocator, thinking_text) catch return thinking_text;
         const child_count = self.tool_history.items.len + @as(usize, if (trailing != null) 1 else 0);
         var shown: usize = 0;
-        for (self.tool_history.items) |name| {
+        for (self.tool_history.items) |entry| {
             shown += 1;
             const branch: []const u8 = if (shown == child_count) "\n└── " else "\n├── ";
             buf.appendSlice(self.allocator, branch) catch return thinking_text;
-            buf.appendSlice(self.allocator, "🔧 Using ") catch return thinking_text;
-            buf.appendSlice(self.allocator, name) catch return thinking_text;
-            buf.appendSlice(self.allocator, "...") catch return thinking_text;
+            switch (entry) {
+                .tool => |t| {
+                    buf.appendSlice(self.allocator, toolEmoji(t.name)) catch return thinking_text;
+                    buf.appendSlice(self.allocator, " Using ") catch return thinking_text;
+                    buf.appendSlice(self.allocator, t.name) catch return thinking_text;
+                    // Only once the model has actually called it more than
+                    // once with *different* arguments — a repeat of the
+                    // identical call never gets here (see `onProgressEvent`).
+                    if (t.count > 1) {
+                        const suffix = std.fmt.allocPrint(self.allocator, " (x{d})", .{t.count}) catch return thinking_text;
+                        buf.appendSlice(self.allocator, suffix) catch return thinking_text;
+                    }
+                    buf.appendSlice(self.allocator, "...") catch return thinking_text;
+                },
+                .retry => |r| {
+                    const line = std.fmt.allocPrint(self.allocator, "🔄 API Error: Retrying ({d}/{d})", .{ r.attempt, r.max }) catch return thinking_text;
+                    buf.appendSlice(self.allocator, line) catch return thinking_text;
+                },
+            }
         }
         if (trailing) |t| {
             buf.appendSlice(self.allocator, "\n└── ") catch return thinking_text;
@@ -9568,6 +10158,84 @@ const TickerState = struct {
         return truncateUtf8(rendered, self.max_len);
     }
 };
+
+test "toolEmoji maps known tools and falls back to the wrench for anything else" {
+    try std.testing.expectEqualStrings("🌐", toolEmoji("web_search"));
+    try std.testing.expectEqualStrings("🪒", toolEmoji("scrape_site"));
+    try std.testing.expectEqualStrings("🧠", toolEmoji("ask_delegate"));
+    // Not in the table (and a tool added later won't be either) — must
+    // still render a line, just with the generic icon.
+    try std.testing.expectEqualStrings("🔧", toolEmoji("some_future_tool"));
+}
+
+/// A `TickerState` wired to an arena, for exercising `onProgressEvent` +
+/// `renderTree` without a connector or a live request. `max_len` is
+/// deliberately large so nothing under test is truncated.
+fn testTicker(arena: std.mem.Allocator) TickerState {
+    return .{ .io = std.testing.io, .allocator = arena, .max_len = 4096 };
+}
+
+test "progress tree: an identical repeat of the same tool call adds nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = testTicker(arena_state.allocator());
+
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 7 } });
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 7 } });
+
+    // The reported bug: several web_search lines stacked under one message.
+    try std.testing.expectEqual(@as(usize, 1), state.tool_history.items.len);
+    const rendered = state.renderTree(null);
+    try std.testing.expectEqualStrings("🤔 Thinking...\n└── 🌐 Using web_search...", rendered);
+}
+
+test "progress tree: the same tool with different arguments collapses into a count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = testTicker(arena_state.allocator());
+
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 1 } });
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 2 } });
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 3 } });
+
+    try std.testing.expectEqual(@as(usize, 1), state.tool_history.items.len);
+    try std.testing.expectEqualStrings(
+        "🤔 Thinking...\n└── 🌐 Using web_search (x3)...",
+        state.renderTree(null),
+    );
+}
+
+test "progress tree: different tools keep their own lines in call order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = testTicker(arena_state.allocator());
+
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 1 } });
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "scrape_site", .input_digest = 2 } });
+    // Back to the first tool: a separate line, not merged across the gap,
+    // so the tree still reads in the order things actually happened.
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 3 } });
+
+    try std.testing.expectEqual(@as(usize, 3), state.tool_history.items.len);
+    try std.testing.expectEqualStrings(
+        "🤔 Thinking...\n├── 🌐 Using web_search...\n├── 🪒 Using scrape_site...\n└── 🌐 Using web_search...",
+        state.renderTree(null),
+    );
+}
+
+test "progress tree: a retry renders as its own line with the attempt count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = testTicker(arena_state.allocator());
+
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 1 } });
+    onProgressEvent(&state, .{ .retry = .{ .attempt = 1, .max = 3, .err = error.RequestTimedOut } });
+
+    try std.testing.expectEqualStrings(
+        "🤔 Thinking...\n├── 🌐 Using web_search...\n└── 🔄 API Error: Retrying (1/3)",
+        state.renderTree(null),
+    );
+}
 
 fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
     const state: *TickerState = @ptrCast(@alignCast(ptr));
@@ -9579,8 +10247,41 @@ fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
             // when there's no tree yet to preserve (the very first turn).
             if (state.tool_history.items.len == 0) state.setStatus(null);
         },
-        .tool_use => |name| {
-            state.tool_history.append(state.allocator, name) catch return;
+        .tool_use => |use| {
+            // Three cases, per the reported bug (identical web_search lines
+            // stacking under one message):
+            //   * same tool, same arguments as the last entry — the model
+            //     re-issuing a call already shown. Not new activity, so
+            //     nothing changes at all, not even a count.
+            //   * same tool, different arguments — a genuinely new call;
+            //     collapse into the existing line as "(xN)" rather than
+            //     repeating the tool's name down the tree.
+            //   * anything else — a new line.
+            // Only the most recent entry is considered, so alternating
+            // tools (search, scrape, search) still read in call order
+            // instead of silently merging across the gap.
+            if (state.tool_history.items.len > 0) {
+                const last = &state.tool_history.items[state.tool_history.items.len - 1];
+                if (last.* == .tool and std.mem.eql(u8, last.tool.name, use.name)) {
+                    if (last.tool.input_digest == use.input_digest) return;
+                    last.tool.input_digest = use.input_digest;
+                    last.tool.count += 1;
+                    state.setStatus(state.renderTree(null));
+                    return;
+                }
+            }
+            state.tool_history.append(state.allocator, .{ .tool = .{
+                .name = use.name,
+                .input_digest = use.input_digest,
+                .count = 1,
+            } }) catch return;
+            state.setStatus(state.renderTree(null));
+        },
+        .retry => |r| {
+            state.tool_history.append(state.allocator, .{ .retry = .{
+                .attempt = r.attempt,
+                .max = r.max,
+            } }) catch return;
             state.setStatus(state.renderTree(null));
         },
         .text => |text_so_far| {
@@ -9894,6 +10595,10 @@ fn replyWithAnswer(
     documents_enabled: bool,
     max_tokens_override: ?u32,
     history_window: i64,
+    /// Retries per model call on a transient failure — see
+    /// `toolcall.callProviderWithRetry`. Threaded from
+    /// `LlmDynamicSettings.max_retries` like every other LLM dial here.
+    max_retries: u32,
     in_flight: *cancel_request.InFlightRequests,
 ) void {
     // The placeholder + ticker only work when the platform supports
@@ -9947,7 +10652,7 @@ fn replyWithAnswer(
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tools);
-    const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window);
+    const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window, max_retries);
 
     // Stop the ticker before touching the placeholder ourselves. Signaled
     // cooperatively (`state.stop`) and joined with a bound, rather than

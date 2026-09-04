@@ -130,7 +130,7 @@ pub const TelegramConnector = struct {
             .chat_id = try std.fmt.allocPrint(allocator, "{d}", .{cmu.chat.id}),
             .user_id = "",
             .chat_type = if (cmu.chat.type.len > 0) try allocator.dupe(u8, cmu.chat.type) else null,
-            .chat_title = if (cmu.chat.title) |t| try allocator.dupe(u8, t) else null,
+            .chat_title = if (try cmu.chat.displayTitle(allocator)) |t| try allocator.dupe(u8, t) else null,
             .chat_ingest_only = true,
         };
     }
@@ -146,7 +146,7 @@ pub const TelegramConnector = struct {
             .chat_id = try std.fmt.allocPrint(allocator, "{d}", .{cp.chat.id}),
             .user_id = "",
             .chat_type = if (cp.chat.type.len > 0) try allocator.dupe(u8, cp.chat.type) else null,
-            .chat_title = if (cp.chat.title) |t| try allocator.dupe(u8, t) else null,
+            .chat_title = if (try cp.chat.displayTitle(allocator)) |t| try allocator.dupe(u8, t) else null,
             .chat_ingest_only = true,
         };
     }
@@ -407,7 +407,7 @@ pub const TelegramConnector = struct {
                     .username = telegram_profile.identity.username,
                     .is_group = is_group,
                     .chat_type = if (cq_message.chat.type.len > 0) try allocator.dupe(u8, cq_message.chat.type) else null,
-                    .chat_title = if (cq_message.chat.title) |t| try allocator.dupe(u8, t) else null,
+                    .chat_title = if (try cq_message.chat.displayTitle(allocator)) |t| try allocator.dupe(u8, t) else null,
                     .identity = telegram_profile.identity,
                     .telegram_profile = telegram_profile,
                     .choice_picked = .{
@@ -492,7 +492,7 @@ pub const TelegramConnector = struct {
                 .reply_to_text = reply_to_text,
                 .is_group = is_group,
                 .chat_type = if (msg.chat.type.len > 0) try allocator.dupe(u8, msg.chat.type) else null,
-                .chat_title = if (msg.chat.title) |t| try allocator.dupe(u8, t) else null,
+                .chat_title = if (try msg.chat.displayTitle(allocator)) |t| try allocator.dupe(u8, t) else null,
                 .reply_to_is_me = reply_to_is_me,
                 .mentions_me = mentions_me,
                 .identity = if (telegram_profile) |p| p.identity else null,

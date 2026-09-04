@@ -412,9 +412,12 @@ pub const ToolContext = struct {
     /// `set_note` tool.
     notes: ?NoteSink = null,
     /// Same lifetime/nullability reasoning as `reminders` above, for the
-    /// `remember_memory` tool — also null (regardless of a real message
-    /// being processed) whenever `WARDEN_EMBEDDINGS_URL` isn't configured,
-    /// see `config.zig`'s `embeddings_url` doc comment.
+    /// `remember_memory` tool. No longer gated on `WARDEN_EMBEDDINGS_URL`:
+    /// memory works without an embeddings endpoint (the fact is stored with
+    /// no vector and ranked on keyword/recency/salience instead), and
+    /// gating it here meant the tool silently did not exist on deployments
+    /// without one -- so nothing was ever remembered and nothing said why.
+    /// See `main.zig`'s `MemoryToolAdapter.createFn`.
     memory: ?MemorySink = null,
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `catch_me_up` tool.

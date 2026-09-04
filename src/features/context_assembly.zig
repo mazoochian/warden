@@ -104,10 +104,13 @@ fn appendStableFactsSection(
     max_chars: usize,
 ) !void {
     const pinned = facts.pinnedForIdentity(pool, allocator, identity_id) catch &.{};
-    const stable = if (query_vector) |qv|
-        facts.rankedStable(pool, allocator, identity_id, qv, question, ranked_stable_limit, now) catch &.{}
-    else
-        &.{};
+    // Ranked even with no query vector: the hybrid score's other three
+    // terms (keyword, recency, salience) still discriminate, and skipping
+    // the query entirely -- as this used to -- meant a deployment without an
+    // embeddings endpoint got *no* stable facts in its context at all, only
+    // pinned ones. See `facts.hybrid_score_expr` on why a null vector is
+    // safe to pass straight through.
+    const stable = facts.rankedStable(pool, allocator, identity_id, query_vector, question, ranked_stable_limit, now) catch &.{};
 
     var lines: std.ArrayList([]const u8) = .empty;
     for (pinned) |f| try lines.append(allocator, try renderFactLine(allocator, f));
@@ -128,8 +131,10 @@ fn appendTentativeFactsSection(
     now: i64,
     max_chars: usize,
 ) !void {
-    const qv = query_vector orelse return;
-    const tentative = facts.rankedTentative(pool, allocator, identity_id, qv, question, ranked_tentative_limit, now) catch &.{};
+    // Same reasoning as the stable section: no query vector is not a reason
+    // to skip tentative facts entirely, only to rank them without the
+    // similarity term.
+    const tentative = facts.rankedTentative(pool, allocator, identity_id, query_vector, question, ranked_tentative_limit, now) catch &.{};
     if (tentative.len == 0) return;
 
     var lines: std.ArrayList([]const u8) = .empty;

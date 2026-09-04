@@ -2,6 +2,8 @@
 //! std.json. Only fields Warden actually uses are modeled; parsing is done
 //! with `ignore_unknown_fields = true` so Telegram can add fields freely.
 
+const std = @import("std");
+
 /// Full Telegram Bot API `User` object (fields Warden can plausibly use for
 /// identity — deprecated/inline-menu-only fields are omitted since
 /// `ignore_unknown_fields = true` means nothing breaks if Telegram sends
@@ -25,11 +27,72 @@ pub const User = struct {
 pub const Chat = struct {
     id: i64,
     type: []const u8 = "",
+    /// Groups, supergroups and channels only. A *private* chat never has
+    /// one — Telegram identifies the other party by name instead, via the
+    /// two fields below. Reading this alone (as everything used to) meant
+    /// every 1:1 chat ended up with no title at all and got displayed by
+    /// raw numeric id. See `displayTitle`.
     title: ?[]const u8 = null,
+    /// Private chats only: the other party's name.
+    first_name: ?[]const u8 = null,
+    last_name: ?[]const u8 = null,
     /// Private chats/channels have a username; groups/supergroups usually
     /// don't unless they have a public invite link.
     username: ?[]const u8 = null,
+
+    /// The best human-readable name for this chat, whatever its type:
+    /// `title` for groups/supergroups/channels, the other party's name for
+    /// a private chat, falling back to `@username` when a private chat has
+    /// no name at all. `null` only when Telegram gave us nothing to go on,
+    /// which is the one case a caller should fall back to the raw id.
+    ///
+    /// Allocates only when it has to join a first and last name; every
+    /// other case borrows from `self`.
+    pub fn displayTitle(self: Chat, allocator: std.mem.Allocator) !?[]const u8 {
+        if (self.title) |t| if (t.len > 0) return t;
+        if (self.first_name) |first| if (first.len > 0) {
+            if (self.last_name) |last| if (last.len > 0) {
+                return try std.fmt.allocPrint(allocator, "{s} {s}", .{ first, last });
+            };
+            return first;
+        };
+        if (self.username) |u| if (u.len > 0) return try std.fmt.allocPrint(allocator, "@{s}", .{u});
+        return null;
+    }
 };
+
+test "Chat.displayTitle prefers a group title" {
+    const a = std.testing.allocator;
+    const chat = Chat{ .id = 1, .type = "supergroup", .title = "Alpacas" };
+    try std.testing.expectEqualStrings("Alpacas", (try chat.displayTitle(a)).?);
+}
+
+test "Chat.displayTitle names a private chat by its person, not its id" {
+    // The bug: private chats carry no `title`, so reading only that left
+    // every 1:1 conversation displayed as a raw numeric chat id.
+    const a = std.testing.allocator;
+
+    const both = Chat{ .id = 2, .type = "private", .first_name = "Ada", .last_name = "Lovelace" };
+    const joined = (try both.displayTitle(a)).?;
+    defer a.free(joined);
+    try std.testing.expectEqualStrings("Ada Lovelace", joined);
+
+    const first_only = Chat{ .id = 3, .type = "private", .first_name = "Ada" };
+    try std.testing.expectEqualStrings("Ada", (try first_only.displayTitle(a)).?);
+}
+
+test "Chat.displayTitle falls back to @username, then to nothing" {
+    const a = std.testing.allocator;
+
+    const uname = Chat{ .id = 4, .type = "private", .username = "ada" };
+    const at = (try uname.displayTitle(a)).?;
+    defer a.free(at);
+    try std.testing.expectEqualStrings("@ada", at);
+
+    // Nothing to go on at all -- only here should a caller show the raw id.
+    const bare = Chat{ .id = 5, .type = "private" };
+    try std.testing.expectEqual(@as(?[]const u8, null), try bare.displayTitle(a));
+}
 
 /// Deliberately flat (no nested `reply_to_message` of its own) rather than
 /// a recursive `Message` — Telegram does allow reply chains, but Warden

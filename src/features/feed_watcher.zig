@@ -11,6 +11,13 @@ const llm = @import("../llm/provider.zig");
 const toolcall = @import("../llm/toolcall.zig");
 const registry = @import("../tools/registry.zig");
 
+/// Retries for this background summariser's own model call. A fixed
+/// default rather than the `WARDEN_LLM_MAX_RETRIES` dynamic value: this
+/// runs on a scheduler with no chat, no user waiting and no
+/// `LlmDynamicSettings` in scope, and a scheduled summary that quietly
+/// retries a congested endpoint is exactly the desired behaviour.
+const default_max_retries: u32 = @intCast(@import("../config.zig").Config.default_llm_max_retries);
+
 const system_prompt =
     \\You write a short update for a group chat about new items that just
     \\appeared in an RSS/Atom feed they're watching. Given a list of new
@@ -190,7 +197,7 @@ fn checkOne(connectors: []const iface.Connector, gpa: std.mem.Allocator, io: Io,
     // would have zero visible effect (same reasoning as digest.zig).
     // show_thinking=false and max_tokens=1024 for the same reasons
     // documented in digest.zig's own toolcall.run call.
-    const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, 1024) catch |err| blk: {
+    const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, 1024, default_max_retries) catch |err| blk: {
         std.log.err("feed_watcher: llm summary failed for {s}: {t}", .{ fw.feed_url, err });
         break :blk "";
     };

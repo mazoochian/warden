@@ -114,6 +114,170 @@ and this entry) — worth a real README section before calling the feature
 line done. `zig build` + `zig build test` green throughout (616/618, 2
 skipped without a local Postgres).
 
+**Phase D was, in fact, unreachable dead code from the day it shipped
+until 2026-09-03** — worth recording in full, because everything about it
+tested green and looked correct in isolation, and the failure was
+completely silent. `handleMessage`'s coarse allowlist gate ran before the
+`.telegram_user` dispatch branch and could never pass for this connector:
+`convertNewMessage` drops the account's own outgoing messages, so every
+message this connector delivers is from *someone else*, which means
+`msg.user_id` is never the owner's and `auth.isOwner` — which compares
+exactly that against `WARDEN_TELEGRAM_USER_OWNER_ID`, the owner's own id —
+can never match. A contact who was never explicitly `/adduser`'d failed the
+allowlist too (and `/adduser` typed to the bot couldn't have helped anyway:
+it records the grant against `connector.platform()`, so it allowlists a
+`telegram` identity, a different `identities` row from the `telegram_user`
+one an inbound DM resolves). So `handleMessage` returned `false` for every
+single personal-account message and `handleTelegramUserAutoReply` was never
+once called. `/autonomy draft` and `/autonomy auto` both wrote and read
+back their settings correctly and then did nothing: no drafts, no
+auto-replies, no errors, an empty `/drafts` and an empty web drafts page.
+
+The fix extracts that decision into `routeIncoming` — a pure function with
+real tests, precisely because the bug was invisible while the logic lived
+inline in a 600-line dispatch chain — and routes `.telegram_user` straight
+to `reply_autonomy`, bypassing both the allowlist and the command
+dispatcher. Bypassing the allowlist is safe *here and only here* because
+`reply_autonomy` is itself the deliberate opt-in and is fail-closed
+(`.off` until the owner turns a chat on); bypassing the command dispatcher
+is mandatory for the same "never the owner typing" reason that broke the
+gate, since otherwise a contact typing `/stats` into the owner's DMs would
+get a reply composed and sent under the owner's own identity. The check
+stays `.telegram_user`-specific rather than "is a personal account": the
+Instagram connector has no `reply_autonomy` path, so exempting it would
+hand its DMs straight to `isAddressedToBot`.
+
+Three further defects behind that one, fixed in the same pass:
+`PendingDrafts` was an in-memory map, so every restart or deploy silently
+dropped every pending draft the owner had been notified about — now the
+`reply_drafts` table (`0049_reply_drafts.sql`), which also removed the need
+for its mutex since Postgres serializes the concurrent access.
+`convertNewMessage` never populated `chat_title`, so draft notifications
+named chats by raw numeric id — now filled from the `updateNewChat` cache
+(no extra round trip on the poll loop). And the autonomy path read
+`/persona`'s `system_prompt` override, which quietly made ghostwritten
+replies sound like a configured bot persona — exactly what
+`default_reply_as_owner_prompt` exists to prevent — so it now has its own
+`chat_settings.reply_autonomy_prompt` (`/autonomy <chat id> prompt`, and
+the web UI's per-chat card).
+
+Also shipped here, and the part the owner actually asked for: a `.draft`
+reply is now written **into the chat's real Telegram composer** via TDLib
+`setChatDraftMessage`, so opening that conversation on any device shows the
+AI text already typed. Telegram syncs drafts across the account's own
+devices, so this reaches the phone where the message is actually read.
+Prefill deliberately overwrites whatever was in the composer (the draft
+should definitely be there) but never silently: the replaced text is read
+first via `getChat`, stored on the draft row, quoted back in the
+notification, and shown on the drafts page. Approve and Discard both clear
+the composer, so an acted-on draft can't sit there waiting to be sent a
+second time. No Matrix/XMPP counterpart is possible or planned — neither
+protocol has a server-side draft concept, and both are bot connectors where
+ghostwriting-as-the-owner doesn't apply in the first place.
+
+**Bug sweep, 2026-09-03/04** (owner-reported list, bugs first). Five
+defects, three of which failed silently — the recurring theme being a
+feature gated on an optional dependency or a fallback path nobody looked
+at:
+
+- **Long-term memory never stored anything.** `main.zig` only wired the
+  `MemorySink` when an embeddings client existed, so with no
+  `WARDEN_EMBEDDINGS_URL` the `remember_memory` tool was never registered:
+  the model would agree to remember something, call nothing, and the fact
+  was gone. `/memory list` and the memory page were empty and correct —
+  there was nothing to show. `facts.embedding` being `NOT NULL` would have
+  blocked the insert anyway. Embeddings are now optional end to end
+  (`0050_optional_embeddings.sql`): `remember` takes `?[]const f32`, the
+  hybrid score COALESCEs its similarity term to 0 for a row or query
+  without a vector (ordering is unaffected — a constant dropped from every
+  row), `context_assembly` ranks with a null vector instead of skipping
+  stable/tentative facts entirely, and startup logs which mode it's in. A
+  configured-but-failing endpoint now degrades to storing without a vector
+  rather than losing the fact. Note this was *never* a regression from the
+  0048 memory rebuild: the pre-rebuild `memories.remember` required a
+  vector too, so memory had never worked on a deployment without one.
+- **One failed model call ended the request.** During a provider's busy
+  hours that turned routine blips into "Sorry, I couldn't reach the model
+  just now". `toolcall.callProviderWithRetry` now retries with exponential
+  backoff (1s/2s/4s), `WARDEN_LLM_MAX_RETRIES` (default 3, clamped 0-10)
+  configurable statically or as a dynamic-config key. Retried *per model
+  call*, deliberately not around `run` as a whole: the conversation may be
+  several turns deep with tools already executed, and replaying that would
+  re-send messages and re-charge expenses. Only transport/congestion
+  failures are retryable — a malformed request or bad key fails once.
+- **Duplicate tool lines in the progress tree.** `tool_history` appended
+  every `.tool_use` unconditionally, so a model re-issuing a call stacked
+  identical `Using web_search` lines. `Progress.Event.tool_use` now carries
+  a fingerprint of the call's arguments (`hashToolInput`), and the renderer
+  collapses a repeat with *different* arguments into `(xN)` while ignoring
+  an identical repeat outright. Only the most recent entry is considered,
+  so alternating tools still read in call order.
+- **Chain-of-thought lost its formatting.** The 💭 expandable blockquote
+  only ever existed inside `markdown_html.toHtml`. Telegram's send path
+  tries HTML and falls back to *plain text* whenever the API rejects it —
+  and that fallback passed the `\x02`/`\x03` marker control bytes straight
+  through, so the thinking arrived as ordinary unquoted prose with the 💭
+  missing, looking exactly like the feature had been removed. Matrix and
+  XMPP did the same thing on every message, having never handled the
+  markers at all. New `llm.renderThinkingPlain` renders a span as a `💭 …`
+  paragraph and is now used by all three. Still outstanding, and a missing
+  *feature* rather than this regression: `llm/anthropic.zig` has no
+  thinking support whatsoever (no `thinking` request block, no parsing),
+  so `show_thinking` is inert on the Anthropic provider.
+- **Chats displayed by raw id.** `chats.title` was simply never populated
+  for two whole categories. Telegram's `types.Chat` only modelled `title`,
+  which the Bot API sets for groups/supergroups/channels and *never* for a
+  private chat — so every 1:1 fell back to its numeric id. Added
+  `first_name`/`last_name` and a `Chat.displayTitle` (title, else the
+  person's name, else `@username`) used at all four message-construction
+  sites. The Matrix connector set `chat_title` on nothing at all; it now
+  reads `m.room.name` through a new `client.roomName`, cached per room
+  including negative results since an unnamed DM would otherwise re-ask on
+  every message. Existing rows self-heal on the next message per chat
+  (`upsertChat` COALESCEs a null title over the stored one).
+
+**Curated feed, 2026-09-04** (owner request: "read any channel I have
+access to, filter and summarise it against a natural-language policy, and
+forward the result to a main feed channel"). `store/feed.zig` +
+`features/curated_feed.zig` + `0051_curated_feed.sql`, with `/feed`, a web
+page and the `curated_feed` feature flag.
+
+Four design decisions worth recording, since each rules out an obvious
+alternative:
+
+- **Sources are opt-in**, not "every channel the account follows". Reading
+  everything makes the model bill a function of how many channels the owner
+  happens to be in, and one noisy channel they had forgotten about would
+  quietly dominate it. `/feed add` names them; `/tdchats`'s own resolver is
+  reused so a channel can be named rather than looked up as an id.
+- **Two-stage filtering.** Every new post gets a one-word YES/NO relevance
+  check against the policy; only survivors pay for a summarisation call. A
+  single combined call would mean paying full summary cost for every post
+  including the discarded majority, which is what would make the feature
+  unaffordable at any real source count. Anything that isn't a clear YES is
+  treated as NO -- an unparseable answer must not smuggle an off-policy
+  post into the feed.
+- **Posts are pulled, not ingested.** `telegram_user.fetchRecentPosts`
+  (`getChatHistory`) is called per source per pass, rather than recording
+  every post of every followed channel into `messages` and querying that.
+  Recording would have meant a firehose in the message store for storage
+  sense to prune, in order to summarise a handful of posts. TDLib has no
+  "since id" form, so a per-source watermark turns "the newest N" into
+  "what is new"; `setWatermark` is `GREATEST`, never assignment, so an
+  overlapping slow pass cannot rewind and replay already-summarised posts.
+- **Inert until fully configured.** `Settings.isRunnable` requires enabled
+  *and* a target *and* a policy. A feed with no policy would mean "forward
+  everything", the opposite of the point, so there is deliberately no
+  default. Both the command and the web page say "enabled but not running"
+  rather than letting that look like a working feed that happens to be
+  quiet. A newly added source is caught up silently (watermark jumps to
+  newest, nothing emitted), so adding a channel never dumps its backlog.
+
+Per-pass ceilings (`posts_per_source`, `max_summaries_per_pass`,
+`max_post_chars`) bound what one tick can cost; overflow stays behind the
+watermark for the next pass rather than being dropped.
+
+
 **Also unplanned, shipped outside the phase sequence** (direct user
 request, 2026-08-18): `/tdsummary <chat id or name>` and its natural-
 language counterpart, the `summarize_unread_chat` tool — on-demand "what

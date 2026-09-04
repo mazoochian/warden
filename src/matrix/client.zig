@@ -315,6 +315,37 @@ pub const Client = struct {
         return true;
     }
 
+    /// `m.room.name` for `room_id`, or `null` when the room has none set
+    /// (a 1:1 DM usually doesn't) or the server refuses the read. Same
+    /// state-endpoint shape as `isRoomEncrypted` above.
+    ///
+    /// Callers must cache: this is a real HTTP round trip, and it exists so
+    /// a Matrix room can be shown by name instead of by raw `!abc:server`
+    /// id — see `matrix.zig`'s `roomTitle`.
+    pub fn roomName(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) !?[]const u8 {
+        const encoded_room = try encodeSegment(allocator, room_id);
+        defer allocator.free(encoded_room);
+        const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/rooms/{s}/state/m.room.name", .{ self.homeserver_url, encoded_room });
+        defer allocator.free(url);
+
+        const auth = try self.authHeader(allocator);
+        defer allocator.free(auth.value);
+        const body = http_util.getWithHeaders(&self.http_client, allocator, url, &.{auth}) catch |err| {
+            // A room with no name set answers 404, which is a normal
+            // outcome here, not a failure worth propagating.
+            if (err == error.HttpRequestFailed) return null;
+            return err;
+        };
+        defer allocator.free(body);
+
+        const Body = struct { name: ?[]const u8 = null };
+        const parsed = json.parseFromSlice(Body, allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+        defer parsed.deinit();
+        const name = parsed.value.name orelse return null;
+        if (name.len == 0) return null;
+        return try allocator.dupe(u8, name);
+    }
+
     /// Currently-joined member user ids for `room_id` — needed to know
     /// whose devices a freshly-created (or expanding) outbound Megolm
     /// session's key must be shared with. A dedicated GET rather than
