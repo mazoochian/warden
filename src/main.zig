@@ -10027,29 +10027,44 @@ const TreeEntry = union(enum) {
 fn toolEmoji(name: []const u8) []const u8 {
     const table = .{
         // Reaching out to the network
-        .{ "web_search", "🌐" },       .{ "scrape_site", "🪒" },
-        .{ "fetch_url", "🔗" },        .{ "hackernews_search", "📰" },
+        .{ "web_search", "🌐" },
+        .{ "scrape_site", "🪒" },
+        .{ "fetch_url", "🔗" },
+        .{ "hackernews_search", "📰" },
         // Asking another model
-        .{ "ask_delegate", "🧠" },     .{ "delegate_generate_image", "🎨" },
+        .{ "ask_delegate", "🧠" },
+        .{ "delegate_generate_image", "🎨" },
         // Reference lookups
-        .{ "dictionary", "📖" },       .{ "urban_dictionary", "🗣" },
-        .{ "calculator", "🧮" },       .{ "currency_convert", "💱" },
-        .{ "crypto_price", "🪙" },     .{ "weather", "🌦" },
+        .{ "dictionary", "📖" },
+        .{ "urban_dictionary", "🗣" },
+        .{ "calculator", "🧮" },
+        .{ "currency_convert", "💱" },
+        .{ "crypto_price", "🪙" },
+        .{ "weather", "🌦" },
         .{ "air_quality", "🌫" },
         // Producing something
-        .{ "qr_code", "🔳" },          .{ "draw_diagram", "📐" },
-        .{ "word_cloud", "☁️" },        .{ "create_poll", "📊" },
-        .{ "convert_file", "🔁" },     .{ "begin_file_conversion", "🔁" },
+        .{ "qr_code", "🔳" },
+        .{ "draw_diagram", "📐" },
+        .{ "word_cloud", "☁️" },
+        .{ "create_poll", "📊" },
+        .{ "convert_file", "🔁" },
+        .{ "begin_file_conversion", "🔁" },
         // Remembering / recalling
-        .{ "remember_memory", "🧷" },  .{ "set_note", "📝" },
-        .{ "catch_me_up", "📚" },      .{ "get_bulletin", "🗞" },
+        .{ "remember_memory", "🧷" },
+        .{ "set_note", "📝" },
+        .{ "catch_me_up", "📚" },
+        .{ "get_bulletin", "🗞" },
         // Scheduling and watching
-        .{ "set_reminder", "⏰" },     .{ "set_alert", "🔔" },
+        .{ "set_reminder", "⏰" },
+        .{ "set_alert", "🔔" },
         .{ "set_expense", "💰" },
         // The personal account
-        .{ "list_personal_chats", "👥" },     .{ "send_personal_message", "✉️" },
-        .{ "reply_to_message", "↩️" },        .{ "summarize_unread_chat", "📬" },
-        .{ "set_chat_monitoring", "👀" },     .{ "set_default_chat_monitoring", "👀" },
+        .{ "list_personal_chats", "👥" },
+        .{ "send_personal_message", "✉️" },
+        .{ "reply_to_message", "↩️" },
+        .{ "summarize_unread_chat", "📬" },
+        .{ "set_chat_monitoring", "👀" },
+        .{ "set_default_chat_monitoring", "👀" },
         .{ "find_chat_member", "🔎" },
     };
     inline for (table) |entry| {
