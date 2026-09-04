@@ -2365,6 +2365,34 @@ pub const Route = enum {
     ignored,
 };
 
+/// Warden's own Bot API user id, parsed out of the `<user id>:<secret>`
+/// shape every Telegram bot token has. Used to recognize the personal
+/// account's DM with Warden itself (see `routeIncoming`).
+///
+/// Derived from the token rather than read from `Connector.selfId()`
+/// deliberately: `selfId` is populated by `getMe`, so it's `null` until
+/// that first call resolves and stays `null` if it ever fails -- and this
+/// check has to fail *closed* (treat the chat as the bot's own and stay
+/// out of it) exactly when identity is unknown, because failing open is
+/// the self-drafting loop. The token is present from startup, needs no
+/// network, and its prefix is the same id `getMe` would return.
+pub fn telegramBotUserId(token: []const u8) ?i64 {
+    const colon = std.mem.indexOfScalar(u8, token, ':') orelse return null;
+    return std.fmt.parseInt(i64, token[0..colon], 10) catch null;
+}
+
+test "telegramBotUserId: parses the id prefix, rejects anything malformed" {
+    try std.testing.expectEqual(@as(?i64, 8807952951), telegramBotUserId("8807952951:AAHreal-looking-secret"));
+    try std.testing.expectEqual(@as(?i64, 123), telegramBotUserId("123:x"));
+    // No colon, empty id, and a non-numeric id all have to come back null
+    // rather than a wrong number -- a wrong id here would silently stop
+    // guarding the real self-DM while blocking some innocent chat instead.
+    try std.testing.expectEqual(@as(?i64, null), telegramBotUserId("no-colon-here"));
+    try std.testing.expectEqual(@as(?i64, null), telegramBotUserId(":secret"));
+    try std.testing.expectEqual(@as(?i64, null), telegramBotUserId("notanumber:secret"));
+    try std.testing.expectEqual(@as(?i64, null), telegramBotUserId(""));
+}
+
 /// The single decision about how far an incoming message gets, extracted
 /// from `handleMessage` so it can actually be tested — the bug it encodes
 /// the fix for was invisible precisely because it lived inline in a
@@ -2390,6 +2418,22 @@ pub const Route = enum {
 ///     stored and read back fine and then never once fired. Fixed
 ///     2026-09-03.
 ///
+///   * **It never manages Warden's own DM with the owner.** The personal
+///     account has a direct chat with Warden's Bot API account like any
+///     other contact, and `convertNewMessage`'s "drop our own outgoing
+///     messages" rule doesn't help here: in *that* chat the bot is the
+///     other party, so every draft notification the bot posts arrives back
+///     as an ordinary inbound message. With autonomy on, drafting a reply
+///     to it produced another notification, which arrived as another
+///     inbound message, and so on -- the bot drafting at itself in a loop,
+///     each round burning an LLM call. Observed in production 2026-09-04
+///     ("I can see there's a recursive loop happening in this chat
+///     history", drafted into chat 8807952951, which is the bot's own id).
+///     Identified by id rather than by title or username: `chat_title` is
+///     whatever the owner renamed the chat to, and a username can change,
+///     but the numeric id can't -- the same "compare the numeric id, never
+///     the username" rule `auth.isOwner` already follows.
+///
 /// Skipping the allowlist is safe here and only here, because
 /// `reply_autonomy` is its own deliberate opt-in and is fail-closed (`.off`
 /// resolves until the owner turns a chat on). That is emphatically not true
@@ -2403,8 +2447,12 @@ pub fn routeIncoming(
     is_owner: bool,
     is_bot_admin: bool,
     allowlisted: bool,
+    is_own_bot_dm: bool,
 ) Route {
-    if (platform == .telegram_user) return .personal_account_autonomy;
+    if (platform == .telegram_user) {
+        if (is_own_bot_dm) return .ignored;
+        return .personal_account_autonomy;
+    }
     if (is_owner or is_bot_admin or allowlisted) return .command_and_qa;
     return .ignored;
 }
@@ -2417,7 +2465,7 @@ test "routeIncoming: a personal-account message reaches autonomy even though not
     // is what made draft/auto mode silently do nothing.
     try std.testing.expectEqual(
         Route.personal_account_autonomy,
-        routeIncoming(.telegram_user, false, false, false),
+        routeIncoming(.telegram_user, false, false, false, false),
     );
 }
 
@@ -2431,7 +2479,7 @@ test "routeIncoming: a personal-account message is never dispatched as a command
             for ([_]bool{ false, true }) |allowlisted| {
                 try std.testing.expectEqual(
                     Route.personal_account_autonomy,
-                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted),
+                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted, false),
                 );
             }
         }
@@ -2444,10 +2492,44 @@ test "routeIncoming: bot connectors keep the allowlist gate exactly as it was" {
     // carve-out must not have loosened this for anyone else -- Instagram
     // especially, since it has no reply_autonomy path of its own.
     for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, true, false));
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, true, false));
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, true));
-        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, true, false, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, true, false, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, true, false));
+        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false, false));
+    }
+}
+
+test "routeIncoming: the personal account's DM with Warden's own bot is left alone" {
+    // The production loop: with autonomy on, the bot drafted a reply to its
+    // own draft notification, whose delivery produced another notification.
+    // Every other flag is the same as a normal inbound personal-account DM
+    // -- only is_own_bot_dm separates the two -- so this must be decided on
+    // that alone.
+    try std.testing.expectEqual(
+        Route.ignored,
+        routeIncoming(.telegram_user, false, false, false, true),
+    );
+    // Whatever else the message looks like.
+    for ([_]bool{ false, true }) |is_owner| {
+        for ([_]bool{ false, true }) |is_bot_admin| {
+            for ([_]bool{ false, true }) |allowlisted| {
+                try std.testing.expectEqual(
+                    Route.ignored,
+                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted, true),
+                );
+            }
+        }
+    }
+}
+
+test "routeIncoming: the self-DM carve-out is scoped to the personal account" {
+    // is_own_bot_dm is only ever computed for `.telegram_user`, but it must
+    // not change any other platform's routing even if it were set -- the
+    // owner talking to the bot in that same DM arrives on the `telegram`
+    // bot connector and has to keep working exactly as before.
+    for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, false, false, true));
+        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false, true));
     }
 }
 
@@ -2537,6 +2619,13 @@ fn handleMessage(
     // never even pay for the `bot_admins` query.
     const is_bot_admin = is_owner or bot_admins.isBotAdmin(pool, identity_id);
     const platform = connector.platform();
+    // Warden's own DM with the owner, seen from the personal account. Not a
+    // chat to be managed -- see `routeIncoming`'s doc comment for the
+    // self-drafting loop this prevents.
+    const is_own_bot_dm = platform == .telegram_user and blk: {
+        const bot_id = telegramBotUserId(config.telegram_bot_token) orelse break :blk false;
+        break :blk chat_id == bot_id;
+    };
     switch (routeIncoming(
         platform,
         is_owner,
@@ -2548,6 +2637,7 @@ fn handleMessage(
         // argument entirely.
         platform != .telegram_user and !is_owner and !is_bot_admin and
             (bot_allowlist.isUserAllowed(pool, identity_id) or bot_allowlist.isChatAllowed(pool, chat_id)),
+        is_own_bot_dm,
     )) {
         .ignored => return false,
         .personal_account_autonomy => {

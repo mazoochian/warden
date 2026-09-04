@@ -24,7 +24,19 @@ fn truncateAll(db: *Db) !void {
         \\  bot_admins, bot_allowed_users, bot_allowed_chats, bot_pending_grants,
         \\  accounts, oauth_providers, management_room_bindings, notes,
         \\  facts, fact_tombstones, daily_digests, period_rollups, retrieval_log,
-        \\  instagram_sessions, instagram_thread_watermarks, reply_drafts, feed_sources
+        \\  instagram_sessions, instagram_thread_watermarks, reply_drafts, feed_sources,
+        \\  feed_settings
         \\  RESTART IDENTITY CASCADE;
     );
+    // `feed_settings` holds a single seeded row (id = 1) rather than a row
+    // per anything, so truncating it alone doesn't restore the
+    // post-migration state -- it leaves the table empty, and every writer
+    // is an `UPDATE ... WHERE id = 1` that would then silently no-op.
+    // Re-seed it exactly as `0051_curated_feed.sql` does.
+    //
+    // Leaving the table out of the TRUNCATE entirely was the original bug:
+    // `enabled`/`target`/`policy` set by one test leaked into the next, so
+    // "settings default to inert" passed or failed purely on the order the
+    // runner's seed happened to pick.
+    try db.exec("INSERT INTO feed_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;");
 }

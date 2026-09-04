@@ -222,7 +222,13 @@ pub fn renderDigest(allocator: std.mem.Allocator, items: []const Item) ![]const 
         }
         try w.print("  • {s}\n", .{item.summary});
     }
-    return out.written();
+    // `toOwnedSlice`, not `written()`: `written()` is a borrowed view of
+    // just the filled part of the writer's buffer, so the caller ends up
+    // freeing a 146-byte slice of a 180-byte allocation -- a size mismatch
+    // the DebugAllocator rejects outright. The `errdefer out.deinit()`
+    // above already says this function hands ownership to the caller on
+    // success, so it has to actually transfer it.
+    return out.toOwnedSlice();
 }
 
 /// UTF-8-boundary-safe truncation, so a post cut at `max` never ends
