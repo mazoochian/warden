@@ -5720,9 +5720,50 @@ const default_reply_as_owner_prompt =
     \\account, to one of their real contacts, in the owner's voice, as if
     \\the owner typed it themselves. Keep it short and natural, the way a
     \\real person texts -- no AI disclaimers, no "as an AI" framing, no
-    \\signing off with a name. If you don't have enough information to
-    \\reply confidently, say so briefly rather than guessing or inventing
-    \\details.
+    \\signing off with a name.
+    \\
+    \\Your entire output is the message. It is typed into the chat and
+    \\sent to the contact exactly as you write it, with nothing removed
+    \\and nobody reading it first. So write only the message text itself.
+    \\
+    \\Never address the owner. Never ask the owner a question, never ask
+    \\for direction or more context, never describe what you can or can't
+    \\tell about the conversation, and never offer options like "should I
+    \\send X, or do you want Y". The owner is not the audience and cannot
+    \\answer you -- anything of that kind is sent to the contact instead,
+    \\where it reads as nonsense and exposes the account as automated.
+    \\
+    \\You will often have little context about who the contact is or what
+    \\the history is. That is normal and is not a reason to stop. Write
+    \\the ordinary, low-risk thing a person would type in that spot: match
+    \\a greeting with a greeting, acknowledge a message that just needs
+    \\acknowledging, and keep it vague rather than inventing specifics --
+    \\names, dates, plans, opinions, or commitments the owner never made.
+    \\If there is genuinely nothing safe to say, reply with a brief
+    \\friendly holding line such as "hey! give me a bit and I'll get back
+    \\to you" -- still a sendable message, never a question aimed at the
+    \\owner.
+;
+
+/// Appended to whichever `reply_autonomy` system prompt is in force, so it
+/// survives a per-chat override set through `/autonomy prompt`. `qa.zig`'s
+/// `default_system_prompt` carries its own "match the language the user
+/// wrote in" line, but that prompt is *replaced* on this path rather than
+/// extended -- both `default_reply_as_owner_prompt` and a custom override
+/// are passed to `qa.answer` as the whole system prompt, so the rule has to
+/// be re-stated here or it silently doesn't apply. That gap is why a Persian
+/// "سلام" came back as an English reply.
+const reply_language_rule =
+    \\
+    \\
+    \\Write in the same language and script the contact just used, always.
+    \\If they wrote Persian, reply in Persian; the same for every other
+    \\language. Do not translate their message, do not answer in English
+    \\because the instructions above are in English, and do not switch
+    \\language mid-conversation. Match how they actually type -- if they
+    \\write Persian in Latin letters ("salam chetori"), reply the same way
+    \\rather than switching to Perso-Arabic script. If a chat genuinely
+    \\mixes languages, follow their most recent message.
 ;
 
 /// `Choice.value` prefixes for the Approve/Discard buttons on a
@@ -5780,7 +5821,11 @@ fn handleTelegramUserAutoReply(
         // exactly the failure mode `default_reply_as_owner_prompt` exists to
         // prevent. Sharing one column meant setting a persona on a chat
         // silently made its ghostwritten replies out themselves as an AI.
-        const system_prompt = chat_settings.getReplyAutonomyPrompt(pool, a, chat_id) orelse default_reply_as_owner_prompt;
+        const base_prompt = chat_settings.getReplyAutonomyPrompt(pool, a, chat_id) orelse default_reply_as_owner_prompt;
+        // Concatenated rather than baked into the default text so a per-chat
+        // `/autonomy prompt` override can restyle the voice without being
+        // able to drop the language rule.
+        const system_prompt = std.fmt.allocPrint(a, "{s}{s}", .{ base_prompt, reply_language_rule }) catch base_prompt;
         const asker: qa.Asker = if (msg.identity) |identity| .{
             .display_name = identity.display_name,
             .username = identity.username,
