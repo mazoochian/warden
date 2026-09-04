@@ -2365,6 +2365,83 @@ pub const Route = enum {
     ignored,
 };
 
+/// Warden's own Bot API user id, parsed out of the `<user id>:<secret>`
+/// shape every Telegram bot token has. Used to recognize the personal
+/// account's DM with Warden itself (see `routeIncoming`).
+///
+/// Derived from the token rather than read from `Connector.selfId()`
+/// deliberately: `selfId` is populated by `getMe`, so it's `null` until
+/// that first call resolves and stays `null` if it ever fails -- and this
+/// check has to fail *closed* (treat the chat as the bot's own and stay
+/// out of it) exactly when identity is unknown, because failing open is
+/// the self-drafting loop. The token is present from startup, needs no
+/// network, and its prefix is the same id `getMe` would return.
+pub fn telegramBotUserId(token: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, token, ':') orelse return null;
+    const id = token[0..colon];
+    if (id.len == 0) return null;
+    for (id) |c| if (!std.ascii.isDigit(c)) return null;
+    return id;
+}
+
+/// Whether `native_chat_id` is Warden's own DM with the owner, seen from
+/// the personal account. A Telegram private chat's id *is* the peer's user
+/// id, so the bot's own DM is the chat whose native id equals the bot's.
+///
+/// Takes the **native** chat id -- the `chat_id` field of `iface.Message`,
+/// not `handleMessage`'s `chat_id` parameter. Those are two different
+/// numbers: the parameter is the internal `chats` row id, the native one is
+/// what Telegram calls the chat. The first version of this check compared
+/// the row id against the bot's user id, which are never equal, so the
+/// guard silently never fired and the self-drafting loop carried on through
+/// a deploy. Hence a named function with its own tests over the real ids
+/// rather than two lines inlined at the call site.
+pub fn isOwnBotDm(platform: iface.Platform, native_chat_id: []const u8, bot_token: []const u8) bool {
+    if (platform != .telegram_user) return false;
+    const bot_id = telegramBotUserId(bot_token) orelse return false;
+    return std.mem.eql(u8, native_chat_id, bot_id);
+}
+
+test "telegramBotUserId: parses the id prefix, rejects anything malformed" {
+    try std.testing.expectEqualStrings("8807952951", telegramBotUserId("8807952951:AAHreal-looking-secret").?);
+    try std.testing.expectEqualStrings("123", telegramBotUserId("123:x").?);
+    // No colon, empty id, and a non-numeric id all have to come back null
+    // rather than a wrong id -- a wrong one here would stop guarding the
+    // real self-DM while blocking some innocent chat instead.
+    try std.testing.expect(telegramBotUserId("no-colon-here") == null);
+    try std.testing.expect(telegramBotUserId(":secret") == null);
+    try std.testing.expect(telegramBotUserId("notanumber:secret") == null);
+    try std.testing.expect(telegramBotUserId("") == null);
+}
+
+test "isOwnBotDm: matches the bot's own DM by its native chat id" {
+    // The real ids from the production loop: the bot is 8807952951, and its
+    // DM with the owner is the chat with that same native id.
+    const token = "8807952951:AAHreal-looking-secret";
+    try std.testing.expect(isOwnBotDm(.telegram_user, "8807952951", token));
+
+    // A group and another contact's DM must be untouched.
+    try std.testing.expect(!isOwnBotDm(.telegram_user, "-1003974181733", token));
+    try std.testing.expect(!isOwnBotDm(.telegram_user, "101573604", token));
+
+    // The regression that shipped: `handleMessage`'s `chat_id` parameter is
+    // the internal `chats` row id, a small integer nothing like the bot's
+    // user id. Passing one of those must not match -- and equally must not
+    // accidentally match some other chat's row id.
+    try std.testing.expect(!isOwnBotDm(.telegram_user, "7", token));
+    try std.testing.expect(!isOwnBotDm(.telegram_user, "1", token));
+
+    // Only the personal-account connector: the owner talking to the bot in
+    // that same DM arrives on the `telegram` bot connector and must keep
+    // working normally.
+    try std.testing.expect(!isOwnBotDm(.telegram, "8807952951", token));
+    try std.testing.expect(!isOwnBotDm(.instagram, "8807952951", token));
+
+    // A malformed token must fail closed for the *bot's* chat only by way
+    // of returning false everywhere -- there is no id to compare against.
+    try std.testing.expect(!isOwnBotDm(.telegram_user, "8807952951", "malformed-token"));
+}
+
 /// The single decision about how far an incoming message gets, extracted
 /// from `handleMessage` so it can actually be tested — the bug it encodes
 /// the fix for was invisible precisely because it lived inline in a
@@ -2390,6 +2467,22 @@ pub const Route = enum {
 ///     stored and read back fine and then never once fired. Fixed
 ///     2026-09-03.
 ///
+///   * **It never manages Warden's own DM with the owner.** The personal
+///     account has a direct chat with Warden's Bot API account like any
+///     other contact, and `convertNewMessage`'s "drop our own outgoing
+///     messages" rule doesn't help here: in *that* chat the bot is the
+///     other party, so every draft notification the bot posts arrives back
+///     as an ordinary inbound message. With autonomy on, drafting a reply
+///     to it produced another notification, which arrived as another
+///     inbound message, and so on -- the bot drafting at itself in a loop,
+///     each round burning an LLM call. Observed in production 2026-09-04
+///     ("I can see there's a recursive loop happening in this chat
+///     history", drafted into chat 8807952951, which is the bot's own id).
+///     Identified by id rather than by title or username: `chat_title` is
+///     whatever the owner renamed the chat to, and a username can change,
+///     but the numeric id can't -- the same "compare the numeric id, never
+///     the username" rule `auth.isOwner` already follows.
+///
 /// Skipping the allowlist is safe here and only here, because
 /// `reply_autonomy` is its own deliberate opt-in and is fail-closed (`.off`
 /// resolves until the owner turns a chat on). That is emphatically not true
@@ -2403,8 +2496,12 @@ pub fn routeIncoming(
     is_owner: bool,
     is_bot_admin: bool,
     allowlisted: bool,
+    is_own_bot_dm: bool,
 ) Route {
-    if (platform == .telegram_user) return .personal_account_autonomy;
+    if (platform == .telegram_user) {
+        if (is_own_bot_dm) return .ignored;
+        return .personal_account_autonomy;
+    }
     if (is_owner or is_bot_admin or allowlisted) return .command_and_qa;
     return .ignored;
 }
@@ -2417,7 +2514,7 @@ test "routeIncoming: a personal-account message reaches autonomy even though not
     // is what made draft/auto mode silently do nothing.
     try std.testing.expectEqual(
         Route.personal_account_autonomy,
-        routeIncoming(.telegram_user, false, false, false),
+        routeIncoming(.telegram_user, false, false, false, false),
     );
 }
 
@@ -2431,7 +2528,7 @@ test "routeIncoming: a personal-account message is never dispatched as a command
             for ([_]bool{ false, true }) |allowlisted| {
                 try std.testing.expectEqual(
                     Route.personal_account_autonomy,
-                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted),
+                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted, false),
                 );
             }
         }
@@ -2444,10 +2541,44 @@ test "routeIncoming: bot connectors keep the allowlist gate exactly as it was" {
     // carve-out must not have loosened this for anyone else -- Instagram
     // especially, since it has no reply_autonomy path of its own.
     for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, true, false));
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, true, false));
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, true));
-        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, true, false, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, true, false, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, true, false));
+        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false, false));
+    }
+}
+
+test "routeIncoming: the personal account's DM with Warden's own bot is left alone" {
+    // The production loop: with autonomy on, the bot drafted a reply to its
+    // own draft notification, whose delivery produced another notification.
+    // Every other flag is the same as a normal inbound personal-account DM
+    // -- only is_own_bot_dm separates the two -- so this must be decided on
+    // that alone.
+    try std.testing.expectEqual(
+        Route.ignored,
+        routeIncoming(.telegram_user, false, false, false, true),
+    );
+    // Whatever else the message looks like.
+    for ([_]bool{ false, true }) |is_owner| {
+        for ([_]bool{ false, true }) |is_bot_admin| {
+            for ([_]bool{ false, true }) |allowlisted| {
+                try std.testing.expectEqual(
+                    Route.ignored,
+                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted, true),
+                );
+            }
+        }
+    }
+}
+
+test "routeIncoming: the self-DM carve-out is scoped to the personal account" {
+    // is_own_bot_dm is only ever computed for `.telegram_user`, but it must
+    // not change any other platform's routing even if it were set -- the
+    // owner talking to the bot in that same DM arrives on the `telegram`
+    // bot connector and has to keep working exactly as before.
+    for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, false, false, true));
+        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false, true));
     }
 }
 
@@ -2537,6 +2668,10 @@ fn handleMessage(
     // never even pay for the `bot_admins` query.
     const is_bot_admin = is_owner or bot_admins.isBotAdmin(pool, identity_id);
     const platform = connector.platform();
+    // Warden's own DM with the owner, seen from the personal account. Not a
+    // chat to be managed -- see `routeIncoming`'s doc comment for the
+    // self-drafting loop this prevents.
+    const is_own_bot_dm = isOwnBotDm(platform, msg.chat_id, config.telegram_bot_token);
     switch (routeIncoming(
         platform,
         is_owner,
@@ -2548,6 +2683,7 @@ fn handleMessage(
         // argument entirely.
         platform != .telegram_user and !is_owner and !is_bot_admin and
             (bot_allowlist.isUserAllowed(pool, identity_id) or bot_allowlist.isChatAllowed(pool, chat_id)),
+        is_own_bot_dm,
     )) {
         .ignored => return false,
         .personal_account_autonomy => {
@@ -5584,9 +5720,50 @@ const default_reply_as_owner_prompt =
     \\account, to one of their real contacts, in the owner's voice, as if
     \\the owner typed it themselves. Keep it short and natural, the way a
     \\real person texts -- no AI disclaimers, no "as an AI" framing, no
-    \\signing off with a name. If you don't have enough information to
-    \\reply confidently, say so briefly rather than guessing or inventing
-    \\details.
+    \\signing off with a name.
+    \\
+    \\Your entire output is the message. It is typed into the chat and
+    \\sent to the contact exactly as you write it, with nothing removed
+    \\and nobody reading it first. So write only the message text itself.
+    \\
+    \\Never address the owner. Never ask the owner a question, never ask
+    \\for direction or more context, never describe what you can or can't
+    \\tell about the conversation, and never offer options like "should I
+    \\send X, or do you want Y". The owner is not the audience and cannot
+    \\answer you -- anything of that kind is sent to the contact instead,
+    \\where it reads as nonsense and exposes the account as automated.
+    \\
+    \\You will often have little context about who the contact is or what
+    \\the history is. That is normal and is not a reason to stop. Write
+    \\the ordinary, low-risk thing a person would type in that spot: match
+    \\a greeting with a greeting, acknowledge a message that just needs
+    \\acknowledging, and keep it vague rather than inventing specifics --
+    \\names, dates, plans, opinions, or commitments the owner never made.
+    \\If there is genuinely nothing safe to say, reply with a brief
+    \\friendly holding line such as "hey! give me a bit and I'll get back
+    \\to you" -- still a sendable message, never a question aimed at the
+    \\owner.
+;
+
+/// Appended to whichever `reply_autonomy` system prompt is in force, so it
+/// survives a per-chat override set through `/autonomy prompt`. `qa.zig`'s
+/// `default_system_prompt` carries its own "match the language the user
+/// wrote in" line, but that prompt is *replaced* on this path rather than
+/// extended -- both `default_reply_as_owner_prompt` and a custom override
+/// are passed to `qa.answer` as the whole system prompt, so the rule has to
+/// be re-stated here or it silently doesn't apply. That gap is why a Persian
+/// "سلام" came back as an English reply.
+const reply_language_rule =
+    \\
+    \\
+    \\Write in the same language and script the contact just used, always.
+    \\If they wrote Persian, reply in Persian; the same for every other
+    \\language. Do not translate their message, do not answer in English
+    \\because the instructions above are in English, and do not switch
+    \\language mid-conversation. Match how they actually type -- if they
+    \\write Persian in Latin letters ("salam chetori"), reply the same way
+    \\rather than switching to Perso-Arabic script. If a chat genuinely
+    \\mixes languages, follow their most recent message.
 ;
 
 /// `Choice.value` prefixes for the Approve/Discard buttons on a
@@ -5644,7 +5821,11 @@ fn handleTelegramUserAutoReply(
         // exactly the failure mode `default_reply_as_owner_prompt` exists to
         // prevent. Sharing one column meant setting a persona on a chat
         // silently made its ghostwritten replies out themselves as an AI.
-        const system_prompt = chat_settings.getReplyAutonomyPrompt(pool, a, chat_id) orelse default_reply_as_owner_prompt;
+        const base_prompt = chat_settings.getReplyAutonomyPrompt(pool, a, chat_id) orelse default_reply_as_owner_prompt;
+        // Concatenated rather than baked into the default text so a per-chat
+        // `/autonomy prompt` override can restyle the voice without being
+        // able to drop the language rule.
+        const system_prompt = std.fmt.allocPrint(a, "{s}{s}", .{ base_prompt, reply_language_rule }) catch base_prompt;
         const asker: qa.Asker = if (msg.identity) |identity| .{
             .display_name = identity.display_name,
             .username = identity.username,
