@@ -72,6 +72,8 @@ const video_download = @import("features/video_download.zig");
 const storage_sense = @import("features/storage_sense.zig");
 const convert_flow = @import("features/convert_flow.zig");
 const reply_drafts = @import("features/reply_drafts.zig");
+const curated_feed = @import("features/curated_feed.zig");
+const feed_store = @import("store/feed.zig");
 const llm = @import("llm/provider.zig");
 const AnthropicProvider = @import("llm/anthropic.zig").AnthropicProvider;
 const OpenAiCompatProvider = @import("llm/openai_compat.zig").OpenAiCompatProvider;
@@ -214,7 +216,7 @@ const public_commands = [_]iface.CommandSpec{
 const reserved_command_names_extra = [_][]const u8{
     "token",     "credit",       "scraper",  "adduser",     "removeuser",
     "allowchat", "disallowchat", "addadmin", "removeadmin", "sudo",
-    "storage",
+    "storage",   "feed",
 };
 
 /// True if `name` (no leading slash) is a real built-in command -- checked
@@ -898,6 +900,7 @@ pub fn main(init: std.process.Init) !void {
         checkAndRevertExpiredPermissions(connectors, gpa, &pool, now);
         alert_feature.checkAndDeliverAlerts(connectors, gpa, io, &pool, now);
         feed_watcher.checkAndNotifyFeeds(connectors, gpa, io, &pool, llm_provider, now);
+        checkCuratedFeed(gpa, io, &pool, llm_provider, telegram_user_ptr, &config, now);
         if (storage_owner_native_id) |onid| {
             if (feature_flags.isEnabled(&pool, "storage_sense_monitor")) {
                 if (resolveOwnerIdentityId(&pool, &config, now)) |owner_identity_id| {
@@ -1877,6 +1880,45 @@ fn checkSlowMode(connector: iface.Connector, a: std.mem.Allocator, config: *cons
 /// Rebuilds the in-memory enabled-chat set from every known chat's
 /// persisted `chat_settings.digest_enabled` — so digests opted into before
 /// a restart keep firing rather than silently going quiet.
+/// One curated-feed tick (see `features/curated_feed.zig`). Its own
+/// interval, stored with the feed's settings rather than taken from the
+/// scheduler loop's cadence: reading channels and summarising them is far
+/// more expensive than the other checks in this loop, and an hourly digest
+/// is the point of the feature — running it every loop iteration would be
+/// both useless and costly.
+///
+/// Its own arena, freed each tick: a pass allocates every post, prompt and
+/// summary it touches, none of which outlives the digest it produces.
+fn checkCuratedFeed(
+    gpa: std.mem.Allocator,
+    io: Io,
+    pool: *store_pool.PgPool,
+    llm_provider: llm.Provider,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    config: *const config_mod.Config,
+    now: i64,
+) void {
+    if (!feature_flags.isEnabled(pool, "curated_feed")) return;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const settings = feed_store.getSettings(pool, a) catch |err| {
+        log.err("curated feed: couldn't read settings: {t}", .{err});
+        return;
+    };
+    if (!settings.isRunnable()) return;
+    if (now - settings.last_run_at < settings.interval_seconds) return;
+
+    const dyn = resolveLlmDynamicSettings(pool, a, config);
+    const posted = curated_feed.runOnce(pool, a, io, llm_provider, telegram_user, dyn.max_retries, now) catch |err| {
+        log.err("curated feed: pass failed: {t}", .{err});
+        return;
+    };
+    if (posted > 0) log.info("curated feed: posted {d} item(s)", .{posted});
+}
+
 fn loadDigestScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, digest_scheduler: *scheduler.DigestScheduler) void {
     const refs = chats.listAll(pool, gpa) catch |err| {
         log.err("digest: failed to scan existing chats: {t}", .{err});
@@ -2983,6 +3025,10 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/autonomy") or std.mem.startsWith(u8, text, "/autonomy ")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleAutonomyCommand(connector, a, config, pool, msg, text, now);
+    } else if (std.mem.eql(u8, text, "/feed") or std.mem.startsWith(u8, text, "/feed ")) {
+        if (!feature_flags.isEnabled(pool, "curated_feed")) return false;
+        if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
+        handleFeedCommand(connector, a, config, pool, io, llm_provider, telegram_user, msg, text, now);
     } else if (std.mem.eql(u8, text, "/drafts")) {
         if (!auth.isOwner(config, connector.platform(), msg.user_id)) return false;
         handleDraftsListCommand(connector, a, config, pending_drafts, msg, now);
@@ -5189,6 +5235,241 @@ fn handleAutonomyCommand(
 /// `/drafts` — lists every pending `reply_autonomy = .draft` draft (see
 /// `reply_drafts.PendingDrafts`), so the owner doesn't have to remember
 /// which chats have one waiting.
+/// `/feed` — the curated-feed control surface (see
+/// `features/curated_feed.zig`). Owner-only throughout: it reads channels
+/// through the owner's personal account and posts under their identity.
+///
+///   /feed                      — status
+///   /feed add <chat id|name>   — watch a channel
+///   /feed remove <chat id>     — stop watching one
+///   /feed list                 — what's watched
+///   /feed target <chat id>     — where digests go
+///   /feed policy <text>        — the natural-language filter
+///   /feed every <duration>     — how often a digest is posted
+///   /feed on | /feed off       — enable/disable
+///   /feed run                  — run a pass right now
+fn handleFeedCommand(
+    connector: iface.Connector,
+    a: std.mem.Allocator,
+    config: *const config_mod.Config,
+    pool: *store_pool.PgPool,
+    io: Io,
+    llm_provider: llm.Provider,
+    telegram_user: ?*telegram_user_platform.TelegramUserConnector,
+    msg: iface.Message,
+    text: []const u8,
+    now: i64,
+) void {
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        reply(connector, a, msg.chat_id, msg.message_id, "Only the bot owner can manage the curated feed.");
+        return;
+    }
+
+    const rest = std.mem.trim(u8, text["/feed".len..], " ");
+    if (rest.len == 0) {
+        feedStatus(connector, a, pool, msg);
+        return;
+    }
+
+    const space = std.mem.indexOfScalar(u8, rest, ' ');
+    const sub = if (space) |i| rest[0..i] else rest;
+    const arg = if (space) |i| std.mem.trim(u8, rest[i + 1 ..], " ") else "";
+
+    if (std.mem.eql(u8, sub, "list")) {
+        const sources = feed_store.listSources(pool, a, false) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't load the source list.");
+            return;
+        };
+        if (sources.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "No sources yet. Add one with /feed add <chat id or name> — see /tdchats for ids.");
+            return;
+        }
+        var out: Io.Writer.Allocating = .init(a);
+        out.writer.writeAll("Feed sources:\n") catch {};
+        for (sources) |src| {
+            out.writer.print("\n{s} ({s}){s}", .{ src.title, src.native_chat_id, if (src.enabled) "" else " — paused" }) catch break;
+        }
+        connector.sendMessage(a, msg.chat_id, out.writer.buffered(), msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "add")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed add <chat id or name> — see /tdchats for ids.");
+            return;
+        }
+        const conn = telegram_user orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
+            return;
+        };
+        // Same resolver /tdsummary uses, so a channel can be named rather
+        // than looked up as a raw id, and an ambiguous name lists the
+        // candidates instead of silently picking one.
+        const resolution = chat_summary.resolveChat(conn, a, arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that chat up.");
+            return;
+        };
+        switch (resolution) {
+            .none => reply(connector, a, msg.chat_id, msg.message_id, "No chat matches that — see /tdchats."),
+            .ambiguous => |candidates| {
+                const listed = chat_summary.formatChatList(a, candidates, 10) catch return;
+                const out = std.fmt.allocPrint(a, "That matches more than one chat:\n\n{s}", .{listed}) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+            .one => |match| {
+                _ = feed_store.addSource(pool, match.native_chat_id, match.title) catch {
+                    reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that source.");
+                    return;
+                };
+                const out = std.fmt.allocPrint(a, "Watching \"{s}\" ({s}). Its existing posts are skipped — only new ones from here on will be considered.", .{ match.title, match.native_chat_id }) catch return;
+                connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            },
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "remove")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed remove <chat id> — see /feed list.");
+            return;
+        }
+        const removed = feed_store.removeSource(pool, arg) catch false;
+        if (removed) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Stopped watching that channel.");
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, "That channel isn't in the feed — see /feed list.");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "target")) {
+        if (arg.len == 0) {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed target <chat id> — where digests get posted.");
+            return;
+        }
+        feed_store.setTarget(pool, arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that.");
+            return;
+        };
+        const out = std.fmt.allocPrint(a, "Digests will be posted to {s}.", .{arg}) catch return;
+        connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "policy")) {
+        if (arg.len == 0) {
+            const settings = feed_store.getSettings(pool, a) catch {
+                reply(connector, a, msg.chat_id, msg.message_id, "Couldn't read the policy.");
+                return;
+            };
+            const out = if (settings.policy) |p|
+                std.fmt.allocPrint(a, "Current policy:\n\n{s}", .{p}) catch return
+            else
+                std.fmt.allocPrint(a, "No policy set. Set one with /feed policy <what you want>, e.g. \"international news, not crypto price talk\".", .{}) catch return;
+            connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+            return;
+        }
+        feed_store.setPolicy(pool, arg) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that.");
+            return;
+        };
+        reply(connector, a, msg.chat_id, msg.message_id, "Policy saved.");
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "every")) {
+        const seconds = reminder_format.parseDuration(arg) orelse {
+            reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed every <duration>, e.g. /feed every 1h.");
+            return;
+        };
+        // A digest every few seconds would be a stream, not a digest, and
+        // would spend model calls faster than anyone could read them.
+        if (seconds < 300) {
+            reply(connector, a, msg.chat_id, msg.message_id, "That's too frequent — five minutes is the shortest useful digest interval.");
+            return;
+        }
+        feed_store.setIntervalSeconds(pool, seconds) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that.");
+            return;
+        };
+        const out = std.fmt.allocPrint(a, "A digest will be posted at most every {d} seconds.", .{seconds}) catch return;
+        connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "on") or std.mem.eql(u8, sub, "off")) {
+        const on = std.mem.eql(u8, sub, "on");
+        feed_store.setEnabled(pool, on) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't save that.");
+            return;
+        };
+        if (on) {
+            // Enabling without a target or policy does nothing, so say so
+            // rather than letting it look like it's running.
+            const settings = feed_store.getSettings(pool, a) catch {
+                reply(connector, a, msg.chat_id, msg.message_id, "Feed enabled.");
+                return;
+            };
+            if (settings.target_native_chat_id == null) {
+                reply(connector, a, msg.chat_id, msg.message_id, "Feed enabled — but it won't run until you set where digests go: /feed target <chat id>.");
+            } else if (settings.policy == null) {
+                reply(connector, a, msg.chat_id, msg.message_id, "Feed enabled — but it won't run until you set what you want: /feed policy <text>.");
+            } else {
+                reply(connector, a, msg.chat_id, msg.message_id, "Feed enabled.");
+            }
+        } else {
+            reply(connector, a, msg.chat_id, msg.message_id, "Feed disabled. Sources and policy are kept.");
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "run")) {
+        const settings = feed_store.getSettings(pool, a) catch {
+            reply(connector, a, msg.chat_id, msg.message_id, "Couldn't read the feed settings.");
+            return;
+        };
+        if (!settings.isRunnable()) {
+            reply(connector, a, msg.chat_id, msg.message_id, "The feed isn't fully set up yet — see /feed.");
+            return;
+        }
+        const dyn = resolveLlmDynamicSettings(pool, a, config);
+        const posted = curated_feed.runOnce(pool, a, io, llm_provider, telegram_user, dyn.max_retries, now) catch |err| {
+            log.err("curated feed: manual run failed: {t}", .{err});
+            reply(connector, a, msg.chat_id, msg.message_id, "That pass failed — see the server log.");
+            return;
+        };
+        const out = if (posted == 0)
+            std.fmt.allocPrint(a, "Nothing new matched the policy.", .{}) catch return
+        else
+            std.fmt.allocPrint(a, "Posted a digest with {d} item(s).", .{posted}) catch return;
+        connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+        return;
+    }
+
+    reply(connector, a, msg.chat_id, msg.message_id, "Usage: /feed [add|remove|list|target|policy|every|on|off|run]");
+}
+
+fn feedStatus(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, msg: iface.Message) void {
+    const settings = feed_store.getSettings(pool, a) catch {
+        reply(connector, a, msg.chat_id, msg.message_id, "Couldn't read the feed settings.");
+        return;
+    };
+    const sources = feed_store.listSources(pool, a, false) catch &.{};
+
+    const out = std.fmt.allocPrint(
+        a,
+        "Curated feed: {s}\nSources: {d}\nTarget: {s}\nInterval: {d}s\nPolicy: {s}\n\n/feed add <chat id or name>, /feed target <chat id>, /feed policy <text>, /feed every <duration>, /feed on, /feed run",
+        .{
+            if (settings.isRunnable()) "on" else if (settings.enabled) "enabled but not configured" else "off",
+            sources.len,
+            settings.target_native_chat_id orelse "(not set)",
+            settings.interval_seconds,
+            settings.policy orelse "(not set)",
+        },
+    ) catch return;
+    connector.sendMessage(a, msg.chat_id, out, msg.message_id);
+}
+
 fn handleDraftsListCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,

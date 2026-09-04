@@ -236,6 +236,48 @@ at:
   every message. Existing rows self-heal on the next message per chat
   (`upsertChat` COALESCEs a null title over the stored one).
 
+**Curated feed, 2026-09-04** (owner request: "read any channel I have
+access to, filter and summarise it against a natural-language policy, and
+forward the result to a main feed channel"). `store/feed.zig` +
+`features/curated_feed.zig` + `0051_curated_feed.sql`, with `/feed`, a web
+page and the `curated_feed` feature flag.
+
+Four design decisions worth recording, since each rules out an obvious
+alternative:
+
+- **Sources are opt-in**, not "every channel the account follows". Reading
+  everything makes the model bill a function of how many channels the owner
+  happens to be in, and one noisy channel they had forgotten about would
+  quietly dominate it. `/feed add` names them; `/tdchats`'s own resolver is
+  reused so a channel can be named rather than looked up as an id.
+- **Two-stage filtering.** Every new post gets a one-word YES/NO relevance
+  check against the policy; only survivors pay for a summarisation call. A
+  single combined call would mean paying full summary cost for every post
+  including the discarded majority, which is what would make the feature
+  unaffordable at any real source count. Anything that isn't a clear YES is
+  treated as NO -- an unparseable answer must not smuggle an off-policy
+  post into the feed.
+- **Posts are pulled, not ingested.** `telegram_user.fetchRecentPosts`
+  (`getChatHistory`) is called per source per pass, rather than recording
+  every post of every followed channel into `messages` and querying that.
+  Recording would have meant a firehose in the message store for storage
+  sense to prune, in order to summarise a handful of posts. TDLib has no
+  "since id" form, so a per-source watermark turns "the newest N" into
+  "what is new"; `setWatermark` is `GREATEST`, never assignment, so an
+  overlapping slow pass cannot rewind and replay already-summarised posts.
+- **Inert until fully configured.** `Settings.isRunnable` requires enabled
+  *and* a target *and* a policy. A feed with no policy would mean "forward
+  everything", the opposite of the point, so there is deliberately no
+  default. Both the command and the web page say "enabled but not running"
+  rather than letting that look like a working feed that happens to be
+  quiet. A newly added source is caught up silently (watermark jumps to
+  newest, nothing emitted), so adding a channel never dumps its backlog.
+
+Per-pass ceilings (`posts_per_source`, `max_summaries_per_pass`,
+`max_post_chars`) bound what one tick can cost; overflow stays behind the
+watermark for the next pass rather than being dropped.
+
+
 **Also unplanned, shipped outside the phase sequence** (direct user
 request, 2026-08-18): `/tdsummary <chat id or name>` and its natural-
 language counterpart, the `summarize_unread_chat` tool — on-demand "what

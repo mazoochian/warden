@@ -458,6 +458,109 @@ pub const TelegramUserConnector = struct {
         return true;
     }
 
+    /// One post pulled from a channel's history by `fetchRecentPosts`.
+    pub const Post = struct {
+        id: i64,
+        date: i64,
+        /// `messageText` body, or a media message's caption. Posts with
+        /// neither are skipped rather than represented with an empty
+        /// string, so a caller never has to filter them out itself.
+        text: []const u8,
+    };
+
+    /// The most recent `limit` posts in `chat_id`, newest first.
+    ///
+    /// Pulled on demand rather than read out of the `messages` table: the
+    /// curated feed only ever wants the handful of posts since its last
+    /// pass, and recording every post of every subscribed channel just to
+    /// summarise a few of them would balloon the message store (and give
+    /// storage sense a firehose to prune) for no other benefit.
+    ///
+    /// TDLib's `getChatHistory` walks *backwards* from `from_message_id`,
+    /// so `0` means "start at the newest". Callers wanting only what's new
+    /// filter on their own watermark — there's no "since id" form of this
+    /// request. `only_local = false` so it actually reaches the network for
+    /// a channel whose history isn't cached yet.
+    pub fn fetchRecentPosts(self: *TelegramUserConnector, allocator: std.mem.Allocator, io: Io, chat_id: i64, limit: u32) ![]Post {
+        const extra_id = self.nextExtraId();
+        self.send(.{
+            .@"@type" = "getChatHistory",
+            .chat_id = chat_id,
+            .from_message_id = 0,
+            .offset = 0,
+            .limit = limit,
+            .only_local = false,
+            .@"@extra" = extra_id,
+        });
+        const raw = try self.waitForResponse(allocator, io, extra_id, request_timeout_seconds) orelse {
+            log.warn("fetchRecentPosts: getChatHistory timed out for chat {d}", .{chat_id});
+            return &.{};
+        };
+        defer allocator.free(raw);
+
+        var parsed = json.parseFromSlice(json.Value, allocator, raw, .{}) catch |err| {
+            log.warn("fetchRecentPosts: failed to parse getChatHistory response: {t}", .{err});
+            return &.{};
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return &.{},
+        };
+        if (obj.get("@type")) |v| if (v == .string and std.mem.eql(u8, v.string, "error")) {
+            log.warn("fetchRecentPosts: getChatHistory error for chat {d}: {s}", .{ chat_id, raw });
+            return &.{};
+        };
+        const messages = switch (obj.get("messages") orelse return &.{}) {
+            .array => |arr| arr,
+            else => return &.{},
+        };
+
+        var out: std.ArrayList(Post) = .empty;
+        errdefer out.deinit(allocator);
+        for (messages.items) |item| {
+            const m = switch (item) {
+                .object => |o| o,
+                else => continue,
+            };
+            const id = switch (m.get("id") orelse continue) {
+                .integer => |n| n,
+                else => continue,
+            };
+            const date = switch (m.get("date") orelse json.Value{ .null = {} }) {
+                .integer => |n| n,
+                else => 0,
+            };
+            const text = postText(m) orelse continue;
+            try out.append(allocator, .{
+                .id = id,
+                .date = date,
+                .text = try allocator.dupe(u8, text),
+            });
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// A post's readable body: `messageText`'s text, or the caption of a
+    /// media post (a channel's photo/video posts carry their actual content
+    /// in the caption). `null` for a post with no text at all — a bare
+    /// image, a sticker — which the feed has nothing to summarise from.
+    fn postText(message: json.ObjectMap) ?[]const u8 {
+        const content = switch (message.get("content") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        const formatted = switch (content.get("text") orelse content.get("caption") orelse return null) {
+            .object => |o| o,
+            else => return null,
+        };
+        const text = switch (formatted.get("text") orelse return null) {
+            .string => |str| str,
+            else => return null,
+        };
+        return if (text.len > 0) text else null;
+    }
+
     /// Reads whatever is currently sitting in `chat_id`'s Telegram composer
     /// — the per-chat draft Telegram itself syncs across the account's
     /// devices (`getChat` -> `draft_message.input_message_text.text.text`).
