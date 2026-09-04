@@ -166,6 +166,10 @@ pub const known_keys = [_]KnownKey{
     .{ .key = "WARDEN_LLM_MAX_TOKENS", .label = "LLM max tokens override (0 = none)", .kind = .i64 },
     .{ .key = "WARDEN_LLM_HISTORY_MESSAGES", .label = "LLM conversation history window", .kind = .i64 },
     .{ .key = "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", .label = "Skip LLM call for trivial messages", .kind = .bool },
+    // Clamped to 0-10 when read back (see main.zig's
+    // resolveLlmDynamicSettings) -- a negative value would wrap on the cast
+    // to u32 and a huge one would keep a dead request alive for hours.
+    .{ .key = "WARDEN_LLM_MAX_RETRIES", .label = "LLM retries on a transient failure (0 = never retry)", .kind = .i64 },
     // "anthropic" or "openai_compat" only, and only one actually
     // configured with credentials -- validated in api/router.zig's
     // handleAdminSetConfig (needs live Config access this module doesn't

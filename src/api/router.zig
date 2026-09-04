@@ -1035,6 +1035,7 @@ fn defaultForKnownKey(a: std.mem.Allocator, config: *const config_mod.Config, ke
     if (std.mem.eql(u8, key, "WARDEN_LLM_MAX_TOKENS")) return std.fmt.allocPrint(a, "{d}", .{config.llm_max_tokens_override orelse 0});
     if (std.mem.eql(u8, key, "WARDEN_LLM_HISTORY_MESSAGES")) return std.fmt.allocPrint(a, "{d}", .{config.llm_history_messages});
     if (std.mem.eql(u8, key, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES")) return std.fmt.allocPrint(a, "{}", .{config.skip_trivial_messages});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_MAX_RETRIES")) return std.fmt.allocPrint(a, "{d}", .{config.llm_max_retries});
     if (std.mem.eql(u8, key, "WARDEN_LLM_PROVIDER")) return a.dupe(u8, if (config.llm == .openai_compat) "openai_compat" else "anthropic");
     return a.dupe(u8, "");
 }
