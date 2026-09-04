@@ -175,6 +175,67 @@ second time. No Matrix/XMPP counterpart is possible or planned — neither
 protocol has a server-side draft concept, and both are bot connectors where
 ghostwriting-as-the-owner doesn't apply in the first place.
 
+**Bug sweep, 2026-09-03/04** (owner-reported list, bugs first). Five
+defects, three of which failed silently — the recurring theme being a
+feature gated on an optional dependency or a fallback path nobody looked
+at:
+
+- **Long-term memory never stored anything.** `main.zig` only wired the
+  `MemorySink` when an embeddings client existed, so with no
+  `WARDEN_EMBEDDINGS_URL` the `remember_memory` tool was never registered:
+  the model would agree to remember something, call nothing, and the fact
+  was gone. `/memory list` and the memory page were empty and correct —
+  there was nothing to show. `facts.embedding` being `NOT NULL` would have
+  blocked the insert anyway. Embeddings are now optional end to end
+  (`0050_optional_embeddings.sql`): `remember` takes `?[]const f32`, the
+  hybrid score COALESCEs its similarity term to 0 for a row or query
+  without a vector (ordering is unaffected — a constant dropped from every
+  row), `context_assembly` ranks with a null vector instead of skipping
+  stable/tentative facts entirely, and startup logs which mode it's in. A
+  configured-but-failing endpoint now degrades to storing without a vector
+  rather than losing the fact. Note this was *never* a regression from the
+  0048 memory rebuild: the pre-rebuild `memories.remember` required a
+  vector too, so memory had never worked on a deployment without one.
+- **One failed model call ended the request.** During a provider's busy
+  hours that turned routine blips into "Sorry, I couldn't reach the model
+  just now". `toolcall.callProviderWithRetry` now retries with exponential
+  backoff (1s/2s/4s), `WARDEN_LLM_MAX_RETRIES` (default 3, clamped 0-10)
+  configurable statically or as a dynamic-config key. Retried *per model
+  call*, deliberately not around `run` as a whole: the conversation may be
+  several turns deep with tools already executed, and replaying that would
+  re-send messages and re-charge expenses. Only transport/congestion
+  failures are retryable — a malformed request or bad key fails once.
+- **Duplicate tool lines in the progress tree.** `tool_history` appended
+  every `.tool_use` unconditionally, so a model re-issuing a call stacked
+  identical `Using web_search` lines. `Progress.Event.tool_use` now carries
+  a fingerprint of the call's arguments (`hashToolInput`), and the renderer
+  collapses a repeat with *different* arguments into `(xN)` while ignoring
+  an identical repeat outright. Only the most recent entry is considered,
+  so alternating tools still read in call order.
+- **Chain-of-thought lost its formatting.** The 💭 expandable blockquote
+  only ever existed inside `markdown_html.toHtml`. Telegram's send path
+  tries HTML and falls back to *plain text* whenever the API rejects it —
+  and that fallback passed the `\x02`/`\x03` marker control bytes straight
+  through, so the thinking arrived as ordinary unquoted prose with the 💭
+  missing, looking exactly like the feature had been removed. Matrix and
+  XMPP did the same thing on every message, having never handled the
+  markers at all. New `llm.renderThinkingPlain` renders a span as a `💭 …`
+  paragraph and is now used by all three. Still outstanding, and a missing
+  *feature* rather than this regression: `llm/anthropic.zig` has no
+  thinking support whatsoever (no `thinking` request block, no parsing),
+  so `show_thinking` is inert on the Anthropic provider.
+- **Chats displayed by raw id.** `chats.title` was simply never populated
+  for two whole categories. Telegram's `types.Chat` only modelled `title`,
+  which the Bot API sets for groups/supergroups/channels and *never* for a
+  private chat — so every 1:1 fell back to its numeric id. Added
+  `first_name`/`last_name` and a `Chat.displayTitle` (title, else the
+  person's name, else `@username`) used at all four message-construction
+  sites. The Matrix connector set `chat_title` on nothing at all; it now
+  reads `m.room.name` through a new `client.roomName`, cached per room
+  including negative results since an unnamed DM would otherwise re-ask on
+  every message. Existing rows self-heal on the next message per chat
+  (`upsertChat` COALESCEs a null title over the stored one).
+
 **Also unplanned, shipped outside the phase sequence** (direct user
 request, 2026-08-18): `/tdsummary <chat id or name>` and its natural-
 language counterpart, the `summarize_unread_chat` tool — on-demand "what

@@ -65,7 +65,7 @@ pub fn summarizeHistory(provider: llm.Provider, allocator: std.mem.Allocator, ct
         .{history},
     ) catch return "";
 
-    return toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, 1024) catch |err| blk: {
+    return toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, 1024, default_max_retries) catch |err| blk: {
         std.log.err("digest: llm summary failed: {t}", .{err});
         break :blk "";
     };
@@ -149,6 +149,13 @@ test "generate skips the LLM call entirely when the chat has no messages" {
 
 const identities = @import("../store/identities.zig");
 const messages_store = @import("../store/messages.zig");
+
+/// Retries for this background summariser's own model call. A fixed
+/// default rather than the `WARDEN_LLM_MAX_RETRIES` dynamic value: this
+/// runs on a scheduler with no chat, no user waiting and no
+/// `LlmDynamicSettings` in scope, and a scheduled summary that quietly
+/// retries a congested endpoint is exactly the desired behaviour.
+const default_max_retries: u32 = @intCast(@import("../config.zig").Config.default_llm_max_retries);
 
 /// Records the prompt it was handed and answers with a fixed sentence, so a
 /// test can assert both "the model was asked at all" and "it was asked

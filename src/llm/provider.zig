@@ -83,6 +83,73 @@ pub const StopReason = enum { end_turn, tool_use, other };
 pub const thinking_start = "\x02";
 pub const thinking_end = "\x03";
 
+/// Fallback rendering of thinking spans for any surface that can't do
+/// something richer with them — the marker bytes are control characters, so
+/// text carrying them must never reach a user as-is.
+///
+/// Telegram's HTML path turns a span into an expandable blockquote
+/// (`telegram/markdown_html.zig`); this is what everything else gets:
+/// Matrix and XMPP, which have no equivalent, and — the case that actually
+/// broke — Telegram's *own* plain-text fallback, taken whenever the API
+/// rejects the HTML attempt. That fallback sent the raw marker bytes
+/// through, so the chain-of-thought arrived as ordinary unquoted prose with
+/// the 💭 gone and no way to collapse it, looking exactly like the feature
+/// had been removed.
+///
+/// Keeps the 💭 so a thought is still visibly a thought, and puts it on its
+/// own paragraph so it reads as set apart rather than running into the
+/// answer. An unterminated span (a truncated or still-streaming response)
+/// is handled the same as a terminated one rather than being dropped.
+pub fn renderThinkingPlain(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, text, thinking_start) == null and
+        std.mem.indexOf(u8, text, thinking_end) == null) return text;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (std.mem.startsWith(u8, text[i..], thinking_start)) {
+            try out.appendSlice(allocator, "\u{1F4AD} ");
+            i += thinking_start.len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[i..], thinking_end)) {
+            i += thinking_end.len;
+            // Only separate the thought from what follows if anything
+            // actually does. Appending unconditionally and trimming after
+            // would mean returning a shortened sub-slice of an owned
+            // allocation, which the caller could no longer free correctly.
+            if (i < text.len) try out.appendSlice(allocator, "\n\n");
+            continue;
+        }
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "renderThinkingPlain turns a thinking span into a thought paragraph" {
+    const a = std.testing.allocator;
+    const out = try renderThinkingPlain(a, thinking_start ++ "pondering" ++ thinking_end ++ "the answer is 4");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("\u{1F4AD} pondering\n\nthe answer is 4", out);
+}
+
+test "renderThinkingPlain leaves text with no markers untouched and allocates nothing" {
+    const a = std.testing.allocator;
+    const plain = "just an answer";
+    // Returned by reference, so there is nothing to free -- the common case
+    // must not pay for a copy.
+    try std.testing.expectEqual(plain.ptr, (try renderThinkingPlain(a, plain)).ptr);
+}
+
+test "renderThinkingPlain handles an unterminated span rather than dropping it" {
+    const a = std.testing.allocator;
+    const out = try renderThinkingPlain(a, thinking_start ++ "still thinking");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("\u{1F4AD} still thinking", out);
+}
+
 pub const ChatRequest = struct {
     /// Top-level system prompt (Anthropic's shape); the OpenAI-compatible
     /// adapter folds this into a leading system-role message instead.

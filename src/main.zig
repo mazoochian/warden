@@ -694,6 +694,13 @@ pub fn main(init: std.process.Init) !void {
         const ec = try gpa.create(embeddings.EmbeddingsClient);
         ec.* = embeddings.EmbeddingsClient.init(gpa, io, url, config.embeddings_api_key, config.embeddings_model);
         embeddings_client = ec;
+    } else {
+        // Say so out loud. Memory works either way now, but which mode it's
+        // in is otherwise invisible, and the previous behaviour here
+        // (no endpoint => the remember_memory tool silently not existing)
+        // was undiagnosable from the outside: the model would agree to
+        // remember something and nothing was ever stored.
+        log.info("memory: WARDEN_EMBEDDINGS_URL isn't set — long-term memory still records and recalls facts, ranked by keyword/recency/salience; semantic (meaning-based) recall is off until an embeddings endpoint is configured", .{});
     }
 
     log.info("warden started, {d} connector(s), {d} owner(s) configured", .{ connectors.len, config.owners.len });
@@ -1578,7 +1585,11 @@ fn processMessageTask(
         // `?Sink = null` field's own "absent means the tool can't run"
         // convention, rather than surfacing a runtime error from inside
         // the tool for something that's a deploy-time config choice.
-        .memory = if (embeddings_client != null) memory_adapter.sink() else null,
+        // Always wired, unlike before: memory no longer requires an
+        // embeddings endpoint (see `MemoryToolAdapter.createFn`), and
+        // gating the tool on one was what made remembering silently
+        // impossible without it.
+        .memory = memory_adapter.sink(),
         .chat_history = chat_history_adapter.sink(),
         .expenses = expense_adapter.sink(),
         .personal_account = personal_account_adapter.sink(),
@@ -2064,6 +2075,7 @@ const LlmDynamicSettings = struct {
     skip_trivial_messages: bool,
     vision_enabled: bool,
     documents_enabled: bool,
+    max_retries: u32,
 };
 
 /// One `dynamic_config.listAll` fetch instead of six separate
@@ -2100,6 +2112,13 @@ fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, con
         .skip_trivial_messages = dynamic_config.findBool(rows, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", config.skip_trivial_messages),
         .vision_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_VISION", config.llm_vision_enabled),
         .documents_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_DOCUMENTS", config.llm_documents_enabled),
+        // Clamped rather than trusted: a negative value would wrap when
+        // cast to u32 and turn "no retries" into billions of them, and an
+        // absurd positive one would keep a dead request alive for hours.
+        .max_retries = blk: {
+            const raw = dynamic_config.findI64(rows, "WARDEN_LLM_MAX_RETRIES", config.llm_max_retries);
+            break :blk @intCast(std.math.clamp(raw, 0, 10));
+        },
     };
 }
 
@@ -2197,7 +2216,7 @@ fn handleModeCommand(
         .native_id = msg.user_id,
     };
     const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, in_flight);
+    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries, in_flight);
 }
 
 test "splitModeArgs splits a leading modifier token from the rest, falling back to reply_to_text" {
@@ -3183,7 +3202,7 @@ fn handleMessage(
             .native_id = msg.user_id,
         };
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, in_flight);
+        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries, in_flight);
     }
     return false;
 }
@@ -5355,7 +5374,7 @@ fn handleTelegramUserAutoReply(
             .native_id = msg.user_id,
         };
         const enabled_tools = filterEnabledTools(pool, a, tools);
-        const raw_answer = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages) catch |err| {
+        const raw_answer = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries) catch |err| {
             log.err("reply_autonomy: qa.answer failed for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
@@ -9445,12 +9464,12 @@ fn formatMemories(a: std.mem.Allocator, listed: []const facts.Memory) []const u8
 /// `NoteToolAdapter`, except scoped to `identity_id` alone (no `chat_id`/
 /// `is_owner` — see `registry.zig`'s `MemorySink` doc comment for why
 /// there's no "or the owner" escape hatch here). `embeddings_client` is
-/// `null` exactly when `config.embeddings_url` is unset; `tool_ctx.memory`
-/// itself is only ever set to this adapter's sink when it's non-null (see
-/// `processMessageTask`), so `createFn` finding it null here would only
-/// ever indicate a wiring bug, not a normal "feature disabled" path — it
-/// still fails safely rather than asserting, since a tool executing is
-/// never a place to crash the whole message-processing task over.
+/// `null` exactly when `config.embeddings_url` is unset — which is now a
+/// fully supported way to run: the fact is stored without a vector and
+/// ranked on keyword/recency/salience instead. `tool_ctx.memory` is
+/// therefore always wired to this adapter's sink (it used to be wired only
+/// when an embeddings client existed, which is what made remembering
+/// silently impossible without one).
 const MemoryToolAdapter = struct {
     pool: *store_pool.PgPool,
     identity_id: i64,
@@ -9469,8 +9488,25 @@ const MemoryToolAdapter = struct {
 
     fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror!i64 {
         const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
-        const client = self.embeddings_client orelse return error.EmbeddingsNotConfigured;
-        const vector = try client.embed(allocator, text);
+        // An embedding is an enhancement, not a prerequisite. This used to
+        // `return error.EmbeddingsNotConfigured` here, and the sink wasn't
+        // even wired up without a client (see `processMessageTask`), so on
+        // a deployment with no WARDEN_EMBEDDINGS_URL the `remember_memory`
+        // tool simply didn't exist: the model would say it had remembered
+        // something and nothing was ever written, with nothing anywhere to
+        // say why. Storing the fact matters more than being able to rank it
+        // by cosine distance later.
+        //
+        // A configured-but-failing endpoint degrades the same way rather
+        // than losing the fact -- logged, since that one IS a
+        // misconfiguration worth seeing, unlike simply not having one.
+        const vector: ?[]const f32 = if (self.embeddings_client) |client|
+            client.embed(allocator, text) catch |err| blk: {
+                log.warn("memory: embedding failed, storing without a vector (semantic recall will skip it): {t}", .{err});
+                break :blk null;
+            }
+        else
+            null;
         return facts.remember(self.pool, allocator, self.identity_id, text, vector, self.now);
     }
 
@@ -9689,6 +9725,58 @@ const ticker_interval_ms: i64 = 1200;
 /// let the ticker thread outlive `replyWithAnswer`'s own stack frame when
 /// it can't be joined promptly (see `tickerLoop`'s doc comment), so nothing
 /// referencing `state` may be on that frame.
+/// One child line under the "🤔 Thinking..." header. A union rather than a
+/// bare tool name so the tree can also carry non-tool progress (a retry),
+/// and so a repeated tool call can be collapsed into a count instead of
+/// stacking identical lines.
+const TreeEntry = union(enum) {
+    /// `input_digest` is the fingerprint of the most recent call's
+    /// arguments (see `toolcall.hashToolInput`) — kept so the *next*
+    /// report for the same tool can tell "same call again" (ignore it)
+    /// from "different arguments" (bump `count`).
+    tool: struct { name: []const u8, input_digest: u64, count: u32 },
+    retry: struct { attempt: u32, max: u32 },
+};
+
+/// Per-tool icon for the progress tree, falling back to the generic wrench
+/// for anything not listed (including a tool added later and not mapped
+/// here yet — a missing icon should never be a missing line). Grouped by
+/// what the tool *does* rather than one arbitrary glyph each, so a family
+/// of related tools reads as a family.
+fn toolEmoji(name: []const u8) []const u8 {
+    const table = .{
+        // Reaching out to the network
+        .{ "web_search", "🌐" },       .{ "scrape_site", "🪒" },
+        .{ "fetch_url", "🔗" },        .{ "hackernews_search", "📰" },
+        // Asking another model
+        .{ "ask_delegate", "🧠" },     .{ "delegate_generate_image", "🎨" },
+        // Reference lookups
+        .{ "dictionary", "📖" },       .{ "urban_dictionary", "🗣" },
+        .{ "calculator", "🧮" },       .{ "currency_convert", "💱" },
+        .{ "crypto_price", "🪙" },     .{ "weather", "🌦" },
+        .{ "air_quality", "🌫" },
+        // Producing something
+        .{ "qr_code", "🔳" },          .{ "draw_diagram", "📐" },
+        .{ "word_cloud", "☁️" },        .{ "create_poll", "📊" },
+        .{ "convert_file", "🔁" },     .{ "begin_file_conversion", "🔁" },
+        // Remembering / recalling
+        .{ "remember_memory", "🧷" },  .{ "set_note", "📝" },
+        .{ "catch_me_up", "📚" },      .{ "get_bulletin", "🗞" },
+        // Scheduling and watching
+        .{ "set_reminder", "⏰" },     .{ "set_alert", "🔔" },
+        .{ "set_expense", "💰" },
+        // The personal account
+        .{ "list_personal_chats", "👥" },     .{ "send_personal_message", "✉️" },
+        .{ "reply_to_message", "↩️" },        .{ "summarize_unread_chat", "📬" },
+        .{ "set_chat_monitoring", "👀" },     .{ "set_default_chat_monitoring", "👀" },
+        .{ "find_chat_member", "🔎" },
+    };
+    inline for (table) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
+    return "🔧";
+}
+
 const TickerState = struct {
     io: Io,
     allocator: std.mem.Allocator,
@@ -9718,13 +9806,13 @@ const TickerState = struct {
     /// eventually 400 out of `editMessage` on a long-running request.
     max_len: usize,
     mutex: Io.Mutex = .init,
-    /// Tool names reported via `.tool_use` so far this request, oldest
-    /// first — rendered as tree-branch child lines under `thinking_text` by
-    /// `renderTree`. Only ever touched from `onProgressEvent`, which (like
-    /// this whole struct's `allocator`) runs exclusively on the main
-    /// per-message task, never the ticker thread — see this struct's own
-    /// doc comment — so it needs no mutex of its own.
-    tool_history: std.ArrayList([]const u8) = .empty,
+    /// What's happened this request, oldest first — rendered as tree-branch
+    /// child lines under `thinking_text` by `renderTree`. Only ever touched
+    /// from `onProgressEvent`, which (like this whole struct's `allocator`)
+    /// runs exclusively on the main per-message task, never the ticker
+    /// thread — see this struct's own doc comment — so it needs no mutex of
+    /// its own.
+    tool_history: std.ArrayList(TreeEntry) = .empty,
     /// null = show the generic thinking animation; set = show this (already
     /// including the tree so far — see `renderTree`) until the model moves
     /// past whatever produced it.
@@ -9757,13 +9845,29 @@ const TickerState = struct {
         buf.appendSlice(self.allocator, thinking_text) catch return thinking_text;
         const child_count = self.tool_history.items.len + @as(usize, if (trailing != null) 1 else 0);
         var shown: usize = 0;
-        for (self.tool_history.items) |name| {
+        for (self.tool_history.items) |entry| {
             shown += 1;
             const branch: []const u8 = if (shown == child_count) "\n└── " else "\n├── ";
             buf.appendSlice(self.allocator, branch) catch return thinking_text;
-            buf.appendSlice(self.allocator, "🔧 Using ") catch return thinking_text;
-            buf.appendSlice(self.allocator, name) catch return thinking_text;
-            buf.appendSlice(self.allocator, "...") catch return thinking_text;
+            switch (entry) {
+                .tool => |t| {
+                    buf.appendSlice(self.allocator, toolEmoji(t.name)) catch return thinking_text;
+                    buf.appendSlice(self.allocator, " Using ") catch return thinking_text;
+                    buf.appendSlice(self.allocator, t.name) catch return thinking_text;
+                    // Only once the model has actually called it more than
+                    // once with *different* arguments — a repeat of the
+                    // identical call never gets here (see `onProgressEvent`).
+                    if (t.count > 1) {
+                        const suffix = std.fmt.allocPrint(self.allocator, " (x{d})", .{t.count}) catch return thinking_text;
+                        buf.appendSlice(self.allocator, suffix) catch return thinking_text;
+                    }
+                    buf.appendSlice(self.allocator, "...") catch return thinking_text;
+                },
+                .retry => |r| {
+                    const line = std.fmt.allocPrint(self.allocator, "🔄 API Error: Retrying ({d}/{d})", .{ r.attempt, r.max }) catch return thinking_text;
+                    buf.appendSlice(self.allocator, line) catch return thinking_text;
+                },
+            }
         }
         if (trailing) |t| {
             buf.appendSlice(self.allocator, "\n└── ") catch return thinking_text;
@@ -9773,6 +9877,84 @@ const TickerState = struct {
         return truncateUtf8(rendered, self.max_len);
     }
 };
+
+test "toolEmoji maps known tools and falls back to the wrench for anything else" {
+    try std.testing.expectEqualStrings("🌐", toolEmoji("web_search"));
+    try std.testing.expectEqualStrings("🪒", toolEmoji("scrape_site"));
+    try std.testing.expectEqualStrings("🧠", toolEmoji("ask_delegate"));
+    // Not in the table (and a tool added later won't be either) — must
+    // still render a line, just with the generic icon.
+    try std.testing.expectEqualStrings("🔧", toolEmoji("some_future_tool"));
+}
+
+/// A `TickerState` wired to an arena, for exercising `onProgressEvent` +
+/// `renderTree` without a connector or a live request. `max_len` is
+/// deliberately large so nothing under test is truncated.
+fn testTicker(arena: std.mem.Allocator) TickerState {
+    return .{ .io = std.testing.io, .allocator = arena, .max_len = 4096 };
+}
+
+test "progress tree: an identical repeat of the same tool call adds nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = testTicker(arena_state.allocator());
+
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 7 } });
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 7 } });
+
+    // The reported bug: several web_search lines stacked under one message.
+    try std.testing.expectEqual(@as(usize, 1), state.tool_history.items.len);
+    const rendered = state.renderTree(null);
+    try std.testing.expectEqualStrings("🤔 Thinking...\n└── 🌐 Using web_search...", rendered);
+}
+
+test "progress tree: the same tool with different arguments collapses into a count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = testTicker(arena_state.allocator());
+
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 1 } });
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 2 } });
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 3 } });
+
+    try std.testing.expectEqual(@as(usize, 1), state.tool_history.items.len);
+    try std.testing.expectEqualStrings(
+        "🤔 Thinking...\n└── 🌐 Using web_search (x3)...",
+        state.renderTree(null),
+    );
+}
+
+test "progress tree: different tools keep their own lines in call order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = testTicker(arena_state.allocator());
+
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 1 } });
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "scrape_site", .input_digest = 2 } });
+    // Back to the first tool: a separate line, not merged across the gap,
+    // so the tree still reads in the order things actually happened.
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 3 } });
+
+    try std.testing.expectEqual(@as(usize, 3), state.tool_history.items.len);
+    try std.testing.expectEqualStrings(
+        "🤔 Thinking...\n├── 🌐 Using web_search...\n├── 🪒 Using scrape_site...\n└── 🌐 Using web_search...",
+        state.renderTree(null),
+    );
+}
+
+test "progress tree: a retry renders as its own line with the attempt count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var state = testTicker(arena_state.allocator());
+
+    onProgressEvent(&state, .{ .tool_use = .{ .name = "web_search", .input_digest = 1 } });
+    onProgressEvent(&state, .{ .retry = .{ .attempt = 1, .max = 3, .err = error.RequestTimedOut } });
+
+    try std.testing.expectEqualStrings(
+        "🤔 Thinking...\n├── 🌐 Using web_search...\n└── 🔄 API Error: Retrying (1/3)",
+        state.renderTree(null),
+    );
+}
 
 fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
     const state: *TickerState = @ptrCast(@alignCast(ptr));
@@ -9784,8 +9966,41 @@ fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
             // when there's no tree yet to preserve (the very first turn).
             if (state.tool_history.items.len == 0) state.setStatus(null);
         },
-        .tool_use => |name| {
-            state.tool_history.append(state.allocator, name) catch return;
+        .tool_use => |use| {
+            // Three cases, per the reported bug (identical web_search lines
+            // stacking under one message):
+            //   * same tool, same arguments as the last entry — the model
+            //     re-issuing a call already shown. Not new activity, so
+            //     nothing changes at all, not even a count.
+            //   * same tool, different arguments — a genuinely new call;
+            //     collapse into the existing line as "(xN)" rather than
+            //     repeating the tool's name down the tree.
+            //   * anything else — a new line.
+            // Only the most recent entry is considered, so alternating
+            // tools (search, scrape, search) still read in call order
+            // instead of silently merging across the gap.
+            if (state.tool_history.items.len > 0) {
+                const last = &state.tool_history.items[state.tool_history.items.len - 1];
+                if (last.* == .tool and std.mem.eql(u8, last.tool.name, use.name)) {
+                    if (last.tool.input_digest == use.input_digest) return;
+                    last.tool.input_digest = use.input_digest;
+                    last.tool.count += 1;
+                    state.setStatus(state.renderTree(null));
+                    return;
+                }
+            }
+            state.tool_history.append(state.allocator, .{ .tool = .{
+                .name = use.name,
+                .input_digest = use.input_digest,
+                .count = 1,
+            } }) catch return;
+            state.setStatus(state.renderTree(null));
+        },
+        .retry => |r| {
+            state.tool_history.append(state.allocator, .{ .retry = .{
+                .attempt = r.attempt,
+                .max = r.max,
+            } }) catch return;
             state.setStatus(state.renderTree(null));
         },
         .text => |text_so_far| {
@@ -10099,6 +10314,10 @@ fn replyWithAnswer(
     documents_enabled: bool,
     max_tokens_override: ?u32,
     history_window: i64,
+    /// Retries per model call on a transient failure — see
+    /// `toolcall.callProviderWithRetry`. Threaded from
+    /// `LlmDynamicSettings.max_retries` like every other LLM dial here.
+    max_retries: u32,
     in_flight: *cancel_request.InFlightRequests,
 ) void {
     // The placeholder + ticker only work when the platform supports
@@ -10152,7 +10371,7 @@ fn replyWithAnswer(
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tools);
-    const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window);
+    const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window, max_retries);
 
     // Stop the ticker before touching the placeholder ourselves. Signaled
     // cooperatively (`state.stop`) and joined with a bound, rather than

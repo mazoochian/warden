@@ -8,6 +8,7 @@ const types = @import("../xmpp/types.zig");
 const Identity = @import("../domain/identity.zig").Identity;
 const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
 const log = @import("../log.zig").scoped("xmpp");
+const llm = @import("../llm/provider.zig");
 
 /// How long a single `pollFn` cycle waits for a stanza before returning an
 /// empty slice — bounds the blocking socket read so the round-robin poll
@@ -643,7 +644,11 @@ pub const XmppConnector = struct {
             return;
         };
         const kind = if (self.isJoinedRoom(chat_id)) "groupchat" else "chat";
-        client.sendMessage(allocator, chat_id, kind, text) catch |err| {
+        // Same reasoning as the Matrix connector: no rich equivalent here,
+        // but the chain-of-thought markers are control bytes and must not
+        // reach a client raw. See `llm.renderThinkingPlain`.
+        const body = llm.renderThinkingPlain(allocator, text) catch text;
+        client.sendMessage(allocator, chat_id, kind, body) catch |err| {
             log.warn("failed to send message to {s}: {t}", .{ chat_id, err });
         };
     }
