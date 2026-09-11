@@ -2721,7 +2721,7 @@ fn handleMessage(
         // shape as the Undo button above — the Approve/Discard buttons on a
         // `reply_autonomy = .draft` notification (see
         // `handleTelegramUserAutoReply`/`handleDraftChoicePicked`).
-        if (handleDraftChoicePicked(connector, a, io, telegram_user, pending_drafts, now, msg, picked)) {
+        if (handleDraftChoicePicked(connector, a, io, config, telegram_user, pending_drafts, now, msg, picked)) {
             return false;
         }
         // Same shape again — `/tdchats`' Prev/Next pager buttons. Checked
@@ -5938,16 +5938,32 @@ fn handleTelegramUserAutoReply(
 /// `audit_notify`/`convert_flow`/`menu`'s own buttons) so `handleMessage`
 /// falls through to its other `choice_picked` consumers unchanged, same
 /// contract as `audit_notify.handleUndoPicked`.
+///
+/// Owner-only, checked here and not left to "the buttons are only ever
+/// posted to the owner's chat": Telegram lets any client send arbitrary
+/// `callback_data` for any bot message, so a `draft_approve:<chat>` value
+/// arriving from someone else is a forged press, and approving it would
+/// send the unreviewed draft from the owner's own personal account. A
+/// forged press is still consumed (`true`) so it can't fall through to
+/// another button consumer, but it does nothing and gets no reply.
 fn handleDraftChoicePicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
     io: Io,
+    config: *const config_mod.Config,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     now: i64,
     msg: iface.Message,
     picked: iface.ChoicePicked,
 ) bool {
+    const is_draft_button = std.mem.startsWith(u8, picked.value, draft_approve_prefix) or
+        std.mem.startsWith(u8, picked.value, draft_discard_prefix);
+    if (!is_draft_button) return false;
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        log.warn("reply_autonomy: ignoring draft button {s} pressed by non-owner {s} in chat {s}", .{ picked.value, msg.user_id, msg.chat_id });
+        return true;
+    }
     if (std.mem.startsWith(u8, picked.value, draft_approve_prefix)) {
         const native_chat_id = picked.value[draft_approve_prefix.len..];
         const draft = pending_drafts.take(a, now, native_chat_id) orelse {
