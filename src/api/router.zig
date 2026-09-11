@@ -1487,6 +1487,24 @@ fn isOwnerOrLiveAdminOfChatAccount(ctx: *const ServerContext, account_id: i64, r
 /// Ownership: on success, the caller owns `chat.native_chat_id` and must
 /// free it.
 fn requireChatAccess(ctx: *const ServerContext, request: *http.Server.Request, chat_id: i64) !?chats_store.ChatRef {
+    const access = (try requireChatAccessWithAuth(ctx, request, chat_id)) orelse return null;
+    return access.chat;
+}
+
+/// What `requireChatAccess` establishes about the caller on the way to its
+/// answer. Handlers that need the account id or roles again *after* reading
+/// the request body must take them from here rather than call `resolveAuth`
+/// a second time: `findCookie` iterates the request headers, and
+/// `std.http.Server` asserts the connection is still in its
+/// `received_head` state to do that -- once the body reader has been
+/// taken, that assert is a process abort in ReleaseSafe, not an error.
+const ChatAccess = struct {
+    chat: chats_store.ChatRef,
+    account_id: i64,
+    roles: Roles,
+};
+
+fn requireChatAccessWithAuth(ctx: *const ServerContext, request: *http.Server.Request, chat_id: i64) !?ChatAccess {
     const a = resolveAuth(ctx, request);
     const account_id = a.account_id orelse {
         try respondError(request, .unauthorized, "unauthorized", "not logged in");
@@ -1508,7 +1526,9 @@ fn requireChatAccess(ctx: *const ServerContext, request: *http.Server.Request, c
         try respondError(request, .internal_server_error, "internal", "failed to check access");
         return null;
     };
-    if (roles.bot_admin or isOwnerOrLiveAdminOfChatAccount(ctx, account_id, roles, chat)) return chat;
+    if (roles.bot_admin or isOwnerOrLiveAdminOfChatAccount(ctx, account_id, roles, chat)) {
+        return .{ .chat = chat, .account_id = account_id, .roles = roles };
+    }
 
     ctx.allocator.free(chat.native_chat_id);
     try respondError(request, .forbidden, "forbidden", "not a live admin of this chat");
@@ -1676,7 +1696,13 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
     };
-    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    // Everything this handler needs to know about the caller is taken here,
+    // before the body read below -- see `ChatAccess`. The owner re-check and
+    // the audit row used to call `resolveAuth` again after the body, which
+    // aborted the process on every successful PATCH, after every setter had
+    // already committed.
+    const access = (try requireChatAccessWithAuth(ctx, request, chat_id)) orelse return;
+    const chat = access.chat;
     defer ctx.allocator.free(chat.native_chat_id);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -1713,15 +1739,7 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
     const current_welcome = chat_settings.getWelcomeMessage(ctx.pool, arena, chat_id);
     const current_location = chat_settings.getDefaultLocation(ctx.pool, arena, chat_id);
     if (optionalStringChanged(current_welcome, body.welcome_message) or optionalStringChanged(current_location, body.default_location)) {
-        const owner_check = resolveAuth(ctx, request);
-        const owner_account_id = owner_check.account_id orelse {
-            return respondError(request, .unauthorized, "unauthorized", "not logged in");
-        };
-        const owner_roles = computeRoles(ctx, owner_account_id) catch |err| {
-            log.err("set-chat-settings: failed to check owner status for account {d}: {t}", .{ owner_account_id, err });
-            return respondError(request, .internal_server_error, "internal", "failed to check access");
-        };
-        if (!owner_roles.owner) {
+        if (!access.roles.owner) {
             return respondError(request, .forbidden, "forbidden", "only the bot owner can change the welcome message or default location");
         }
     }
@@ -1771,8 +1789,7 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
         return respondError(request, .internal_server_error, "internal", "failed to update settings");
     };
 
-    const a = resolveAuth(ctx, request);
-    audit_log.record(ctx.pool, a.account_id, null, "chat_settings.set", id_str, null);
+    audit_log.record(ctx.pool, access.account_id, null, "chat_settings.set", id_str, null);
 
     return respondJson(ctx, request, .ok, .{});
 }
@@ -3903,7 +3920,11 @@ fn handleCreateAnnouncement(ctx: *const ServerContext, request: *http.Server.Req
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
     };
-    const chat = (try requireChatAccess(ctx, request, chat_id)) orelse return;
+    // Taken before the body read -- see `ChatAccess`. This used to call
+    // `resolveAuth` again after the body to learn the account id, which
+    // aborted the process on every call.
+    const access = (try requireChatAccessWithAuth(ctx, request, chat_id)) orelse return;
+    const chat = access.chat;
     defer ctx.allocator.free(chat.native_chat_id);
     if (!feature_flags.isEnabled(ctx.pool, "announcements")) {
         return respondError(request, .forbidden, "forbidden", "the announcements module is disabled");
@@ -3935,10 +3956,7 @@ fn handleCreateAnnouncement(ctx: *const ServerContext, request: *http.Server.Req
         }
     }
 
-    const a = resolveAuth(ctx, request);
-    const account_id = a.account_id orelse {
-        return respondError(request, .unauthorized, "unauthorized", "not logged in");
-    };
+    const account_id = access.account_id;
     const identity_ids = accounts.listIdentityIds(ctx.pool, arena, account_id) catch |err| {
         log.err("create-announcement: failed to list identities for account {d}: {t}", .{ account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to resolve identity");
