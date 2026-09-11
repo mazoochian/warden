@@ -75,11 +75,11 @@ pub const StopReason = enum { end_turn, tool_use, other };
 /// chain-of-thought (see `llm/openai_compat.zig`'s use in place of the old
 /// bare "💭 " prefix) — platform-neutral on purpose: what a *renderer* does
 /// with a wrapped span (Telegram: an expandable blockquote, see
-/// `telegram/markdown_html.zig`; a platform with no special treatment yet:
-/// nothing, or strip the markers and show it plain) is that renderer's own
-/// decision, not something an LLM provider adapter should know about.
-/// Control bytes, never legitimately present in real model output, so they
-/// can't collide with anything the model writes and need no escaping.
+/// `platform/telegram/markdown_html.zig`; a platform with no special
+/// treatment yet: nothing, or strip the markers and show it plain) is that
+/// renderer's own decision, not something an LLM provider adapter should know
+/// about. Control bytes, never legitimately present in real model output, so
+/// they can't collide with anything the model writes and need no escaping.
 pub const thinking_start = "\x02";
 pub const thinking_end = "\x03";
 
@@ -88,7 +88,7 @@ pub const thinking_end = "\x03";
 /// text carrying them must never reach a user as-is.
 ///
 /// Telegram's HTML path turns a span into an expandable blockquote
-/// (`telegram/markdown_html.zig`); this is what everything else gets:
+/// (`platform/telegram/markdown_html.zig`); this is what everything else gets:
 /// Matrix and XMPP, which have no equivalent, and — the case that actually
 /// broke — Telegram's *own* plain-text fallback, taken whenever the API
 /// rejects the HTML attempt. That fallback sent the raw marker bytes

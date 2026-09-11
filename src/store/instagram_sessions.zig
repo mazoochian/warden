@@ -1,7 +1,7 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// Everything `instagram/session.zig` needs to resume a logged-in session
+/// Everything `platform/instagram/session.zig` needs to resume a logged-in session
 /// without re-authenticating -- device identity plus session cookies. See
 /// `0047_instagram_sessions.sql`'s doc comment for why this is a single
 /// fixed-id row (one personal account per deployment, not multi-tenant).
@@ -84,7 +84,7 @@ pub fn saveSession(pool: *PgPool, session: StoredSession) !void {
 
 /// `/iglogin logout` -- clears the persisted session so the next login
 /// starts fresh server-side too (the device profile is intentionally NOT
-/// cleared by this alone; see `instagram/session.zig`'s `logOut`, which
+/// cleared by this alone; see `platform/instagram/session.zig`'s `logOut`, which
 /// decides whether to keep or regenerate the device identity).
 pub fn clearSession(pool: *PgPool) !void {
     const db = try pool.acquire();

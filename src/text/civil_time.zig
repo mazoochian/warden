@@ -69,11 +69,32 @@ pub fn civilFromDays(days: i64) struct { year: i32, month: u8, day: u8 } {
 
 const seconds_per_day: i64 = 86400;
 
+/// The widest unix timestamps `localFromUnix` will render — 0001-01-01 and
+/// 9999-12-31, the range a four-digit year covers. Anything outside is
+/// clamped to the nearest end rather than converted.
+///
+/// Clamped rather than asserted because these timestamps arrive from
+/// Postgres rows and from arithmetic on user input, not from constants: a
+/// `reminders.due_at` written by hand, or one `reminder_format.nextOccurrence`
+/// saturated to `maxInt(i64)` on an absurd recur interval, used to abort the
+/// process here instead of showing a date — `civilFromDays` would hand a year
+/// around 2.9e11 to an `i32`, and the offset addition below overflowed i64
+/// outright. That turned every listing that touches the row (`/reminders`,
+/// `GET /api/v1/reminders`, the menu's reminder list) into a crash, which is
+/// exactly the path a stuck row is supposed to be fixed from.
+pub const min_unix: i64 = -62135596800;
+pub const max_unix: i64 = 253402300799;
+
 /// Splits a unix timestamp into local calendar/clock components under a
 /// fixed UTC offset (see `civil_time.zig`'s module doc comment for why a
-/// fixed offset, not a real DST-aware zone).
+/// fixed offset, not a real DST-aware zone). Out-of-range timestamps are
+/// clamped to `min_unix`/`max_unix` — see their doc comment.
 pub fn localFromUnix(unix_ts: i64, offset_minutes: i32) Civil {
-    const local_ts = unix_ts + @as(i64, offset_minutes) * 60;
+    // Clamped before the offset is applied as well as after, so the addition
+    // itself can't overflow: the clamped value leaves i64 room to spare for
+    // any offset a timezone can hold.
+    const clamped = std.math.clamp(unix_ts, min_unix, max_unix);
+    const local_ts = std.math.clamp(clamped + @as(i64, offset_minutes) * 60, min_unix, max_unix);
     const days = @divFloor(local_ts, seconds_per_day);
     const secs_of_day = local_ts - days * seconds_per_day;
     const ymd = civilFromDays(days);
@@ -166,6 +187,28 @@ test "localFromUnix/unixFromLocal round-trip across positive, negative, and half
         const c = localFromUnix(ts, off);
         try testing.expectEqual(ts, unixFromLocal(c, off));
     }
+}
+
+test "localFromUnix clamps an out-of-range timestamp instead of aborting" {
+    // Both of these used to panic rather than return: the first on
+    // `civilFromDays`'s `@intCast` to an `i32` year, the second on the
+    // offset addition overflowing i64 before it even got there. Reachable
+    // from a `reminders.due_at` that `nextOccurrence` parked at `maxInt`.
+    const far_future = localFromUnix(std.math.maxInt(i64), 0);
+    try testing.expectEqual(@as(i32, 9999), far_future.year);
+    try testing.expectEqual(@as(u8, 12), far_future.month);
+    try testing.expectEqual(@as(u8, 31), far_future.day);
+
+    const with_offset = localFromUnix(std.math.maxInt(i64), 210);
+    try testing.expectEqual(@as(i32, 9999), with_offset.year);
+
+    const far_past = localFromUnix(std.math.minInt(i64), -300);
+    try testing.expectEqual(@as(i32, 1), far_past.year);
+    try testing.expectEqual(@as(u8, 1), far_past.month);
+    try testing.expectEqual(@as(u8, 1), far_past.day);
+
+    // In-range timestamps are untouched by the clamp.
+    try testing.expectEqual(@as(i32, 1970), localFromUnix(0, 0).year);
 }
 
 test "localFromUnix applies the offset before splitting into calendar components" {

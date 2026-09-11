@@ -19,7 +19,7 @@ const feature_flags = @import("../store/feature_flags.zig");
 const dynamic_config = @import("../store/dynamic_config.zig");
 const config_mod = @import("../config.zig");
 const iface = @import("../platform/interface.zig");
-const telegram_user_platform = @import("../platform/telegram_user.zig");
+const telegram_user_platform = @import("../platform/telegram/user_connector.zig");
 const chat_summary = @import("../features/chat_summary.zig");
 const curated_feed = @import("../features/curated_feed.zig");
 const feed_store = @import("../store/feed.zig");
@@ -2220,6 +2220,12 @@ fn handleChatActionMute(ctx: *const ServerContext, request: *http.Server.Request
 
     const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
     const duration = body.duration_seconds orelse default_mute_seconds;
+    // Unbounded before: a negative duration is a past `until_date`, which
+    // Telegram reads as a *permanent* mute, and a huge one overflowed the
+    // addition below.
+    if (duration <= 0 or duration > reminder_format.max_schedule_seconds) {
+        return respondError(request, .bad_request, "bad_request", "duration_seconds must be positive and at most 366 days");
+    }
     ac.connector.muteUser(arena, ac.chat.native_chat_id, target_native_id, now + duration) catch |err| {
         log.err("chat-action-mute: failed for chat {d} target {d}: {t}", .{ chat_id, body.identity_id, err });
         return respondError(request, .internal_server_error, "internal", "mute failed");
@@ -3725,8 +3731,8 @@ fn resolveWhenDueAt(ctx: *const ServerContext, request: *http.Server.Request, wh
             try respondError(request, .bad_request, "bad_request", "when.seconds required for a duration");
             return null;
         };
-        if (seconds <= 0) {
-            try respondError(request, .bad_request, "bad_request", "when.seconds must be positive");
+        if (seconds <= 0 or seconds > reminder_format.max_schedule_seconds) {
+            try respondError(request, .bad_request, "bad_request", "when.seconds must be positive and at most 366 days");
             return null;
         }
         const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
@@ -3785,8 +3791,13 @@ fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request
         return respondError(request, .bad_request, "bad_request", "message must be 1-500 bytes");
     }
     if (body.recur_interval_seconds) |interval| {
-        if (interval <= 0) {
-            return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive");
+        // The upper bound matters as much as the lower one: `nextOccurrence`
+        // multiplies this by however many firings were missed, and an
+        // unbounded value used to overflow i64 there -- an abort in the
+        // scheduler, on a row that stayed due, so it repeated on every
+        // restart. See `reminder_format.max_schedule_seconds`.
+        if (interval <= 0 or interval > reminder_format.max_schedule_seconds) {
+            return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive and at most 366 days");
         }
     }
 
@@ -3914,8 +3925,13 @@ fn handleCreateAnnouncement(ctx: *const ServerContext, request: *http.Server.Req
         return respondError(request, .bad_request, "bad_request", "message must be 1-1000 bytes");
     }
     if (body.recur_interval_seconds) |interval| {
-        if (interval <= 0) {
-            return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive");
+        // The upper bound matters as much as the lower one: `nextOccurrence`
+        // multiplies this by however many firings were missed, and an
+        // unbounded value used to overflow i64 there -- an abort in the
+        // scheduler, on a row that stayed due, so it repeated on every
+        // restart. See `reminder_format.max_schedule_seconds`.
+        if (interval <= 0 or interval > reminder_format.max_schedule_seconds) {
+            return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive and at most 366 days");
         }
     }
 

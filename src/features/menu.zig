@@ -100,6 +100,18 @@ pub const ActionContext = struct {
     /// wrapper message for `.perform`/`.performDynamicPick`, or the actual
     /// follow-up message for `.resumeAwaitingInput`.
     msg: iface.Message,
+    /// The presser's bot-wide tiers, resolved once by the caller in
+    /// `main.zig` (it has already paid for both lookups to dispatch the
+    /// message at all) — read by `ActionRunner.authorize` to evaluate a
+    /// node's `menu_tree.MinRole`, never by `menu.zig` itself.
+    is_owner: bool,
+    is_bot_admin: bool,
+    /// Memo for the one live `isGroupAdmin` round trip a `.chat_admin` node
+    /// needs: rendering a branch authorizes every child, so without this a
+    /// single Group Administration screen would cost ten identical platform
+    /// calls. Points at a local in the caller's frame (see `menuCtx`), so its
+    /// lifetime is this one message's dispatch and no lock is needed.
+    live_admin_cache: *?bool,
     /// The rest of this bundle is only needed by a handful of specific
     /// actions (word cloud/pie chart rendering, the digest on/off toggle,
     /// launching `/convert`'s own flow) — carried through unconditionally
@@ -115,6 +127,13 @@ pub const ActionContext = struct {
 /// a ptr+vtable pair like `iface.Connector` — there's exactly one
 /// implementation, so the extra indirection buys nothing.
 pub const ActionRunner = struct {
+    /// May this presser see and run `id`? Called for every child before it's
+    /// rendered as a button, and again for the node itself immediately before
+    /// any of the five dispatch entry points below — the menu is a UI over
+    /// handlers that mostly assume their caller gated them, so this is where
+    /// that gate actually lives for the button path. See
+    /// `menu_tree.MinRole`.
+    authorize: *const fn (id: NodeId, ctx: ActionContext) bool,
     /// Runs a `.action` node's effect.
     perform: *const fn (id: NodeId, ctx: ActionContext) Outcome,
     /// Produces a `.dynamic_list` node's live choices (e.g. this chat's
@@ -161,12 +180,21 @@ const Rendered = struct {
 /// Back (only when there's somewhere to go back to) and Close. This same
 /// list is rebuilt both to render a screen and to resolve a Matrix pick
 /// (matched by emoji) — see `resolvePick`.
+///
+/// In `.normal` mode a child the presser isn't authorized for is left out
+/// entirely, so it's neither shown nor resolvable. `.help` mode is
+/// deliberately unfiltered: it performs nothing, and the point of the Help
+/// browser is documenting what the bot can do, including the parts this
+/// reader can't invoke.
 fn choicesFor(n: *const tree.MenuNode, mode: Mode, runner: ActionRunner, ctx: ActionContext, stack_len: usize) []const iface.Choice {
     var out: std.ArrayList(iface.Choice) = .empty;
     if (mode == .normal and n.kind == .dynamic_list) {
         for (runner.dynamicChoices(n.id, ctx)) |c| out.append(ctx.a, c) catch {};
     } else {
-        for (n.children) |c| out.append(ctx.a, .{ .emoji = c.emoji, .label = c.label, .value = @tagName(c.id) }) catch {};
+        for (n.children) |c| {
+            if (mode == .normal and !runner.authorize(c.id, ctx)) continue;
+            out.append(ctx.a, .{ .emoji = c.emoji, .label = c.label, .value = @tagName(c.id) }) catch {};
+        }
     }
     if (stack_len > 0) out.append(ctx.a, .{ .emoji = back_emoji, .label = "Back", .value = back_value }) catch {};
     out.append(ctx.a, .{ .emoji = close_emoji, .label = "Close", .value = close_value }) catch {};
@@ -409,12 +437,19 @@ pub const Sessions = struct {
     /// Opens a brand new `/menu` (always at `.root`, `.normal` mode) —
     /// replaces any session already open for this (chat, user), same as
     /// `convert_flow.beginAwaitingFile` replacing a stale entry.
-    /// `a` is a throwaway allocator for this one call's rendering/sending
+    /// `ctx.a` is a throwaway allocator for this one call's rendering/sending
     /// (an arena in production, freed with the rest of the per-message
     /// task) — distinct from `self.allocator`, the session store's own
     /// long-lived allocator used only for what `putSession` actually keeps.
-    pub fn open(self: *Sessions, connector: iface.Connector, a: std.mem.Allocator, runner: ActionRunner, now: i64, msg: iface.Message) void {
-        const ctx = ActionContext{ .connector = connector, .a = a, .pool = undefined, .config = undefined, .chat_id = 0, .identity_id = 0, .now = now, .msg = msg, .io = self.io, .digest_scheduler = undefined, .pending_conversions = undefined, .pending_undos = undefined };
+    /// Takes the caller's full `ActionContext` (rather than the four fields it
+    /// needs directly) because rendering the root already runs
+    /// `runner.authorize` for every child, which reads the presser's tiers
+    /// out of it.
+    pub fn open(self: *Sessions, runner: ActionRunner, ctx: ActionContext) void {
+        const connector = ctx.connector;
+        const a = ctx.a;
+        const now = ctx.now;
+        const msg = ctx.msg;
         const rendered = renderNode(.root, .normal, runner, ctx, 0);
         const prompt_id = (connector.sendChoicePrompt(a, msg.chat_id, rendered.text, rendered.choices, msg.message_id) catch |err| {
             log.err("failed to open menu for chat {s}: {t}", .{ msg.chat_id, err });
@@ -543,6 +578,15 @@ pub const Sessions = struct {
         switch (n.kind) {
             .branch => {
                 const picked_id = std.meta.stringToEnum(NodeId, resolved) orelse return;
+                // Second layer over `choicesFor`'s filter: `resolvePick` only
+                // matches what that filter produced, but a value resolved
+                // from an emoji (Matrix) or a `callback_data` string a client
+                // made up is not proof of anything on its own, and a session
+                // can outlive the role it was opened with.
+                if (!runner.authorize(picked_id, ctx)) {
+                    log.warn("unauthorized menu pick {t} by user {s} in chat {s}", .{ picked_id, user_id, chat_id });
+                    return;
+                }
                 const picked_node = tree.node(picked_id);
                 switch (picked_node.kind) {
                     // Entering `.help` specifically is what switches the
@@ -817,6 +861,13 @@ pub const Sessions = struct {
         switch (s.stage) {
             .browsing => return false,
             .awaiting_input => |id| {
+                // Re-checked here, not just when the prompt was opened: the
+                // effect happens now, and a role can be revoked in between
+                // (the prompt lives for `timeout_seconds`).
+                if (!runner.authorize(id, ctx)) {
+                    log.warn("unauthorized menu input for {t} by user {s} in chat {s}", .{ id, user_id, chat_id });
+                    return false;
+                }
                 self.runAndApply(ctx.connector, runner, ctx, chat_id, user_id, runner.resumeAwaitingInput(id, ctx));
                 return true;
             },
@@ -905,8 +956,17 @@ pub const Sessions = struct {
 
 const testing = std.testing;
 
+/// Permissive `authorize` — the tests below exercise navigation/wizard
+/// mechanics, not the permission tiers (`restrictedRunner` covers those), and
+/// several of them navigate into `group_admin`, whose real tier is
+/// `.chat_admin`.
 fn testRunner() ActionRunner {
     const impl = struct {
+        fn authorize(id: NodeId, ctx: ActionContext) bool {
+            _ = id;
+            _ = ctx;
+            return true;
+        }
         fn perform(id: NodeId, ctx: ActionContext) Outcome {
             _ = ctx;
             return .{ .show = tree.node(id).parent orelse .root };
@@ -938,6 +998,7 @@ fn testRunner() ActionRunner {
         }
     };
     return .{
+        .authorize = impl.authorize,
         .perform = impl.perform,
         .dynamicChoices = impl.dynamicChoices,
         .performDynamicPick = impl.performDynamicPick,
@@ -945,6 +1006,35 @@ fn testRunner() ActionRunner {
         .beginWizard = impl.beginWizard,
         .finishWizard = impl.finishWizard,
     };
+}
+
+/// `testRunner`, but authorizing by the real tree tiers against a plain
+/// member (no owner/bot-admin/chat-admin standing) the way `main.zig`'s
+/// `menuAuthorize` would — plus a record of every node it let through, so a
+/// test can assert an action never ran rather than only that no button for it
+/// was drawn.
+var restricted_performed: std.ArrayList(NodeId) = .empty;
+
+fn restrictedRunner() ActionRunner {
+    var r = testRunner();
+    const impl = struct {
+        fn authorize(id: NodeId, ctx: ActionContext) bool {
+            _ = ctx;
+            return tree.node(id).min_role == .anyone;
+        }
+        fn perform(id: NodeId, ctx: ActionContext) Outcome {
+            restricted_performed.append(ctx.a, id) catch {};
+            return .{ .show = tree.node(id).parent orelse .root };
+        }
+        fn resumeAwaitingInput(id: NodeId, ctx: ActionContext) Outcome {
+            restricted_performed.append(ctx.a, id) catch {};
+            return .{ .show = tree.node(id).parent orelse .root };
+        }
+    };
+    r.authorize = impl.authorize;
+    r.perform = impl.perform;
+    r.resumeAwaitingInput = impl.resumeAwaitingInput;
+    return r;
 }
 
 const StubConnector = struct {
@@ -1017,6 +1107,11 @@ const StubConnector = struct {
     }
 };
 
+/// Every test here supplies its own `authorize`, so the tier fields are only
+/// along for the ride — a single file-scope cache is enough (these tests are
+/// single-threaded).
+var test_live_admin_cache: ?bool = null;
+
 fn baseCtx(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, now: i64) ActionContext {
     return .{
         .connector = connector,
@@ -1031,7 +1126,18 @@ fn baseCtx(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8
         .digest_scheduler = undefined,
         .pending_conversions = undefined,
         .pending_undos = undefined,
+        .is_owner = false,
+        .is_bot_admin = false,
+        .live_admin_cache = &test_live_admin_cache,
     };
+}
+
+/// Opens a session for ("chat1", `user_id`) at `now = 1000` — the starting
+/// point of nearly every test below.
+fn openMenu(sessions: *Sessions, stub: *StubConnector, a: std.mem.Allocator, runner: ActionRunner, user_id: []const u8) void {
+    var ctx = baseCtx(stub.connector(), a, "chat1", user_id, 1000);
+    ctx.msg.message_id = "1";
+    sessions.open(runner, ctx);
 }
 
 test "open sends the root menu and stores a session" {
@@ -1042,7 +1148,7 @@ test "open sends the root menu and stores a session" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     try testing.expectEqual(@as(usize, 1), stub.sent_messages.items.len);
     try testing.expect(std.mem.indexOf(u8, stub.sent_messages.items[0], "Warden") != null);
 }
@@ -1055,7 +1161,7 @@ test "handleChoicePicked navigates into a branch and edits the message in place"
     defer arena.deinit();
     const a = arena.allocator();
 
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     const prompt_id = stub.next_message_id; // the id `sendChoicePrompt` handed back
 
     var ctx = baseCtx(stub.connector(), a, "chat1", "alice", 1001);
@@ -1078,7 +1184,7 @@ test "a different user pressing the same message gets rejected on Telegram" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     const prompt_id = stub.next_message_id;
 
     const ctx = baseCtx(stub.connector(), a, "chat1", "mallory", 1001);
@@ -1101,7 +1207,7 @@ test "Matrix falls back to a fresh message when editChoicePrompt is unsupported"
     defer arena.deinit();
     const a = arena.allocator();
 
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     const prompt_id = stub.next_message_id;
     const sent_before = stub.sent_messages.items.len;
 
@@ -1125,7 +1231,7 @@ test "awaiting_input round trip: a bad follow-up retries, a good one advances an
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     const prompt_id = stub.next_message_id;
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{prompt_id}) catch unreachable;
@@ -1156,7 +1262,7 @@ test "cancel clears an open session and reports whether anything was open" {
     const a = arena.allocator();
 
     try testing.expect(!sessions.cancel("chat1", "alice"));
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     try testing.expect(sessions.cancel("chat1", "alice"));
     try testing.expect(!sessions.isAwaitingInput(1000, "chat1", "alice"));
 }
@@ -1169,7 +1275,7 @@ test "sweepExpired evicts only sessions past their deadline" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     sessions.sweepExpired(&.{stub.connector()}, 1000 + 59);
     try testing.expect(sessions.map.count() == 1);
     sessions.sweepExpired(&.{stub.connector()}, 1000 + 61);
@@ -1184,7 +1290,7 @@ test "sweepExpired edits the timed-out menu message to \"Menu timeout\" with no 
     defer arena.deinit();
     const a = arena.allocator();
 
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     sessions.sweepExpired(&.{stub.connector()}, 1000 + 61);
 
     try testing.expectEqual(@as(usize, 1), stub.edited.items.len);
@@ -1199,7 +1305,7 @@ test "sweepExpired doesn't crash when no connector matches the session's platfor
     defer arena.deinit();
     const a = arena.allocator();
 
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     sessions.sweepExpired(&.{}, 1000 + 61);
     try testing.expect(sessions.map.count() == 0);
 }
@@ -1212,7 +1318,7 @@ test "close deletes the message and drops the session" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    sessions.open(stub.connector(), a, testRunner(), 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
     const prompt_id = stub.next_message_id;
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{prompt_id}) catch unreachable;
@@ -1233,7 +1339,7 @@ test "a dynamic_list node shows the runner's live choices, and picking one calls
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
 
@@ -1258,7 +1364,7 @@ test "help mode browses read-only: picking a module shows its help text, never r
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
 
@@ -1294,7 +1400,7 @@ test "wizard: entering a .wizard child shows the date stepper with the runner's 
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
     enterReminderWizard(&sessions, &stub, a, runner, pid);
@@ -1313,7 +1419,7 @@ test "wizard: +/- steps the current field, Next/Previous move linearly through d
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
     enterReminderWizard(&sessions, &stub, a, runner, pid);
@@ -1367,7 +1473,7 @@ test "wizard: the message step captures a follow-up message and shows the confir
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
     enterReminderWizard(&sessions, &stub, a, runner, pid);
@@ -1397,7 +1503,7 @@ test "wizard: a date reply on a stepper step jumps straight there and advances t
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
     enterReminderWizard(&sessions, &stub, a, runner, pid);
@@ -1417,7 +1523,7 @@ test "wizard: unparseable text on a stepper step is left alone for normal dispat
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
     enterReminderWizard(&sessions, &stub, a, runner, pid);
@@ -1437,7 +1543,7 @@ test "wizard: Discard from the confirm screen exits back to Reminders without le
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
     enterReminderWizard(&sessions, &stub, a, runner, pid);
@@ -1464,7 +1570,7 @@ test "wizard: Create on the confirm screen calls finishWizard and shows its outc
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
     enterReminderWizard(&sessions, &stub, a, runner, pid);
@@ -1492,7 +1598,7 @@ test "wizard: Close mid-wizard tears the session down cleanly (no leaked draft m
     const a = arena.allocator();
     const runner = testRunner();
 
-    sessions.open(stub.connector(), a, runner, 1000, .{ .chat_id = "chat1", .user_id = "alice", .message_id = "1" });
+    openMenu(&sessions, &stub, a, runner, "alice");
     var buf: [16]u8 = undefined;
     const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
     enterReminderWizard(&sessions, &stub, a, runner, pid);
@@ -1510,4 +1616,97 @@ test "wizard: Close mid-wizard tears the session down cleanly (no leaked draft m
     // The leak checker on `sessions.deinit()`/the arena above is the real
     // assertion here: a bug in `freeStage` would surface as a testing
     // allocator failure, not a normal `expect`.
+}
+
+test "a non-owner, non-admin sees no privileged buttons and can't reach one by forging a pick" {
+    var sessions = Sessions.init(testing.allocator, testing.io, 60);
+    defer sessions.deinit();
+    var stub = StubConnector{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const runner = restrictedRunner();
+    restricted_performed = .empty;
+
+    openMenu(&sessions, &stub, a, runner, "mallory");
+    var buf: [16]u8 = undefined;
+    const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
+
+    // Root offers the open modules but neither Group Administration nor
+    // anything under Settings -> Global.
+    const root_screen = stub.sent_messages.items[0];
+    try testing.expect(std.mem.indexOf(u8, root_screen, "Alerts") != null);
+    try testing.expect(std.mem.indexOf(u8, root_screen, "Group Administration") == null);
+
+    // Telegram hands back whatever `callback_data` the client sent, so try
+    // jumping straight into the branch that wasn't drawn.
+    const ctx1 = baseCtx(stub.connector(), a, "chat1", "mallory", 1001);
+    sessions.handleChoicePicked(runner, 1001, ctx1, .{ .prompt_message_id = pid, .value = "group_admin" });
+    try testing.expectEqual(@as(usize, 0), stub.edited.items.len); // never navigated
+
+    // And straight at the action itself (CORE-1's three-tap path: Settings ->
+    // Global -> Add bot admin), from the session's real current node.
+    const ctx2 = baseCtx(stub.connector(), a, "chat1", "mallory", 1002);
+    sessions.handleChoicePicked(runner, 1002, ctx2, .{ .prompt_message_id = pid, .value = "settings_global_addadmin" });
+    try testing.expectEqual(@as(usize, 0), restricted_performed.items.len);
+    try testing.expect(!sessions.isAwaitingInput(1002, "chat1", "mallory"));
+
+    // Settings itself is open to everyone; its Global child is not.
+    const ctx3 = baseCtx(stub.connector(), a, "chat1", "mallory", 1003);
+    sessions.handleChoicePicked(runner, 1003, ctx3, .{ .prompt_message_id = pid, .value = "settings" });
+    const settings_screen = stub.edited.items[stub.edited.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, settings_screen, "Personal") != null);
+    try testing.expect(std.mem.indexOf(u8, settings_screen, "Global") == null);
+}
+
+test "an awaiting_input prompt whose authorization is revoked mid-flow doesn't run on the follow-up" {
+    var sessions = Sessions.init(testing.allocator, testing.io, 60);
+    defer sessions.deinit();
+    var stub = StubConnector{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    restricted_performed = .empty;
+
+    // Opened and navigated to Kick as a chat admin (permissive runner)...
+    openMenu(&sessions, &stub, a, testRunner(), "alice");
+    var buf: [16]u8 = undefined;
+    const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
+    const ctx1 = baseCtx(stub.connector(), a, "chat1", "alice", 1001);
+    sessions.handleChoicePicked(testRunner(), 1001, ctx1, .{ .prompt_message_id = pid, .value = "group_admin" });
+    const ctx2 = baseCtx(stub.connector(), a, "chat1", "alice", 1002);
+    sessions.handleChoicePicked(testRunner(), 1002, ctx2, .{ .prompt_message_id = pid, .value = "group_admin_kick" });
+    try testing.expect(sessions.isAwaitingInput(1002, "chat1", "alice"));
+
+    // ...but demoted before naming a target: the reply is left for normal
+    // dispatch (`false`) and the handler never runs.
+    var reply_ctx = baseCtx(stub.connector(), a, "chat1", "alice", 1003);
+    reply_ctx.msg.text = "@someone";
+    try testing.expect(!sessions.handleAwaitingInputMessage(restrictedRunner(), reply_ctx));
+    try testing.expectEqual(@as(usize, 0), restricted_performed.items.len);
+}
+
+test "help mode still lists privileged modules for a plain member (read-only, nothing runs)" {
+    var sessions = Sessions.init(testing.allocator, testing.io, 60);
+    defer sessions.deinit();
+    var stub = StubConnector{};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const runner = restrictedRunner();
+    restricted_performed = .empty;
+
+    openMenu(&sessions, &stub, a, runner, "mallory");
+    var buf: [16]u8 = undefined;
+    const pid = std.fmt.bufPrint(&buf, "{d}", .{stub.next_message_id}) catch unreachable;
+
+    const ctx1 = baseCtx(stub.connector(), a, "chat1", "mallory", 1001);
+    sessions.handleChoicePicked(runner, 1001, ctx1, .{ .prompt_message_id = pid, .value = "help" });
+    const help_screen = stub.edited.items[stub.edited.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, help_screen, "Group Administration") != null);
+
+    const ctx2 = baseCtx(stub.connector(), a, "chat1", "mallory", 1002);
+    sessions.handleChoicePicked(runner, 1002, ctx2, .{ .prompt_message_id = pid, .value = "group_admin" });
+    try testing.expectEqual(@as(usize, 0), restricted_performed.items.len);
+    try testing.expect(!sessions.isAwaitingInput(1002, "chat1", "mallory"));
 }

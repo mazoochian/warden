@@ -65,8 +65,9 @@ pub fn imageBlockForAttachment(ctx: registry.ToolContext) ?llm.ContentBlock {
     const kind = ctx.attachment_kind orelse return null;
 
     // Telegram never reports a `mime_type` for a `.photo` at all (see
-    // `platform/telegram.zig`'s `attachmentFromMessage`) -- always JPEG for
-    // the size warden picks, so this is a safe hardcode, not a guess.
+    // `platform/telegram/connector.zig`'s `attachmentFromMessage`) -- always
+    // JPEG for the size warden picks, so this is a safe hardcode, not a
+    // guess.
     const media_type = switch (kind) {
         .photo => "image/jpeg",
         .document => imageMediaTypeForDocument(ctx) orelse return null,

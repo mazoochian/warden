@@ -19,8 +19,22 @@ pub fn parseDuration(text: []const u8) ?i64 {
         'd' => 86400,
         else => return null,
     };
-    return n * multiplier;
+    // `n * multiplier` unchecked was a crash any chat member could trigger
+    // (`/remind 106751991167301d x` overflows i64, which is an abort in
+    // `-Doptimize=ReleaseSafe`, not an error). The cap does the same job for
+    // the values just under that too: a reminder a thousand years out is a
+    // typo, and treating it as one gives the caller the usage message.
+    const seconds = std.math.mul(i64, n, multiplier) catch return null;
+    if (seconds > max_schedule_seconds) return null;
+    return seconds;
 }
+
+/// Upper bound on any user-supplied delay or repeat interval — a year (plus a
+/// day for leap years). Enforced by `parseDuration` for the command/tool
+/// shorthand, and by `api/router.zig` for the raw `seconds`/
+/// `recur_interval_seconds` numbers the web API accepts, since those never
+/// pass through the shorthand parser at all.
+pub const max_schedule_seconds: i64 = 366 * 86400;
 
 /// Parses a 24h clock time like "9:00" or "14:30" and resolves it to the
 /// next absolute unix timestamp at or after `now` that matches that
@@ -241,11 +255,22 @@ pub fn parseWhenLocal(text: []const u8, now: i64, offset_minutes: i32, date_form
 /// one step — so a reminder that missed several firings (bot was down,
 /// clock skew) doesn't fire once per missed interval in a burst, just once
 /// for "now" and resumes its normal cadence from there.
+/// Saturates instead of overflowing: a row whose `recur_interval_seconds`
+/// predates the cap in `parseDuration`/the API (or was written straight into
+/// Postgres) would otherwise abort the scheduler here — and because the
+/// scheduler sends the message *before* rescheduling, that abort left the row
+/// still due and re-fired it on every restart until someone deleted it by
+/// hand. Parking it at `maxInt` retires the reminder instead, which is
+/// visible in `/reminders` and fixable from chat — that last part only
+/// because `civil_time.localFromUnix` clamps rather than converting: a
+/// `maxInt` timestamp is far outside a four-digit year, and rendering one
+/// used to be its own abort on every listing that included the row.
 pub fn nextOccurrence(due_at: i64, interval_seconds: i64, now: i64) i64 {
     if (interval_seconds <= 0 or due_at > now) return due_at;
-    const overdue_by = now - due_at;
+    const overdue_by = now -| due_at;
     const missed = @divFloor(overdue_by, interval_seconds) + 1;
-    return due_at + missed * interval_seconds;
+    const advance = std.math.mul(i64, missed, interval_seconds) catch return std.math.maxInt(i64);
+    return std.math.add(i64, due_at, advance) catch std.math.maxInt(i64);
 }
 
 /// Renders a recur interval back into compact shorthand ("1d", "2h", "30m")
@@ -426,4 +451,24 @@ test "formatRemaining scales units and clamps negatives to 0" {
     try testing.expectEqualStrings("12m", formatRemaining(a, 12 * 60));
     try testing.expectEqualStrings("3h 5m", formatRemaining(a, 3 * 3600 + 5 * 60));
     try testing.expectEqualStrings("2d 1h", formatRemaining(a, 2 * 86400 + 3600));
+}
+
+// AUDIT-2026-09-03 TEXT-1 / API-3: both of these were aborts in
+// `-Doptimize=ReleaseSafe` rather than errors, and the recurring one was a
+// crash loop that survived restarts (the row stayed due).
+test "parseDuration refuses a duration that would overflow, or that is simply absurd" {
+    try std.testing.expectEqual(@as(?i64, 1800), parseDuration("30m"));
+    try std.testing.expectEqual(@as(?i64, 366 * 86400), parseDuration("366d"));
+    try std.testing.expectEqual(@as(?i64, null), parseDuration("367d"));
+    try std.testing.expectEqual(@as(?i64, null), parseDuration("106751991167301d"));
+    try std.testing.expectEqual(@as(?i64, null), parseDuration("9223372036854775807m"));
+}
+
+test "nextOccurrence saturates instead of overflowing on an absurd interval" {
+    // Normal case: three intervals missed, one jump past `now`.
+    try std.testing.expectEqual(@as(i64, 400), nextOccurrence(100, 100, 350));
+    // An interval only reachable by writing straight to Postgres (or by the
+    // pre-cap web API) no longer takes the scheduler down with it.
+    try std.testing.expectEqual(std.math.maxInt(i64), nextOccurrence(0, std.math.maxInt(i64), std.math.maxInt(i64) - 1));
+    try std.testing.expectEqual(std.math.maxInt(i64), nextOccurrence(std.math.minInt(i64), std.math.maxInt(i64), 0));
 }

@@ -30,7 +30,7 @@ const Io = std.Io;
 
 const store_pool = @import("store/pool.zig");
 const chats = @import("store/chats.zig");
-const raw = @import("telegram/client.zig");
+const raw = @import("platform/telegram/client.zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;

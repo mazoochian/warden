@@ -1,6 +1,6 @@
 const std = @import("std");
 const Platform = @import("platform/interface.zig").Platform;
-const instagram_transport = @import("instagram/transport.zig");
+const instagram_transport = @import("platform/instagram/transport.zig");
 
 pub const OwnerEntry = struct {
     platform: Platform,
@@ -36,8 +36,8 @@ pub const MatrixConfig = struct {
     access_token: []const u8,
 };
 
-/// How `xmpp/client.zig`'s `startTls` verifies the server's certificate —
-/// `WARDEN_XMPP_TLS_MODE` selects one, see `loadXmppConfig`.
+/// How `platform/xmpp/client.zig`'s `startTls` verifies the server's
+/// certificate — `WARDEN_XMPP_TLS_MODE` selects one, see `loadXmppConfig`.
 pub const XmppTlsMode = enum {
     /// Default: the certificate must be well-formed and self-consistent
     /// (a valid self-signed cert, or a valid chain, expiry checked either
@@ -65,7 +65,7 @@ pub const XmppTlsMode = enum {
 /// from `domain`, e.g. a compose service name like "prosody" vs. a JID's
 /// "localhost" domain part). Authenticates via SASL SCRAM-SHA-256/-SHA-1
 /// when the server advertises either, falling back to PLAIN otherwise —
-/// see `xmpp/client.zig`'s `authScram`/`authPlain`.
+/// see `platform/xmpp/client.zig`'s `authScram`/`authPlain`.
 pub const XmppConfig = struct {
     host: []const u8,
     port: u16,
@@ -84,7 +84,7 @@ pub const XmppConfig = struct {
 /// `api_hash` come from my.telegram.org (per-application credentials,
 /// unrelated to a bot token). `session_dir` is where TDLib persists its
 /// login session (phone/code/2FA happens once, interactively — see
-/// `platform/telegram_user.zig`'s login flow — then this directory is
+/// `platform/telegram/user_connector.zig`'s login flow — then this directory is
 /// reused on every subsequent start, same "half-configured stays disabled"
 /// convention as `MatrixConfig`/`XmppConfig`: all three of these are
 /// required together or the connector doesn't start).
@@ -108,8 +108,9 @@ pub const InstagramConfig = struct {
     /// than a chat platform's long-poll (XMPP/Telegram effectively poll in
     /// seconds), since Instagram's private API is unofficial and aggressive
     /// polling is a real account-suspension risk (see the connector plan's
-    /// "Rate-limit / ban-avoidance policy" section). `instagram/policy.zig`
-    /// adds jitter on top of this, never polls faster than this floor.
+    /// "Rate-limit / ban-avoidance policy" section).
+    /// `platform/instagram/policy.zig` adds jitter on top of this, never
+    /// polls faster than this floor.
     poll_interval_ms: u32 = default_instagram_poll_interval_ms,
     /// Reverse-engineered protocol constants Instagram rotates without
     /// notice (see `instagram_transport.RotatingConstants`'s doc comment).
@@ -345,12 +346,12 @@ pub const Config = struct {
     /// this is set.
     matrix: ?MatrixConfig = null,
     /// The local secret libolm's account/session pickles (see
-    /// `src/matrix/olm.zig`) are encrypted under before being persisted —
-    /// deliberately sourced from config, not stored in the database
-    /// alongside the pickles themselves, so a DB-only compromise doesn't
-    /// also hand over the key material needed to decrypt them. Null means
-    /// Matrix E2E encryption stays inert (device keys never get created/
-    /// uploaded) even if `matrix` is otherwise configured — same
+    /// `src/platform/matrix/olm.zig`) are encrypted under before being
+    /// persisted — deliberately sourced from config, not stored in the
+    /// database alongside the pickles themselves, so a DB-only compromise
+    /// doesn't also hand over the key material needed to decrypt them. Null
+    /// means Matrix E2E encryption stays inert (device keys never get
+    /// created/ uploaded) even if `matrix` is otherwise configured — same
     /// half-configured-stays-disabled reasoning as the connector configs.
     matrix_pickle_key: ?[]const u8 = null,
     /// Null when XMPP isn't configured — `main.zig` only constructs an
@@ -360,7 +361,7 @@ pub const Config = struct {
     /// Null when the personal-account (TDLib) connector isn't configured —
     /// `main.zig` only constructs a `TelegramUserConnector` (and adds it to
     /// the active connector list) when this is set. See
-    /// `platform/telegram_user.zig`.
+    /// `platform/telegram/user_connector.zig`.
     telegram_user: ?TelegramUserConfig = null,
     /// Null when the Instagram personal-account connector isn't configured
     /// — `main.zig` only constructs an `InstagramConnector` (and adds it to

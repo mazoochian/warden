@@ -6,7 +6,7 @@ const toolcall = @import("../llm/toolcall.zig");
 const registry = @import("../tools/registry.zig");
 const PgPool = @import("../store/pool.zig").PgPool;
 const feed = @import("../store/feed.zig");
-const telegram_user_platform = @import("../platform/telegram_user.zig");
+const telegram_user_platform = @import("../platform/telegram/user_connector.zig");
 const log = @import("../log.zig").scoped("curated_feed");
 
 /// How many recent posts are pulled per source per pass. TDLib's

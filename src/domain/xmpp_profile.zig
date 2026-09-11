@@ -2,11 +2,11 @@ const std = @import("std");
 const Identity = @import("identity.zig").Identity;
 
 /// XMPP-specific extension of `Identity`, populated by
-/// `src/platform/xmpp.zig`'s `pollFn`. `jid_resource` is the resource part
-/// of whichever full JID a message was addressed from — null for a MUC
-/// message's synthetic room+nick sender, where the room's `identity.
-/// native_id` already carries the nick as its "resource" (see
-/// `platform/xmpp.zig`'s `messagesFromElement`).
+/// `src/platform/xmpp/connector.zig`'s `pollFn`. `jid_resource` is the
+/// resource part of whichever full JID a message was addressed from —
+/// null for a MUC message's synthetic room+nick sender, where the room's
+/// `identity.native_id` already carries the nick as its "resource" (see
+/// `platform/xmpp/connector.zig`'s `messagesFromElement`).
 pub const XmppProfile = struct {
     identity: Identity,
     jid_resource: ?[]const u8 = null,

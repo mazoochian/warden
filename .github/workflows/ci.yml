@@ -55,7 +55,8 @@ jobs:
         # (src/features/video_download.zig) -- without it, its yt-dlp-gated
         # tests skip instead of actually exercising the binary-presence and
         # failure-path checks. telegram-tdlib-dev is the personal-account
-        # connector's tdjson headers/link lib (src/platform/telegram_user.zig)
+        # connector's tdjson headers/link lib
+        # (src/platform/telegram/user_connector.zig)
         # -- missing here entirely until 2026-08-18, which is why every CI
         # run from that connector's first commit onward failed at `zig
         # build` with "unable to find dynamic system library 'tdjson'"
@@ -105,5 +106,20 @@ jobs:
       # detached thread rather than that module -- `coredumpctl info <pid>`
       # names the actually-faulting thread, which is the fastest way to tell
       # a real regression from a misattributed one.
+      #
+      # `--summary all` because a passing `zig build test` prints nothing at
+      # all -- no test count, no step list -- so a green run left no evidence
+      # in the log of what actually ran, and a step that silently stopped
+      # running the suite would look identical to one that passed it. With
+      # this, every run ends in a `Build Summary: N/N steps succeeded; X/Y
+      # tests passed` line to read (and to diff against the last run when the
+      # count moves unexpectedly).
+      #
+      # Expect a `failed command: .../test ... --listen=-` line in the log
+      # even on a green run: the API tests in `src/api/server.zig` detach a
+      # `serve` thread that outlives the test, and the binary exits
+      # abnormally during teardown *after* it has already reported results.
+      # The build runner has the results by then, so the summary and the exit
+      # code are both still trustworthy -- see NOTES.md.
       - name: zig build test
-        run: zig build test
+        run: zig build test --summary all

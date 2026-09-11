@@ -1,0 +1,51 @@
+# Optional sidecar: a small self-hosted LLM (see README's "Self-hosted
+# local model" section) -- a llama.cpp server the bot can talk to via
+# WARDEN_LLM_PROVIDER=openai_compat instead of a paid/rate-limited API.
+# Not part of the default deployment; merge this file in explicitly:
+#
+#   docker compose -f compose.yaml -f examples/llama-server/compose.yaml up -d
+#
+# Then point the bot at it:
+#
+#   export WARDEN_LLM_PROVIDER=openai_compat
+#   export WARDEN_OPENAI_BASE_URL=http://llama-server:8090/v1
+#   export WARDEN_OPENAI_MODEL=qwen3.5-4b
+services:
+  llama-server:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    restart: unless-stopped
+    volumes:
+      - ./examples/llama-server/models:/models:ro
+    # The image's baked-in healthcheck hardcodes port 8080; override it to
+    # match --port below, or `docker ps` reports this as permanently
+    # unhealthy despite working fine (confirmed: 404s hitting the wrong
+    # port, not an actual problem).
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+    # --host 0.0.0.0 so it's reachable from the warden container over the
+    # compose network by service name (http://llama-server:8090/v1); this
+    # is still never exposed to the host/LAN since no `ports:` is
+    # published here. `--threads` is deliberately unset (defaults to the
+    # container's visible core count) -- set it explicitly if colocated
+    # with other CPU-hungry services and you want to leave them headroom.
+    command:
+      - --model
+      - /models/Qwen3.5-4B-Q4_K_M.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8090"
+      - --ctx-size
+      - "8192"
+      - --jinja
+      - --alias
+      - qwen3.5-4b
+      # Qwen3.5 defaults to an extended "thinking" trace before its real
+      # answer -- confirmed by hand: a plain 2-sentence question burned a
+      # 300-token budget entirely on reasoning and never reached the
+      # actual reply. --reasoning off is this llama.cpp build's current
+      # flag for this (older docs/guides say --chat-template-kwargs
+      # '{"enable_thinking":false}', which still works but logs a
+      # deprecation warning on this image).
+      - --reasoning
+      - "off"

@@ -1,7 +1,6 @@
 [Unit]
-# Wraps the existing docker-compose.yaml stack (warden + warden-ui +
-# searxng + the VPS-local postgres/traefik override) so systemd — not just
-# Docker's own
+# Wraps the existing docker-compose.yaml stack (warden + warden-ui + the
+# VPS-local postgres/traefik override) so systemd — not just Docker's own
 # `restart: unless-stopped` — supervises it. Two things this buys over the
 # container-only setup:
 #   1. Boot-time start: containers with `restart: unless-stopped` only come
@@ -20,7 +19,7 @@
 # the `docker compose up` process itself dies (lost its connection to a
 # restarted Docker daemon, was OOM-killed, etc.), `Restart=always` below
 # brings the whole stack back.
-Description=Warden bot (docker compose: warden, warden-ui, searxng, postgres, traefik)
+Description=Warden bot (docker compose: warden, warden-ui, postgres, traefik)
 Documentation=https://github.com/mother-of-all-self-hosting
 After=docker.service network-online.target
 Wants=network-online.target
@@ -34,14 +33,18 @@ WorkingDirectory=/home/armin/warden
 # it off defensively so journal entries never carry stray ANSI escapes.
 # --remove-orphans: drops containers for services removed from
 # compose.yaml over time instead of leaving them running unmanaged.
-# Explicit service names, not a bare `up`: this repo also defines optional
-# sidecar services (llama-server, whisper-server, prosody) meant to be
-# opt-in only — see compose.yaml's own comments on why a bare `docker
-# compose up` would try to start those too. `traefik`/`warden-ui` are
+# Explicit service names, not a bare `up`: keeps this unit pinned to the
+# services it actually supervises, so an override file gaining a service
+# doesn't silently enlarge what systemd restarts. `traefik`/`warden-ui` are
 # defined in compose.override.yaml (VPS-only, not shipped in this repo —
 # see ARCHITECTURE.md §2 in the warden-ui repo for the reverse-proxy plan).
-ExecStart=/usr/bin/docker compose up --no-color --remove-orphans warden warden-ui searxng postgres traefik whisper-server
-ExecStop=/usr/bin/docker compose stop warden warden-ui searxng postgres traefik whisper-server
+# Sidecars (searxng, llama-server, whisper-server, prosody) are NOT named
+# here: they live in examples/*/compose.yaml, which this `docker compose`
+# invocation doesn't merge, so naming one would fail the whole unit with
+# "no such service". To supervise one, add its fragment with a `-f` here
+# and add the service name to both lines below.
+ExecStart=/usr/bin/docker compose up --no-color --remove-orphans warden warden-ui postgres traefik
+ExecStop=/usr/bin/docker compose stop warden warden-ui postgres traefik
 Restart=always
 RestartSec=10
 TimeoutStartSec=180

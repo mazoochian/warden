@@ -130,6 +130,15 @@ pub const NoteSink = struct {
 /// (see `tools/set_expense.zig`), so this sink -- like every store-layer
 /// boundary in this file -- only ever deals in the exact integer unit
 /// real money is stored as.
+/// Ceiling on a single expense amount, in cents (~1 trillion units of
+/// whatever currency). Lives here rather than in `main.zig` so both entry
+/// points share it: `/expense add`'s hand-rolled decimal parser and the
+/// `set_expense` tool's float conversion. Past this an amount is a mistake
+/// (or a hallucination) rather than a purchase, and both paths used to abort
+/// the process on the way to finding that out -- integer overflow in one,
+/// an out-of-range `@intFromFloat` in the other.
+pub const max_expense_cents: i64 = 100_000_000_000_000;
+
 pub const ExpenseSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -448,7 +457,7 @@ pub const ToolContext = struct {
     /// `iface.Attachment.kind` for this message's attachment, if any — see
     /// `llm/attachment_content.zig`'s `imageBlockForAttachment`, which needs
     /// this specifically because a Telegram photo never reports a
-    /// `mime_type` at all (see `platform/telegram.zig`'s
+    /// `mime_type` at all (see `platform/telegram/connector.zig`'s
     /// `attachmentFromMessage`), so `kind == .photo` is the only reliable
     /// "this is an image" signal for that case.
     attachment_kind: ?iface.AttachmentKind = null,

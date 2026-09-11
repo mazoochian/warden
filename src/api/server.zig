@@ -16,7 +16,7 @@ const WorkerPool = @import("../worker_pool.zig").WorkerPool;
 const store_pool = @import("../store/pool.zig");
 const config_mod = @import("../config.zig");
 const iface = @import("../platform/interface.zig");
-const telegram_user_platform = @import("../platform/telegram_user.zig");
+const telegram_user_platform = @import("../platform/telegram/user_connector.zig");
 const reply_drafts = @import("../features/reply_drafts.zig");
 const bot_view = @import("bot_view.zig");
 const llm = @import("../llm/provider.zig");
@@ -149,6 +149,49 @@ fn handleConnection(item: ConnectionItem) void {
         log.debug("failed to receive request head: {t}", .{err});
         return;
     };
+    // Two upstream asserts in `std.http.Server` turn a malformed request head
+    // into a process abort, and `-Doptimize=ReleaseSafe` (the Dockerfile's
+    // mode) keeps both live, so a single unauthenticated request could take
+    // every connector down with the API. Screened here, once, rather than at
+    // the ~26 `readerExpectNone` call sites in `router.zig`:
+    //
+    //  * A body-carrying method with neither `content-length` nor
+    //    `transfer-encoding` reaches `assert(transfer_encoding != .none or
+    //    content_length != null)` inside `Request.discardBody`, which every
+    //    `respond` on a keep-alive connection runs -- including the 401 from
+    //    `requireLoggedIn` and the 404 fallthrough, neither of which reads a
+    //    body. `Head.parse` doesn't reject the combination itself. 411 is the
+    //    RFC 7231 answer.
+    //  * `Request.readerExpectNone` asserts `head.expect == null`, so any
+    //    request with an `expect:` header panics at the first body read. Stock
+    //    curl sends `expect: 100-continue` for a large body, so this fired on
+    //    legitimate `/api/v1/convert` uploads too, not just hostile ones.
+    //    Answered properly here (write the continuation, flush it so the
+    //    client actually starts sending, then clear `expect` so the handlers'
+    //    own reads are unchanged); any other expectation is a 417.
+    if (request.head.method.requestHasBody() and
+        request.head.transfer_encoding == .none and request.head.content_length == null)
+    {
+        respondFatalHeadError(&request, .length_required, "length_required", "content-length or transfer-encoding is required");
+        return;
+    }
+    if (request.head.expect != null) {
+        request.writeExpectContinue() catch |err| switch (err) {
+            error.HttpExpectationFailed => {
+                respondFatalHeadError(&request, .expectation_failed, "expectation_failed", "unsupported expect header");
+                return;
+            },
+            error.WriteFailed => {
+                log.debug("failed to write 100-continue", .{});
+                return;
+            },
+        };
+        stream_writer.interface.flush() catch |err| {
+            log.debug("failed to flush 100-continue: {t}", .{err});
+            return;
+        };
+    }
+
     // One line per request -- method, path, outcome, elapsed -- through
     // the same tabular logger every other subsystem uses (Phase 7's
     // "production observability" item), not a second logging convention.
@@ -171,6 +214,32 @@ fn handleConnection(item: ConnectionItem) void {
             .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
         }) catch {};
     }
+}
+
+/// A refusal sent before any handler runs, for a request head this server
+/// can't safely process at all. `keep_alive = false` is the point: it keeps
+/// `respond` out of `discardBody`'s body-discarding path (whose assert is
+/// exactly what the 411 case above is avoiding), and it's honest --
+/// `handleConnection` closes the connection after one request regardless.
+fn respondFatalHeadError(request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) void {
+    // Clearing `expect` is what makes the 417 above actually reach the client.
+    // `respond` starts by calling `writeExpectContinue` itself, and that
+    // returns `error.HttpExpectationFailed` -- before writing a single byte --
+    // for any expectation that isn't `100-continue`. It also doesn't clear
+    // `expect` on that error path, so the failed call in `handleConnection`
+    // leaves it set and the `catch {}` below silently swallowed the whole
+    // response: the client got an empty reply and a closed connection instead
+    // of the status. The expectation is answered by this refusal, so drop it.
+    request.head.expect = null;
+
+    var buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(buf[0..], "{{\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}", .{ code, message }) catch return;
+    log.warn("rejected request head: {s}", .{code});
+    request.respond(body, .{
+        .status = status,
+        .keep_alive = false,
+        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+    }) catch {};
 }
 
 const testing = std.testing;
@@ -724,4 +793,101 @@ test "convert endpoint: a real multipart POST whose body exceeds one buffered re
     const resp_body = try readBody(&response, testing.allocator);
     defer testing.allocator.free(resp_body);
     try testing.expectEqualStrings(file_content ++ "\n", resp_body);
+}
+
+/// Sends `raw` verbatim over a fresh TCP connection to the test server and
+/// returns everything it writes back — the only way to exercise a request head
+/// no HTTP client would produce (`std.http.Client` won't omit
+/// `content-length`, and its `expect` handling is its own).
+fn rawRequest(allocator: std.mem.Allocator, port: u16, raw: []const u8) ![]u8 {
+    var address = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
+    const stream = try address.connect(testing.io, .{ .mode = .stream });
+    defer stream.close(testing.io);
+
+    var send_buf: [1024]u8 = undefined;
+    var stream_writer = stream.writer(testing.io, &send_buf);
+    try stream_writer.interface.writeAll(raw);
+    try stream_writer.interface.flush();
+
+    var recv_buf: [4096]u8 = undefined;
+    var stream_reader = stream.reader(testing.io, &recv_buf);
+
+    // Accumulated chunk by chunk rather than with `allocRemaining`, which
+    // discards everything it read if the stream ends in a reset -- and it
+    // does here: the server answers a bad head and closes with the request
+    // body still unread, so the response arrives and *then* the connection is
+    // reset. The bytes are the point of the test, so keep them.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    while (out.items.len < 64 * 1024) {
+        stream_reader.interface.fillMore() catch break;
+        const data = stream_reader.interface.buffered();
+        if (data.len == 0) break;
+        try out.appendSlice(allocator, data);
+        stream_reader.interface.toss(data.len);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+// AUDIT-2026-09-03 API-1/API-2: both of these used to abort the process
+// (`panic: reached unreachable code` from `discardBody`, and the
+// `head.expect == null` assert in `readerExpectNone`) rather than answer, and
+// the first needed no session at all. The real assertion in both cases is that
+// the third request below still gets served -- i.e. the process is alive.
+test "a malformed request head is refused instead of aborting the process" {
+    const gpa = std.heap.page_allocator;
+
+    const db = try gpa.create(Db);
+    db.* = try test_support.openTestDb(gpa) orelse return error.SkipZigTest;
+    const pool = try gpa.create(PgPool);
+    pool.* = try PgPool.wrapForTest(gpa, testing.io, db);
+
+    const config = try gpa.create(config_mod.Config);
+    config.* = testConfig();
+
+    const ctx = try gpa.create(ServerContext);
+    ctx.* = .{ .allocator = gpa, .io = testing.io, .pool = pool, .config = config };
+
+    const listener = try gpa.create(Io.net.Server);
+    listener.* = try bind(testing.io, 0);
+    const port = listener.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
+    thread.detach();
+
+    // API-1: a body method with neither content-length nor transfer-encoding.
+    {
+        const response = try rawRequest(testing.allocator, port, "POST /api/v1/notes HTTP/1.1\r\nHost: x\r\n\r\n");
+        defer testing.allocator.free(response);
+        try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 411 Length Required"));
+    }
+
+    // API-2: an expectation this server can't satisfy.
+    {
+        const response = try rawRequest(testing.allocator, port, "POST /api/v1/notes HTTP/1.1\r\nHost: x\r\ncontent-length: 2\r\nexpect: something-else\r\n\r\n{}");
+        defer testing.allocator.free(response);
+        try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 417 Expectation Failed"));
+    }
+
+    // `expect: 100-continue` is answered with the continuation and then served
+    // normally -- 401 here (no session cookie), not a panic.
+    {
+        const response = try rawRequest(testing.allocator, port, "POST /api/v1/notes HTTP/1.1\r\nHost: x\r\ncontent-length: 2\r\nexpect: 100-continue\r\n\r\n{}");
+        defer testing.allocator.free(response);
+        try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 100 Continue"));
+        try testing.expect(std.mem.indexOf(u8, response, "401") != null);
+    }
+
+    // Still alive and serving.
+    {
+        var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+        defer client.deinit();
+        var url_buf: [128]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api/v1/auth/session", .{port});
+        var req = try client.request(.GET, try std.Uri.parse(url), .{ .keep_alive = false });
+        defer req.deinit();
+        try req.sendBodiless();
+        const response = try req.receiveHead(&.{});
+        try testing.expectEqual(.ok, response.head.status);
+    }
 }

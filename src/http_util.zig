@@ -158,11 +158,11 @@ const FetchShared = struct {
     /// store instead of reusing a long-lived client's cached copy. For the
     /// per-invocation clients in `tools/*.zig` this changes nothing — they
     /// already paid it per call — but the long-lived ones
-    /// (`telegram/client.zig`, `matrix/client.zig`, the LLM adapters) now
-    /// pay it per request too. It is small next to the network round trip
-    /// it precedes, though not free on a 1-vCPU host. The way to get it
-    /// back is one process-wide client shared by every request (its pool
-    /// and CA bundle are already lock-guarded, and a process-lifetime
+    /// (`platform/telegram/client.zig`, `platform/matrix/client.zig`, the LLM
+    /// adapters) now pay it per request too. It is small next to the network
+    /// round trip it precedes, though not free on a 1-vCPU host. The way to
+    /// get it back is one process-wide client shared by every request (its
+    /// pool and CA bundle are already lock-guarded, and a process-lifetime
     /// client is trivially safe to detach from) — deliberately NOT done in
     /// the same change as a crash fix, since it reshapes connection
     /// handling for the whole bot.

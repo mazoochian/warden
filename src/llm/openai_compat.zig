@@ -272,7 +272,7 @@ fn stripThinkingBlock(allocator: std.mem.Allocator, content: []const u8, comptim
 /// thought embedded directly in `content` (MiniMax-M3 and similar do this,
 /// rather than/as well as the separate `reasoning`/`reasoning_content`
 /// field) — into `llm.thinking_start`/`thinking_end`-wrapped spans, so
-/// `telegram/markdown_html.zig` renders them as the same expandable
+/// `platform/telegram/markdown_html.zig` renders them as the same expandable
 /// blockquote as field-based reasoning gets, instead of the raw tag text
 /// showing up escaped and unrendered. The mirror image of
 /// `stripThinkingBlock`: content is *kept* (wrapped, not deleted) — this
@@ -456,7 +456,7 @@ const StreamState = struct {
     /// `<think>`/`<thinking>` tags (some models, MiniMax-M3 included, embed
     /// chain-of-thought directly in `content` rather than a separate
     /// field) into `llm.thinking_start`/`thinking_end` markers, so
-    /// `telegram/markdown_html.zig` renders them as an expandable
+    /// `platform/telegram/markdown_html.zig` renders them as an expandable
     /// blockquote instead of raw, unrendered tag text.
     ///
     /// Re-scanning the whole buffer each call is O(n) in the response

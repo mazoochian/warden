@@ -16,15 +16,15 @@ pub fn build(b: *std.Build) void {
     // right there in /usr/lib.
     exe_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     exe_mod.linkSystemLibrary("pq", .{});
-    // libolm (Matrix E2E encryption, see src/matrix/olm.zig) — same
+    // libolm (Matrix E2E encryption, see src/platform/matrix/olm.zig) — same
     // reasoning/shape as the pq linkage above.
     exe_mod.linkSystemLibrary("olm", .{});
-    // TDLib's JSON client (src/platform/telegram_user.zig) — same
+    // TDLib's JSON client (src/platform/telegram/user_connector.zig) — same
     // library-path reasoning as pq above, plus an explicit *include* path
     // this one actually needs and pq/olm don't: those two have no
     // `@cImport` anywhere in this codebase (hand-written `extern fn`
     // bindings instead), so they never depended on the C compiler finding
-    // a header at all. `telegram_user.zig` is the first file to
+    // a header at all. `user_connector.zig` is the first file to
     // `@cInclude` a system header, and the same "-Dtarget skips default
     // search paths" gap documented above for libraries turned out to
     // apply to header search paths too — confirmed live: this compiled
@@ -59,43 +59,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
-    // One-time SQLite -> Postgres data migration tool (see
-    // src/migrate_tool.zig). Not part of the `warden` binary or its Docker
-    // image — the only place SQLite-reading code survives post-cutover, so
-    // it's the only target that still vendors the SQLite amalgamation.
-    const migrate_mod = b.createModule(.{
-        .root_source_file = b.path("src/migrate_tool.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    migrate_mod.link_libc = true;
-    migrate_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-    migrate_mod.linkSystemLibrary("pq", .{});
-    migrate_mod.addIncludePath(b.path("third_party/sqlite"));
-    migrate_mod.addCSourceFile(.{
-        .file = b.path("third_party/sqlite/sqlite3.c"),
-        .flags = &.{
-            "-DSQLITE_THREADSAFE=1",
-            "-DSQLITE_DEFAULT_MEMSTATUS=0",
-            "-DSQLITE_OMIT_LOAD_EXTENSION",
-            "-DSQLITE_OMIT_DEPRECATED",
-        },
-    });
-
-    const migrate_exe = b.addExecutable(.{
-        .name = "warden-migrate",
-        .root_module = migrate_mod,
-    });
-
-    const migrate_step = b.step("migrate-data", "One-time migration of data/chats/*.db into Postgres");
-    const run_migrate_cmd = b.addRunArtifact(migrate_exe);
-    migrate_step.dependOn(&run_migrate_cmd.step);
-    if (b.args) |args| run_migrate_cmd.addArgs(args);
-
     // Retroactive chat-departure reconciliation tool (see
-    // src/cleanup_left_chats.zig) -- installed (unlike migrate_exe) so the
-    // Docker image can also copy it in and run it against production, not
-    // just locally via `zig build cleanup-left-chats`.
+    // src/cleanup_left_chats.zig) -- installed, not just wired to its own
+    // step, so the Docker image can copy it in and run it against
+    // production rather than only locally via `zig build
+    // cleanup-left-chats`.
     const cleanup_mod = b.createModule(.{
         .root_source_file = b.path("src/cleanup_left_chats.zig"),
         .target = target,

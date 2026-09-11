@@ -9,7 +9,7 @@ const PgPool = @import("pool.zig").PgPool;
 /// (one code path — see `main.zig`'s `checkSlowMode`, wired into
 /// `processMessageTask` right where `recordMessage` already runs), and left
 /// unimplemented on XMPP, whose `Connector` vtable has no moderation slots
-/// at all (`platform/xmpp.zig` never sets `deleteMessage`, so
+/// at all (`platform/xmpp/connector.zig` never sets `deleteMessage`, so
 /// `checkSlowMode` degrades to a no-op there via the same `error.Unsupported`
 /// path every other XMPP moderation gap already uses).
 ///

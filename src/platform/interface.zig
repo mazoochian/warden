@@ -27,8 +27,8 @@ const InstagramProfile = @import("../domain/instagram_profile.zig").InstagramPro
 /// (private mobile-app API, interactive login) rather than holding a
 /// platform-issued bot credential. Unlike `.telegram_user`, Instagram has
 /// no separate bot-account concept at all — the connector's identity IS
-/// the owner's account — so `instagram/auth.zig`'s login flow is the only
-/// way this platform ever gets configured, there's no static-token path.
+/// the owner's account — so `platform/instagram/auth.zig`'s login flow is the
+/// only way this platform ever gets configured, there's no static-token path.
 pub const Platform = enum {
     telegram,
     telegram_user,
@@ -76,7 +76,7 @@ pub const MemberPermission = struct {
     /// (`read`/`reactions`/`edit_tags`) is stored for cross-platform intent
     /// but never actually restricts anything on Telegram (no Bot API field
     /// exists for "can't read"/"can't react"/"can't edit own tag"). See
-    /// `platform/telegram.zig`'s `restrictChatMemberPermissionsFn`.
+    /// `platform/telegram/connector.zig`'s `restrictChatMemberPermissionsFn`.
     pub const telegram_enforceable: u32 = write | photos | videos | file | music | voice |
         video_messages | stickers | polls | embed_links | change_info;
 
@@ -286,7 +286,7 @@ pub const Message = struct {
     /// content." Set for a Telegram channel post (channels have no `from`
     /// user and never produce ordinary `message` updates, only these) and
     /// for the bot being newly added to/promoted in a chat via
-    /// `my_chat_member` (see `platform/telegram.zig`'s
+    /// `my_chat_member` (see `platform/telegram/connector.zig`'s
     /// `chatJoinedMessageFromUpdate`) — the latter matters most for
     /// channels, which otherwise wouldn't become a `chats` row until their
     /// first post, which may never come if the channel is post-only for
@@ -500,8 +500,8 @@ pub const Connector = struct {
         selfId: ?*const fn (ptr: *anyopaque) ?[]const u8 = null,
         /// Every owner/administrator of `chat_id`, if this platform exposes
         /// such a call — the closest thing to a bulk member listing bots
-        /// get (see `telegram/client.zig`'s `getChatAdministrators` doc
-        /// comment: there is no bulk call for regular members). Used to
+        /// get (see `platform/telegram/client.zig`'s `getChatAdministrators`
+        /// doc comment: there is no bulk call for regular members). Used to
         /// seed the local roster (`chat_members`) with admins who may never
         /// have sent a message themselves. Optional: a platform without the
         /// concept just reports `error.Unsupported`.

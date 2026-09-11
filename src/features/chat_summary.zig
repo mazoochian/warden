@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const telegram_user_platform = @import("../platform/telegram_user.zig");
+const telegram_user_platform = @import("../platform/telegram/user_connector.zig");
 const TelegramUserConnector = telegram_user_platform.TelegramUserConnector;
 const llm = @import("../llm/provider.zig");
 const registry = @import("../tools/registry.zig");
@@ -132,10 +132,10 @@ pub const UnreadSummary = struct {
     /// uses) rather than a live TDLib fetch — empty when there's nothing
     /// summarizable (no unread messages, or the unread backlog is entirely
     /// non-text content this connector doesn't convert — see Phase A scope
-    /// in `platform/telegram_user.zig`). Callers format these themselves:
-    /// `summarizeChat` wants plain prose input, `describeUnreadForModel`
-    /// wants ids attached so a model can cite one back via
-    /// `reply_to_message`.
+    /// in `platform/telegram/user_connector.zig`). Callers format these
+    /// themselves: `summarizeChat` wants plain prose input,
+    /// `describeUnreadForModel` wants ids attached so a model can cite one
+    /// back via `reply_to_message`.
     rows: []const messages.HistoryRow,
     marked_read: bool,
 };

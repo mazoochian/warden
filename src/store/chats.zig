@@ -153,7 +153,7 @@ pub fn markLeft(pool: *PgPool, chat_id: i64, at: i64) !void {
 }
 
 /// In-place id rename for Telegram's basic-group -> supergroup upgrade
-/// (see `platform/telegram.zig`'s handling of `migrate_to_chat_id`):
+/// (see `platform/telegram/connector.zig`'s handling of `migrate_to_chat_id`):
 /// Telegram mints a brand-new chat id for the same real-world group, and
 /// without this the old row would go stale while a second row got created
 /// for the new id the moment the next message arrived — the actual cause

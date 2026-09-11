@@ -21,11 +21,11 @@ const config_mod = @import("config.zig");
 const auth = @import("auth.zig");
 const iface = @import("platform/interface.zig");
 const Identity = @import("domain/identity.zig").Identity;
-const telegram_platform = @import("platform/telegram.zig");
-const matrix_platform = @import("platform/matrix.zig");
-const xmpp_platform = @import("platform/xmpp.zig");
-const telegram_user_platform = @import("platform/telegram_user.zig");
-const instagram_platform = @import("platform/instagram.zig");
+const telegram_platform = @import("platform/telegram/connector.zig");
+const matrix_platform = @import("platform/matrix/connector.zig");
+const xmpp_platform = @import("platform/xmpp/connector.zig");
+const telegram_user_platform = @import("platform/telegram/user_connector.zig");
+const instagram_platform = @import("platform/instagram/connector.zig");
 const reply_redirect = @import("platform/reply_redirect.zig");
 const store_pool = @import("store/pool.zig");
 const api_server = @import("api/server.zig");
@@ -521,7 +521,7 @@ pub fn main(init: std.process.Init) !void {
     // Matrix E2EE setup below, until this connector needed it earlier too)
     // since this is the first connector that needs the Postgres pool
     // already at construction time (session/device-profile persistence,
-    // see `instagram/session.zig`) -- nothing between here and its old
+    // see `platform/instagram/session.zig`) -- nothing between here and its old
     // location actually depended on connector construction happening
     // first.
     var pool = store_pool.PgPool.init(
@@ -579,10 +579,10 @@ pub fn main(init: std.process.Init) !void {
     const max_message_len = effectiveMaxMessageLength(connectors);
 
     // Device key creation/upload plus ongoing encrypt/decrypt for Matrix
-    // E2E encryption (see src/matrix/olm.zig, src/matrix/crypto.zig,
-    // ROADMAP.md's Phase 2b) — only active when `WARDEN_MATRIX_PICKLE_KEY`
-    // is set; a failure here is logged, not fatal, since plaintext-room
-    // Matrix functionality doesn't depend on it.
+    // E2E encryption (see src/platform/matrix/olm.zig,
+    // src/platform/matrix/crypto.zig, ROADMAP.md's Phase 2b) — only active
+    // when `WARDEN_MATRIX_PICKLE_KEY` is set; a failure here is logged, not
+    // fatal, since plaintext-room Matrix functionality doesn't depend on it.
     if (matrix_adapter) |*m| {
         if (config.matrix_pickle_key) |pickle_key| {
             m.enableCrypto(gpa, io, &pool, pickle_key) catch |err| {
@@ -2741,7 +2741,8 @@ fn handleMessage(
         if (pending_conversions.isAwaitingFormat(now, msg.chat_id, msg.user_id)) {
             convert_flow.handleChoicePicked(connector, a, io, config.tmp_dir, pending_conversions, now, msg, picked);
         } else {
-            menu_sessions.handleChoicePicked(menu_runner, now, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos), picked);
+            var live_admin_cache: ?bool = null;
+            menu_sessions.handleChoicePicked(menu_runner, now, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos, is_owner, is_bot_admin, &live_admin_cache), picked);
         }
         return false;
     }
@@ -2824,8 +2825,9 @@ fn handleMessage(
     // is deliberately exempted so it always reaches its own handler below
     // (one of whose fallback tiers is exactly this session), rather than
     // being swallowed as a failed target-resolution attempt.
+    var menu_live_admin_cache: ?bool = null;
     if (!std.mem.eql(u8, text, "/cancel") and
-        menu_sessions.handleAwaitingInputMessage(menu_runner, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos)))
+        menu_sessions.handleAwaitingInputMessage(menu_runner, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos, is_owner, is_bot_admin, &menu_live_admin_cache)))
     {
         return false;
     }
@@ -2898,7 +2900,7 @@ fn handleMessage(
         // `!menu` already reaches here as `/menu` too --
         // `normalizeCommandMention` rewrites any leading `!` to `/` for
         // every platform, not just Matrix's requested trigger.
-        menu_sessions.open(connector, a, menu_runner, now, msg);
+        menu_sessions.open(menu_runner, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos, is_owner, is_bot_admin, &menu_live_admin_cache));
     } else if (std.mem.eql(u8, text, "/stats")) {
         replyWithStats(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
     } else if (std.mem.eql(u8, text, "/wordcloud")) {
@@ -3841,8 +3843,13 @@ fn parseAmountCents(s: []const u8) ?i64 {
     } else if (frac_str.len == 2) {
         frac = std.fmt.parseInt(i64, frac_str, 10) catch return null;
     }
-    const cents = whole * 100 + frac;
-    if (cents <= 0) return null;
+    // Checked, not `whole * 100 + frac`: `/expense add 9223372036854775807
+    // food` overflowed i64 here, and an overflow is an abort in
+    // `-Doptimize=ReleaseSafe`. Also caps the amount -- past this, a "12"
+    // that was meant to be dollars is indistinguishable from a mistake, and
+    // no real expense is a quadrillion dollars.
+    const cents = std.math.add(i64, std.math.mul(i64, whole, 100) catch return null, frac) catch return null;
+    if (cents <= 0 or cents > tool_registry.max_expense_cents) return null;
     return cents;
 }
 
@@ -3857,6 +3864,10 @@ test "parseAmountCents handles whole numbers, one and two decimal digits, and re
     try std.testing.expectEqual(@as(?i64, null), parseAmountCents("12.500"));
     try std.testing.expectEqual(@as(?i64, null), parseAmountCents(".50"));
     try std.testing.expectEqual(@as(?i64, null), parseAmountCents("abc"));
+    // AUDIT-2026-09-03 TEXT-1: `whole * 100 + frac` unchecked made this an
+    // abort, reachable by any allowed user.
+    try std.testing.expectEqual(@as(?i64, null), parseAmountCents("9223372036854775807"));
+    try std.testing.expectEqual(@as(?i64, null), parseAmountCents("92233720368547758.07"));
 }
 
 /// "1250 USD" -> "12.50 USD" -- always shows the ISO currency code rather
@@ -4558,11 +4569,11 @@ fn formatTemplateList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i
 /// persona rewrite, but still not something to leave open to anyone).
 /// `/tdlogin status|phone <number>|code <digits>|password <password>` —
 /// bot-chat fallback for driving the personal-account connector's login
-/// (see `platform/telegram_user.zig`'s doc comment; warden-ui's own login
-/// form at `/api/v1/telegram-user/*` is the primary path). Owner-only,
+/// (see `platform/telegram/user_connector.zig`'s doc comment; warden-ui's own
+/// login form at `/api/v1/telegram-user/*` is the primary path). Owner-only,
 /// checked here rather than at the dispatch site since every sibling
-/// owner-only command (`/scraper`, etc.) follows the same "check inside
-/// the handler" shape.
+/// owner-only command (`/scraper`, etc.) follows the same "check inside the
+/// handler" shape.
 ///
 /// The `code` subcommand strips every non-digit character before passing
 /// the result to `submitAuthCode` — this is the obfuscation workaround
@@ -4706,11 +4717,11 @@ fn handleTdloginCommand(
 
 /// `/iglogin status|start <username> <password>|challenge <digits>|code <digits>|2fa <digits>|logout`
 /// — drives the Instagram connector's login/challenge/2FA state machine
-/// (`instagram/auth.zig`), same owner-only/bot-chat-fallback shape as
+/// (`platform/instagram/auth.zig`), same owner-only/bot-chat-fallback shape as
 /// `/tdlogin` above. The password is typed directly into this trusted
 /// chat (same trust boundary `/tdlogin`'s phone number and every other
 /// owner-only command already relies on) and is never logged or persisted
-/// — see `instagram/auth.zig`'s `AuthClient.login` doc comment.
+/// — see `platform/instagram/auth.zig`'s `AuthClient.login` doc comment.
 fn handleIgloginCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8444,13 +8455,14 @@ fn videoProgressTickerLoop(connector: iface.Connector, chat_id: []const u8, mess
 /// a `WorkerPool` worker for a slow background op" reasoning `qa.zig`'s
 /// thinking-ticker (`tickerLoop`) already uses for its own detached thread.
 ///
-/// XMPP has no `sendDocument` support at all (see `platform/xmpp.zig`'s
-/// vtable — no `sendDocument` slot is wired up there). Checked up front,
-/// before spending several minutes on a download nobody could receive —
-/// logged plainly rather than left silent. Calling `connector.sendDocument`
-/// unconditionally instead would have `Connector.sendDocument`'s own
-/// "platform doesn't support this" fallback post a visible chat message for
-/// *every* video link a group posts, exactly the per-link error spam this
+/// XMPP has no `sendDocument` support at all (see
+/// `platform/xmpp/connector.zig`'s vtable — no `sendDocument` slot is wired
+/// up there). Checked up front, before spending several minutes on a download
+/// nobody could receive — logged plainly rather than left silent. Calling
+/// `connector.sendDocument` unconditionally instead would have
+/// `Connector.sendDocument`'s own "platform doesn't support this" fallback
+/// post a visible chat message for *every* video link a group posts, exactly
+/// the per-link error spam this
 /// feature's fail-closed philosophy exists to avoid — so that fallback is
 /// deliberately never reached here. `sendVideo` (lossy mode's preferred
 /// delivery) is intentionally NOT gated the same way: it's strictly
@@ -8837,10 +8849,11 @@ fn handleNoteCommand(connector: iface.Connector, a: std.mem.Allocator, io: Io, c
     // voice message means "transcribe this and save it". Checked before the
     // empty-arg usage reply below, which is what a bare `/note` would
     // otherwise hit. Telegram delivers a caption in `msg.caption`, which
-    // `platform/telegram.zig` maps onto `text` -- so a captioned voice
-    // message never reaches `resolveQuestion`'s transcription path (that
-    // one only fires for *captionless* attachments), which is exactly why
-    // this needed its own hook rather than falling out of the existing one.
+    // `platform/telegram/connector.zig` maps onto `text` -- so a captioned
+    // voice message never reaches `resolveQuestion`'s transcription path
+    // (that one only fires for *captionless* attachments), which is exactly
+    // why this needed its own hook rather than falling out of the existing
+    // one.
     if (isVoiceNoteRequest(if (msg.attachment) |att| att.kind else null, arg)) {
         handleVoiceNote(connector, a, io, config, pool, tool_ctx, chat_id, identity_id, now, msg);
         return;
@@ -10208,29 +10221,44 @@ const TreeEntry = union(enum) {
 fn toolEmoji(name: []const u8) []const u8 {
     const table = .{
         // Reaching out to the network
-        .{ "web_search", "🌐" },       .{ "scrape_site", "🪒" },
-        .{ "fetch_url", "🔗" },        .{ "hackernews_search", "📰" },
+        .{ "web_search", "🌐" },
+        .{ "scrape_site", "🪒" },
+        .{ "fetch_url", "🔗" },
+        .{ "hackernews_search", "📰" },
         // Asking another model
-        .{ "ask_delegate", "🧠" },     .{ "delegate_generate_image", "🎨" },
+        .{ "ask_delegate", "🧠" },
+        .{ "delegate_generate_image", "🎨" },
         // Reference lookups
-        .{ "dictionary", "📖" },       .{ "urban_dictionary", "🗣" },
-        .{ "calculator", "🧮" },       .{ "currency_convert", "💱" },
-        .{ "crypto_price", "🪙" },     .{ "weather", "🌦" },
+        .{ "dictionary", "📖" },
+        .{ "urban_dictionary", "🗣" },
+        .{ "calculator", "🧮" },
+        .{ "currency_convert", "💱" },
+        .{ "crypto_price", "🪙" },
+        .{ "weather", "🌦" },
         .{ "air_quality", "🌫" },
         // Producing something
-        .{ "qr_code", "🔳" },          .{ "draw_diagram", "📐" },
-        .{ "word_cloud", "☁️" },        .{ "create_poll", "📊" },
-        .{ "convert_file", "🔁" },     .{ "begin_file_conversion", "🔁" },
+        .{ "qr_code", "🔳" },
+        .{ "draw_diagram", "📐" },
+        .{ "word_cloud", "☁️" },
+        .{ "create_poll", "📊" },
+        .{ "convert_file", "🔁" },
+        .{ "begin_file_conversion", "🔁" },
         // Remembering / recalling
-        .{ "remember_memory", "🧷" },  .{ "set_note", "📝" },
-        .{ "catch_me_up", "📚" },      .{ "get_bulletin", "🗞" },
+        .{ "remember_memory", "🧷" },
+        .{ "set_note", "📝" },
+        .{ "catch_me_up", "📚" },
+        .{ "get_bulletin", "🗞" },
         // Scheduling and watching
-        .{ "set_reminder", "⏰" },     .{ "set_alert", "🔔" },
+        .{ "set_reminder", "⏰" },
+        .{ "set_alert", "🔔" },
         .{ "set_expense", "💰" },
         // The personal account
-        .{ "list_personal_chats", "👥" },     .{ "send_personal_message", "✉️" },
-        .{ "reply_to_message", "↩️" },        .{ "summarize_unread_chat", "📬" },
-        .{ "set_chat_monitoring", "👀" },     .{ "set_default_chat_monitoring", "👀" },
+        .{ "list_personal_chats", "👥" },
+        .{ "send_personal_message", "✉️" },
+        .{ "reply_to_message", "↩️" },
+        .{ "summarize_unread_chat", "📬" },
+        .{ "set_chat_monitoring", "👀" },
+        .{ "set_default_chat_monitoring", "👀" },
         .{ "find_chat_member", "🔎" },
     };
     inline for (table) |entry| {
@@ -10982,10 +11010,12 @@ fn replyWithStats(connector: iface.Connector, a: std.mem.Allocator, pool: *store
 // /menu ActionRunner — the switch that actually performs every module's
 // buttons/prompts. Deliberately thin: almost every branch below calls
 // straight into a handler function (or store mutation) that already exists
-// and is already gated by its own `auth.*` check for the slash-command
-// equivalent — the menu is a UI layer over those, never a second
-// permission system. See `features/menu.zig`'s module doc comment for the
-// engine this plugs into.
+// for the slash-command equivalent. Authorization for the button path is
+// *not* inherited from those handlers (several of them assume their caller
+// gated them); it lives in `menuAuthorize` below, driven by each node's
+// `menu_tree.MinRole`, and the engine applies it both when rendering a
+// branch's buttons and again before every dispatch. See
+// `features/menu.zig`'s module doc comment for the engine this plugs into.
 // ---------------------------------------------------------------------------
 
 fn menuCtx(
@@ -11001,6 +11031,9 @@ fn menuCtx(
     digest_scheduler: *scheduler.DigestScheduler,
     pending_conversions: *convert_flow.PendingConversions,
     pending_undos: *audit_notify.PendingUndos,
+    is_owner: bool,
+    is_bot_admin: bool,
+    live_admin_cache: *?bool,
 ) menu.ActionContext {
     return .{
         .connector = connector,
@@ -11015,10 +11048,41 @@ fn menuCtx(
         .digest_scheduler = digest_scheduler,
         .pending_conversions = pending_conversions,
         .pending_undos = pending_undos,
+        .is_owner = is_owner,
+        .is_bot_admin = is_bot_admin,
+        .live_admin_cache = live_admin_cache,
     };
 }
 
+/// `ActionRunner.authorize` — the menu path's permission check, one tier per
+/// `menu_tree.MinRole`. Every state-changing node names its tier in the tree
+/// (see that enum's doc comment for why `.chat_admin` here is owner-or-live-
+/// platform-admin, with no `/sudo` or token fallback).
+fn menuAuthorize(id: menu_tree.NodeId, ctx: menu.ActionContext) bool {
+    return switch (menu_tree.node(id).min_role) {
+        .anyone => true,
+        .chat_admin => ctx.is_owner or menuIsLiveChatAdmin(ctx),
+        .bot_admin => ctx.is_owner or ctx.is_bot_admin,
+        .owner => ctx.is_owner,
+    };
+}
+
+/// The live `getChatMember` half of `.chat_admin`, memoized per message in
+/// `ctx.live_admin_cache` (rendering Group Administration authorizes ten
+/// children in a row). Fails closed on a platform error, same as
+/// `auth.checkGroupAdminAccess`.
+fn menuIsLiveChatAdmin(ctx: menu.ActionContext) bool {
+    if (ctx.live_admin_cache.*) |cached| return cached;
+    const is_admin = ctx.connector.isGroupAdmin(ctx.a, ctx.msg.chat_id, ctx.msg.user_id) catch |err| blk: {
+        log.warn("menu: platform admin check failed for user {s} in chat {s}: {t}", .{ ctx.msg.user_id, ctx.msg.chat_id, err });
+        break :blk false;
+    };
+    ctx.live_admin_cache.* = is_admin;
+    return is_admin;
+}
+
 const menu_runner: menu.ActionRunner = .{
+    .authorize = menuAuthorize,
     .perform = menuPerform,
     .dynamicChoices = menuDynamicChoices,
     .performDynamicPick = menuPerformDynamicPick,
@@ -11545,9 +11609,9 @@ test {
     _ = @import("tools/dictionary.zig");
     _ = @import("tools/urban_dictionary.zig");
     _ = @import("tools/hackernews.zig");
-    _ = @import("platform/telegram.zig");
-    _ = @import("telegram/client.zig");
-    _ = @import("telegram/markdown_html.zig");
+    _ = @import("platform/telegram/connector.zig");
+    _ = @import("platform/telegram/client.zig");
+    _ = @import("platform/telegram/markdown_html.zig");
     _ = @import("http_util.zig");
     _ = @import("features/scheduler.zig");
     _ = @import("features/digest.zig");
@@ -11557,29 +11621,29 @@ test {
     _ = @import("platform/interface.zig");
     _ = @import("domain/identity.zig");
     _ = @import("domain/telegram_profile.zig");
-    _ = @import("platform/matrix.zig");
-    _ = @import("matrix/types.zig");
+    _ = @import("platform/matrix/connector.zig");
+    _ = @import("platform/matrix/types.zig");
     _ = @import("domain/matrix_profile.zig");
-    _ = @import("matrix/olm.zig");
-    _ = @import("matrix/verification.zig");
-    _ = @import("matrix/crypto.zig");
+    _ = @import("platform/matrix/olm.zig");
+    _ = @import("platform/matrix/verification.zig");
+    _ = @import("platform/matrix/crypto.zig");
     _ = @import("store/crypto.zig");
-    _ = @import("platform/xmpp.zig");
+    _ = @import("platform/xmpp/connector.zig");
     _ = @import("platform/reply_redirect.zig");
-    _ = @import("platform/telegram_user.zig");
-    _ = @import("xmpp/xml.zig");
-    _ = @import("xmpp/types.zig");
-    _ = @import("xmpp/client.zig");
+    _ = @import("platform/telegram/user_connector.zig");
+    _ = @import("platform/xmpp/xml.zig");
+    _ = @import("platform/xmpp/types.zig");
+    _ = @import("platform/xmpp/client.zig");
     _ = @import("domain/xmpp_profile.zig");
     _ = @import("domain/instagram_profile.zig");
-    _ = @import("instagram/crypto.zig");
-    _ = @import("instagram/transport.zig");
-    _ = @import("instagram/auth.zig");
-    _ = @import("instagram/session.zig");
-    _ = @import("instagram/direct.zig");
-    _ = @import("instagram/media.zig");
-    _ = @import("instagram/policy.zig");
-    _ = @import("platform/instagram.zig");
+    _ = @import("platform/instagram/crypto.zig");
+    _ = @import("platform/instagram/transport.zig");
+    _ = @import("platform/instagram/auth.zig");
+    _ = @import("platform/instagram/session.zig");
+    _ = @import("platform/instagram/direct.zig");
+    _ = @import("platform/instagram/media.zig");
+    _ = @import("platform/instagram/policy.zig");
+    _ = @import("platform/instagram/connector.zig");
     _ = @import("store/instagram_sessions.zig");
     _ = @import("worker_pool.zig");
     _ = @import("store/db.zig");

@@ -1,15 +1,15 @@
 .zig-cache/
 zig-out/
 data/
-prosody/data/
+examples/prosody/data/
 .env
 prod.env
 .oidc
 node_modules/
 bfg.jar
 compose.override.yaml
-llama-server/models/
-whisper-server/models/
+examples/llama-server/models/
+examples/whisper-server/models/
 warden.log
 
 CLAUDE.md

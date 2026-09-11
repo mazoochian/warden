@@ -2,10 +2,10 @@ const std = @import("std");
 const Identity = @import("identity.zig").Identity;
 
 /// Matrix-specific extension of `Identity`, populated by
-/// `src/platform/matrix.zig`'s `pollFn`. `avatar_url` stays null for now —
-/// Matrix event content doesn't carry the sender's avatar directly, and
-/// resolving it needs an extra `/profile/{userId}` call `matrix/client.zig`
-/// doesn't implement yet.
+/// `src/platform/matrix/connector.zig`'s `pollFn`. `avatar_url` stays null
+/// for now — Matrix event content doesn't carry the sender's avatar
+/// directly, and resolving it needs an extra `/profile/{userId}` call
+/// `platform/matrix/client.zig` doesn't implement yet.
 pub const MatrixProfile = struct {
     identity: Identity,
     homeserver: []const u8 = "",

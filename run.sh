@@ -21,7 +21,8 @@ case "$cmd" in
   *)
     echo "usage: $0 {dev|deploy}" >&2
     echo "  dev     run natively via 'zig build run' (sources .env)" >&2
-    echo "  deploy  docker compose up -d --build (warden + searxng)" >&2
+    echo "  deploy  docker compose up -d --build (warden only; merge in" >&2
+    echo "          examples/*/compose.yaml for optional sidecars)" >&2
     exit 1
     ;;
 esac

@@ -9,7 +9,7 @@ ARG ZIG_VERSION=0.16.0
 # The retry loop and curl --retry exist because builds run on networks with
 # transient DNS/connection failures; downloading to a file (rather than
 # piping into tar) keeps a mid-stream retry from corrupting the extraction.
-# telegram-tdlib-dev (src/platform/telegram_user.zig's tdjson headers/link
+# telegram-tdlib-dev (src/platform/telegram/user_connector.zig's tdjson headers/link
 # lib) only exists in Alpine's edge/testing repo, not the stable 3.22 one
 # this image is otherwise pinned to -- pulled in via -X rather than
 # appending to /etc/apk/repositories, so it (and its edge/main,edge/
@@ -34,7 +34,6 @@ ENV PATH="/opt/zig:${PATH}"
 
 WORKDIR /build
 COPY build.zig build.zig.zon ./
-COPY third_party ./third_party
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/zig \
     zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl
@@ -66,7 +65,7 @@ RUN cd piechart && npm ci --omit=dev
 # pdf *output* reuses the chromium already installed here (pandoc -> html,
 # then chromium --headless --print-to-pdf) rather than pulling in a whole
 # separate LaTeX toolchain just for that one direction. `olm` is the runtime
-# half of Matrix E2E encryption's libolm binding (see src/matrix/olm.zig) —
+# half of Matrix E2E encryption's libolm binding (see src/platform/matrix/olm.zig) —
 # `olm-dev` above is the build-time headers/import-lib half. `yt-dlp` backs
 # ROADMAP.md's Phase 25 auto-download feature (src/features/video_download.zig).
 # ---------------------------------------------------------------------------

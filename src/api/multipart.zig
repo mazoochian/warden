@@ -1,13 +1,12 @@
 //! Minimal `multipart/form-data` request-body parser — Zig's `std.http`
 //! has no built-in support for this (only the outgoing multipart builder
-//! `http_util.zig`/`telegram/client.zig` use, for uploading files *to* a
-//! platform), and Convert (Phase 5c) is the first endpoint that needs to
-//! *receive* a file upload. Deliberately hand-rolled and scoped to exactly
+//! `http_util.zig`/`platform/telegram/client.zig` use, for uploading files
+//! *to* a platform), and Convert (Phase 5c) is the first endpoint that needs
+//! to *receive* a file upload. Deliberately hand-rolled and scoped to exactly
 //! what a browser's `FormData` + `fetch` actually produces (RFC 2046's
 //! general case — nested multipart, non-ASCII header folding, etc. — is
-//! never emitted by that path), matching this codebase's existing
-//! preference for a small purpose-built parser over a general-purpose
-//! dependency.
+//! never emitted by that path), matching this codebase's existing preference
+//! for a small purpose-built parser over a general-purpose dependency.
 const std = @import("std");
 
 pub const Part = struct {

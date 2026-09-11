@@ -401,12 +401,12 @@ still deliberately out of scope:
   but anyone who can intercept the TCP connection can impersonate the
   server. Escape hatch only.
 
-For local development, `compose.yaml` includes an opt-in `prosody` service
-(same not-started-by-a-plain-`up`-shape as `llama-server`/`whisper-server`)
-— bring it up with `docker compose up -d prosody warden searxng`, then
-create a test account (`docker compose exec prosody prosodyctl adduser
-bot@localhost`) before pointing `WARDEN_XMPP_JID`/`WARDEN_XMPP_PASSWORD` at
-it. See `prosody/config/prosody.cfg.lua`'s comments for why this config is
+For local development, `examples/prosody/` holds a compose fragment for a
+Prosody instance — merge it in explicitly (`docker compose -f compose.yaml -f
+examples/prosody/compose.yaml up -d`), then create a test account (`docker
+compose exec prosody prosodyctl adduser bot@localhost`) before pointing
+`WARDEN_XMPP_JID`/`WARDEN_XMPP_PASSWORD` at it. See
+`examples/prosody/config/prosody.cfg.lua`'s comments for why this config is
 test-only (self-signed TLS, `internal_plain` auth storage).
 
 Supported Messaging Platforms:
@@ -495,8 +495,8 @@ export WARDEN_ANTHROPIC_MODEL=claude-sonnet-5
 # export WARDEN_DELEGATE_CLAUDE2_MODEL=claude-opus-5
 
 # Web search — base URL of a SearXNG instance with format=json enabled.
-# Unset disables the web_search tool. (docker compose sets this
-# automatically to its bundled searxng service.)
+# Unset disables the web_search tool. (examples/searxng/compose.yaml sets
+# this automatically when you merge that fragment in.)
 # export WARDEN_SEARXNG_URL=http://localhost:8080
 
 # Voice transcription — base URL of a whisper.cpp whisper-server instance
@@ -571,22 +571,6 @@ export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
 # export WARDEN_LOG_LEVEL=info
 ```
 
-## Migrating from an older SQLite-based install
-Versions before this one stored chat history in one SQLite file per chat
-under `data/chats/`. If you're upgrading from one of those, run the one-time
-migration tool once (with `WARDEN_POSTGRES_DSN` set, and `WARDEN_DATA_DIR`
-pointed at your existing `data/chats` directory if it isn't in the default
-location) before starting the new binary:
-
-```bash
-zig build migrate-data
-```
-
-This reads every `<chat_id>.db` file (plus the bot-wide `_global.db`) and
-writes their messages, per-chat token balances, digest/magic-word settings,
-and scraper config into Postgres, then it's done — nothing reads from the
-old SQLite files afterward.
-
 Once all is set up, run:
 ```bash
 ./zig-out/bin/warden
@@ -612,11 +596,30 @@ bind-mounted from the directory you run compose from:
 docker compose up -d
 ```
 
-Compose also starts a private SearXNG container (`searxng/` holds its
-config) and points the bot at it via `WARDEN_SEARXNG_URL`, so web search
-works out of the box. To use a custom system prompt in docker, add a bind
-mount for the prompt file to the warden service and set
-`WARDEN_SYSTEM_PROMPT_FILE` in your `.env`.
+`compose.yaml` is the bot alone — no sidecars. Each optional one lives in
+`examples/<name>/compose.yaml` as a fragment you merge in explicitly, so you
+decide what else runs alongside it:
+
+```bash
+# web search via a private SearXNG instance
+docker compose -f compose.yaml -f examples/searxng/compose.yaml up -d
+
+# several at once
+docker compose \
+  -f compose.yaml \
+  -f examples/searxng/compose.yaml \
+  -f examples/llama-server/compose.yaml \
+  up -d
+```
+
+`examples/searxng/` is the one most deployments want: a private metasearch
+instance backing the `web_search` tool, with no API keys and no bot checks.
+Its fragment sets `WARDEN_SEARXNG_URL` for the bot; without it, set that
+variable yourself in `.env` or the tool stays disabled.
+
+To use a custom system prompt in docker, add a bind mount for the prompt
+file to the warden service and set `WARDEN_SYSTEM_PROMPT_FILE` in your
+`.env`.
 
 ## Self-hosted local model
 Compose can also run a small local LLM instead of paying for (or being
@@ -631,13 +634,13 @@ comfortably; ~2.1 GB resident once loaded).
 1. Download the GGUF once, wherever you have a good connection — not
    necessarily the machine that'll run it:
    ```bash
-   mkdir -p llama-server/models
-   curl -L -o llama-server/models/Qwen3.5-4B-Q4_K_M.gguf \
+   mkdir -p examples/llama-server/models
+   curl -L -o examples/llama-server/models/Qwen3.5-4B-Q4_K_M.gguf \
      https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf
    ```
-2. It's not started by a plain `docker compose up -d` (opt-in, unlike
-   SearXNG) — bring it up explicitly, or point `WARDEN_OPENAI_BASE_URL` at
-   it and let `docker compose up -d` start whatever your `.env` needs.
+2. Merge its fragment in to bring it up (`docker compose -f compose.yaml -f
+   examples/llama-server/compose.yaml up -d`), and point
+   `WARDEN_OPENAI_BASE_URL` at it in `.env`.
 3. Point warden at it (see the `.env` example above):
    ```bash
    export WARDEN_LLM_PROVIDER=openai_compat
@@ -653,8 +656,9 @@ check whether it needs the same treatment.
 
 Swapping in a different model (a bigger one, if your hardware has room —
 16 GiB of RAM comfortably fits something well past 4B) means changing the
-GGUF filename in both the download command and `compose.yaml`'s
-`--model`/`--alias` args, and `WARDEN_OPENAI_MODEL` in `.env` to match.
+GGUF filename in both the download command and
+`examples/llama-server/compose.yaml`'s `--model`/`--alias` args, and
+`WARDEN_OPENAI_MODEL` in `.env` to match.
 
 If you're on a machine that can't route bridge-network container traffic
 properly (e.g. behind a Tailscale exit node with policy routing — this bit
@@ -672,8 +676,8 @@ gets transcribed and answered for real, instead of the bot just noticing
 
 1. Download the model once, wherever you have a good connection:
    ```bash
-   mkdir -p whisper-server/models
-   curl -L -o whisper-server/models/ggml-base.bin \
+   mkdir -p examples/whisper-server/models
+   curl -L -o examples/whisper-server/models/ggml-base.bin \
      https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
    ```
    `ggml-base.bin` (~148 MB) is the multilingual base model — picked over the
@@ -682,16 +686,16 @@ gets transcribed and answered for real, instead of the bot just noticing
    multilingual models (`ggml-small.bin` at ~466 MB, `ggml-medium.bin` at
    ~1.5 GB) trade more RAM/CPU for better accuracy if a captionless voice
    message's transcription quality matters enough to be worth it.
-2. Bring it up explicitly (`docker compose up -d whisper-server warden
-   searxng`), or just set `WARDEN_WHISPER_URL` in `.env` and let
-   `docker compose up -d` start whatever it needs.
+2. Merge its fragment in to bring it up (`docker compose -f compose.yaml -f
+   examples/whisper-server/compose.yaml up -d`), and set
+   `WARDEN_WHISPER_URL` in `.env`.
 3. Point warden at it (see the `.env` example above):
    ```bash
    export WARDEN_WHISPER_URL=http://whisper-server:8091
    ```
 
 Swapping in a different model means changing the filename in both the
-download command and `compose.yaml`'s `whisper-server` `--model` arg.
+download command and `examples/whisper-server/compose.yaml`'s `--model` arg.
 
 ## Deploying to a machine without a registry (e.g. an OpenWRT router)
 Compose references the image by name (`warden:latest`). Docker always checks

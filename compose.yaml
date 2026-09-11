@@ -21,120 +21,19 @@ services:
       # service for it) — this now only persists WARDEN_TMP_DIR's scratch
       # files across restarts.
       - ./data:/app/data
-    environment:
-      # Default to the bundled SearXNG service; a WARDEN_SEARXNG_URL in
-      # .env overrides this (the entrypoint sources .env last). Unset it
-      # with an empty value in .env to disable web search.
-      WARDEN_SEARXNG_URL: http://searxng:8080
-    depends_on:
-      - searxng
-
-  # Private metasearch instance backing the bot's web_search tool — no API
-  # keys, no bot checks, and never exposed outside the compose network.
-  searxng:
-    image: searxng/searxng:latest
-    restart: unless-stopped
-    volumes:
-      - ./searxng:/etc/searxng
-    environment:
-      SEARXNG_SECRET: ${SEARXNG_SECRET:-warden-local-searxng-secret}
-
-  # Optional self-hosted LLM (see README's "Self-hosted local model"
-  # section) — a small model warden can talk to via WARDEN_LLM_PROVIDER=
-  # openai_compat instead of a paid/rate-limited API. Not started by
-  # default `docker compose up` invocations that don't reference it; only
-  # runs when explicitly brought up (e.g. `docker compose up -d llama-server
-  # warden searxng`) or once warden's .env points WARDEN_OPENAI_BASE_URL at
-  # it, since depends_on isn't set here (this service is opt-in, unlike
-  # searxng which every deployment wants).
-  llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server
-    restart: unless-stopped
-    volumes:
-      - ./llama-server/models:/models:ro
-    # The image's baked-in healthcheck hardcodes port 8080; override it to
-    # match --port below, or `docker ps` reports this as permanently
-    # unhealthy despite working fine (confirmed: 404s hitting the wrong
-    # port, not an actual problem).
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
-    # --host 0.0.0.0 so it's reachable from the warden container over the
-    # compose network by service name (http://llama-server:8090/v1); this
-    # is still never exposed to the host/LAN since no `ports:` is
-    # published here. `--threads` is deliberately unset (defaults to the
-    # container's visible core count) — set it explicitly if colocated
-    # with other CPU-hungry services and you want to leave them headroom.
-    command:
-      - --model
-      - /models/Qwen3.5-4B-Q4_K_M.gguf
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8090"
-      - --ctx-size
-      - "8192"
-      - --jinja
-      - --alias
-      - qwen3.5-4b
-      # Qwen3.5 defaults to an extended "thinking" trace before its real
-      # answer — confirmed by hand: a plain 2-sentence question burned a
-      # 300-token budget entirely on reasoning and never reached the
-      # actual reply. --reasoning off is this llama.cpp build's current
-      # flag for this (older docs/guides say --chat-template-kwargs
-      # '{"enable_thinking":false}', which still works but logs a
-      # deprecation warning on this image).
-      - --reasoning
-      - "off"
-
-  # Optional voice-message transcription (see README's "Voice transcription"
-  # section) — whisper.cpp's own server, same opt-in-sidecar shape as
-  # llama-server above: not started by a plain `docker compose up -d`,
-  # only once warden's .env points WARDEN_WHISPER_URL at it.
-  whisper-server:
-    image: ghcr.io/ggml-org/whisper.cpp:main
-    restart: unless-stopped
-    volumes:
-      - ./whisper-server/models:/models:ro
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8091/"]
-    # This image's ENTRYPOINT is `["bash", "-c"]` (unlike llama.cpp's, which
-    # exec's its server binary directly): Compose always resolves `command:`
-    # to an array before handing it to Docker, whether written as a YAML
-    # list or a bare scalar (a scalar just gets shell-word-split into one
-    # array element per word first) — and `bash -c` treats array[0] alone
-    # as its script, feeding every element after it in as unused positional
-    # parameters ($1, $2, ...) rather than appending them to the command
-    # (confirmed: the server started fine but silently ignored
-    # --model/--host/--port and fell back to its own baked-in defaults).
-    # The fix is a YAML list containing exactly *one* string — Compose
-    # doesn't re-split an already-list value, so this is the one way to
-    # make the whole line land in bash's $0 script slot as a single piece.
-    # --host 0.0.0.0 so it's reachable from the warden container over the
-    # compose network by service name (http://whisper-server:8091).
-    command: ["whisper-server --model /models/ggml-base.bin --host 0.0.0.0 --port 8091"]
-
-  # Self-hosted XMPP server for developing/testing the XMPP connector (see
-  # README's "XMPP" section) — same opt-in-sidecar shape as llama-server/
-  # whisper-server above: not started by a plain `docker compose up -d`,
-  # only when named explicitly (e.g. `docker compose up -d prosody warden
-  # searxng`). Test-only config (see prosody/config/prosody.cfg.lua):
-  # self-signed TLS, SASL PLAIN via internal_plain storage. Port 5222 is
-  # published to the host (not just the compose network) so a real XMPP
-  # client (Gajim/Dino) and the manual openssl/SASL sanity check can reach
-  # it during development from outside the compose network too.
-  prosody:
-    # `:latest` resolves to 0.11.9 (2019) as of this writing, whose bundled
-    # LuaSec/OpenSSL couldn't complete a TLS 1.3 handshake with Zig 0.16's
-    # `std.crypto.tls.Client` (its ClientHello offers a hybrid ML-KEM768
-    # post-quantum key share by default, with no Options field to disable
-    # it — confirmed via `TlsUnexpectedMessage` failing consistently against
-    # 0.11.9 while a plain Python `ssl` client succeeded against the same
-    # server). `:trunk` resolved this — a real server-version compatibility
-    # gap, not a bug in the connector.
-    image: prosody/prosody:trunk
-    restart: unless-stopped
-    volumes:
-      - ./prosody/config:/etc/prosody
-      - ./prosody/data:/var/lib/prosody
-    ports:
-      - "5222:5222"
+    # No sidecar services are bundled here on purpose — this is the core
+    # bot alone, so you decide what (if anything) else to run alongside
+    # it. See examples/ for optional sidecars (SearXNG for web search, a
+    # self-hosted LLM, whisper.cpp for voice transcription, a Prosody
+    # instance for XMPP development), each with its own compose.yaml
+    # fragment you merge in explicitly, e.g.:
+    #
+    #   docker compose -f compose.yaml -f examples/searxng/compose.yaml up -d
+    #
+    # or, to run several at once:
+    #
+    #   docker compose \
+    #     -f compose.yaml \
+    #     -f examples/searxng/compose.yaml \
+    #     -f examples/llama-server/compose.yaml \
+    #     up -d

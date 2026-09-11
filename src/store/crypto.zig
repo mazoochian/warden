@@ -3,7 +3,7 @@ const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
 /// Persistence for the bot's one process-wide Olm account (see
-/// `src/matrix/olm.zig`'s doc comment on why there's only ever one row,
+/// `src/platform/matrix/olm.zig`'s doc comment on why there's only ever one row,
 /// keyed by the fixed id `'self'`).
 pub const StoredAccount = struct {
     device_id: []const u8,
@@ -40,7 +40,7 @@ pub fn saveAccount(pool: *PgPool, device_id: []const u8, pickled_account: []cons
     _ = try stmt.step();
 }
 
-/// Persistence for a per-device Olm session (see `matrix/olm.zig`'s
+/// Persistence for a per-device Olm session (see `platform/matrix/olm.zig`'s
 /// `Session`). Deliberately one session per sender identity key, not a
 /// multi-session-per-sender model real clients eventually need (trying
 /// every known session until one decrypts) — a reasonable simplification
@@ -87,7 +87,7 @@ pub fn saveSession(pool: *PgPool, their_identity_key: []const u8, session_id: []
     _ = try stmt.step();
 }
 
-/// Persistence for a received Megolm session (see `matrix/olm.zig`'s
+/// Persistence for a received Megolm session (see `platform/matrix/olm.zig`'s
 /// `InboundGroupSession`) — one per `(room, sending device, session id)`.
 pub fn loadInboundGroupSession(pool: *PgPool, allocator: std.mem.Allocator, room_id: []const u8, sender_key: []const u8, session_id: []const u8) !?[]const u8 {
     const db = try pool.acquire();
@@ -125,7 +125,7 @@ pub fn saveInboundGroupSession(pool: *PgPool, room_id: []const u8, sender_key: [
 }
 
 /// Persistence for this device's outbound Megolm session for one room (see
-/// `matrix/olm.zig`'s `OutboundGroupSession`).
+/// `platform/matrix/olm.zig`'s `OutboundGroupSession`).
 pub const StoredOutboundSession = struct {
     pickled_session: []const u8,
     shared_with_json: []const u8,

@@ -37,8 +37,14 @@ pub const tool: registry.ToolDef = .{
 /// past this point only ever deals in integer cents, never a float.
 fn centsFromAmount(amount: f64) ?i64 {
     if (!std.math.isFinite(amount)) return null;
-    const cents: i64 = @intFromFloat(@round(amount * 100.0));
-    if (cents <= 0) return null;
+    // Range-checked *before* `@intFromFloat`: converting an out-of-range
+    // float is an abort in `-Doptimize=ReleaseSafe`, and `amount` comes
+    // straight from the model, so a hallucinated `1e30` took the bot down.
+    // The ceiling is the same one `/expense add` uses.
+    const scaled = @round(amount * 100.0);
+    const max_cents: f64 = @floatFromInt(registry.max_expense_cents);
+    if (scaled <= 0 or scaled > max_cents) return null;
+    const cents: i64 = @intFromFloat(scaled);
     return cents;
 }
 
@@ -173,4 +179,14 @@ test "execute list forwards straight to the sink" {
 
     const out = try execute(ctx, "{\"action\":\"list\"}");
     try testing.expectEqualStrings(fake.list_text, out);
+}
+
+test "centsFromAmount rejects non-finite and out-of-range amounts instead of aborting" {
+    try testing.expectEqual(@as(?i64, 1250), centsFromAmount(12.50));
+    try testing.expectEqual(@as(?i64, null), centsFromAmount(0));
+    try testing.expectEqual(@as(?i64, null), centsFromAmount(-5));
+    try testing.expectEqual(@as(?i64, null), centsFromAmount(std.math.inf(f64)));
+    try testing.expectEqual(@as(?i64, null), centsFromAmount(std.math.nan(f64)));
+    // An `@intFromFloat` on this used to be a process abort.
+    try testing.expectEqual(@as(?i64, null), centsFromAmount(1e30));
 }

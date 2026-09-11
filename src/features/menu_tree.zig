@@ -108,6 +108,25 @@ pub const NodeKind = enum {
     wizard,
 };
 
+/// The trust tier a presser must hold before a node is offered to them, let
+/// alone run. Enforced by `menu.zig` through `ActionRunner.authorize` (whose
+/// only implementation is `main.zig`'s `menuAuthorize`) in two places: when
+/// building a branch's buttons, and again immediately before dispatching a
+/// pick — Telegram lets a client send arbitrary `callback_data` for any bot
+/// message, so a node being absent from the rendered keyboard is not on its
+/// own a gate.
+///
+/// Ordered least → most trusted; the comptime guard below requires every
+/// child to be at least as strict as its parent, so hiding a branch really
+/// does hide everything underneath it.
+///
+/// `.chat_admin` is deliberately stricter than the slash-command ladder in
+/// `auth.checkGroupAdminAccess`: owner or a live platform admin only. There's
+/// no `/sudo` prefix to type on a button, and silently spending one of the
+/// presser's per-chat tokens (that ladder's tier 4) on a tap would be a
+/// surprising way to lose a token.
+pub const MinRole = enum { anyone, chat_admin, bot_admin, owner };
+
 pub const MenuNode = struct {
     id: NodeId,
     parent: ?NodeId,
@@ -117,6 +136,9 @@ pub const MenuNode = struct {
     /// which use `prompt`/their own runner-produced text instead.
     body: []const u8 = "",
     kind: NodeKind,
+    /// Who may see and run this node — see `MinRole`. Defaults to `.anyone`;
+    /// every node that needs a gate names one explicitly.
+    min_role: MinRole = .anyone,
     children: []const ChildRef = &.{},
     /// Only used when `kind == .awaiting_input`.
     prompt: []const u8 = "",
@@ -294,6 +316,7 @@ const table = [_]MenuNode{
         .title = "🛡 Group Administration",
         .body = "Moderation actions for this chat. Same access rules as their slash-command equivalents — tapping a button doesn't grant anything a command couldn't already do.",
         .kind = .branch,
+        .min_role = .chat_admin,
         .children = &.{
             .{ .id = .group_admin_mute, .emoji = "🔇", .label = "Mute" },
             .{ .id = .group_admin_unmute, .emoji = "🔊", .label = "Unmute" },
@@ -312,6 +335,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "🔇 Mute",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Reply to the message of the person you want to mute.",
         .help_example = "reply to their message with /mute",
     },
@@ -320,6 +344,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "🔊 Unmute",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Reply to the message of the person you want to unmute.",
     },
     .{
@@ -327,6 +352,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "📌 Pin",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Reply to the message you want to pin.",
     },
     .{
@@ -334,6 +360,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "📍 Unpin",
         .kind = .action,
+        .min_role = .chat_admin,
         .help_body = "Unpins whatever's currently pinned — no target needed.",
     },
     .{
@@ -341,6 +368,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "🗑 Delete message",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Reply to the message you want deleted.",
     },
     .{
@@ -348,6 +376,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "👢 Kick",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Reply to the message of the person you want to kick, or send their @username or user id.",
         .help_example = "@spammer, or their raw user id",
     },
@@ -356,6 +385,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "⛔ Ban",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Reply to the message of the person you want to ban, or send their @username or user id.",
     },
     .{
@@ -363,6 +393,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "⬆️ Promote to admin",
         .kind = .awaiting_input,
+        .min_role = .owner,
         .prompt = "Reply to the message of the person you want to promote to admin. Bot owner only.",
     },
     .{
@@ -370,6 +401,7 @@ const table = [_]MenuNode{
         .parent = .group_admin,
         .title = "⬇️ Demote",
         .kind = .awaiting_input,
+        .min_role = .owner,
         .prompt = "Reply to the message of the person you want to demote. Bot owner only.",
     },
     .{
@@ -378,6 +410,7 @@ const table = [_]MenuNode{
         .title = "🧹 Redact / bulk delete",
         .body = "Delete messages in bulk, up to 100 at a time.",
         .kind = .branch,
+        .min_role = .chat_admin,
         .children = &.{
             .{ .id = .group_admin_redact_lastn, .emoji = "🔢", .label = "Last N messages" },
             .{ .id = .group_admin_redact_user, .emoji = "👤", .label = "A user's last N" },
@@ -390,6 +423,7 @@ const table = [_]MenuNode{
         .parent = .group_admin_redact,
         .title = "🧹 Redact — last N",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Send how many of the most recent messages to delete (up to 100).",
     },
     .{
@@ -397,6 +431,7 @@ const table = [_]MenuNode{
         .parent = .group_admin_redact,
         .title = "🧹 Redact — a user's last N",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Reply to that user's message, optionally followed by how many of their messages to delete (default: up to 100).",
     },
     .{
@@ -404,6 +439,7 @@ const table = [_]MenuNode{
         .parent = .group_admin_redact,
         .title = "🧹 Redact — containing text",
         .kind = .awaiting_input,
+        .min_role = .chat_admin,
         .prompt = "Send the substring to search for and delete (case-insensitive).",
     },
     .{
@@ -411,6 +447,7 @@ const table = [_]MenuNode{
         .parent = .group_admin_redact,
         .title = "🧹 Redact — matching regex",
         .kind = .awaiting_input,
+        .min_role = .bot_admin,
         .prompt = "Send the regex pattern to match and delete. Bot admin/owner only, even if you got here as a live chat admin.",
     },
 
@@ -433,6 +470,7 @@ const table = [_]MenuNode{
         .title = "🌐 Global settings",
         .body = "Bot-wide access control and configuration. Owner/bot admin only.",
         .kind = .branch,
+        .min_role = .bot_admin,
         .children = &.{
             .{ .id = .settings_global_addadmin, .emoji = "➕", .label = "Add bot admin" },
             .{ .id = .settings_global_removeadmin, .emoji = "➖", .label = "Remove bot admin" },
@@ -450,6 +488,7 @@ const table = [_]MenuNode{
         .parent = .settings_global,
         .title = "➕ Add bot admin",
         .kind = .awaiting_input,
+        .min_role = .bot_admin,
         .prompt = "Reply to the user, or send @username or their user id, to make them a bot admin.",
     },
     .{
@@ -457,6 +496,7 @@ const table = [_]MenuNode{
         .parent = .settings_global,
         .title = "➖ Remove bot admin",
         .kind = .awaiting_input,
+        .min_role = .bot_admin,
         .prompt = "Reply to the user, or send @username or their user id, to remove them as a bot admin.",
     },
     .{
@@ -464,6 +504,7 @@ const table = [_]MenuNode{
         .parent = .settings_global,
         .title = "✅ Allow a user",
         .kind = .awaiting_input,
+        .min_role = .bot_admin,
         .prompt = "Reply to the user, or send @username or their user id, to let them use this bot.",
     },
     .{
@@ -471,6 +512,7 @@ const table = [_]MenuNode{
         .parent = .settings_global,
         .title = "🚫 Remove a user",
         .kind = .awaiting_input,
+        .min_role = .bot_admin,
         .prompt = "Reply to the user, or send @username or their user id, to remove them.",
     },
     .{
@@ -478,18 +520,21 @@ const table = [_]MenuNode{
         .parent = .settings_global,
         .title = "🟢 Allow this chat",
         .kind = .action,
+        .min_role = .bot_admin,
     },
     .{
         .id = .settings_global_disallowchat,
         .parent = .settings_global,
         .title = "🔴 Disallow this chat",
         .kind = .action,
+        .min_role = .bot_admin,
     },
     .{
         .id = .settings_global_whois,
         .parent = .settings_global,
         .title = "🔎 Look up a user",
         .kind = .awaiting_input,
+        .min_role = .bot_admin,
         .prompt = "Reply to a user, or send @username or their user id, to look them up.",
     },
     .{
@@ -497,6 +542,7 @@ const table = [_]MenuNode{
         .parent = .settings_global,
         .title = "🕷 Scraper config",
         .kind = .action,
+        .min_role = .owner,
         .help_body = "Shows the current scraper mode/endpoint. Changing it stays a typed command (several independent options) — see /scraper.",
         .help_example = "/scraper mode remote",
     },
@@ -518,6 +564,7 @@ const table = [_]MenuNode{
         .parent = .settings_chat,
         .title = "🪄 Magic word",
         .kind = .awaiting_input,
+        .min_role = .owner,
         .prompt = "Send the new magic word, or \"off\" to disable it. (Owner only to change.)",
     },
     .{
@@ -525,6 +572,7 @@ const table = [_]MenuNode{
         .parent = .settings_chat,
         .title = "🎭 Persona",
         .kind = .awaiting_input,
+        .min_role = .owner,
         .prompt = "Send this chat's new persona/system-prompt text, or \"off\" to reset to the default. (Owner only to change.)",
     },
     .{
@@ -533,15 +581,16 @@ const table = [_]MenuNode{
         .title = "🧠 Show thinking",
         .body = "Show the model's reasoning in this chat?",
         .kind = .branch,
+        .min_role = .owner,
         .children = &.{
             .{ .id = .settings_chat_thinking_on, .emoji = "✅", .label = "On" },
             .{ .id = .settings_chat_thinking_off, .emoji = "🚫", .label = "Off" },
             .{ .id = .settings_chat_thinking_default, .emoji = "↩️", .label = "Bot-wide default" },
         },
     },
-    .{ .id = .settings_chat_thinking_on, .parent = .settings_chat_thinking, .title = "🧠 Show thinking: on", .kind = .action },
-    .{ .id = .settings_chat_thinking_off, .parent = .settings_chat_thinking, .title = "🧠 Show thinking: off", .kind = .action },
-    .{ .id = .settings_chat_thinking_default, .parent = .settings_chat_thinking, .title = "🧠 Show thinking: bot-wide default", .kind = .action },
+    .{ .id = .settings_chat_thinking_on, .parent = .settings_chat_thinking, .title = "🧠 Show thinking: on", .kind = .action, .min_role = .owner },
+    .{ .id = .settings_chat_thinking_off, .parent = .settings_chat_thinking, .title = "🧠 Show thinking: off", .kind = .action, .min_role = .owner },
+    .{ .id = .settings_chat_thinking_default, .parent = .settings_chat_thinking, .title = "🧠 Show thinking: bot-wide default", .kind = .action, .min_role = .owner },
     .{
         .id = .settings_chat_digest,
         .parent = .settings_chat,
@@ -634,6 +683,23 @@ comptime {
     }
     for (std.enums.values(NodeId)) |id| {
         if (!seen.get(id)) @compileError("menu_tree: node " ++ @tagName(id) ++ " has no table entry");
+    }
+
+    // `min_role` must never get laxer on the way down: `menu.zig` filters a
+    // branch's buttons by `authorize`, so a child looser than its parent
+    // would be unreachable through the UI while still being a legitimate
+    // target for a forged `callback_data` pick that only the per-pick check
+    // stops. Keeping the tree monotone means both layers agree. Compared by
+    // `children`, not `parent`, so the Help browser's second set of links
+    // into the real tree is checked too.
+    var role_of = std.EnumArray(NodeId, MinRole).initFill(.anyone);
+    for (table) |n| role_of.set(n.id, n.min_role);
+    for (table) |n| {
+        for (n.children) |c| {
+            if (@intFromEnum(role_of.get(c.id)) < @intFromEnum(n.min_role)) {
+                @compileError("menu_tree: child " ++ @tagName(c.id) ++ " is laxer than its parent " ++ @tagName(n.id));
+            }
+        }
     }
 }
 

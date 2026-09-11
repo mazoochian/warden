@@ -1,0 +1,23 @@
+# Optional sidecar: a private SearXNG metasearch instance backing the
+# bot's web_search tool -- no API keys, no bot checks, never exposed
+# outside the compose network. Not part of the default deployment; merge
+# this file in explicitly when you want it:
+#
+#   docker compose -f compose.yaml -f examples/searxng/compose.yaml up -d
+#
+# Then point the bot at it (compose resolves service-name DNS on the
+# shared compose network):
+#
+#   export WARDEN_SEARXNG_URL=http://searxng:8080
+services:
+  warden:
+    depends_on:
+      - searxng
+
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    volumes:
+      - ./examples/searxng:/etc/searxng
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-warden-local-searxng-secret}
