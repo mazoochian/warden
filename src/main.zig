@@ -1568,6 +1568,29 @@ fn processMessageTask(
         .chat_id = chat_id,
         .now = ts,
     };
+    // The three adapters below act *as the owner* -- sending from the
+    // owner's personal account, reading and marking-read their DMs, moving
+    // their bulletin cursor -- so they're only wired when the sender is the
+    // owner, same as `.memory`'s "absent means the tool can't run" rule
+    // below. Every bot admin, and every credit-holding user whenever
+    // `WARDEN_LLM_OWNER_ONLY=false`, reaches this code path; before this
+    // gate they all got these sinks, with their own identity as "owner".
+    // `filterEnabledTools` also stops offering the tools to the model when
+    // the sink is null, so a non-owner never sees them rather than
+    // watching them fail. The owner identity is resolved the way the
+    // `/autonomy`/reply_autonomy command side does, so the cursor and
+    // defaults land on one identity no matter which platform the owner
+    // asked from -- but only when they're *not* on the Telegram bot, where
+    // `identity_id` already is that row (`resolveOwnerIdentityId` is the
+    // same `getOrCreateMinimal(.telegram, owner id)` lookup that produced
+    // it) and the extra query would be a wasted round trip on every owner
+    // message. If it can't be resolved, the asker's own identity is the
+    // same fallback it always was.
+    const is_owner = auth.isOwner(config, connector.platform(), msg.user_id);
+    const owner_identity_id = if (is_owner and connector.platform() != .telegram)
+        resolveOwnerIdentityId(pool, config, ts) catch identity_id
+    else
+        identity_id;
     var personal_account_adapter: PersonalAccountToolAdapter = .{
         .telegram_user = telegram_user,
         .pool = pool,
@@ -1576,11 +1599,11 @@ fn processMessageTask(
     var monitoring_adapter: MonitoringToolAdapter = .{
         .telegram_user = telegram_user,
         .pool = pool,
-        .owner_identity_id = identity_id,
+        .owner_identity_id = owner_identity_id,
     };
     var bulletin_adapter: BulletinToolAdapter = .{
         .pool = pool,
-        .owner_identity_id = identity_id,
+        .owner_identity_id = owner_identity_id,
         .now = ts,
     };
     const tool_ctx = tool_registry.ToolContext{
@@ -1609,9 +1632,9 @@ fn processMessageTask(
         .memory = memory_adapter.sink(),
         .chat_history = chat_history_adapter.sink(),
         .expenses = expense_adapter.sink(),
-        .personal_account = personal_account_adapter.sink(),
-        .monitoring = monitoring_adapter.sink(),
-        .bulletin = bulletin_adapter.sink(),
+        .personal_account = if (is_owner) personal_account_adapter.sink() else null,
+        .monitoring = if (is_owner) monitoring_adapter.sink() else null,
+        .bulletin = if (is_owner) bulletin_adapter.sink() else null,
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -5863,7 +5886,7 @@ fn handleTelegramUserAutoReply(
             .username = msg.username,
             .native_id = msg.user_id,
         };
-        const enabled_tools = filterEnabledTools(pool, a, tools);
+        const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
         const raw_answer = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries) catch |err| {
             log.err("reply_autonomy: qa.answer failed for chat {s}: {t}", .{ msg.chat_id, err });
             return;
@@ -10665,17 +10688,36 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// `false` for a tool whose `ToolContext` sink is null — the owner-only
+/// sinks `processMessageTask` leaves unwired for anyone but the owner.
+/// Such a tool would only ever answer `error.MissingToolContext`, so it
+/// isn't offered to the model in the first place. Tools that don't go
+/// through one of these sinks are always `true` here; they're gated by
+/// `toolModuleKey`/`feature_flags` alone.
+fn toolSinkPresent(ctx: tool_registry.ToolContext, name: []const u8) bool {
+    const personal_account = [_][]const u8{ "summarize_unread_chat", "list_personal_chats", "send_personal_message", "reply_to_message" };
+    for (personal_account) |n| {
+        if (std.mem.eql(u8, n, name)) return ctx.personal_account != null;
+    }
+    if (std.mem.eql(u8, name, "set_chat_monitoring") or std.mem.eql(u8, name, "set_default_chat_monitoring")) return ctx.monitoring != null;
+    if (std.mem.eql(u8, name, "get_bulletin")) return ctx.bulletin != null;
+    return true;
+}
+
 /// Filters `tools` against `feature_flags` right before handing them to
 /// the model — the "handing over" moment ARCHITECTURE.md §5 describes,
 /// checked fresh on every turn so a toggle takes effect immediately, no
-/// restart needed. `a` is expected to be the caller's per-message arena
-/// (same convention every other per-message allocation in this function
-/// follows) — falls back to returning `tools` unfiltered on allocation
-/// failure rather than failing the whole reply over a disabled-tools list.
-fn filterEnabledTools(pool: *store_pool.PgPool, a: std.mem.Allocator, tools: []const tool_registry.ToolDef) []const tool_registry.ToolDef {
+/// restart needed — and against `ctx`, dropping any tool whose sink isn't
+/// wired for this sender (see `toolSinkPresent`). `a` is expected to be
+/// the caller's per-message arena (same convention every other per-message
+/// allocation in this function follows) — falls back to returning `tools`
+/// unfiltered on allocation failure rather than failing the whole reply
+/// over a disabled-tools list.
+fn filterEnabledTools(pool: *store_pool.PgPool, a: std.mem.Allocator, ctx: tool_registry.ToolContext, tools: []const tool_registry.ToolDef) []const tool_registry.ToolDef {
     const out = a.alloc(tool_registry.ToolDef, tools.len) catch return tools;
     var n: usize = 0;
     for (tools) |t| {
+        if (!toolSinkPresent(ctx, t.name)) continue;
         const key = toolModuleKey(t.name) orelse {
             out[n] = t;
             n += 1;
@@ -10735,10 +10777,49 @@ test "filterEnabledTools drops only tools whose module is explicitly disabled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const filtered = filterEnabledTools(&pool, arena.allocator(), &tools);
+    const ctx = tool_registry.ToolContext{ .allocator = arena.allocator(), .io = std.testing.io };
+    const filtered = filterEnabledTools(&pool, arena.allocator(), ctx, &tools);
     try std.testing.expectEqual(@as(usize, 2), filtered.len);
     try std.testing.expectEqualStrings("calculator", filtered[0].name);
     try std.testing.expectEqualStrings("air_quality", filtered[1].name);
+}
+
+// AUDIT-2026-09-03 CORE-4: the personal-account, monitoring and bulletin
+// tools used to be offered to (and wired for) every asker. With their sinks
+// absent from the context -- what a non-owner gets -- none of them is
+// offered, module flags notwithstanding; a tool with no sink is untouched.
+test "filterEnabledTools drops the owner-only tools when their sink isn't wired" {
+    const test_support = @import("store/test_support.zig");
+    var db = try test_support.openTestDb(std.testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try store_pool.PgPool.wrapForTest(std.testing.allocator, std.testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const dummy_execute = struct {
+        fn call(ctx: tool_registry.ToolContext, input_json: []const u8) anyerror![]const u8 {
+            _ = ctx;
+            _ = input_json;
+            return "";
+        }
+    }.call;
+    const tools = [_]tool_registry.ToolDef{
+        .{ .name = "calculator", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "summarize_unread_chat", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "list_personal_chats", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "send_personal_message", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "reply_to_message", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "set_chat_monitoring", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "set_default_chat_monitoring", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "get_bulletin", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ctx = tool_registry.ToolContext{ .allocator = arena.allocator(), .io = std.testing.io };
+    const filtered = filterEnabledTools(&pool, arena.allocator(), ctx, &tools);
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("calculator", filtered[0].name);
 }
 
 /// The "🛑 Cancel" button attached to the thinking/tool-use placeholder —
@@ -10893,7 +10974,7 @@ fn replyWithAnswer(
     defer if (placeholder_id) |pid| in_flight.unregister(native_chat_id, pid);
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
-    const enabled_tools = filterEnabledTools(pool, a, tools);
+    const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
     const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window, max_retries);
 
     // Stop the ticker before touching the placeholder ourselves. Signaled
