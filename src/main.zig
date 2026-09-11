@@ -210,13 +210,20 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "as", .description = "<chat id> <command> -- run an admin command against a chat you're an admin of; the reply comes back here. Admins only." },
 };
 
-/// Owner-only commands deliberately left out of `public_commands` (see its
-/// own doc comment) but still reserved -- an alias must never shadow one
-/// of these either.
+/// Commands deliberately left out of `public_commands` (see its own doc
+/// comment) but still reserved -- an alias must never shadow one of these
+/// either. Every name the dispatch chain in `handleMessage` matches on
+/// belongs in one list or the other: the personal-account and draft
+/// commands below were missing for a while, which let any allowed user
+/// `/alias add sendas ...` in a chat and have the owner's own later
+/// `/sendas` there expand into text of the aliaser's choosing.
 const reserved_command_names_extra = [_][]const u8{
-    "token",     "credit",       "scraper",  "adduser",     "removeuser",
-    "allowchat", "disallowchat", "addadmin", "removeadmin", "sudo",
-    "storage",   "feed",
+    "token",      "credit",       "scraper",  "adduser",     "removeuser",
+    "allowchat",  "disallowchat", "addadmin", "removeadmin", "sudo",
+    "storage",    "feed",         "tdlogin",  "tdlogout",    "iglogin",
+    "sendas",     "tdsend",       "tdchats",  "tdsearch",    "tdsummary",
+    "autonomy",   "drafts",       "approve",  "discard",     "slowmode",
+    "permission", "tag",
 };
 
 /// True if `name` (no leading slash) is a real built-in command -- checked
@@ -240,6 +247,13 @@ test "isReservedCommandName covers both the public menu and the owner-only extra
     try std.testing.expect(isReservedCommandName("Token"));
     try std.testing.expect(!isReservedCommandName("gm"));
     try std.testing.expect(!isReservedCommandName("standup"));
+    // AUDIT-2026-09-03 CORE-3: the fifteen the list used to be missing.
+    for ([_][]const u8{
+        "tdlogin",  "tdlogout", "iglogin", "sendas",  "tdsend",   "tdchats",    "tdsearch", "tdsummary",
+        "autonomy", "drafts",   "approve", "discard", "slowmode", "permission", "tag",
+    }) |name| {
+        try std.testing.expect(isReservedCommandName(name));
+    }
 }
 
 /// `/help`'s reply — kept as a single static string (matches `reply()`'s
@@ -2803,13 +2817,16 @@ fn handleMessage(
     // alias's name, it's dispatched as literal text from here on rather
     // than re-expanded -- a simple, safe rule that rules out alias loops
     // by construction, not by a depth counter. `isReservedCommandName`
-    // means a real built-in command is never shadowable, so this lookup
-    // can never change the meaning of an existing command even if the
-    // query below returns a row (it never will for one).
+    // means a real built-in command is never shadowable: `/alias add`
+    // refuses those names, and the lookup below skips them too, so a row
+    // that predates a name being reserved (or was written straight into
+    // Postgres) still can't change what a built-in command does.
     if (feature_flags.isEnabled(pool, "power_tools") and text.len > 1 and text[0] == '/') {
         const cmd_end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
         const cmd_name = text[1..cmd_end];
-        if (command_aliases.get(pool, a, chat_id, cmd_name) catch null) |alias| {
+        if (isReservedCommandName(cmd_name)) {
+            // Fall through with `text` untouched.
+        } else if (command_aliases.get(pool, a, chat_id, cmd_name) catch null) |alias| {
             const trailing = std.mem.trim(u8, text[cmd_end..], " ");
             text = if (trailing.len > 0)
                 std.fmt.allocPrint(a, "{s} {s}", .{ alias.expansion, trailing }) catch text
