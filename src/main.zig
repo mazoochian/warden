@@ -11680,6 +11680,27 @@ test {
     _ = @import("store/instagram_sessions.zig");
     _ = @import("worker_pool.zig");
     _ = @import("store/db.zig");
+    // AUDIT-2026-09-03 TEXT-6/STORE-4: these seventeen carried tests that
+    // no `zig build test` had ever reached -- the known "not in this block,
+    // silently never runs" gotcha, at scale. The member-ACL persistence
+    // tests in `store/member_permissions.zig` were among them.
+    _ = @import("auth.zig");
+    _ = @import("log.zig");
+    _ = @import("features/bulletin.zig");
+    _ = @import("features/chat_summary.zig");
+    _ = @import("features/reply_drafts.zig");
+    _ = @import("llm/delegates.zig");
+    _ = @import("store/member_permissions.zig");
+    _ = @import("store/rate_limits.zig");
+    _ = @import("tools/ask_delegate.zig");
+    _ = @import("tools/delegate_generate_image.zig");
+    _ = @import("tools/get_bulletin.zig");
+    _ = @import("tools/list_personal_chats.zig");
+    _ = @import("tools/reply_to_message.zig");
+    _ = @import("tools/send_personal_message.zig");
+    _ = @import("tools/set_chat_monitoring.zig");
+    _ = @import("tools/set_default_chat_monitoring.zig");
+    _ = @import("tools/summarize_unread_chat.zig");
 }
 
 /// Codepoints that delimit a word for magic-word / keyword matching.
