@@ -99,7 +99,7 @@ const ConnectionItem = struct {
 pub fn run(ctx: *const ServerContext, port: u16, worker_count: usize) !void {
     var listener = try bind(ctx.io, port);
     defer listener.deinit(ctx.io);
-    serve(ctx, &listener, worker_count);
+    serve(ctx, &listener, worker_count, null);
 }
 
 pub fn bind(io: Io, port: u16) !Io.net.Server {
@@ -107,18 +107,57 @@ pub fn bind(io: Io, port: u16) !Io.net.Server {
     return address.listen(io, .{ .reuse_address = true });
 }
 
-/// The accept loop itself — never returns under normal operation.
-pub fn serve(ctx: *const ServerContext, listener: *Io.net.Server, worker_count: usize) void {
+/// Cooperative stop signal for `serve`. Production passes `null` and the
+/// loop runs forever as it always has; tests pass one so the accept thread
+/// and its workers can be wound down at the end of the test instead of
+/// running for the rest of the test binary. Use `Stop.shutdown` rather than
+/// setting `flag` by hand — a `serve` parked in `accept` won't notice the
+/// flag until a connection arrives.
+pub const Stop = struct {
+    flag: std.atomic.Value(bool) = .init(false),
+
+    fn shouldStop(self: *const Stop) bool {
+        return self.flag.load(.acquire);
+    }
+
+    /// Signals `serve` to stop and then makes one throwaway connection to
+    /// `port` purely to wake the blocked `accept`, so this returns only once
+    /// the loop has actually observed the flag. Closing the listener out
+    /// from under `accept` would be the other way to unblock it, but that
+    /// races with the accept thread over a file descriptor the kernel is
+    /// free to hand back out for something else the moment it's closed.
+    pub fn shutdown(self: *Stop, io: Io, port: u16) void {
+        self.flag.store(true, .release);
+        const address = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
+        const stream = address.connect(io, .{ .mode = .stream }) catch return;
+        stream.close(io);
+    }
+};
+
+/// The accept loop itself — never returns under normal operation, and only
+/// returns at all when handed a `Stop` (see that type).
+pub fn serve(ctx: *const ServerContext, listener: *Io.net.Server, worker_count: usize, stop: ?*const Stop) void {
     const workers = WorkerPool(ConnectionItem).init(ctx.allocator, ctx.io, worker_count, handleConnection) catch |err| {
         log.err("failed to start worker pool: {t}", .{err});
         return;
     };
+    defer if (stop != null) workers.deinit();
 
     log.info("listening ({d} worker(s))", .{worker_count});
     while (true) {
+        if (stop) |s| if (s.shouldStop()) return;
         const stream = listener.accept(ctx.io) catch |err| {
+            if (stop) |s| if (s.shouldStop()) return;
             log.warn("accept failed: {t}", .{err});
             continue;
+        };
+        // Checked again after `accept` returns because the connection that
+        // just arrived is usually `Stop.shutdown`'s own throwaway one, which
+        // has nothing to serve and would otherwise be handed to a worker
+        // that's about to be told to stop.
+        if (stop) |s| if (s.shouldStop()) {
+            stream.close(ctx.io);
+            return;
         };
         workers.push(.{ .ctx = ctx, .stream = stream }) catch |err| {
             log.warn("failed to enqueue connection: {t}", .{err});
@@ -338,8 +377,17 @@ test "full HTTP round trip: unauthenticated session, dev-login, authenticated se
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
     defer client.deinit();
@@ -556,8 +604,17 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
     defer client.deinit();
@@ -750,8 +807,17 @@ test "convert endpoint: a real multipart POST whose body exceeds one buffered re
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
     defer client.deinit();
@@ -853,8 +919,17 @@ test "a malformed request head is refused instead of aborting the process" {
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     // API-1: a body method with neither content-length nor transfer-encoding.
     {
@@ -946,8 +1021,17 @@ test "settings PATCH and announcement POST answer instead of aborting after the 
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
     defer client.deinit();
