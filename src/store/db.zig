@@ -12,10 +12,26 @@ pub const c = @cImport({
 /// values by index until `step()` first runs the query.
 const max_params = 16;
 
-/// How often `runWithDeadline` re-checks the background thread's done flag
-/// — same idiom/value as `pool.zig`'s `acquire` poll loop and
-/// `http_util.zig`'s `fetchWithTimeout`.
-const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
+/// How often `runWithDeadline` re-checks the background thread's done flag.
+/// The interval starts at `initial_poll_interval_ns` and doubles on every
+/// wakeup up to `max_poll_interval_ns`, rather than being the flat 100 ms it
+/// was until 2026-09-13.
+///
+/// A flat interval put a hard floor under *every* query in the process: the
+/// done flag is checked once, then the caller sleeps the whole interval
+/// before looking again, so a query that Postgres answered in 200 µs still
+/// cost 100 ms of wall clock. Measured cost to the test suite alone was
+/// ~5.5 s of pure sleeping per DB-backed test and 23 min over a full run,
+/// against 19 s of actual CPU — see `store/test_support.zig`'s `openTestDb`
+/// and `migrate.zig`.
+///
+/// Backing off rather than just picking a smaller flat value keeps both
+/// ends sane: a fast query is noticed in well under a millisecond, and a
+/// genuinely slow one (lock contention, a stalled link to Postgres) settles
+/// back to the same 100 ms cadence it always had instead of spinning
+/// thousands of pointless wakeups while it waits out the deadline.
+const initial_poll_interval_ns: u64 = 50 * std.time.ns_per_us;
+const max_poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
 /// Slack added on top of `statement_timeout_seconds` to get
 /// `Db.query_timeout_ns`. `statement_timeout` is a *server-side* clock that
@@ -227,10 +243,12 @@ fn runWithDeadline(comptime T: type, db: *Db, comptime func: anytype, args: anyt
     };
 
     var waited_ns: u64 = 0;
+    var interval_ns: u64 = initial_poll_interval_ns;
     while (!outcome.done.load(.acquire) and waited_ns < db.query_timeout_ns) {
-        const step = @min(poll_interval_ns, db.query_timeout_ns - waited_ns);
+        const step = @min(interval_ns, db.query_timeout_ns - waited_ns);
         Io.sleep(db.io, .fromNanoseconds(@intCast(step)), .awake) catch break;
         waited_ns += step;
+        interval_ns = @min(interval_ns * 2, max_poll_interval_ns);
     }
 
     if (outcome.done.load(.acquire)) {
