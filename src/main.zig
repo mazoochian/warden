@@ -210,13 +210,20 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "as", .description = "<chat id> <command> -- run an admin command against a chat you're an admin of; the reply comes back here. Admins only." },
 };
 
-/// Owner-only commands deliberately left out of `public_commands` (see its
-/// own doc comment) but still reserved -- an alias must never shadow one
-/// of these either.
+/// Commands deliberately left out of `public_commands` (see its own doc
+/// comment) but still reserved -- an alias must never shadow one of these
+/// either. Every name the dispatch chain in `handleMessage` matches on
+/// belongs in one list or the other: the personal-account and draft
+/// commands below were missing for a while, which let any allowed user
+/// `/alias add sendas ...` in a chat and have the owner's own later
+/// `/sendas` there expand into text of the aliaser's choosing.
 const reserved_command_names_extra = [_][]const u8{
-    "token",     "credit",       "scraper",  "adduser",     "removeuser",
-    "allowchat", "disallowchat", "addadmin", "removeadmin", "sudo",
-    "storage",   "feed",
+    "token",      "credit",       "scraper",  "adduser",     "removeuser",
+    "allowchat",  "disallowchat", "addadmin", "removeadmin", "sudo",
+    "storage",    "feed",         "tdlogin",  "tdlogout",    "iglogin",
+    "sendas",     "tdsend",       "tdchats",  "tdsearch",    "tdsummary",
+    "autonomy",   "drafts",       "approve",  "discard",     "slowmode",
+    "permission", "tag",
 };
 
 /// True if `name` (no leading slash) is a real built-in command -- checked
@@ -240,6 +247,13 @@ test "isReservedCommandName covers both the public menu and the owner-only extra
     try std.testing.expect(isReservedCommandName("Token"));
     try std.testing.expect(!isReservedCommandName("gm"));
     try std.testing.expect(!isReservedCommandName("standup"));
+    // AUDIT-2026-09-03 CORE-3: the fifteen the list used to be missing.
+    for ([_][]const u8{
+        "tdlogin",  "tdlogout", "iglogin", "sendas",  "tdsend",   "tdchats",    "tdsearch", "tdsummary",
+        "autonomy", "drafts",   "approve", "discard", "slowmode", "permission", "tag",
+    }) |name| {
+        try std.testing.expect(isReservedCommandName(name));
+    }
 }
 
 /// `/help`'s reply — kept as a single static string (matches `reply()`'s
@@ -1554,6 +1568,29 @@ fn processMessageTask(
         .chat_id = chat_id,
         .now = ts,
     };
+    // The three adapters below act *as the owner* -- sending from the
+    // owner's personal account, reading and marking-read their DMs, moving
+    // their bulletin cursor -- so they're only wired when the sender is the
+    // owner, same as `.memory`'s "absent means the tool can't run" rule
+    // below. Every bot admin, and every credit-holding user whenever
+    // `WARDEN_LLM_OWNER_ONLY=false`, reaches this code path; before this
+    // gate they all got these sinks, with their own identity as "owner".
+    // `filterEnabledTools` also stops offering the tools to the model when
+    // the sink is null, so a non-owner never sees them rather than
+    // watching them fail. The owner identity is resolved the way the
+    // `/autonomy`/reply_autonomy command side does, so the cursor and
+    // defaults land on one identity no matter which platform the owner
+    // asked from -- but only when they're *not* on the Telegram bot, where
+    // `identity_id` already is that row (`resolveOwnerIdentityId` is the
+    // same `getOrCreateMinimal(.telegram, owner id)` lookup that produced
+    // it) and the extra query would be a wasted round trip on every owner
+    // message. If it can't be resolved, the asker's own identity is the
+    // same fallback it always was.
+    const is_owner = auth.isOwner(config, connector.platform(), msg.user_id);
+    const owner_identity_id = if (is_owner and connector.platform() != .telegram)
+        resolveOwnerIdentityId(pool, config, ts) catch identity_id
+    else
+        identity_id;
     var personal_account_adapter: PersonalAccountToolAdapter = .{
         .telegram_user = telegram_user,
         .pool = pool,
@@ -1562,11 +1599,11 @@ fn processMessageTask(
     var monitoring_adapter: MonitoringToolAdapter = .{
         .telegram_user = telegram_user,
         .pool = pool,
-        .owner_identity_id = identity_id,
+        .owner_identity_id = owner_identity_id,
     };
     var bulletin_adapter: BulletinToolAdapter = .{
         .pool = pool,
-        .owner_identity_id = identity_id,
+        .owner_identity_id = owner_identity_id,
         .now = ts,
     };
     const tool_ctx = tool_registry.ToolContext{
@@ -1595,9 +1632,9 @@ fn processMessageTask(
         .memory = memory_adapter.sink(),
         .chat_history = chat_history_adapter.sink(),
         .expenses = expense_adapter.sink(),
-        .personal_account = personal_account_adapter.sink(),
-        .monitoring = monitoring_adapter.sink(),
-        .bulletin = bulletin_adapter.sink(),
+        .personal_account = if (is_owner) personal_account_adapter.sink() else null,
+        .monitoring = if (is_owner) monitoring_adapter.sink() else null,
+        .bulletin = if (is_owner) bulletin_adapter.sink() else null,
         .attachment_path = attachment_path,
         .attachment_file_name = if (msg.attachment) |att| att.file_name else null,
         .attachment_mime = if (msg.attachment) |att| att.mime_type else null,
@@ -2721,7 +2758,7 @@ fn handleMessage(
         // shape as the Undo button above — the Approve/Discard buttons on a
         // `reply_autonomy = .draft` notification (see
         // `handleTelegramUserAutoReply`/`handleDraftChoicePicked`).
-        if (handleDraftChoicePicked(connector, a, io, telegram_user, pending_drafts, now, msg, picked)) {
+        if (handleDraftChoicePicked(connector, a, io, config, telegram_user, pending_drafts, now, msg, picked)) {
             return false;
         }
         // Same shape again — `/tdchats`' Prev/Next pager buttons. Checked
@@ -2803,13 +2840,16 @@ fn handleMessage(
     // alias's name, it's dispatched as literal text from here on rather
     // than re-expanded -- a simple, safe rule that rules out alias loops
     // by construction, not by a depth counter. `isReservedCommandName`
-    // means a real built-in command is never shadowable, so this lookup
-    // can never change the meaning of an existing command even if the
-    // query below returns a row (it never will for one).
+    // means a real built-in command is never shadowable: `/alias add`
+    // refuses those names, and the lookup below skips them too, so a row
+    // that predates a name being reserved (or was written straight into
+    // Postgres) still can't change what a built-in command does.
     if (feature_flags.isEnabled(pool, "power_tools") and text.len > 1 and text[0] == '/') {
         const cmd_end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
         const cmd_name = text[1..cmd_end];
-        if (command_aliases.get(pool, a, chat_id, cmd_name) catch null) |alias| {
+        if (isReservedCommandName(cmd_name)) {
+            // Fall through with `text` untouched.
+        } else if (command_aliases.get(pool, a, chat_id, cmd_name) catch null) |alias| {
             const trailing = std.mem.trim(u8, text[cmd_end..], " ");
             text = if (trailing.len > 0)
                 std.fmt.allocPrint(a, "{s} {s}", .{ alias.expansion, trailing }) catch text
@@ -5846,7 +5886,7 @@ fn handleTelegramUserAutoReply(
             .username = msg.username,
             .native_id = msg.user_id,
         };
-        const enabled_tools = filterEnabledTools(pool, a, tools);
+        const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
         const raw_answer = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries) catch |err| {
             log.err("reply_autonomy: qa.answer failed for chat {s}: {t}", .{ msg.chat_id, err });
             return;
@@ -5938,16 +5978,32 @@ fn handleTelegramUserAutoReply(
 /// `audit_notify`/`convert_flow`/`menu`'s own buttons) so `handleMessage`
 /// falls through to its other `choice_picked` consumers unchanged, same
 /// contract as `audit_notify.handleUndoPicked`.
+///
+/// Owner-only, checked here and not left to "the buttons are only ever
+/// posted to the owner's chat": Telegram lets any client send arbitrary
+/// `callback_data` for any bot message, so a `draft_approve:<chat>` value
+/// arriving from someone else is a forged press, and approving it would
+/// send the unreviewed draft from the owner's own personal account. A
+/// forged press is still consumed (`true`) so it can't fall through to
+/// another button consumer, but it does nothing and gets no reply.
 fn handleDraftChoicePicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
     io: Io,
+    config: *const config_mod.Config,
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pending_drafts: *reply_drafts.PendingDrafts,
     now: i64,
     msg: iface.Message,
     picked: iface.ChoicePicked,
 ) bool {
+    const is_draft_button = std.mem.startsWith(u8, picked.value, draft_approve_prefix) or
+        std.mem.startsWith(u8, picked.value, draft_discard_prefix);
+    if (!is_draft_button) return false;
+    if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
+        log.warn("reply_autonomy: ignoring draft button {s} pressed by non-owner {s} in chat {s}", .{ picked.value, msg.user_id, msg.chat_id });
+        return true;
+    }
     if (std.mem.startsWith(u8, picked.value, draft_approve_prefix)) {
         const native_chat_id = picked.value[draft_approve_prefix.len..];
         const draft = pending_drafts.take(a, now, native_chat_id) orelse {
@@ -10632,17 +10688,36 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// `false` for a tool whose `ToolContext` sink is null — the owner-only
+/// sinks `processMessageTask` leaves unwired for anyone but the owner.
+/// Such a tool would only ever answer `error.MissingToolContext`, so it
+/// isn't offered to the model in the first place. Tools that don't go
+/// through one of these sinks are always `true` here; they're gated by
+/// `toolModuleKey`/`feature_flags` alone.
+fn toolSinkPresent(ctx: tool_registry.ToolContext, name: []const u8) bool {
+    const personal_account = [_][]const u8{ "summarize_unread_chat", "list_personal_chats", "send_personal_message", "reply_to_message" };
+    for (personal_account) |n| {
+        if (std.mem.eql(u8, n, name)) return ctx.personal_account != null;
+    }
+    if (std.mem.eql(u8, name, "set_chat_monitoring") or std.mem.eql(u8, name, "set_default_chat_monitoring")) return ctx.monitoring != null;
+    if (std.mem.eql(u8, name, "get_bulletin")) return ctx.bulletin != null;
+    return true;
+}
+
 /// Filters `tools` against `feature_flags` right before handing them to
 /// the model — the "handing over" moment ARCHITECTURE.md §5 describes,
 /// checked fresh on every turn so a toggle takes effect immediately, no
-/// restart needed. `a` is expected to be the caller's per-message arena
-/// (same convention every other per-message allocation in this function
-/// follows) — falls back to returning `tools` unfiltered on allocation
-/// failure rather than failing the whole reply over a disabled-tools list.
-fn filterEnabledTools(pool: *store_pool.PgPool, a: std.mem.Allocator, tools: []const tool_registry.ToolDef) []const tool_registry.ToolDef {
+/// restart needed — and against `ctx`, dropping any tool whose sink isn't
+/// wired for this sender (see `toolSinkPresent`). `a` is expected to be
+/// the caller's per-message arena (same convention every other per-message
+/// allocation in this function follows) — falls back to returning `tools`
+/// unfiltered on allocation failure rather than failing the whole reply
+/// over a disabled-tools list.
+fn filterEnabledTools(pool: *store_pool.PgPool, a: std.mem.Allocator, ctx: tool_registry.ToolContext, tools: []const tool_registry.ToolDef) []const tool_registry.ToolDef {
     const out = a.alloc(tool_registry.ToolDef, tools.len) catch return tools;
     var n: usize = 0;
     for (tools) |t| {
+        if (!toolSinkPresent(ctx, t.name)) continue;
         const key = toolModuleKey(t.name) orelse {
             out[n] = t;
             n += 1;
@@ -10702,10 +10777,49 @@ test "filterEnabledTools drops only tools whose module is explicitly disabled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const filtered = filterEnabledTools(&pool, arena.allocator(), &tools);
+    const ctx = tool_registry.ToolContext{ .allocator = arena.allocator(), .io = std.testing.io };
+    const filtered = filterEnabledTools(&pool, arena.allocator(), ctx, &tools);
     try std.testing.expectEqual(@as(usize, 2), filtered.len);
     try std.testing.expectEqualStrings("calculator", filtered[0].name);
     try std.testing.expectEqualStrings("air_quality", filtered[1].name);
+}
+
+// AUDIT-2026-09-03 CORE-4: the personal-account, monitoring and bulletin
+// tools used to be offered to (and wired for) every asker. With their sinks
+// absent from the context -- what a non-owner gets -- none of them is
+// offered, module flags notwithstanding; a tool with no sink is untouched.
+test "filterEnabledTools drops the owner-only tools when their sink isn't wired" {
+    const test_support = @import("store/test_support.zig");
+    var db = try test_support.openTestDb(std.testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try store_pool.PgPool.wrapForTest(std.testing.allocator, std.testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const dummy_execute = struct {
+        fn call(ctx: tool_registry.ToolContext, input_json: []const u8) anyerror![]const u8 {
+            _ = ctx;
+            _ = input_json;
+            return "";
+        }
+    }.call;
+    const tools = [_]tool_registry.ToolDef{
+        .{ .name = "calculator", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "summarize_unread_chat", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "list_personal_chats", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "send_personal_message", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "reply_to_message", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "set_chat_monitoring", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "set_default_chat_monitoring", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+        .{ .name = "get_bulletin", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ctx = tool_registry.ToolContext{ .allocator = arena.allocator(), .io = std.testing.io };
+    const filtered = filterEnabledTools(&pool, arena.allocator(), ctx, &tools);
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("calculator", filtered[0].name);
 }
 
 /// The "🛑 Cancel" button attached to the thinking/tool-use placeholder —
@@ -10860,7 +10974,7 @@ fn replyWithAnswer(
     defer if (placeholder_id) |pid| in_flight.unregister(native_chat_id, pid);
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
-    const enabled_tools = filterEnabledTools(pool, a, tools);
+    const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
     const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window, max_retries);
 
     // Stop the ticker before touching the placeholder ourselves. Signaled
@@ -11647,6 +11761,27 @@ test {
     _ = @import("store/instagram_sessions.zig");
     _ = @import("worker_pool.zig");
     _ = @import("store/db.zig");
+    // AUDIT-2026-09-03 TEXT-6/STORE-4: these seventeen carried tests that
+    // no `zig build test` had ever reached -- the known "not in this block,
+    // silently never runs" gotcha, at scale. The member-ACL persistence
+    // tests in `store/member_permissions.zig` were among them.
+    _ = @import("auth.zig");
+    _ = @import("log.zig");
+    _ = @import("features/bulletin.zig");
+    _ = @import("features/chat_summary.zig");
+    _ = @import("features/reply_drafts.zig");
+    _ = @import("llm/delegates.zig");
+    _ = @import("store/member_permissions.zig");
+    _ = @import("store/rate_limits.zig");
+    _ = @import("tools/ask_delegate.zig");
+    _ = @import("tools/delegate_generate_image.zig");
+    _ = @import("tools/get_bulletin.zig");
+    _ = @import("tools/list_personal_chats.zig");
+    _ = @import("tools/reply_to_message.zig");
+    _ = @import("tools/send_personal_message.zig");
+    _ = @import("tools/set_chat_monitoring.zig");
+    _ = @import("tools/set_default_chat_monitoring.zig");
+    _ = @import("tools/summarize_unread_chat.zig");
 }
 
 /// Codepoints that delimit a word for magic-word / keyword matching.

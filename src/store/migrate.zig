@@ -78,8 +78,23 @@ pub fn migrate(db: *Db, allocator: std.mem.Allocator) !void {
         \\);
     );
 
+    // One round trip for the whole set, not one per migration. This used to
+    // call `isApplied` inside the loop below, which is a separate query each
+    // -- 51 of them on every `migrate()`, and `migrate()` runs on every
+    // `openTestDb`, so it dominated the test suite's runtime (see
+    // `db.zig`'s poll-interval doc comment for the other half of that).
+    // The table is one small row per applied migration; reading all of it
+    // is cheaper than a single one of those probes was.
+    var applied = std.AutoHashMapUnmanaged(i64, void).empty;
+    defer applied.deinit(allocator);
+    {
+        var stmt = try db.prepare("SELECT version FROM schema_migrations;");
+        defer stmt.finalize();
+        while (try stmt.step()) try applied.put(allocator, stmt.columnInt64(0), {});
+    }
+
     for (migrations) |m| {
-        if (try isApplied(db, m.version)) continue;
+        if (applied.contains(m.version)) continue;
 
         std.log.info("applying migration {d} ({s})", .{ m.version, m.name });
         const combined = try std.fmt.allocPrintSentinel(
@@ -91,13 +106,6 @@ pub fn migrate(db: *Db, allocator: std.mem.Allocator) !void {
         defer allocator.free(combined);
         try db.exec(combined);
     }
-}
-
-fn isApplied(db: *Db, version: i64) !bool {
-    var stmt = try db.prepare("SELECT 1 FROM schema_migrations WHERE version = $1;");
-    defer stmt.finalize();
-    stmt.bindInt64(1, version);
-    return try stmt.step();
 }
 
 const testing = std.testing;

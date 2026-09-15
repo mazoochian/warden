@@ -13,3 +13,4 @@ examples/whisper-server/models/
 warden.log
 
 CLAUDE.md
+AUDIT-*.md

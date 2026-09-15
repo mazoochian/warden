@@ -74,10 +74,11 @@ const FakeSink = struct {
         return self.result_text;
     }
 
-    fn unusedSummarizeFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8) anyerror![]const u8 {
+    fn unusedSummarizeFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, all: bool) anyerror![]const u8 {
         _ = ptr;
         _ = allocator;
         _ = chat_query;
+        _ = all;
         return error.Unsupported;
     }
 

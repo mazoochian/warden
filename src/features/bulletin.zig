@@ -83,7 +83,11 @@ test "gather reports nothing monitored when no chat has opted in" {
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
-    const a = testing.allocator;
+    // `gather` allocates for the per-message arena and frees nothing
+    // itself, so the tests hand it one too.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     const owner = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
     const text = try gather(&pool, a, owner, null, 100_000);
@@ -95,7 +99,9 @@ test "gather reports no new activity when monitored chats have nothing since the
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
-    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     const owner = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
     const chat_id = try chats.upsertChat(&pool, .telegram_user, "10", null, "Family");
@@ -110,7 +116,9 @@ test "gather groups messages by chat with bracketed ids, ordered by importance, 
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
-    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     const owner = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
     const sender = try identities.getOrCreateMinimal(&pool, .telegram_user, "2", "alice", null, false, 1000);
@@ -139,7 +147,9 @@ test "gather with an explicit hours window never advances the cursor" {
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
-    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     const owner = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "owner", null, false, 1000);
     const sender = try identities.getOrCreateMinimal(&pool, .telegram_user, "2", "alice", null, false, 1000);

@@ -43,13 +43,19 @@ pub fn WorkerPool(comptime Item: type) type {
         cond: Io.Condition = .init,
         queue: std.ArrayList(Item) = .empty,
         run_fn: *const fn (Item) void,
+        /// Set by `deinit` to tell idle workers to return instead of going
+        /// back to sleep on `cond`. Guarded by `mutex` like the queue it's
+        /// checked alongside; atomic only so the check itself is race-free.
+        stopping: std.atomic.Value(bool) = .init(false),
 
         /// Spawns `worker_count` real OS threads immediately (each blocks on
-        /// the initially-empty queue until `push` wakes one). Never joined
-        /// or stopped during normal operation — same "long-lived, runs for
+        /// the initially-empty queue until `push` wakes one). In production
+        /// these are never joined or stopped — same "long-lived, runs for
         /// the whole process, never explicitly awaited" shape as
         /// `main.zig`'s per-connector poll-loop threads and the `Io.Group`
-        /// this replaces, so there's deliberately no `deinit`/shutdown path.
+        /// this replaces — so nothing on that path calls `deinit`. It exists
+        /// for tests, which would otherwise strand a pool's worth of threads
+        /// per test for the rest of the run; see `deinit`.
         pub fn init(allocator: std.mem.Allocator, io: Io, worker_count: usize, run_fn: *const fn (Item) void) !*Self {
             std.debug.assert(worker_count > 0);
             const self = try allocator.create(Self);
@@ -92,6 +98,30 @@ pub fn WorkerPool(comptime Item: type) type {
             self.cond.signal(self.io);
         }
 
+        /// Stops every worker and frees the pool. Only workers that are
+        /// *idle* return: an item already being handled runs to completion
+        /// first, and anything still queued is dropped rather than drained,
+        /// which is what a caller shutting the pool down wants either way.
+        ///
+        /// Deliberately not called in production (see `init`) — a
+        /// long-running warden process has nothing to shut a pool down
+        /// *for*, and doing it at exit would only add a way to hang on a
+        /// wedged item. Tests are the caller that needs it, so that a test
+        /// spawning a server doesn't leave its workers running for the
+        /// remainder of the test binary.
+        pub fn deinit(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            self.stopping.store(true, .release);
+            self.cond.broadcast(self.io);
+            self.mutex.unlock(self.io);
+
+            for (self.threads) |t| t.join();
+
+            self.queue.deinit(self.allocator);
+            self.allocator.free(self.threads);
+            self.allocator.destroy(self);
+        }
+
         /// No ordering guarantee across items (LIFO in practice, via
         /// `pop()` rather than a true FIFO shift) — matches the `Io.Group`
         /// this replaces, which never guaranteed message-processing order
@@ -102,6 +132,10 @@ pub fn WorkerPool(comptime Item: type) type {
             while (true) {
                 self.mutex.lockUncancelable(self.io);
                 while (self.queue.items.len == 0) {
+                    if (self.stopping.load(.acquire)) {
+                        self.mutex.unlock(self.io);
+                        return;
+                    }
                     self.cond.waitUncancelable(self.io, &self.mutex);
                 }
                 const item = self.queue.pop().?;
@@ -127,12 +161,14 @@ test "WorkerPool drains every pushed item exactly once, even with a single worke
     const Pool = WorkerPool(CounterTask);
 
     var counter: std.atomic.Value(usize) = .init(0);
-    // Deliberately not `testing.allocator`: `WorkerPool` has no `deinit` by
-    // design (its worker threads are meant to run for the whole process,
-    // same as `main.zig`'s connector poll threads — see `init`'s doc
-    // comment), so a leak-checking allocator would always flag this as a
-    // leak even though it's the intended, permanent shape in production.
-    // Same reasoning/pattern as `http_util.zig`'s deliberate-leak test.
+    // Deliberately not `testing.allocator`: this test exercises the
+    // production shape, where the pool is never shut down (its worker
+    // threads are meant to run for the whole process, same as `main.zig`'s
+    // connector poll threads — see `init`'s doc comment), so it doesn't call
+    // the `deinit` that exists for tests that do want to wind one down. A
+    // leak-checking allocator would always flag that as a leak even though
+    // it's the intended, permanent shape in production. Same
+    // reasoning/pattern as `http_util.zig`'s deliberate-leak test.
     const pool = try Pool.init(std.heap.page_allocator, io, 1, CounterTask.run);
 
     const n = 50;

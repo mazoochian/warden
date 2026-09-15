@@ -99,7 +99,7 @@ const ConnectionItem = struct {
 pub fn run(ctx: *const ServerContext, port: u16, worker_count: usize) !void {
     var listener = try bind(ctx.io, port);
     defer listener.deinit(ctx.io);
-    serve(ctx, &listener, worker_count);
+    serve(ctx, &listener, worker_count, null);
 }
 
 pub fn bind(io: Io, port: u16) !Io.net.Server {
@@ -107,18 +107,57 @@ pub fn bind(io: Io, port: u16) !Io.net.Server {
     return address.listen(io, .{ .reuse_address = true });
 }
 
-/// The accept loop itself — never returns under normal operation.
-pub fn serve(ctx: *const ServerContext, listener: *Io.net.Server, worker_count: usize) void {
+/// Cooperative stop signal for `serve`. Production passes `null` and the
+/// loop runs forever as it always has; tests pass one so the accept thread
+/// and its workers can be wound down at the end of the test instead of
+/// running for the rest of the test binary. Use `Stop.shutdown` rather than
+/// setting `flag` by hand — a `serve` parked in `accept` won't notice the
+/// flag until a connection arrives.
+pub const Stop = struct {
+    flag: std.atomic.Value(bool) = .init(false),
+
+    fn shouldStop(self: *const Stop) bool {
+        return self.flag.load(.acquire);
+    }
+
+    /// Signals `serve` to stop and then makes one throwaway connection to
+    /// `port` purely to wake the blocked `accept`, so this returns only once
+    /// the loop has actually observed the flag. Closing the listener out
+    /// from under `accept` would be the other way to unblock it, but that
+    /// races with the accept thread over a file descriptor the kernel is
+    /// free to hand back out for something else the moment it's closed.
+    pub fn shutdown(self: *Stop, io: Io, port: u16) void {
+        self.flag.store(true, .release);
+        const address = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
+        const stream = address.connect(io, .{ .mode = .stream }) catch return;
+        stream.close(io);
+    }
+};
+
+/// The accept loop itself — never returns under normal operation, and only
+/// returns at all when handed a `Stop` (see that type).
+pub fn serve(ctx: *const ServerContext, listener: *Io.net.Server, worker_count: usize, stop: ?*const Stop) void {
     const workers = WorkerPool(ConnectionItem).init(ctx.allocator, ctx.io, worker_count, handleConnection) catch |err| {
         log.err("failed to start worker pool: {t}", .{err});
         return;
     };
+    defer if (stop != null) workers.deinit();
 
     log.info("listening ({d} worker(s))", .{worker_count});
     while (true) {
+        if (stop) |s| if (s.shouldStop()) return;
         const stream = listener.accept(ctx.io) catch |err| {
+            if (stop) |s| if (s.shouldStop()) return;
             log.warn("accept failed: {t}", .{err});
             continue;
+        };
+        // Checked again after `accept` returns because the connection that
+        // just arrived is usually `Stop.shutdown`'s own throwaway one, which
+        // has nothing to serve and would otherwise be handed to a worker
+        // that's about to be told to stop.
+        if (stop) |s| if (s.shouldStop()) {
+            stream.close(ctx.io);
+            return;
         };
         workers.push(.{ .ctx = ctx, .stream = stream }) catch |err| {
             log.warn("failed to enqueue connection: {t}", .{err});
@@ -248,6 +287,7 @@ const PgPool = store_pool.PgPool;
 const test_support = @import("../store/test_support.zig");
 const identities = @import("../store/identities.zig");
 const chats_store = @import("../store/chats.zig");
+const bot_admins = @import("../store/bot_admins.zig");
 const convert = @import("../features/convert.zig");
 
 fn testConfig() config_mod.Config {
@@ -337,8 +377,17 @@ test "full HTTP round trip: unauthenticated session, dev-login, authenticated se
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
     defer client.deinit();
@@ -555,8 +604,17 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
     defer client.deinit();
@@ -749,8 +807,17 @@ test "convert endpoint: a real multipart POST whose body exceeds one buffered re
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
     defer client.deinit();
@@ -852,8 +919,17 @@ test "a malformed request head is refused instead of aborting the process" {
     listener.* = try bind(testing.io, 0);
     const port = listener.socket.address.getPort();
 
-    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2) });
-    thread.detach();
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
 
     // API-1: a body method with neither content-length nor transfer-encoding.
     {
@@ -882,6 +958,126 @@ test "a malformed request head is refused instead of aborting the process" {
     {
         var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
         defer client.deinit();
+        var url_buf: [128]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api/v1/auth/session", .{port});
+        var req = try client.request(.GET, try std.Uri.parse(url), .{ .keep_alive = false });
+        defer req.deinit();
+        try req.sendBodiless();
+        const response = try req.receiveHead(&.{});
+        try testing.expectEqual(.ok, response.head.status);
+    }
+}
+
+/// One authenticated JSON request with a body, for the handlers below that
+/// read one. `keep_alive = false` like every other test request here.
+fn jsonRequest(client: *http.Client, port: u16, method: http.Method, path: []const u8, cookie: []const u8, body: []const u8) !http.Status {
+    var url_buf: [160]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path });
+    var req = try client.request(method, try std.Uri.parse(url), .{
+        .keep_alive = false,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "cookie", .value = cookie },
+        },
+    });
+    defer req.deinit();
+    req.transfer_encoding = .{ .content_length = body.len };
+    var body_writer = try req.sendBodyUnflushed(&.{});
+    try body_writer.writer.writeAll(body);
+    try body_writer.end();
+    try req.connection.?.flush();
+    const response = try req.receiveHead(&.{});
+    return response.head.status;
+}
+
+// AUDIT-2026-09-03 API-5: both handlers called `resolveAuth` again after
+// taking the body reader, to re-check the owner tier and to stamp the audit
+// row. `findCookie` iterates the request headers, and `std.http.Server`
+// asserts the connection is still at `received_head` to do that -- so every
+// successful settings PATCH (after all ten setters had committed) and every
+// announcement POST aborted the process. As with the malformed-head test
+// above, the real assertion is the last request: the server is still there.
+test "settings PATCH and announcement POST answer instead of aborting after the body read" {
+    const gpa = std.heap.page_allocator;
+
+    const db = try gpa.create(Db);
+    db.* = try test_support.openTestDb(gpa) orelse return error.SkipZigTest;
+    const pool = try gpa.create(PgPool);
+    pool.* = try PgPool.wrapForTest(gpa, testing.io, db);
+
+    // A bot admin passes `requireChatAccess` for any chat without a live
+    // platform admin lookup, which the stub-free test server can't answer.
+    const identity_id = try identities.getOrCreateMinimal(pool, .telegram, "556", "Settings Test Admin", null, false, 1000);
+    try bot_admins.addBotAdmin(pool, identity_id, identity_id);
+    const chat_id = try chats_store.upsertChat(pool, .telegram, "-1005560000", "supergroup", "Settings Test Chat");
+
+    const config = try gpa.create(config_mod.Config);
+    config.* = testConfig();
+
+    const ctx = try gpa.create(ServerContext);
+    ctx.* = .{ .allocator = gpa, .io = testing.io, .pool = pool, .config = config };
+
+    const listener = try gpa.create(Io.net.Server);
+    listener.* = try bind(testing.io, 0);
+    const port = listener.socket.address.getPort();
+
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    // Registered before the request-side defers below so it runs after them:
+    // the client is finished with the server by the time the loop is told to
+    // stop. Joined rather than detached so the accept thread and its workers
+    // are gone when the test returns, instead of staying live for the rest of
+    // the test binary.
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
+
+    var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+
+    const cookie = try devLogin(&client, port, identity_id);
+    defer testing.allocator.free(cookie);
+
+    var path_buf: [96]u8 = undefined;
+
+    // The whole-object PATCH with nothing owner-gated changing: reaches the
+    // audit-row `resolveAuth` at the very end, which is the one every
+    // successful call hit.
+    {
+        const path = try std.fmt.bufPrint(&path_buf, "/api/v1/chats/{d}/settings", .{chat_id});
+        const body =
+            \\{"persona":null,"magic_word":null,"digest_enabled":false,"thinking_override":null,
+            \\"briefing_enabled":false,"default_location":null,"welcome_message":null,
+            \\"autopin_announcements":false,"video_download_enabled":false,
+            \\"video_download_lossy":false,"slowmode_seconds":0}
+        ;
+        try testing.expectEqual(.ok, try jsonRequest(&client, port, .PATCH, path, cookie, body));
+    }
+
+    // Changing the welcome message reaches the owner re-check, which is a
+    // 403 for a bot admin -- an answer, not an abort.
+    {
+        const path = try std.fmt.bufPrint(&path_buf, "/api/v1/chats/{d}/settings", .{chat_id});
+        const body =
+            \\{"persona":null,"magic_word":null,"digest_enabled":false,"thinking_override":null,
+            \\"briefing_enabled":false,"default_location":null,"welcome_message":"hi",
+            \\"autopin_announcements":false,"video_download_enabled":false,
+            \\"video_download_lossy":false,"slowmode_seconds":0}
+        ;
+        try testing.expectEqual(.forbidden, try jsonRequest(&client, port, .PATCH, path, cookie, body));
+    }
+
+    {
+        const path = try std.fmt.bufPrint(&path_buf, "/api/v1/chats/{d}/announcements", .{chat_id});
+        const body =
+            \\{"message":"still here","when":{"kind":"duration","seconds":3600}}
+        ;
+        try testing.expectEqual(.ok, try jsonRequest(&client, port, .POST, path, cookie, body));
+    }
+
+    // Still alive and serving.
+    {
         var url_buf: [128]u8 = undefined;
         const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api/v1/auth/session", .{port});
         var req = try client.request(.GET, try std.Uri.parse(url), .{ .keep_alive = false });
