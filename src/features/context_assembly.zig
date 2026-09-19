@@ -1,13 +1,8 @@
 //! `assembleContext`, per the memory-layer design brief: renders pinned +
 //! ranked facts, ranked/recent daily digests, and recent chat history into
-//! one context block under a hard, code-enforced character budget, so
-//! prompt quality doesn't degrade as history grows (failure mode 1 --
-//! "context rot"). Every date is precomputed here, never left for the model
-//! to infer (failure mode 2), tentative facts are suppressed to a small
-//! top-ranked set under their own "may be stale" heading (failure mode 3),
-//! and a fact's own bitemporal `valid_to`/`superseded_by` (`store/facts.zig`)
-//! keeps a contradicted fact from ever being retrieved at all (failure mode
-//! 4) -- this module only renders what the store layer already resolved.
+//! one context block under a hard, code-enforced character budget, so prompt
+//! quality doesn't degrade as history grows (failure mode 1 -- "context
+//! rot").
 const std = @import("std");
 const civil_time = @import("../text/civil_time.zig");
 const PgPool = @import("../store/pool.zig").PgPool;
@@ -16,12 +11,7 @@ const daily_digests = @import("../store/daily_digests.zig");
 const messages = @import("../store/messages.zig");
 const embeddings = @import("../llm/embeddings.zig");
 
-/// Character budgets per section -- `chars ~= tokens * 3`, the same
-/// conservative estimate `qa.zig`'s `min_chars_per_token` already uses
-/// elsewhere in this codebase, so the two stay consistent rather than
-/// picking a second, different heuristic here. Matches the design brief's
-/// token table (header ~60, pinned ~250, facts ~500, episodes ~500,
-/// session ~2000).
+/// Character budgets per section.
 pub const Budget = struct {
     header_chars: usize = 60 * 3,
     stable_facts_chars: usize = 750 * 3, // pinned (~250) + retrieved (~500) share one rendered section
@@ -36,13 +26,8 @@ const ranked_tentative_limit: u32 = 3;
 const digests_recency_floor: u32 = 3;
 const digests_ranked_limit: u32 = 3;
 
-/// Builds the full memory+history block `qa.zig` injects ahead of the
-/// asker line and question -- everything from "Today is..." through
-/// "## Recent chat history", budget-capped section by section. Never
-/// fails the caller: any retrieval error (embeddings down, a query error)
-/// just drops that section, same "soft failure" convention the old
-/// `qa.zig` memories block used -- a missing memory section is better than
-/// no answer at all.
+/// Builds the full memory+history block `qa.zig` injects ahead of the asker
+/// line and question -- everything from "Today is...
 pub fn assemble(
     pool: *PgPool,
     allocator: std.mem.Allocator,
@@ -66,10 +51,8 @@ pub fn assemble(
     });
     try w.writeAll(truncateHead(header, budget.header_chars));
 
-    // Only pay for an embedding (and the ranked queries that need it) if
-    // there's actually something to rank -- matches the old memories
-    // block's `hasAny` short circuit, extended to also cover this chat's
-    // digests.
+    // Only pay for an embedding (and the ranked queries that need it) if there's
+    // actually something to rank.
     const has_facts = facts.hasAny(pool, identity_id) catch false;
     const has_digests = daily_digests.hasAny(pool, chat_id) catch false;
     const query_vector: ?[]f32 = if (has_facts or has_digests) blk: {
@@ -104,12 +87,7 @@ fn appendStableFactsSection(
     max_chars: usize,
 ) !void {
     const pinned = facts.pinnedForIdentity(pool, allocator, identity_id) catch &.{};
-    // Ranked even with no query vector: the hybrid score's other three
-    // terms (keyword, recency, salience) still discriminate, and skipping
-    // the query entirely -- as this used to -- meant a deployment without an
-    // embeddings endpoint got *no* stable facts in its context at all, only
-    // pinned ones. See `facts.hybrid_score_expr` on why a null vector is
-    // safe to pass straight through.
+    // Ranked even with no query vector.
     const stable = facts.rankedStable(pool, allocator, identity_id, query_vector, question, ranked_stable_limit, now) catch &.{};
 
     var lines: std.ArrayList([]const u8) = .empty;
@@ -131,9 +109,9 @@ fn appendTentativeFactsSection(
     now: i64,
     max_chars: usize,
 ) !void {
-    // Same reasoning as the stable section: no query vector is not a reason
-    // to skip tentative facts entirely, only to rank them without the
-    // similarity term.
+    // Same reasoning as the stable section: no query vector is not a reason to
+    // skip tentative facts entirely, only to rank them without the similarity
+    // term.
     const tentative = facts.rankedTentative(pool, allocator, identity_id, query_vector, question, ranked_tentative_limit, now) catch &.{};
     if (tentative.len == 0) return;
 
@@ -205,9 +183,7 @@ fn renderFactLine(allocator: std.mem.Allocator, f: facts.RankedFact) ![]const u8
     return std.fmt.allocPrint(allocator, "- {s}. [since {s}, confirmed {d}x]\n", .{ f.statement, since, f.confirmations });
 }
 
-/// "4 months ago" / "2 days ago" -- coarse on purpose (the design brief
-/// only requires a precomputed relative age be present, not calendar-exact
-/// month arithmetic).
+/// "4 months ago" / "2 days ago" -- coarse on purpose.
 fn relativeAge(allocator: std.mem.Allocator, now: i64, then: i64) []const u8 {
     const days = @divFloor(now - then, 86400);
     if (days <= 0) return "today";
@@ -217,9 +193,8 @@ fn relativeAge(allocator: std.mem.Allocator, now: i64, then: i64) []const u8 {
     return std.fmt.allocPrint(allocator, "{d} years ago", .{@divFloor(days, 365)}) catch "years ago";
 }
 
-/// Greedily includes lines (already best-first) until the next one would
-/// blow `max_chars` -- the hard, code-enforced budget the design brief
-/// requires instead of asking the model to self-limit.
+/// Greedily includes lines (already best-first) until the next one would blow
+/// `max_chars`.
 fn writeBudgetedLines(w: *std.Io.Writer, lines: []const []const u8, max_chars: usize) !void {
     var used: usize = 0;
     for (lines) |line| {
@@ -234,9 +209,7 @@ fn truncateHead(text: []const u8, max_chars: usize) []const u8 {
 }
 
 /// Drops whole lines from the front of `text` until what's left fits in
-/// `max_chars` -- keeps the *most recent* turns verbatim and lets older
-/// ones fall out of the prompt first, per the design brief's session
-/// handling (nothing is deleted from storage, just not injected).
+/// `max_chars`.
 fn truncateTail(text: []const u8, max_chars: usize) []const u8 {
     if (text.len <= max_chars) return text;
     var rest = text;

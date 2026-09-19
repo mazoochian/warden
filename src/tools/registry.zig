@@ -3,10 +3,7 @@ const Io = std.Io;
 const iface = @import("../platform/interface.zig");
 const delegates_mod = @import("../llm/delegates.zig");
 
-/// Scraper mode/endpoint for `scrape_site`. Defined here (rather than in
-/// `store/bot_config.zig`) so `registry.zig` — imported by every tool — has
-/// no dependency on the store layer; `bot_config.zig` produces values of
-/// this shape instead.
+/// Scraper mode/endpoint for `scrape_site`.
 pub const ScraperMode = enum { local, remote };
 
 pub const ScraperConfig = struct {
@@ -15,18 +12,8 @@ pub const ScraperConfig = struct {
     remote_api_key: ?[]const u8 = null,
 };
 
-/// Most tools are pure request/response (fetch some data, return text to
-/// feed back to the model). A few — like rendering and sending a diagram —
-/// have a side effect (sending a photo to the chat), so the
-/// connector/chat_id/scratch dir are available too. Optional (rather than
-/// required) so simple tools and their tests can keep constructing a
-/// `ToolContext` with just `allocator`/`io`.
-/// Callback surface the `set_reminder` tool uses to persist/query/cancel
-/// reminders — same ptr+vtable shape as `Connector`/`llm.Provider`, so this
-/// file (imported by every tool) still never depends on the store layer
-/// directly (see `ScraperConfig`'s doc comment above for why that boundary
-/// matters); `main.zig` wires the real Postgres-backed implementation in,
-/// scoped to the sending chat/identity for a given message.
+/// Most tools are pure request/response (fetch some data, return text to feed
+/// back to the model).
 pub const ReminderSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -38,10 +25,8 @@ pub const ReminderSink = struct {
         /// see the `0003_reminders_recurrence.sql` migration comment.
         create: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, message: []const u8, due_at: i64, recur_interval_seconds: ?i64) anyerror!i64,
         cancel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!CancelResult,
-        /// Returns pending reminders for this chat, already formatted as a
-        /// human-readable list (empty-case text included) — formatting
-        /// needs `now` and per-row lookups the tool itself has no access
-        /// to, so it's simplest for the sink to own it end to end.
+        /// Returns pending reminders for this chat, already formatted as a human-
+        /// readable list (empty-case text included).
         listPending: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]const u8,
     };
 
@@ -58,11 +43,6 @@ pub const ReminderSink = struct {
     }
 };
 
-/// Same ptr+vtable shape as `ReminderSink`, for the `set_alert` tool — kept
-/// as its own type (rather than folding into `ReminderSink`) since alerts
-/// have a materially different shape (kind/subject/condition/threshold vs.
-/// message/due_at) and no shared behavior beyond "persisted, chat-scoped,
-/// cancelable thing".
 pub const AlertSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -91,8 +71,7 @@ pub const AlertSink = struct {
 };
 
 /// Same ptr+vtable shape as `ReminderSink`/`AlertSink`, for the `set_note`
-/// tool — notes/lists (shopping lists, wishlists, packing lists, etc. are
-/// all just this one generic shape, see `store/notes.zig`'s doc comment).
+/// tool.
 pub const NoteSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -121,22 +100,7 @@ pub const NoteSink = struct {
 };
 
 /// Same ptr+vtable shape as `NoteSink`, for the `set_expense` tool
-/// (ROADMAP.md's Phase 17) -- lets the model log an expense from natural
-/// language ("I spent $12 on lunch") or a receipt photo it can already
-/// see via Phase 10's vision support, with no separate OCR plumbing
-/// needed: the model reads the amount/items off the image itself and
-/// calls this like any other expense. `amount_cents` is already
-/// converted from the model's dollar-amount input by the tool itself
-/// (see `tools/set_expense.zig`), so this sink -- like every store-layer
-/// boundary in this file -- only ever deals in the exact integer unit
-/// real money is stored as.
-/// Ceiling on a single expense amount, in cents (~1 trillion units of
-/// whatever currency). Lives here rather than in `main.zig` so both entry
-/// points share it: `/expense add`'s hand-rolled decimal parser and the
-/// `set_expense` tool's float conversion. Past this an amount is a mistake
-/// (or a hallucination) rather than a purchase, and both paths used to abort
-/// the process on the way to finding that out -- integer overflow in one,
-/// an out-of-range `@intFromFloat` in the other.
+///.
 pub const max_expense_cents: i64 = 100_000_000_000_000;
 
 pub const ExpenseSink = struct {
@@ -166,14 +130,6 @@ pub const ExpenseSink = struct {
     }
 };
 
-/// Same ptr+vtable shape as `NoteSink`, for the `remember_memory` tool —
-/// see `store/memories.zig`'s doc comment for the "explicit remember/
-/// forget, per-identity, not per-chat" scope decision (ROADMAP.md's Phase
-/// 12). Unlike `NoteSink.delete` there's no "or the owner" escape hatch on
-/// `forget` — a memory is per-identity, never chat-visible, so there's
-/// nothing for a chat's/bot's owner to moderate; only the identity that
-/// owns a given memory can ever forget it (enforced by the `main.zig`
-/// adapter, not this type).
 pub const MemorySink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -182,8 +138,8 @@ pub const MemorySink = struct {
 
     pub const VTable = struct {
         /// May itself make an embeddings API call before persisting — see
-        /// `main.zig`'s `MemoryToolAdapter`, the actual implementation
-        /// behind this vtable slot.
+        /// `main.zig`'s `MemoryToolAdapter`, the actual implementation behind this
+        /// vtable slot.
         create: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror!i64,
         forget: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i64) anyerror!ForgetResult,
         /// Same "sink formats its own listing" reasoning as
@@ -205,11 +161,7 @@ pub const MemorySink = struct {
 };
 
 /// Callback surface the `begin_file_conversion` tool uses to kick off the
-/// interactive multi-stage `/convert` flow (see `features/convert_flow.zig`)
-/// when the user expresses intent in natural language rather than typing
-/// bare `/convert` — same ptr+vtable boundary reasoning as `ReminderSink`/
-/// `AlertSink`: `registry.zig` is imported by every tool and must never
-/// depend on a specific feature module directly.
+/// interactive multi-stage `/convert` flow.
 pub const ConvertFlowSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -223,22 +175,18 @@ pub const ConvertFlowSink = struct {
     }
 };
 
-/// One match `find_chat_member` can hand back to the model — enough to
-/// resolve a name to a real handle/id (to @-mention someone, or just refer
-/// to them correctly) without exposing internal store row ids.
+/// One match `find_chat_member` can hand back to the model.
 pub const MemberMatch = struct {
     display_name: []const u8,
     username: ?[]const u8 = null,
     /// Platform-native user id (Telegram: decimal string) — mirrors
-    /// `iface.Message.user_id`'s "never parsed to a native int in shared
-    /// code" reasoning.
+    /// `iface.Message.user_id`'s "never parsed to a native int in shared code"
+    /// reasoning.
     native_id: []const u8,
 };
 
 /// Callback surface the `find_chat_member` tool uses to fuzzy-search this
-/// chat's known participants — same ptr+vtable shape as `ReminderSink`/
-/// `AlertSink`, for the same "registry.zig must never depend on the store
-/// layer" reason (see `ScraperConfig`'s doc comment).
+/// chat's known participants.
 pub const MemberDirectorySink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -253,20 +201,16 @@ pub const MemberDirectorySink = struct {
 };
 
 /// Callback surface the `catch_me_up` tool uses to pull this chat's own
-/// logged history windowed by time rather than the fixed row count
-/// `qa.zig`'s own conversational context uses — same ptr+vtable boundary
-/// reasoning as `ReminderSink`/`MemberDirectorySink` (`registry.zig` must
-/// never depend on the store layer directly, see `ScraperConfig`'s doc
-/// comment). Read-only, so unlike `ReminderSink`/`NoteSink` there's just
-/// the one method.
+/// logged history windowed by time rather than the fixed row count `qa.zig`'s
+/// own conversational context uses — same ptr+vtable boundary as
+/// `ReminderSink`: `registry.zig` must never depend on the store layer.
 pub const ChatHistorySink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Already formatted as "who: text" lines, oldest-first, empty
-        /// string when nothing falls in the window — same "sink formats its
-        /// own listing" reasoning as `ReminderSink.VTable.listPending`.
+        /// Already formatted as "who: text" lines, oldest-first, empty string when
+        /// nothing falls in the window.
         recentSince: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, hours_ago: i64) anyerror![]const u8,
     };
 
@@ -275,43 +219,23 @@ pub const ChatHistorySink = struct {
     }
 };
 
-/// Backs the personal-account (TDLib) family of LLM tools --
-/// `summarize_unread_chat`, `list_personal_chats`, `send_personal_message`
-/// -- not this Bot-API chat's own history (that's `ChatHistorySink`
-/// above). One sink rather than three: all three operate on the same
-/// underlying connector and share the same "not configured"/"not logged
-/// in yet" preconditions, so a single adapter implementation (see
-/// `main.zig`'s `PersonalAccountToolAdapter`) covers all of them. Null
-/// whenever the personal-account connector isn't configured/logged in,
-/// same nullability convention as every other optional sink here.
+/// Backs the personal-account (TDLib) family of LLM tools.
 pub const PersonalAccountSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Resolves `chat_query` (a TDLib chat id, or a title substring)
-        /// and returns text ready to hand back to the model as the tool
-        /// result — already covers "no such chat"/"ambiguous, pick one"/
-        /// "N unread: <lines>", same "sink formats its own listing"
-        /// convention `ChatHistorySink`/`ReminderSink` already follow.
-        /// `all = true` summarizes the last 100 messages regardless of
-        /// read state instead of just unread ones (no mark-as-read side
-        /// effect in that mode) — see `chat_summary.fetchRecent`.
+        /// Resolves `chat_query` (a TDLib chat id, or a title substring) and returns
+        /// text ready to hand back to the model as the tool result.
         summarizeUnread: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, all: bool) anyerror![]const u8,
-        /// Lists known chats, optionally narrowed by a title substring
-        /// (`null`/empty means "every chat") — backs `list_personal_chats`.
-        /// Formatted "id — title" lines, same as `/tdchats`/`/tdsearch`.
+        /// Lists known chats, optionally narrowed by a title substring (`null`/empty
+        /// means "every chat") — backs `list_personal_chats`.
         listChats: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, query: ?[]const u8) anyerror![]const u8,
         /// Resolves `chat_query` and sends `message` through it — backs
-        /// `send_personal_message`. Returns a confirmation (naming which
-        /// chat it actually sent to) or, for `.none`/`.ambiguous`, the same
-        /// kind of "didn't send, here's why" text `summarizeUnread`
-        /// returns for its own unresolvable cases — never silently drops a
-        /// message the caller thought was sent.
+        /// `send_personal_message`.
         sendMessage: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, message: []const u8) anyerror![]const u8,
         /// Resolves `chat_query` and sends `message` as a threaded reply to
-        /// `native_message_id` — backs `reply_to_message`. Same
-        /// resolution/confirmation shape as `sendMessage` above.
+        /// `native_message_id` — backs `reply_to_message`.
         sendReply: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, native_message_id: []const u8, message: []const u8) anyerror![]const u8,
     };
 
@@ -332,30 +256,18 @@ pub const PersonalAccountSink = struct {
     }
 };
 
-/// Callback surface the `set_chat_monitoring` tool uses to set (or clear)
-/// a personal-account chat's owner-declared monitoring/importance state --
-/// same ptr+vtable boundary reasoning as `ReminderSink`/`ChatHistorySink`
-/// (`registry.zig` must never depend on the store layer directly, see
-/// `ScraperConfig`'s doc comment). `importance` is a raw string (one of
-/// "low"/"normal"/"high"/"off", matching the tool's own JSON schema enum)
-/// rather than a typed enum, so this file has no need to mirror
-/// `chat_settings.MonitorImportance` locally -- the real adapter
-/// (`main.zig`) parses/validates it against the store layer's own enum.
+/// Callback surface the `set_chat_monitoring` tool uses to set (or clear) a
+/// personal-account chat's owner-declared monitoring/importance state.
 pub const MonitoringSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Resolves `chat_query` (a TDLib chat id, or a title substring) and
-        /// sets its monitoring state -- covers "no such chat"/"ambiguous,
-        /// pick one"/confirmation the same way `PersonalAccountSink.
-        /// sendMessage` already does for its own unresolvable cases.
+        /// Resolves `chat_query` (a TDLib chat id, or a title substring) and sets its
+        /// monitoring state.
         setImportance: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, chat_query: []const u8, importance: []const u8) anyerror![]const u8,
-        /// Sets the owner's global monitoring default, applied to every
-        /// chat with no override of its own -- backs
-        /// `set_default_chat_monitoring`. No chat to resolve, so this is
-        /// just a confirmation string, same "off" sentinel convention as
-        /// `setImportance`.
+        /// Sets the owner's global monitoring default, applied to every chat with no
+        /// override of its own -- backs `set_default_chat_monitoring`.
         setDefaultImportance: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, importance: []const u8) anyerror![]const u8,
     };
 
@@ -369,17 +281,15 @@ pub const MonitoringSink = struct {
 };
 
 /// Callback surface the `get_bulletin` tool uses to gather raw, id-tagged
-/// message text across every monitored personal-account chat -- same
-/// ptr+vtable boundary reasoning as the sinks above.
+/// message text across every monitored personal-account chat.
 pub const BulletinSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// `hours = null` uses the owner's last-bulletin cursor (or 24h if
-        /// never run) and advances that cursor as a side effect; an
-        /// explicit `hours` is a stateless ad-hoc probe that never touches
-        /// the cursor -- see `features/bulletin.zig`'s doc comment.
+        /// `hours = null` uses the owner's last-bulletin cursor (or 24h if never run)
+        /// and advances that cursor as a side effect; an explicit `hours` is a
+        /// stateless ad-hoc probe that never touches the cursor.
         generate: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, hours: ?i64) anyerror![]const u8,
     };
 
@@ -404,9 +314,8 @@ pub const ToolContext = struct {
     /// Current time (unix seconds) — `set_reminder` needs this to turn a
     /// relative duration into an absolute `due_at`.
     now: i64 = 0,
-    /// Set for a real inbound message; null for contexts that never run
-    /// tools needing reminder persistence (e.g. digest generation, which
-    /// always passes an empty tool list anyway).
+    /// Set for a real inbound message; null for contexts that never run tools
+    /// needing reminder persistence.
     reminders: ?ReminderSink = null,
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `set_alert` tool.
@@ -421,12 +330,7 @@ pub const ToolContext = struct {
     /// `set_note` tool.
     notes: ?NoteSink = null,
     /// Same lifetime/nullability reasoning as `reminders` above, for the
-    /// `remember_memory` tool. No longer gated on `WARDEN_EMBEDDINGS_URL`:
-    /// memory works without an embeddings endpoint (the fact is stored with
-    /// no vector and ranked on keyword/recency/salience instead), and
-    /// gating it here meant the tool silently did not exist on deployments
-    /// without one -- so nothing was ever remembered and nothing said why.
-    /// See `main.zig`'s `MemoryToolAdapter.createFn`.
+    /// `remember_memory` tool.
     memory: ?MemorySink = null,
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `catch_me_up` tool.
@@ -434,9 +338,6 @@ pub const ToolContext = struct {
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `set_expense` tool.
     expenses: ?ExpenseSink = null,
-    /// Same lifetime/nullability reasoning as `reminders` above, for the
-    /// `summarize_unread_chat`/`list_personal_chats`/`send_personal_message`/
-    /// `reply_to_message` tools.
     personal_account: ?PersonalAccountSink = null,
     /// Same lifetime/nullability reasoning as `reminders` above, for the
     /// `set_chat_monitoring` tool.
@@ -446,26 +347,17 @@ pub const ToolContext = struct {
     bulletin: ?BulletinSink = null,
     /// Local filesystem path to this message's downloaded attachment (see
     /// `iface.Attachment`), when it has one and `main.zig` successfully
-    /// downloaded it — the file `convert_file` operates on. Null when the
-    /// message had no attachment, or the download failed.
+    /// downloaded it.
     attachment_path: ?[]const u8 = null,
     /// Original filename Telegram (or whichever platform) reported for the
-    /// attachment, if any — carries the source extension `convert_file`
-    /// needs when `attachment_mime` alone doesn't disambiguate.
+    /// attachment, if any.
     attachment_file_name: ?[]const u8 = null,
     attachment_mime: ?[]const u8 = null,
     /// `iface.Attachment.kind` for this message's attachment, if any — see
-    /// `llm/attachment_content.zig`'s `imageBlockForAttachment`, which needs
-    /// this specifically because a Telegram photo never reports a
-    /// `mime_type` at all (see `platform/telegram/connector.zig`'s
-    /// `attachmentFromMessage`), so `kind == .photo` is the only reliable
-    /// "this is an image" signal for that case.
+    /// `llm/attachment_content.zig`'s `imageBlockForAttachment`.
     attachment_kind: ?iface.AttachmentKind = null,
     /// Every configured "ask another model" target for the `ask_delegate`/
-    /// `delegate_generate_image` tools — see `llm/delegates.zig`'s
-    /// `Delegate` doc comment and `config.zig`'s `Config.delegates`. Empty
-    /// (the default) rather than those tools joining `active_tools` at all
-    /// when nothing's configured — see `main.zig`'s tool-list construction.
+    /// `delegate_generate_image` tools.
     delegates: []const delegates_mod.Delegate = &.{},
 };
 

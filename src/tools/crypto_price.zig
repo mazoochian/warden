@@ -49,9 +49,7 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
     return formatPrices(ctx.allocator, body, parsed.value.currency);
 }
 
-/// Fetches a single coin's current price — the plain, non-LLM-tool-call
-/// path `features/alerts.zig` uses so checking a price alert doesn't need
-/// to go through the tool-call loop for something this simple.
+/// Fetches a single coin's current price.
 pub fn fetchPrice(allocator: std.mem.Allocator, io: std.Io, coin: []const u8, currency: []const u8) !f64 {
     var client: http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();

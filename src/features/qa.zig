@@ -85,19 +85,12 @@ pub const default_system_prompt =
     \\did (and didn't do) on previous turns.
 ;
 
-/// Longest slice of a tool's description that makes it into the
-/// generated "Your tools" list -- the first sentence usually says what the
-/// tool is for; the full text still reaches the model via the tool
-/// definitions themselves.
+/// Longest slice of a tool's description that makes it into the generated
+/// "Your tools" list.
 const tool_list_desc_max = 140;
 
 /// Renders `tool_defs` as a compact "Your tools" section for the system
-/// prompt: one line per enabled tool, name plus the head of its
-/// description. Generated per request rather than written into the
-/// prompt text, so it can never drift from what's actually callable in
-/// this chat -- the old hand-maintained prose list had fallen far behind
-/// the registry and was what the model quoted when asked what it could
-/// do. Empty string when there are no tools at all.
+/// prompt: one line per enabled tool, name plus the head of its description.
 pub fn renderToolList(allocator: std.mem.Allocator, tool_defs: []const registry.ToolDef) ![]const u8 {
     if (tool_defs.len == 0) return "";
     var buf: std.ArrayList(u8) = .empty;
@@ -126,26 +119,16 @@ fn descriptionHead(description: []const u8) []const u8 {
 }
 
 /// Reserved token budget for a reasoning model's `<think>...</think>` phase,
-/// on top of whatever the visible answer itself needs — a chain-of-thought
-/// can run to several thousand tokens for a non-trivial question, and none
-/// of it counts toward the platform's *character* limit (it's stripped or
-/// hidden before the user ever sees it, see `openai_compat.zig`'s
-/// `stripThinkingBlock`/`shownText`). Without this, `max_tokens` sized only
-/// off the visible answer's length risks the model exhausting its whole
-/// budget mid-thought and never producing (or truncating) the real answer.
+/// on top of whatever the visible answer itself needs.
 const thinking_token_reserve: u32 = 4000;
 
-/// Deliberately conservative (fewer characters per token than most
-/// real-world English text averages) so the *answer* portion of the budget
-/// is never the actual bottleneck for a less token-efficient script/
-/// language — overshooting here just means `max_tokens` is a bit more
-/// generous than strictly necessary, not that a real answer gets cut short.
+/// Deliberately conservative (fewer characters per token than most real-world
+/// English text averages) so the *answer* portion of the budget is never the
+/// actual bottleneck for a less token-efficient script/ language.
 const min_chars_per_token: usize = 3;
 
 /// `max_tokens` for a request whose visible answer is capped at
-/// `max_answer_len` characters (the active platform's message-size limit,
-/// see `main.zig`'s `effectiveMaxMessageLength`) — covers both that answer
-/// and `thinking_token_reserve` worth of chain-of-thought ahead of it.
+/// `max_answer_len` characters.
 fn answerMaxTokens(max_answer_len: usize) u32 {
     const capped_chars = @min(max_answer_len, std.math.maxInt(u32) * min_chars_per_token);
     const answer_tokens: u32 = @intCast(capped_chars / min_chars_per_token);
@@ -153,12 +136,7 @@ fn answerMaxTokens(max_answer_len: usize) u32 {
 }
 
 /// Identifies who's actually sending *this* turn's question — deliberately
-/// separate from the "who: text" tags in `recentFormatted`'s history, which
-/// only cover past messages and fall back to "unknown" for a sender with
-/// neither a username nor a display name. Without this, a group chat with
-/// several active participants gives the model no reliable way to tell them
-/// apart on the current turn (see main.zig's `resolveSenderIdentity`/
-/// `iface.Message.identity`, which is where these fields come from).
+/// separate from the "who: text" tags in `recentFormatted`'s history.
 pub const Asker = struct {
     display_name: []const u8,
     username: ?[]const u8 = null,
@@ -166,23 +144,8 @@ pub const Asker = struct {
     native_id: []const u8,
 };
 
-/// Grounded free-form Q&A: pulls recent local chat history (not model
-/// memory) as context, then runs the tool-calling loop so the model can
-/// also reach for weather/currency/calculator/web_search/fetch_url as
-/// needed. `replied_to` carries the text of the (bot's) message the user
-/// replied to, so follow-ups keep their referent even if it has scrolled
-/// out of the history window. `asker` identifies who sent this specific
-/// question — see `Asker`'s doc comment. `stream`/`show_thinking` are
-/// forwarded straight to `toolcall.run`/`ChatRequest` — see
-/// `config.zig`'s `llm_streaming` doc comment and
-/// `store/chat_settings.zig`'s `getShowThinkingOverride` for why both are
-/// caller-controlled (a global default that can be overridden) rather than
-/// fixed. `max_tokens` is derived from `max_answer_len` unless
-/// `max_tokens_override` is set — see `answerMaxTokens`. `history_window`
-/// caps how many recent messages `recentFormatted` sends verbatim as
-/// context (`config.zig`'s `llm_history_messages`) — the whole context-
-/// sizing mechanism today; see `ROADMAP.md`'s backlog for a real
-/// summarization-based downsampling strategy.
+/// Grounded free-form Q&A: pulls recent local chat history (not model memory)
+/// as context.
 pub fn answer(
     provider: llm.Provider,
     embeddings_client: ?*embeddings.EmbeddingsClient,
@@ -208,10 +171,8 @@ pub fn answer(
     /// `toolcall.callProviderWithRetry`.
     max_retries: u32,
 ) !toolcall.RunResult {
-    // ROADMAP.md's memory-layer phase: pinned/ranked facts, ranked/recent
-    // daily digests, and recent chat history, all budget-capped in code —
-    // see `context_assembly.zig`'s module doc comment. Never fails the
-    // caller; a retrieval problem just drops that section from the prompt.
+    // Layer phase: pinned/ranked facts, ranked/recent daily digests, and recent
+    // chat history, all budget-capped in code.
     const context = try context_assembly.assemble(
         pool,
         allocator,
@@ -245,26 +206,14 @@ pub fn answer(
 
     const effective_max_tokens = max_tokens_override orelse answerMaxTokens(max_answer_len);
 
-    // When a flat `max_tokens_override` is active (a deployment tuned for
-    // short, cheap answers), steer the model toward a length that actually
-    // fits inside it — chars ≈ tokens × `min_chars_per_token` — rather than
-    // the full platform limit, so the hard cutoff at `effective_max_tokens`
-    // rarely has to actually bite (an answer cut off mid-sentence reads far
-    // worse than one that was simply asked to stay short). Otherwise
-    // (`max_tokens_override == null`), same behavior as before: aim for the
-    // platform's own limit.
+    // When a flat `max_tokens_override` is active (a deployment tuned for short,
+    // cheap answers).
     const length_hint_chars = if (max_tokens_override) |t|
         @min(max_answer_len, @as(usize, t) * min_chars_per_token)
     else
         max_answer_len;
 
-    // A hard file-fallback exists for whatever slips through (see
-    // `main.zig`'s `sendTextOrFile`), but steering the model to stay under
-    // budget up front means that rarely has to fire — most answers should
-    // just read as normal chat messages, not surprise file attachments.
-    // The generated tool list goes last, whatever prompt is in force (the
-    // default, the operator's, or a per-chat persona), so a custom prompt
-    // never leaves the model guessing at its own capabilities.
+    // A hard file-fallback exists for whatever slips through.
     const system_with_budget = try std.fmt.allocPrint(
         allocator,
         "{s}\n\nLength budget: keep replies under {d} characters when at all possible — that's the active platform's message-size limit. If the answer genuinely needs to be longer (e.g. the user asked for something long-form), that's fine: anything over the limit is sent as a file attachment automatically, so don't refuse or truncate awkwardly instead of finishing your answer.{s}",

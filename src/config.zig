@@ -4,9 +4,8 @@ const instagram_transport = @import("platform/instagram/transport.zig");
 
 pub const OwnerEntry = struct {
     platform: Platform,
-    /// Native user id for that platform, as a string (Telegram: decimal
-    /// numeric id; Matrix would be "@user:server", etc.). Compared as an
-    /// exact string match — never a username, since those can change.
+    /// Native user id for that platform, as a string (Telegram: decimal numeric
+    /// id; Matrix would be "@user:server", etc.).
     owner_id: []const u8,
 };
 
@@ -26,10 +25,6 @@ pub const OpenAiCompatConfig = struct {
 
 /// Matrix connector config — both fields required together (see `load`'s
 /// handling of `WARDEN_MATRIX_HOMESERVER_URL`/`WARDEN_MATRIX_ACCESS_TOKEN`).
-/// A pre-provisioned access token rather than username/password: same shape
-/// as Telegram's bot token, avoids the bot ever holding a real password, and
-/// sidesteps needing to implement the interactive `m.login.password` flow
-/// (device management, refresh tokens) for what's meant to run unattended.
 pub const MatrixConfig = struct {
     /// No trailing slash (trimmed in `load`).
     homeserver_url: []const u8,
@@ -39,85 +34,43 @@ pub const MatrixConfig = struct {
 /// How `platform/xmpp/client.zig`'s `startTls` verifies the server's
 /// certificate — `WARDEN_XMPP_TLS_MODE` selects one, see `loadXmppConfig`.
 pub const XmppTlsMode = enum {
-    /// Default: the certificate must be well-formed and self-consistent
-    /// (a valid self-signed cert, or a valid chain, expiry checked either
-    /// way) and its identity must match the JID's domain — but with no CA
-    /// to vouch for it, this provides no real protection against an active
-    /// attacker who can present their own self-signed cert for the same
-    /// name. Suitable for a self-hosted server reached over a network you
-    /// already trust (a Docker Compose network, a LAN, a VPN).
+    /// Default: the certificate must be well-formed and self-consistent.
     self_signed,
     /// Full verification against the system CA trust store (loaded via
-    /// `std.crypto.Certificate.Bundle.rescan`) plus hostname match — the
-    /// only mode that actually defends against a network-level attacker.
-    /// Needs a real (e.g. Let's Encrypt) certificate on the server; a
-    /// self-hosted server with a self-signed cert will fail to connect
-    /// under this mode.
+    /// `std.crypto.Certificate.Bundle.rescan`) plus hostname match.
     bundle,
-    /// No certificate verification at all — STARTTLS still runs so the
-    /// password isn't sent in cleartext, but anyone who can intercept the
-    /// TCP connection can impersonate the server. Escape hatch only, e.g.
-    /// a self-signed cert whose name doesn't match the JID's domain.
+    /// No certificate verification at all.
     insecure,
 };
 
-/// XMPP connector config — `host`/`port` is the raw TCP target (may differ
-/// from `domain`, e.g. a compose service name like "prosody" vs. a JID's
-/// "localhost" domain part). Authenticates via SASL SCRAM-SHA-256/-SHA-1
-/// when the server advertises either, falling back to PLAIN otherwise —
-/// see `platform/xmpp/client.zig`'s `authScram`/`authPlain`.
+/// XMPP connector config — `host`/`port` is the raw TCP target.
 pub const XmppConfig = struct {
     host: []const u8,
     port: u16,
     domain: []const u8,
     jid_user: []const u8,
     password: []const u8,
-    /// Bare room JIDs to auto-join on connect — MUC has no Telegram/
-    /// Matrix-equivalent "just works once added to a group" step, so this
-    /// is how the operator opts a room in.
+    /// Bare room JIDs to auto-join on connect — MUC has no Telegram/ Matrix-
+    /// equivalent "just works once added to a group" step.
     muc_rooms: []const []const u8,
     tls_mode: XmppTlsMode = .self_signed,
 };
 
 /// TDLib (personal-account) connector config — the owner's own Telegram
-/// account, connected via MTProto rather than the Bot API. `api_id`/
-/// `api_hash` come from my.telegram.org (per-application credentials,
-/// unrelated to a bot token). `session_dir` is where TDLib persists its
-/// login session (phone/code/2FA happens once, interactively — see
-/// `platform/telegram/user_connector.zig`'s login flow — then this directory is
-/// reused on every subsequent start, same "half-configured stays disabled"
-/// convention as `MatrixConfig`/`XmppConfig`: all three of these are
-/// required together or the connector doesn't start).
+/// account, connected via MTProto rather than the Bot API.
 pub const TelegramUserConfig = struct {
     api_id: i32,
     api_hash: []const u8,
     session_dir: []const u8,
 };
 
-/// Instagram (personal-account) connector config — see
-/// `platform/interface.zig`'s `Platform.instagram` doc comment for why this
-/// is login-flow-first like `TelegramUserConfig` rather than a static token
-/// like `MatrixConfig`: Instagram has no bot-token concept, and the account
-/// itself IS the owner's, so there's no separate identity to provision one
-/// for. `enabled` is the only required setting — actual login happens
-/// through the interactive `/iglogin` command
-/// (`main.zig`'s `handleIgloginCommand`), same shape as `/tdlogin`.
+/// Instagram (personal-account) connector config.
 pub const InstagramConfig = struct {
     enabled: bool,
-    /// Base interval between inbox poll cycles — deliberately much longer
-    /// than a chat platform's long-poll (XMPP/Telegram effectively poll in
-    /// seconds), since Instagram's private API is unofficial and aggressive
-    /// polling is a real account-suspension risk (see the connector plan's
-    /// "Rate-limit / ban-avoidance policy" section).
-    /// `platform/instagram/policy.zig` adds jitter on top of this, never
-    /// polls faster than this floor.
+    /// Base interval between inbox poll cycles — deliberately much longer than a
+    /// chat platform's long-poll (XMPP/Telegram effectively poll in seconds).
     poll_interval_ms: u32 = default_instagram_poll_interval_ms,
-    /// Reverse-engineered protocol constants Instagram rotates without
-    /// notice (see `instagram_transport.RotatingConstants`'s doc comment).
-    /// Defaults to this build's best-effort current values; override via
-    /// `WARDEN_INSTAGRAM_SIG_KEY`/`_SIG_KEY_VERSION`/`_APP_ID`/
-    /// `_CAPABILITIES`/`_APP_VERSION`/`_APP_VERSION_CODE` without a code
-    /// change when Instagram rotates them and login/requests start failing.
+    /// Reverse-engineered protocol constants Instagram rotates without notice.
     rotating: instagram_transport.RotatingConstants = .{},
 };
 
@@ -130,16 +83,11 @@ pub const LlmConfig = union(LlmProviderKind) {
 
 pub const DelegateKind = enum { anthropic, openai_compat };
 
-/// One "ask another model" target the `ask_delegate`/`delegate_generate_image`
-/// tools (see `tools/ask_delegate.zig`, `tools/delegate_generate_image.zig`)
-/// can send a task to on the delegating model's own initiative — see
-/// `loadDelegateConfigs`'s doc comment for the env var shape that produces
-/// these. Plain data, same "config struct in, real provider built in
-/// main.zig" split as `AnthropicConfig`/`OpenAiCompatConfig` above.
+/// One "ask another model" target the
+/// `ask_delegate`/`delegate_generate_image` tools.
 pub const DelegateConfig = struct {
-    /// Case-insensitively matched against the tool call's `delegate`
-    /// argument — also what the model sees as the tool's target name, so
-    /// keep it short and recognizable ("chatgpt", "local").
+    /// Case-insensitively matched against the tool call's `delegate` argument —
+    /// also what the model sees as the tool's target name.
     name: []const u8,
     kind: DelegateKind,
     /// Required for `openai_compat`; unused for `anthropic` (which always
@@ -150,278 +98,142 @@ pub const DelegateConfig = struct {
     api_key: []const u8 = "",
     model: []const u8,
     /// Set only when this delegate should also be offered for
-    /// `delegate_generate_image` — the image-generation model name to
-    /// request against `{base_url}/images/generations`. Always null for an
-    /// `anthropic`-kind delegate: neither Claude model family exposes an
-    /// image-generation endpoint.
+    /// `delegate_generate_image`.
     image_model: ?[]const u8 = null,
-    /// Shown to the delegating model alongside `name` so it can pick the
-    /// right target for a given task, e.g. "OpenAI's GPT-4o — strong at
-    /// code and general reasoning."
+    /// Shown to the delegating model alongside `name` so it can pick the right
+    /// target for a given task, e.g. "OpenAI's GPT-4o.
     description: []const u8 = "",
 };
 
 /// Runtime configuration, loaded from environment variables.
-///
-/// Kept deliberately simple (env vars, not a config file) since the bot
-/// currently only targets local/dev deployment.
 pub const Config = struct {
     telegram_bot_token: []const u8,
-    /// One entry per connected platform. Only `.telegram` is populated
-    /// today; adding Matrix/Discord/WhatsApp later means adding another
-    /// `OwnerEntry` here plus its own connector, not touching `auth.zig`.
+    /// One entry per connected platform.
     owners: []const OwnerEntry,
     /// libpq connection string/URI for the shared Postgres database.
     postgres_dsn: []const u8,
     /// Size of the Postgres connection pool (see `store/pool.zig`).
     postgres_pool_size: usize,
-    /// How long `PgPool.acquire` waits for a free connection before giving
-    /// up with `error.PoolExhausted` instead of blocking forever — see
-    /// `store/pool.zig`'s doc comment for why an unbounded wait here used to
-    /// be able to wedge every platform's message handling permanently.
+    /// How long `PgPool.acquire` waits for a free connection before giving up
+    /// with `error.PoolExhausted` instead of blocking forever.
     postgres_acquire_timeout_seconds: i64,
-    /// Server-side `statement_timeout` set on every pooled connection right
-    /// after connecting (see `store/db.zig`'s `Db.open`) — bounds a single
-    /// wedged query so it can't hold a pool slot forever even once
-    /// connected, complementing `postgres_acquire_timeout_seconds` above.
+    /// Server-side `statement_timeout` set on every pooled connection right after
+    /// connecting (see `store/db.zig`'s `Db.open`).
     postgres_statement_timeout_seconds: i64,
     /// Worker threads per platform connector that actually run
-    /// `processMessageTask` (see `main.zig`'s `WorkerPool` usage). Defaults
-    /// to whatever gives real parallelism regardless of how few cores the
-    /// host has — see `default_workers_per_platform`'s doc comment for why
-    /// this can no longer be left to Zig's own (unconfigurable, CPU-count-
-    /// derived, and silently-degrading-to-zero-on-a-1-vCPU-host) `Io.Group`
-    /// pool.
+    /// `processMessageTask` (see `main.zig`'s `WorkerPool` usage).
     workers_per_platform: usize,
     /// Per-chat message retention: keep only the most recent N messages.
     retention_messages: i64,
-    /// Whichever provider `WARDEN_LLM_PROVIDER` selected at startup — the
-    /// default `llm/dynamic_provider.zig` falls back to, and what
-    /// `api/router.zig`'s config-display endpoint reads to decide which
-    /// secret field to show. NOT necessarily what's actually in use on any
-    /// given call once `dynamic_config`'s `WARDEN_LLM_PROVIDER` override
-    /// exists — see `llm_anthropic`/`llm_openai_compat` below.
+    /// Whichever provider `WARDEN_LLM_PROVIDER` selected at startup.
     llm: LlmConfig,
-    /// Both loaded independently, whichever credentials are present in
-    /// env (unlike `llm` above, which is a tagged union holding only the
-    /// one selected at startup) — `null` for a provider whose required
-    /// env vars weren't set. `Config.load` fails only if *neither* loads,
-    /// same as before this pair of fields existed. Populating both
-    /// (when both are configured) is what makes `WARDEN_LLM_PROVIDER`
-    /// genuinely hot-swappable via `dynamic_config`: swapping to a
-    /// provider whose credentials were never loaded here would have
-    /// nothing to swap *to*.
+    /// Both loaded independently, whichever credentials are present in env.
     llm_anthropic: ?AnthropicConfig = null,
     llm_openai_compat: ?OpenAiCompatConfig = null,
-    /// Every configured "ask another model" target — see
-    /// `loadDelegateConfigs`'s doc comment for the `WARDEN_DELEGATES`/
-    /// `WARDEN_DELEGATE_<NAME>_*` env vars that populate this. Empty (the
-    /// default) means the `ask_delegate`/`delegate_generate_image` tools
-    /// never join the active tool list at all — see `main.zig`'s tool-list
-    /// construction, same "tool only joins when its backend is configured"
-    /// convention as `web_search`/`WARDEN_SEARXNG_URL`.
+    /// Every configured "ask another model" target.
     delegates: []const DelegateConfig = &.{},
     /// How long a ban/kick confirmation stays valid before expiring.
     confirm_timeout_seconds: i64,
-    /// How long a pending interactive /convert flow (waiting for a file
-    /// upload, or waiting for a format pick) stays valid before expiring —
-    /// longer than `confirm_timeout_seconds` since the user needs time to
-    /// actually go find and upload a file, not just tap yes/no.
+    /// How long a pending interactive /convert flow (waiting for a file upload,
+    /// or waiting for a format pick) stays valid before expiring.
     convert_timeout_seconds: i64,
-    /// How long an open `/menu` session (including a submenu waiting on a
-    /// follow-up reply, e.g. Group Administration's "reply with the user
-    /// you want to kick") stays valid before expiring — see
-    /// `features/menu.zig`.
+    /// How long an open `/menu` session.
     menu_timeout_seconds: i64,
     /// Scratch directory for shelling out to external renderers (word
-    /// cloud/diagram scripts) — unrelated to the database, purely
-    /// throwaway local scratch space.
+    /// cloud/diagram scripts).
     tmp_dir: []const u8,
     /// How often an opted-in chat gets a digest (interval-based, not
     /// wall-clock time-of-day — see `features/scheduler.zig`).
     digest_interval_seconds: i64,
-    /// How often an opted-in chat gets a proactive briefing (same
-    /// interval-based tradeoff as `digest_interval_seconds` above — see
-    /// `features/scheduler.zig`'s `BriefingScheduler`).
+    /// How often an opted-in chat gets a proactive briefing.
     briefing_interval_seconds: i64,
-    /// Overrides the built-in Q&A system prompt when set — either inline
-    /// via WARDEN_SYSTEM_PROMPT or from a file via
-    /// WARDEN_SYSTEM_PROMPT_FILE (the file wins if both are set, since a
-    /// file is the "properly edited" variant).
+    /// Overrides the built-in Q&A system prompt when set — either inline via
+    /// WARDEN_SYSTEM_PROMPT or from a file via WARDEN_SYSTEM_PROMPT_FILE.
     system_prompt: ?[]const u8,
     /// Base URL of a SearXNG instance (e.g. "http://searxng:8080") for the
     /// web_search tool. Unset disables web search entirely.
     searxng_url: ?[]const u8,
-    /// Base URL of a whisper.cpp `whisper-server` instance (e.g.
-    /// "http://whisper-server:8091") for transcribing inbound voice
-    /// messages. Unset disables transcription entirely — a voice message
-    /// then just gets `main.zig`'s generic attachment placeholder, same as
-    /// today.
+    /// Base URL of a whisper.cpp `whisper-server` instance (e.g. "http://whisper-
+    /// server:8091") for transcribing inbound voice messages.
     whisper_url: ?[]const u8,
     /// Base URL of an OpenAI-compatible embeddings endpoint (e.g.
-    /// "https://api.openai.com/v1" or a self-hosted server implementing
-    /// `POST {url}/embeddings`) for the long-term memory feature
-    /// (`llm/embeddings.zig`, `store/memories.zig`) — ROADMAP.md's Phase
-    /// 12. Unset disables the whole feature: `/memory`, the
-    /// `remember_memory` tool, and `qa.zig`'s retrieval step all become
-    /// no-ops. Deliberately separate from `llm_anthropic`/
-    /// `llm_openai_compat` (the chat providers) since an embeddings
-    /// backend is very likely a different service/model entirely.
+    /// "https://api.openai.com/v1" or a self-hosted server implementing `POST
+    /// {url}/embeddings`) for the long-term memory feature (`llm/embeddings.zig`.
     embeddings_url: ?[]const u8,
     /// Empty string means no Authorization header is sent, same
     /// convention `OpenAiCompatProvider.api_key` uses.
     embeddings_api_key: []const u8,
-    /// The embedding model to request. Its output dimension must be 1536
-    /// (matching OpenAI's text-embedding-3-small/ada-002) — the
-    /// `memories.embedding` column's vector width is fixed at migration
-    /// time (see `0025_memories.sql`), not derived from this at runtime.
-    /// A model with a different dimension fails loudly on the first
-    /// `remember` call (a Postgres dimension-mismatch error), not
-    /// silently.
+    /// The embedding model to request.
     embeddings_model: []const u8,
     /// Gates the bot's free-form LLM Q&A to the configured owner(s) only.
-    /// Every other command keeps its own existing access control regardless
-    /// of this setting. Meant to be flipped on before switching to an
-    /// expensive model, off for an open assistant.
     llm_owner_only: bool,
     /// Whether a reasoning model's chain-of-thought is shown to the user.
-    /// When false, `<think>`/`<thinking>` tags and any `reasoning_content`/
-    /// `reasoning` field the OpenAI-compatible backend sends are filtered
-    /// out before the reply is shown — see `llm/openai_compat.zig`.
     llm_show_thinking: bool,
-    /// Whether `toolcall.run` uses `Provider.chatStream` (progressively
-    /// edits the reply into the chat as the model generates it) instead of
-    /// one blocking `Provider.chat` call. Defaults to off: as of this
-    /// writing, the streaming SSE read path
-    /// (`http_util.postJsonSSE`/`postJsonSSEOnce`) has a known bug that can
-    /// spin a CPU core indefinitely, past even its own timeout — confirmed
-    /// live, not theoretical. Flip on to test a fix; leave off otherwise.
+    /// Whether `toolcall.run` uses `Provider.chatStream` (progressively edits the
+    /// reply into the chat as the model generates it) instead of one blocking
+    /// `Provider.chat` call.
     llm_streaming: bool,
-    /// Whether `toolcall.run` attaches an image attachment's actual bytes
-    /// to the model call (see `llm/attachment_content.zig`) instead of only
-    /// ever mechanically converting/transcribing it — ROADMAP.md's Phase 10.
-    /// Defaults on: current Anthropic models all support vision. An owner
-    /// pointed at an OpenAI-compatible backend whose configured model
-    /// genuinely doesn't (e.g. a local non-vision-tuned model) can turn
-    /// this off with one setting — there's no per-provider/per-model
-    /// capability metadata anywhere else in this codebase to gate on
-    /// automatically.
+    /// Whether `toolcall.run` attaches an image attachment's actual bytes to the
+    /// model call.
     llm_vision_enabled: bool,
-    /// Whether `toolcall.run` attaches a PDF attachment's actual bytes to
-    /// the model call (see `llm/attachment_content.zig`) so the model reads
-    /// the real document instead of only ever converting it — ROADMAP.md's
-    /// Phase 10 slice 2. Separate from `llm_vision_enabled` because it's a
-    /// separate capability with a much narrower provider story: native
-    /// document blocks are Anthropic-only, and the OpenAI-compatible
-    /// adapter has to tell the model the document is unreadable instead
-    /// (see `llm/openai_compat.zig`'s `writeMessages`). Defaults on, like
-    /// vision; an owner on a backend without document support can turn it
-    /// off to drop that note rather than have it appear on every PDF.
+    /// Whether `toolcall.run` attaches a PDF attachment's actual bytes to the
+    /// model call.
     llm_documents_enabled: bool,
-    /// Overrides `qa.zig`'s `answerMaxTokens` (which sizes the budget off
-    /// the active platform's message-length cap plus a reasoning-model
-    /// thinking reserve) with a flat ceiling instead — for keeping a
-    /// deployment's answers short and its token spend predictable
-    /// regardless of platform limits. `null` (unset) preserves the
-    /// existing dynamic sizing.
+    /// Overrides `qa.zig`'s `answerMaxTokens` (which sizes the budget off the
+    /// active platform's message-length cap plus a reasoning-model thinking
+    /// reserve) with a flat ceiling instead — for keeping a deployment's answers
+    /// short and its token spend predictable regardless of platform limits.
     llm_max_tokens_override: ?u32 = null,
-    /// How many recent chat messages `qa.zig` sends verbatim as context on
-    /// every LLM call — the entire history mechanism today (no
-    /// summarization/downsampling, see `ROADMAP.md`'s backlog entry on
-    /// that). Smaller means less context (cheaper, faster) at the cost of
-    /// the model potentially missing something further back.
+    /// How many recent chat messages `qa.zig` sends verbatim as context on every
+    /// LLM call.
     llm_history_messages: i64 = default_llm_history_messages,
-    /// How many times a failed model call is retried before the request
-    /// gives up — see `llm/toolcall.zig`'s `callProviderWithRetry`.
-    /// Overridable at runtime via the `WARDEN_LLM_MAX_RETRIES` dynamic
-    /// config key, same as the other LLM dials.
+    /// How many times a failed model call is retried before the request gives up
+    /// — see `llm/toolcall.zig`'s `callProviderWithRetry`.
     llm_max_retries: i64 = default_llm_max_retries,
-    /// Whether a message that's addressed to the bot but is essentially
-    /// just a greeting/acknowledgement/sign-off ("hi", "thanks", "lol", ...)
-    /// gets an instant canned reply instead of a real (paid) LLM call —
-    /// see `features/trivial_reply.zig`.
+    /// Whether a message that's addressed to the bot but is essentially just a
+    /// greeting/acknowledgement/sign-off.
     skip_trivial_messages: bool = default_skip_trivial_messages,
     /// Null when Matrix isn't configured — `main.zig` only constructs a
-    /// `MatrixConnector` (and adds it to the active connector list) when
-    /// this is set.
+    /// `MatrixConnector` (and adds it to the active connector list) when this is
+    /// set.
     matrix: ?MatrixConfig = null,
     /// The local secret libolm's account/session pickles (see
-    /// `src/platform/matrix/olm.zig`) are encrypted under before being
-    /// persisted — deliberately sourced from config, not stored in the
-    /// database alongside the pickles themselves, so a DB-only compromise
-    /// doesn't also hand over the key material needed to decrypt them. Null
-    /// means Matrix E2E encryption stays inert (device keys never get
-    /// created/ uploaded) even if `matrix` is otherwise configured — same
-    /// half-configured-stays-disabled reasoning as the connector configs.
+    /// `src/platform/matrix/olm.zig`) are encrypted under before being persisted.
     matrix_pickle_key: ?[]const u8 = null,
     /// Null when XMPP isn't configured — `main.zig` only constructs an
-    /// `XmppConnector` (and adds it to the active connector list) when
-    /// this is set.
+    /// `XmppConnector` (and adds it to the active connector list) when this is
+    /// set.
     xmpp: ?XmppConfig = null,
-    /// Null when the personal-account (TDLib) connector isn't configured —
-    /// `main.zig` only constructs a `TelegramUserConnector` (and adds it to
-    /// the active connector list) when this is set. See
-    /// `platform/telegram/user_connector.zig`.
+    /// Null when the personal-account (TDLib) connector isn't configured.
     telegram_user: ?TelegramUserConfig = null,
-    /// Null when the Instagram personal-account connector isn't configured
-    /// — `main.zig` only constructs an `InstagramConnector` (and adds it to
-    /// the active connector list) when this is set. See `InstagramConfig`'s
-    /// doc comment.
+    /// Null when the Instagram personal-account connector isn't configured.
     instagram: ?InstagramConfig = null,
-    /// Null (the default) means the warden-ui HTTP+WebSocket API
-    /// (`src/api/`) stays entirely off — same half-configured-stays-
-    /// disabled convention as `matrix`/`xmpp` above, and a deliberate
-    /// choice while this is still under active development: an
-    /// in-progress API surface shouldn't be reachable at all on a
-    /// production deployment just because the binary happens to support
-    /// it now. Set to enable it (see `api_session_secret` below, which is
-    /// required once this is set).
+    /// Null (the default) means the warden-ui HTTP+WebSocket API (`src/api/`)
+    /// stays entirely off.
     api_port: ?u16 = null,
     /// Worker threads servicing API requests — same `WorkerPool` shape as
-    /// `workers_per_platform`, so a slow/stuck API request can't wedge the
-    /// bot's own message processing (or vice versa).
+    /// `workers_per_platform`.
     api_workers: usize = default_api_workers,
     /// HMAC-SHA256 signing key for session cookies (`src/api/auth.zig`) —
-    /// required (load fails) if `api_port` is set, since an API server
-    /// with no way to sign sessions can't authenticate anyone safely.
-    /// Never has a default — an auto-generated or hardcoded fallback here
-    /// would silently invalidate every session on every restart (auto-
-    /// generated) or be a shared, guessable secret across every
-    /// deployment of this codebase (hardcoded), either of which is worse
-    /// than failing loudly at startup.
+    /// required (load fails) if `api_port` is set.
     api_session_secret: ?[]const u8 = null,
-    /// DANGER: lets anyone hit `POST /api/v1/auth/dev-login` and become
-    /// any identity by id, no real login required — exists purely so
-    /// Phase 0 could prove the whole session/account/RBAC chain end to
-    /// end before any real login provider (Telegram widget/Google/OIDC)
-    /// was wired up. Must be confirmed OFF (unset) before this is ever
-    /// reachable from anywhere but a contributor's own machine — this
-    /// flag existing at all is a tracked TODO to remove once Phase 1's
-    /// real logins land, not a permanent feature. Defaults to false.
+    /// DANGER: lets anyone hit `POST /api/v1/auth/dev-login` and become any
+    /// identity by id, no real login required.
     api_dev_login: bool = false,
-    /// Ladder tunables for `features/storage_sense.zig` -- same
-    /// "env sets the compiled default, `dynamic_config` can override live"
-    /// pattern `retention_messages` already uses. See that module's doc
-    /// comment for what each watermark actually triggers.
+    /// Ladder tunables for `features/storage_sense.zig`.
     storage_sense_low_watermark_pct: i64 = default_storage_sense_low_watermark_pct,
     storage_sense_high_watermark_pct: i64 = default_storage_sense_high_watermark_pct,
     storage_sense_flood_watermark_pct: i64 = default_storage_sense_flood_watermark_pct,
     storage_sense_resume_margin_pct: i64 = default_storage_sense_resume_margin_pct,
     storage_sense_prune_age_days: i64 = default_storage_sense_prune_age_days,
     storage_sense_resample_batch_size: i64 = default_storage_sense_resample_batch_size,
-    /// Off by default -- gates the ladder's destructive actions (prune,
-    /// resample, sleep mode), not the monitoring/alerting itself (that's
-    /// `feature_flags.zig`'s `storage_sense_monitor`, which fails open like
-    /// every other module). Stays off until the owner has watched
-    /// `/storage status` for a while and flips it on deliberately.
+    /// Off by default -- gates the ladder's destructive actions (prune, resample,
+    /// sleep mode).
     storage_sense_autopilot_enabled: bool = false,
 
     pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile, ApiEnabledWithoutSessionSecret } || std.mem.Allocator.Error;
 
     /// `env` is expected to be `init.environ_map` from `std.process.Init`.
-    /// `arena` should be long-lived (e.g. `init.arena.allocator()`) since
-    /// the returned Config borrows from both `env` and `arena` for its
-    /// lifetime. `io` is only used to read WARDEN_SYSTEM_PROMPT_FILE.
     pub fn load(env: *const std.process.Environ.Map, arena: std.mem.Allocator, io: std.Io) LoadError!Config {
         const telegram_bot_token = env.get("WARDEN_TELEGRAM_BOT_TOKEN") orelse return error.MissingBotToken;
 
@@ -454,15 +266,8 @@ pub const Config = struct {
             }
         }
         if (telegram_user != null) {
-            // Unlike Matrix/XMPP, this connector's account IS the owner by
-            // definition — there's no other identity it could authenticate
-            // as. Still sourced from an explicit env var rather than
-            // resolved automatically from the TDLib session at startup:
-            // `Config.load` runs before any connector exists, and requiring
-            // the same numeric id you already know as the bot owner keeps
-            // this whole block's shape identical to Matrix/XMPP's (each
-            // platform's owner_id is a plain, explicit env var, no
-            // exceptions) rather than special-casing one of the four.
+            // Unlike Matrix/XMPP, this connector's account IS the owner by definition —
+            // there's no other identity it could authenticate as.
             if (env.get("WARDEN_TELEGRAM_USER_OWNER_ID")) |user_owner_id| {
                 owners_buf[owners_len] = .{ .platform = .telegram_user, .owner_id = user_owner_id };
                 owners_len += 1;
@@ -471,12 +276,6 @@ pub const Config = struct {
             }
         }
         if (instagram != null) {
-            // Same reasoning as `telegram_user` above: this connector's
-            // account IS the owner by definition (there's no bot-vs-owner
-            // distinction on a personal-account connector), but the owner id
-            // is still sourced from an explicit env var rather than resolved
-            // from the logged-in session at startup — `Config.load` runs
-            // before any connector (or login) exists.
             if (env.get("WARDEN_INSTAGRAM_OWNER_ID")) |ig_owner_id| {
                 owners_buf[owners_len] = .{ .platform = .instagram, .owner_id = ig_owner_id };
                 owners_len += 1;
@@ -545,9 +344,8 @@ pub const Config = struct {
 
         var system_prompt: ?[]const u8 = env.get("WARDEN_SYSTEM_PROMPT");
         if (env.get("WARDEN_SYSTEM_PROMPT_FILE")) |path| {
-            // A configured-but-unreadable prompt file is a hard error: the
-            // operator clearly wanted a specific persona, so silently
-            // falling back to the default would be worse than not starting.
+            // A configured-but-unreadable prompt file is a hard error: the operator
+            // clearly wanted a specific persona.
             const contents = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_system_prompt_bytes)) catch |err| {
                 std.log.err("could not read WARDEN_SYSTEM_PROMPT_FILE '{s}': {t}", .{ path, err });
                 return error.BadSystemPromptFile;
@@ -694,9 +492,8 @@ pub const Config = struct {
         };
     }
 
-    /// Accepts "true"/"1" and "false"/"0" (case-insensitive for the word
-    /// forms); anything else, including an unset var, falls back to
-    /// `default` rather than failing config load over a typo.
+    /// Accepts "true"/"1" and "false"/"0" (case-insensitive for the word forms);
+    /// anything else, including an unset var.
     fn parseBoolEnv(env: *const std.process.Environ.Map, key: []const u8, default: bool) bool {
         const raw = env.get(key) orelse return default;
         if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
@@ -704,25 +501,16 @@ pub const Config = struct {
         return default;
     }
 
-    /// Treats an empty string the same as an absent env var — a value left
-    /// as `export VAR=""` (e.g. a placeholder for a human to fill in by
-    /// hand) should disable the feature it configures, not activate it
-    /// with garbage.
+    /// Treats an empty string the same as an absent env var.
     fn nonEmpty(raw: ?[]const u8) ?[]const u8 {
         const v = raw orelse return null;
         return if (v.len == 0) null else v;
     }
 
-    /// `null` when neither var is set. When only one of the pair is set,
-    /// logs an error and also returns `null` — a half-configured Matrix
-    /// connector (e.g. a homeserver URL with no token) would otherwise fail
-    /// obscurely on its first API call instead of just not starting.
+    /// `null` when neither var is set.
     fn loadMatrixConfig(env: *const std.process.Environ.Map) ?MatrixConfig {
-        // An env var set to an empty string (e.g. a placeholder left for a
-        // human to fill in by hand) counts as unset, same as
-        // `WARDEN_SEARXNG_URL`/`WARDEN_WHISPER_URL` — otherwise Matrix would
-        // try to activate with blank credentials and spam connection errors
-        // until real values land.
+        // An env var set to an empty string (e.g. a placeholder left for a human to
+        // fill in by hand) counts as unset.
         const homeserver_url = nonEmpty(env.get("WARDEN_MATRIX_HOMESERVER_URL"));
         const access_token = nonEmpty(env.get("WARDEN_MATRIX_ACCESS_TOKEN"));
         if (homeserver_url == null and access_token == null) return null;
@@ -737,10 +525,9 @@ pub const Config = struct {
         return .{ .homeserver_url = std.mem.trimEnd(u8, hs, "/"), .access_token = token };
     }
 
-    /// `null` when neither `WARDEN_XMPP_JID` nor `WARDEN_XMPP_PASSWORD` is
-    /// set; logs and also returns `null` when only one is (same half-
-    /// configured-stays-disabled reasoning as `loadMatrixConfig`), or when
-    /// `WARDEN_XMPP_JID` isn't shaped like `user@domain`.
+    /// `null` when neither `WARDEN_XMPP_JID` nor `WARDEN_XMPP_PASSWORD` is set;
+    /// logs and also returns `null` when only one is (same half- configured-
+    /// stays-disabled reasoning as `loadMatrixConfig`), or when `WARDEN_XMPP_JID`
     fn loadXmppConfig(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !?XmppConfig {
         const jid = nonEmpty(env.get("WARDEN_XMPP_JID"));
         const password = nonEmpty(env.get("WARDEN_XMPP_PASSWORD"));
@@ -761,9 +548,7 @@ pub const Config = struct {
         const jid_user = full_jid[0..at];
         const domain = full_jid[at + 1 ..];
 
-        // Defaults to dialing `domain` directly on the standard client port
-        // — override with `WARDEN_XMPP_SERVER` when the socket target
-        // differs from the JID's domain (e.g. a compose service name).
+        // Defaults to dialing `domain` directly on the standard client port.
         var host: []const u8 = domain;
         var port: u16 = default_xmpp_port;
         if (env.get("WARDEN_XMPP_SERVER")) |server| {
@@ -804,12 +589,11 @@ pub const Config = struct {
     }
 
     /// `null` unless all three of `WARDEN_TELEGRAM_USER_API_ID`/
-    /// `_API_HASH`/`_SESSION_DIR` are set (same half-configured-stays-
-    /// disabled reasoning as `loadMatrixConfig`/`loadXmppConfig`, extended
-    /// to three required fields instead of two — `session_dir` isn't
-    /// optional-with-a-default since it holds session material equivalent
-    /// to full account access; a silent default risks landing it somewhere
-    /// unintended).
+    /// `_API_HASH`/`_SESSION_DIR` are set (same half-configured-stays- disabled
+    /// reasoning as `loadMatrixConfig`/`loadXmppConfig`, extended to three
+    /// required fields instead of two — `session_dir` isn't optional-with-a-
+    /// default since it holds session material equivalent to full account access;
+    /// a silent default risks landing it somewhere unintended).
     fn loadTelegramUserConfig(env: *const std.process.Environ.Map) ?TelegramUserConfig {
         const api_id_raw = nonEmpty(env.get("WARDEN_TELEGRAM_USER_API_ID"));
         const api_hash = nonEmpty(env.get("WARDEN_TELEGRAM_USER_API_HASH"));
@@ -835,12 +619,7 @@ pub const Config = struct {
         return .{ .api_id = api_id, .api_hash = hash, .session_dir = dir };
     }
 
-    /// `null` unless `WARDEN_INSTAGRAM_ENABLED` is truthy — everything else
-    /// (device profile, session cookies, the account's own username) comes
-    /// from the interactive `/iglogin` flow and persisted session state, not
-    /// static env config, so there's no "half-configured" state to detect
-    /// here the way `loadMatrixConfig`/`loadXmppConfig`/
-    /// `loadTelegramUserConfig` do — just on or off.
+    /// `null` unless `WARDEN_INSTAGRAM_ENABLED` is truthy.
     fn loadInstagramConfig(env: *const std.process.Environ.Map) ?InstagramConfig {
         if (!parseBoolEnv(env, "WARDEN_INSTAGRAM_ENABLED", false)) return null;
 
@@ -862,25 +641,10 @@ pub const Config = struct {
         return .{ .enabled = true, .poll_interval_ms = poll_interval_ms, .rotating = rotating };
     }
 
-    /// Longest delegate `name` accepted — well past anything a real config
-    /// would use, just a sane bound on the stack buffer `loadDelegateConfigs`
-    /// upper-cases each name into to build its env var keys.
+    /// Longest delegate `name` accepted.
     const max_delegate_name_len = 32;
 
-    /// Loads every delegate named in `WARDEN_DELEGATES` (a comma-separated
-    /// list, e.g. `WARDEN_DELEGATES=chatgpt,local`) from its own
-    /// `WARDEN_DELEGATE_<NAME>_*` env vars — `<NAME>` is `name` upper-cased
-    /// verbatim, so a delegate named `chatgpt` reads
-    /// `WARDEN_DELEGATE_CHATGPT_KIND`/`_BASE_URL`/`_API_KEY`/`_MODEL`/
-    /// `_IMAGE_MODEL`/`_DESCRIPTION`. `_KIND` defaults to `openai_compat`
-    /// (the common case: pointing at OpenAI itself, or any other
-    /// OpenAI-compatible API) — set it to `anthropic` for a second/different
-    /// Claude model or persona. A delegate missing a required var for its
-    /// kind is skipped (logged), same half-configured-stays-disabled
-    /// convention as `loadMatrixConfig`/`loadXmppConfig` — one bad entry
-    /// never fails the whole process. See `DelegateConfig`'s doc comment for
-    /// what each field ends up meaning, and `main.zig` for where these turn
-    /// into real `llm.Provider`s.
+    /// Loads every delegate named in `WARDEN_DELEGATES`.
     fn loadDelegateConfigs(env: *const std.process.Environ.Map, arena: std.mem.Allocator) ![]const DelegateConfig {
         const raw = env.get("WARDEN_DELEGATES") orelse return &.{};
 
@@ -941,13 +705,8 @@ pub const Config = struct {
         openai_compat: ?OpenAiCompatConfig,
     };
 
-    /// Loads *both* providers' credentials independently, whichever are
-    /// present in env — not just the one `WARDEN_LLM_PROVIDER` selects —
-    /// so `llm/dynamic_provider.zig` has something to hot-swap *to*. Fails
-    /// only if neither is configured; picking which one becomes `active`
-    /// (the startup default) has the exact same precedence/fallback
-    /// behavior this function had before `llm_anthropic`/`llm_openai_compat`
-    /// existed, so a single-provider deployment's behavior is unchanged.
+    /// Loads *both* providers' credentials independently, whichever are present
+    /// in env.
     fn loadLlmConfig(env: *const std.process.Environ.Map) LoadError!LoadedLlmConfig {
         const anthropic: ?AnthropicConfig = if (env.get("WARDEN_ANTHROPIC_API_KEY")) |api_key| .{
             .api_key = api_key,
@@ -960,12 +719,6 @@ pub const Config = struct {
             .model = env.get("WARDEN_OPENAI_MODEL") orelse "llama3",
         } else null;
 
-        // Selection logic here is byte-for-byte the same decision this
-        // function made before `llm_anthropic`/`llm_openai_compat` existed
-        // (explicitly selecting a provider with missing credentials is
-        // still a hard `error.MissingLlmConfig`, no silent cross-provider
-        // fallback) — only the *loading* changed, to also capture whatever
-        // the other provider's env vars hold, if any.
         const provider_name = env.get("WARDEN_LLM_PROVIDER") orelse "anthropic";
         const active: LlmConfig = if (std.mem.eql(u8, provider_name, "openai_compat"))
             LlmConfig{ .openai_compat = openai_compat orelse return error.MissingLlmConfig }
@@ -982,18 +735,7 @@ pub const Config = struct {
     pub const default_postgres_acquire_timeout_seconds: i64 = 30;
     pub const default_postgres_statement_timeout_seconds: i64 = 30;
 
-    /// Floor of 2 regardless of detected core count: on a 1-vCPU host,
-    /// Zig's own implicit `Io.Threaded` async pool sizes itself to
-    /// `cpu_count - 1` (`0` slots here — confirmed live on the production
-    /// VPS), which silently defeats per-message concurrency entirely
-    /// (`Io.Group.async` falls back to running inline on the caller instead
-    /// of queuing once its bounded pool is exhausted). `WorkerPool` is a
-    /// warden-owned pool of real `std.Thread`s instead, so it isn't subject
-    /// to that limit — but a "1 worker" default would still let a single
-    /// stuck message wedge the whole platform forever, exactly the bug this
-    /// replaces, so 2 is the true minimum useful value even on the smallest
-    /// possible host. Scales up automatically on beefier hardware; override
-    /// with `WARDEN_WORKERS_PER_PLATFORM` to tune either direction.
+    /// Floor of 2 regardless of detected core count.
     fn defaultWorkersPerPlatform() usize {
         const cpu_count = std.Thread.getCpuCount() catch 1;
         return @max(2, cpu_count);
@@ -1002,10 +744,8 @@ pub const Config = struct {
     pub const default_convert_timeout_seconds: i64 = 300;
     pub const default_menu_timeout_seconds: i64 = 180;
     /// Deliberately small and fixed (not CPU-scaled like
-    /// `defaultWorkersPerPlatform`) — the API is new/low-traffic by
-    /// design for now (see `api_port`'s doc comment), not yet a surface
-    /// that needs to scale with the host's core count the way per-
-    /// platform message workers do.
+    /// `defaultWorkersPerPlatform`) — the API is new/low-traffic by design for
+    /// now.
     pub const default_api_workers: usize = 4;
     pub const default_digest_interval_seconds: i64 = 86_400;
     pub const default_briefing_interval_seconds: i64 = 86_400;
@@ -1015,14 +755,10 @@ pub const Config = struct {
     pub const default_llm_vision_enabled: bool = true;
     pub const default_llm_documents_enabled: bool = true;
     /// Unchanged from the hardcoded value `qa.zig` used before this was
-    /// configurable — existing behavior by default, override via
-    /// `WARDEN_LLM_HISTORY_MESSAGES` for a cheaper/smaller context window.
+    /// configurable.
     pub const default_llm_history_messages: i64 = 200;
-    /// Retries per model call on a *transient* failure (see
-    /// `llm/toolcall.zig`'s `isRetryable`). 3 because a single attempt
-    /// turned every routine blip during a provider's busy hours into a
-    /// user-visible "Sorry, I couldn't reach the model just now"; 0
-    /// restores that old single-attempt behaviour.
+    /// Retries per model call on a *transient* failure (see `llm/toolcall.zig`'s
+    /// `isRetryable`).
     pub const default_llm_max_retries: i64 = 3;
     pub const default_skip_trivial_messages: bool = true;
     pub const default_xmpp_port: u16 = 5222;
@@ -1031,11 +767,7 @@ pub const Config = struct {
     /// username-based, since usernames can change.
     pub const default_telegram_owner_id: []const u8 = "101573604";
 
-    /// Elasticsearch-watermark-style thresholds for `storage_sense.zig` --
-    /// 80% starts pruning/resampling, 90% starts daily owner alerts, 95% is
-    /// the final warning + sleep mode, with a 3-point margin below flood
-    /// before it resumes (92%), so the bot doesn't flap in and out of sleep
-    /// right at the boundary.
+    /// Elasticsearch-watermark-style thresholds for `storage_sense.zig`.
     pub const default_storage_sense_low_watermark_pct: i64 = 80;
     pub const default_storage_sense_high_watermark_pct: i64 = 90;
     pub const default_storage_sense_flood_watermark_pct: i64 = 95;

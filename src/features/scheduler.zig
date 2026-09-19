@@ -2,30 +2,12 @@ const std = @import("std");
 const Io = std.Io;
 const Platform = @import("../platform/interface.zig").Platform;
 
-/// Tracks which chats have opted into periodic digests. Interval-based
-/// (every `interval_seconds` since that chat's last digest), not
-/// wall-clock "at 9am" — a real timezone-aware scheduler needs a tz
-/// database Zig's std lib doesn't ship, and this is a personal bot for one
-/// owner, so "every ~24h" is a deliberate, simpler tradeoff over precise
-/// local-time scheduling.
-///
-/// The enabled-chat set lives in memory (rebuilt at startup via
-/// `chats.listAll` + each chat's persisted `chat_settings.digest_enabled`),
-/// while the actual on/off state and last-sent timestamp are persisted
-/// per-chat so they survive restarts.
-///
-/// Accessed from concurrently-running per-message tasks (see `PgPool`'s
-/// doc comment for why), so `enabled_chats` needs a lock.
+/// Tracks which chats have opted into periodic digests.
 pub const DigestScheduler = struct {
     allocator: std.mem.Allocator,
     io: Io,
     /// Keyed by `compositeKey(platform, native_chat_id)`, not bare
-    /// `native_chat_id` — two different platforms' chats can otherwise
-    /// collide on the same native id string (e.g. a numeric-looking Matrix
-    /// alias matching a Telegram chat id), and even where they can't, every
-    /// chat still needs its platform recorded so `checkAndSendDueDigests`
-    /// knows which connector to deliver through once more than one is
-    /// active.
+    /// `native_chat_id`.
     enabled_chats: std.StringHashMap(void),
     mutex: Io.Mutex = .init,
     interval_seconds: i64,
@@ -45,9 +27,7 @@ pub const DigestScheduler = struct {
         self.enabled_chats.deinit();
     }
 
-    /// `platform` tag plus native id, joined on a NUL byte — chosen over a
-    /// human-readable separator like ":" since Matrix's own native ids
-    /// already contain colons ("!room:server").
+    /// `platform` tag plus native id, joined on a NUL byte.
     fn compositeKey(allocator: std.mem.Allocator, platform: Platform, native_chat_id: []const u8) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ @tagName(platform), native_chat_id });
     }
@@ -88,10 +68,7 @@ pub const DigestScheduler = struct {
 
     pub const ChatKey = struct { platform: Platform, native_chat_id: []const u8 };
 
-    /// Returns a snapshot of currently-enabled chats, duped into
-    /// `allocator`. Iterating `enabled_chats` directly from outside would
-    /// race with `enable`/`disable` running concurrently on another
-    /// message-handling task; this is the safe way to walk the set.
+    /// Returns a snapshot of currently-enabled chats, duped into `allocator`.
     pub fn snapshotEnabledChatIds(self: *DigestScheduler, allocator: std.mem.Allocator) ![]ChatKey {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -111,15 +88,7 @@ pub const DigestScheduler = struct {
     }
 };
 
-/// Tracks which chats have opted into Phase 13's proactive daily briefing
-/// -- a near-exact structural copy of `DigestScheduler` above (same
-/// interval-based, not wall-clock, tradeoff for the same reason: a real
-/// timezone-aware scheduler needs a tz database Zig's std lib doesn't
-/// ship, and this is a personal bot for one owner), kept as its own
-/// struct per this codebase's established convention of a separate copy
-/// per domain (see e.g. `store/notes.zig`'s own near-exact copy of
-/// `reminders.zig`/`alerts.zig`) rather than generalizing `DigestScheduler`
-/// into something shared between the two.
+/// Tracks which chats have opted into the proactive daily briefing.
 pub const BriefingScheduler = struct {
     allocator: std.mem.Allocator,
     io: Io,

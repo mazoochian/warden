@@ -7,11 +7,7 @@ const Args = struct {
     hours: ?i64 = null,
 };
 
-/// On-demand only -- no scheduler, no automatic delivery. Deliberately
-/// returns raw grouped-by-chat, id-tagged lines for the model to rank and
-/// write the actual bulletin from itself, the same "we just fetch, the
-/// model summarizes" shape `catch_me_up.zig`'s own doc comment already
-/// establishes -- there's no nested LLM call in `features/bulletin.zig`.
+/// On-demand only -- no scheduler, no automatic delivery.
 pub const tool: registry.ToolDef = .{
     .name = "get_bulletin",
     .description = "Fetches raw recent messages from every personal-account chat the owner has marked as monitored (set_chat_monitoring), grouped by chat and ordered by importance (high, then normal, then low), since the last bulletin was generated (or the last N hours if given, default 24 if no bulletin has ever run). Returns raw \"[id] who: text\" lines for you to rank and write the actual bulletin from -- don't just dump this back verbatim. Cite an id with reply_to_message if the owner wants to respond to something specific.",

@@ -14,10 +14,7 @@ pub const Civil = struct {
 
 pub const Weekday = enum(u3) { sunday, monday, tuesday, wednesday, thursday, friday, saturday };
 
-/// Day of the week for a `daysFromCivil`-style day count. 1970-01-01 (day
-/// 0) was a Thursday, so `days + 4` lands Sunday=0..Saturday=6; `@mod` on a
-/// positive divisor is always non-negative in Zig regardless of `days`'
-/// sign, so this holds for pre-epoch dates too.
+/// Day of the week for a `daysFromCivil`-style day count.
 pub fn weekdayFromDays(days: i64) Weekday {
     return @enumFromInt(@as(u3, @intCast(@mod(days + 4, 7))));
 }
@@ -35,13 +32,7 @@ pub fn weekdayName(w: Weekday) []const u8 {
 }
 
 /// Days since the Unix epoch (1970-01-01) for a given proleptic-Gregorian
-/// civil date — Howard Hinnant's well-known constant-time algorithm
-/// (public domain: http://howardhinnant.github.io/date_algorithms.html),
-/// correct for any year (including negative ones) and exact leap-year
-/// handling, without a loop or a lookup table. No calendar math existed
-/// anywhere in this codebase before — see `reminder_format.zig`'s own
-/// "deliberately naive about timezones" doc comment, which this replaces
-/// for anything that now cares about a per-user offset/format.
+/// civil date.
 pub fn daysFromCivil(year: i32, month: u8, day: u8) i64 {
     const y: i64 = if (month <= 2) @as(i64, year) - 1 else @as(i64, year);
     const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
@@ -70,29 +61,15 @@ pub fn civilFromDays(days: i64) struct { year: i32, month: u8, day: u8 } {
 const seconds_per_day: i64 = 86400;
 
 /// The widest unix timestamps `localFromUnix` will render — 0001-01-01 and
-/// 9999-12-31, the range a four-digit year covers. Anything outside is
-/// clamped to the nearest end rather than converted.
-///
-/// Clamped rather than asserted because these timestamps arrive from
-/// Postgres rows and from arithmetic on user input, not from constants: a
-/// `reminders.due_at` written by hand, or one `reminder_format.nextOccurrence`
-/// saturated to `maxInt(i64)` on an absurd recur interval, used to abort the
-/// process here instead of showing a date — `civilFromDays` would hand a year
-/// around 2.9e11 to an `i32`, and the offset addition below overflowed i64
-/// outright. That turned every listing that touches the row (`/reminders`,
-/// `GET /api/v1/reminders`, the menu's reminder list) into a crash, which is
-/// exactly the path a stuck row is supposed to be fixed from.
+/// 9999-12-31, the range a four-digit year covers.
 pub const min_unix: i64 = -62135596800;
 pub const max_unix: i64 = 253402300799;
 
-/// Splits a unix timestamp into local calendar/clock components under a
-/// fixed UTC offset (see `civil_time.zig`'s module doc comment for why a
-/// fixed offset, not a real DST-aware zone). Out-of-range timestamps are
-/// clamped to `min_unix`/`max_unix` — see their doc comment.
+/// Splits a unix timestamp into local calendar/clock components under a fixed
+/// UTC offset.
 pub fn localFromUnix(unix_ts: i64, offset_minutes: i32) Civil {
     // Clamped before the offset is applied as well as after, so the addition
-    // itself can't overflow: the clamped value leaves i64 room to spare for
-    // any offset a timezone can hold.
+    // itself can't overflow.
     const clamped = std.math.clamp(unix_ts, min_unix, max_unix);
     const local_ts = std.math.clamp(clamped + @as(i64, offset_minutes) * 60, min_unix, max_unix);
     const days = @divFloor(local_ts, seconds_per_day);
@@ -190,10 +167,7 @@ test "localFromUnix/unixFromLocal round-trip across positive, negative, and half
 }
 
 test "localFromUnix clamps an out-of-range timestamp instead of aborting" {
-    // Both of these used to panic rather than return: the first on
-    // `civilFromDays`'s `@intCast` to an `i32` year, the second on the
-    // offset addition overflowing i64 before it even got there. Reachable
-    // from a `reminders.due_at` that `nextOccurrence` parked at `maxInt`.
+    // Both of these used to panic rather than return.
     const far_future = localFromUnix(std.math.maxInt(i64), 0);
     try testing.expectEqual(@as(i32, 9999), far_future.year);
     try testing.expectEqual(@as(u8, 12), far_future.month);

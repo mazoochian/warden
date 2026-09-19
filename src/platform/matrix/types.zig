@@ -1,18 +1,13 @@
-//! Minimal subset of the Matrix Client-Server API's JSON shapes, decoded
-//! with std.json — same spirit as `../telegram/types.zig`: only fields Warden
+//! Minimal subset of the Matrix Client-Server API's JSON shapes, decoded with
+//! std.json — same spirit as `../telegram/types.zig`: only fields Warden
 //! actually uses are modeled, with `ignore_unknown_fields = true` at every
 //! call site so the homeserver can send more than this without breaking
 //! parsing. Field names that contain a literal dot (Matrix convention, e.g.
-//! "m.relates_to") use Zig's `@"..."` quoted-identifier syntax rather than a
-//! renamed field, since std.json matches JSON keys against the struct field
-//! name exactly.
 
 const std = @import("std");
 const json = std.json;
 
-/// `GET /_matrix/client/v3/account/whoami` — Matrix's equivalent of
-/// Telegram's `getMe`, used to learn the bot's own user id at startup
-/// (needed for mention detection and to avoid processing its own messages).
+/// `GET /_matrix/client/v3/account/whoami`.
 pub const WhoamiResponse = struct {
     user_id: []const u8 = "",
     device_id: ?[]const u8 = null,
@@ -42,8 +37,7 @@ pub const MediaInfo = struct {
 };
 
 /// `m.room.message` content, flattened across every msgtype Warden cares
-/// about (text, image, file, audio, video) rather than a JSON-tagged union
-/// — same style as `../telegram/types.zig`'s `ChatMember`.
+/// about (text, image, file, audio, video) rather than a JSON-tagged union.
 pub const MessageContent = struct {
     msgtype: ?[]const u8 = null,
     body: ?[]const u8 = null,
@@ -57,9 +51,8 @@ pub const MessageContent = struct {
     /// Presence of this key (any value, even `{}`) marks an `m.audio`
     /// message as a voice message per MSC3245.
     @"org.matrix.msc3245.voice": ?json.Value = null,
-    /// Modern (MSC3952) explicit-mentions block; `user_ids` containing the
-    /// bot's own id is the primary mention signal — see
-    /// `MatrixConnector.mentionsMe`.
+    /// Modern (MSC3952) explicit-mentions block; `user_ids` containing the bot's
+    /// own id is the primary mention signal — see `MatrixConnector.mentionsMe`.
     @"m.mentions": ?Mentions = null,
 };
 
@@ -72,12 +65,8 @@ pub const RoomEvent = struct {
     sender: []const u8 = "",
     event_id: []const u8 = "",
     origin_server_ts: i64 = 0,
-    /// Left as a raw `json.Value` rather than a fixed `MessageContent`:
-    /// this event's `type` determines the actual content shape — plain
-    /// `m.room.message` parses as `MessageContent`, but `m.room.encrypted`
-    /// is a completely different shape (`MegolmEncryptedContent`), decided
-    /// by whichever code reads this field, same pattern `ToDeviceEvent.
-    /// content` below uses.
+    /// Left as a raw `json.Value` rather than a fixed `MessageContent`: this
+    /// event's `type` determines the actual content shape.
     content: json.Value = .null,
     /// Only meaningful for `m.room.member` events (join/leave/ban), unused
     /// for messages.
@@ -92,20 +81,14 @@ pub const JoinedRoom = struct {
     timeline: Timeline = .{},
 };
 
-/// `rooms.invite`'s per-room value carries `invite_state`, but auto-join
-/// only needs the room id itself (the map key) — the value is parsed just
-/// enough to satisfy the schema, not actually read.
+/// `rooms.invite`'s per-room value carries `invite_state`, but auto-join only
+/// needs the room id itself (the map key).
 pub const InvitedRoom = struct {
     invite_state: ?json.Value = null,
 };
 
-/// `rooms.leave`'s per-room value carries `timeline`/`state` for the
-/// room's final events, but detecting the departure itself only needs the
-/// room id (the map key) — same "just enough to satisfy the schema" style
-/// as `InvitedRoom`. Covers the bot leaving voluntarily, being kicked, or
-/// being banned; Matrix doesn't distinguish these in `/sync`'s shape, and
-/// `platform/matrix/connector.zig` doesn't need to either (see `iface.Message.
-/// chat_left`'s doc comment).
+/// `rooms.leave`'s per-room value carries `timeline`/`state` for the room's
+/// final events, but detecting the departure itself only needs the room id.
 pub const LeftRoom = struct {
     timeline: ?json.Value = null,
 };
@@ -116,9 +99,7 @@ pub const Rooms = struct {
     leave: json.ArrayHashMap(LeftRoom) = .{},
 };
 
-/// One entry of an Olm-encrypted to-device event's `ciphertext` map — keyed
-/// by the *recipient's* curve25519 identity key (there's normally exactly
-/// one entry, addressed to us, since to-device delivery is per-recipient).
+/// One entry of an Olm-encrypted to-device event's `ciphertext` map.
 pub const OlmCiphertextEntry = struct {
     type: usize = 0,
     body: []const u8 = "",
@@ -126,9 +107,7 @@ pub const OlmCiphertextEntry = struct {
 
 /// `m.room.encrypted` content for a **to-device** event (Olm,
 /// `m.olm.v1.curve25519-aes-sha2`) — see `crypto.zig`'s
-/// `State.handleToDeviceEvent`. Distinct shape from `MegolmEncryptedContent`
-/// below: Olm's `ciphertext` is an object keyed by recipient identity key,
-/// Megolm's is a plain base64 string.
+/// `State.handleToDeviceEvent`.
 pub const OlmEncryptedContent = struct {
     algorithm: []const u8 = "",
     sender_key: []const u8 = "",
@@ -136,8 +115,7 @@ pub const OlmEncryptedContent = struct {
 };
 
 /// `m.room.encrypted` content for a **room-timeline** event (Megolm,
-/// `m.megolm.v1.aes-sha2`) — see `crypto.zig`'s
-/// `State.decryptRoomEvent`.
+/// `m.megolm.v1.aes-sha2`) — see `crypto.zig`'s `State.decryptRoomEvent`.
 pub const MegolmEncryptedContent = struct {
     algorithm: []const u8 = "",
     sender_key: []const u8 = "",
@@ -155,9 +133,8 @@ pub const ToDeviceEvent = struct {
     content: json.Value = .null,
 };
 
-/// `m.room_key_request`'s `body` field — identifies which Megolm session
-/// is being asked for. Only present when `action == "request"` (a
-/// `"request_cancellation"` has no `body`).
+/// `m.room_key_request`'s `body` field — identifies which Megolm session is
+/// being asked for.
 pub const RoomKeyRequestBody = struct {
     algorithm: []const u8 = "",
     room_id: []const u8 = "",
@@ -165,11 +142,7 @@ pub const RoomKeyRequestBody = struct {
     session_id: []const u8 = "",
 };
 
-/// A to-device `m.room_key_request` — the reactive counterpart to
-/// `m.room_key`'s proactive share, sent when a client (e.g. one of the
-/// bot's own other devices, or a client that ran `/discardsession`)
-/// couldn't decrypt a message and wants the session forwarded. See
-/// `crypto.zig`'s `State.handleRoomKeyRequest`.
+/// A to-device `m.room_key_request`.
 pub const RoomKeyRequestContent = struct {
     action: []const u8 = "",
     body: ?RoomKeyRequestBody = null,
@@ -181,14 +154,7 @@ pub const ToDevice = struct {
     events: []ToDeviceEvent = &.{},
 };
 
-/// Interactive (SAS/emoji) device verification, `m.key.verification.*` —
-/// see `verification.zig` for the protocol logic and
-/// `crypto.zig`'s `State.handleVerificationRequest` and friends for
-/// the handlers. No `.ready`/`.start` receive-side structs: this bot only
-/// ever *responds* to an incoming `.request` (never initiates one), and
-/// per the spec's tie-break rule (whoever sends `.ready` auto-selects the
-/// method and sends `.start` next), that means the bot always sends both
-/// of those itself and never needs to parse a received one.
+/// Interactive (SAS/emoji) device verification, `m.key.verification.*`.
 pub const VerificationRequestContent = struct {
     from_device: []const u8 = "",
     methods: []const []const u8 = &.{},
@@ -234,18 +200,8 @@ pub const VerificationCancelContent = struct {
     reason: []const u8 = "",
 };
 
-/// The plaintext an Olm-decrypted to-device `m.room.encrypted` event
-/// unwraps to — itself a full event shape (`type`+`content`), per the
-/// Matrix spec's to-device encryption design. Only `m.room_key` is
-/// understood; anything else is logged and ignored.
-///
-/// `sender`/`recipient`/`recipient_keys` are the same envelope fields
-/// `crypto.zig`'s `State.buildRoomKeyPayload` writes on the send
-/// side (see its doc comment for why they're required) — `State.
-/// handleToDeviceEventFallible` validates them here on receive too,
-/// mirroring matrix-js-sdk's own `OlmDecryption.decryptEvent` checks:
-/// defense against a forged/misdirected Olm message, and symmetry with
-/// what we now require of ourselves when sending.
+/// The plaintext an Olm-decrypted to-device `m.room.encrypted` event unwraps
+/// to.
 pub const RoomKeyPayload = struct {
     type: []const u8 = "",
     content: RoomKeyContent = .{},
@@ -266,8 +222,7 @@ pub const RoomKeyContent = struct {
 };
 
 /// The plaintext a Megolm-decrypted room-timeline `m.room.encrypted` event
-/// unwraps to — `content` reuses `MessageContent` directly since it's the
-/// exact same shape an unencrypted `m.room.message` event's content is.
+/// unwraps to.
 pub const DecryptedRoomEventPayload = struct {
     type: []const u8 = "",
     content: MessageContent = .{},
@@ -278,12 +233,8 @@ pub const SyncResponse = struct {
     next_batch: []const u8 = "",
     rooms: Rooms = .{},
     to_device: ToDevice = .{},
-    /// `{algorithm: count}`, e.g. `{"signed_curve25519": 12}` — this
-    /// device's remaining one-time keys still on the server, per the spec.
-    /// Previously discarded (never parsed at all): the account's initial
-    /// batch of 20 one-time keys, generated once at first startup, was
-    /// never topped up as they got claimed — see `crypto.zig`'s
-    /// `State.topUpOneTimeKeysIfNeeded`, driven by this field.
+    /// `{algorithm: count}`, e.g. `{"signed_curve25519": 12}` — this device's
+    /// remaining one-time keys still on the server, per the spec.
     device_one_time_keys_count: json.ArrayHashMap(i64) = .{},
 };
 
@@ -296,10 +247,7 @@ pub const UploadResponse = struct {
 };
 
 /// Matrix errors are `{errcode, error}` on a non-2xx status — `http_util`'s
-/// non-2xx handling discards the body (see its doc comment), so this is
-/// only decoded where a client method needs the specific `errcode` (none
-/// currently do; kept for parity with `../telegram/types.zig`'s equivalent
-/// error shapes and as a landing spot if that changes).
+/// non-2xx handling discards the body.
 pub const ErrorResponse = struct {
     errcode: []const u8 = "",
     @"error": []const u8 = "",

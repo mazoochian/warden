@@ -1,26 +1,9 @@
 //! Converts model-generated, Markdown-ish text into Telegram-safe HTML
 //! (`parse_mode=HTML`) — models overwhelmingly write standard Markdown
 //! (`**bold**`, `` `code` ``, fenced code blocks, `[text](url)` links) when
-//! asked for anything richer than plain prose, but Telegram doesn't
-//! interpret that syntax at all without `parse_mode` set, so replies were
-//! showing up with literal asterisks/backticks.
-//!
-//! Deliberately narrow: only the handful of constructs above are
-//! recognized; everything else — including single-`*`/`_` italics, which
-//! are genuinely ambiguous against normal prose ("5 * 3", "file_name.txt")
-//! — passes through as literal (HTML-escaped) text rather than risk
-//! misinterpreting it. An unclosed marker (a stray "`" with no matching
-//! close, "**bold" with no closing "**" — the latter routine mid-stream,
-//! before the closing marker has arrived yet) is likewise left as literal
-//! text instead of swallowing the rest of the message, so a live streaming
-//! preview degrades gracefully rather than ever showing wrong formatting.
-//!
-//! `main.zig`/`client.zig` are expected to send every message
-//! through `toHtml` with `parse_mode=HTML`, and to retry once as plain
-//! text (no `parse_mode`) if Telegram rejects the send — a defense-in-depth
-//! safety net for whatever this converter's necessarily-incomplete grammar
-//! still gets wrong, since Telegram rejecting one bad entity would
-//! otherwise silently drop the whole message.
+//! asked for anything richer than plain prose, but Telegram doesn't interpret
+//! that syntax at all without `parse_mode` set, so replies were showing up
+//! with literal asterisks/backticks.
 
 const std = @import("std");
 const llm = @import("../../llm/provider.zig");
@@ -120,12 +103,7 @@ fn isLikelyLangTag(s: []const u8) bool {
 
 const Link = struct { label: []const u8, url: []const u8, end: usize };
 
-/// Parses a `[label](url)` starting at `text[i] == '['`. Doesn't handle
-/// nested brackets/parens in `label`/`url` — an acceptable gap for the
-/// simple links LLM output typically contains, and a malformed/unclosed
-/// attempt just falls through to being escaped as literal text (see
-/// `convertInto`'s caller), same graceful-degradation story as every other
-/// construct here.
+/// Parses a `[label](url)` starting at `text[i] == '['`.
 fn parseLink(text: []const u8, i: usize) ?Link {
     const close_bracket = std.mem.indexOfScalarPos(u8, text, i + 1, ']') orelse return null;
     if (close_bracket + 1 >= text.len or text[close_bracket + 1] != '(') return null;
@@ -154,10 +132,8 @@ fn escapeChar(allocator: std.mem.Allocator, out: *std.ArrayList(u8), c: u8) !voi
         '&' => try out.appendSlice(allocator, "&amp;"),
         '<' => try out.appendSlice(allocator, "&lt;"),
         '>' => try out.appendSlice(allocator, "&gt;"),
-        // Control bytes (our own sentinel bytes included, if one somehow
-        // reaches here unpaired — e.g. a truncated stream) are dropped:
-        // Telegram's HTML parser has no use for raw control bytes either.
-        // \t/\n/\r are kept since they're meaningful whitespace.
+        // Control bytes (our own sentinel bytes included, if one somehow reaches here
+        // unpaired — e.g. a truncated stream) are dropped.
         0...8, 11, 12, 14...31 => {},
         else => try out.append(allocator, c),
     }
@@ -204,9 +180,8 @@ test "toHtml converts a fenced code block with no language tag, keeping the fenc
     const a = testing.allocator;
     const out = try toHtml(a, "```\nplain block\n```");
     defer a.free(out);
-    // No language tag to strip (the first line right after the opening
-    // fence is empty, not a tag), so the newline that always immediately
-    // follows an opening ``` fence is part of the content as-is.
+    // No language tag to strip (the first line right after the opening fence is
+    // empty, not a tag).
     try testing.expectEqualStrings("<pre><code>\nplain block\n</code></pre>", out);
 }
 

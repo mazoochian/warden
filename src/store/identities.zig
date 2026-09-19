@@ -6,10 +6,8 @@ const TelegramProfile = @import("../domain/telegram_profile.zig").TelegramProfil
 const MatrixProfile = @import("../domain/matrix_profile.zig").MatrixProfile;
 const XmppProfile = @import("../domain/xmpp_profile.zig").XmppProfile;
 
-/// Upserts the platform-neutral ancestor identity row (see `Identity`'s doc
-/// comment) and returns its internal `identities.id` — the FK every other
-/// store module (chats, chat_members, messages) keys on, replacing the old
-/// per-chat-file `users` table's raw `user_id` string.
+/// Upserts the platform-neutral ancestor identity row and returns its
+/// internal `identities.id`.
 pub fn upsertIdentity(pool: *PgPool, identity: Identity) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -40,7 +38,7 @@ fn upsertIdentityDb(db: *Db, identity: Identity) !i64 {
 }
 
 /// Upserts a Telegram-specific profile extension for an already-upserted
-/// identity (see `TelegramProfile`'s doc comment).
+/// Identity.
 pub fn upsertTelegramProfile(pool: *PgPool, identity_id: i64, profile: TelegramProfile) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -80,7 +78,7 @@ pub fn upsertTelegramUser(pool: *PgPool, profile: TelegramProfile) !i64 {
 }
 
 /// Upserts a Matrix-specific profile extension for an already-upserted
-/// identity (see `MatrixProfile`'s doc comment).
+/// Identity.
 pub fn upsertMatrixProfile(pool: *PgPool, identity_id: i64, profile: MatrixProfile) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -100,7 +98,7 @@ pub fn upsertMatrixProfile(pool: *PgPool, identity_id: i64, profile: MatrixProfi
 }
 
 /// Upserts an XMPP-specific profile extension for an already-upserted
-/// identity (see `XmppProfile`'s doc comment).
+/// Identity.
 pub fn upsertXmppProfile(pool: *PgPool, identity_id: i64, profile: XmppProfile) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -120,23 +118,7 @@ pub fn upsertXmppProfile(pool: *PgPool, identity_id: i64, profile: XmppProfile) 
 const Platform = @import("../platform/interface.zig").Platform;
 
 /// Resolves an identity by (platform, native_id), creating a minimal
-/// placeholder row if none exists yet — used when a command targets a user
-/// by id alone (e.g. replying to ban/kick/blockuser, or the bot resolving its
-/// own identity to log its own replies) without a full `Identity` already
-/// in hand. Unlike `upsertIdentity`, never overwrites an existing row's
-/// `display_name`/`is_bot` (`is_bot` therefore only takes effect the first
-/// time a given (platform, native_id) is seen) — but `username` IS
-/// backfilled on conflict when the existing row doesn't have one yet
-/// (`COALESCE(identities.username, excluded.username)`), never overwriting
-/// a real value that's already there. Without this backfill, an identity
-/// first created through a reply-based command (which only ever has the
-/// target's native id in hand, not necessarily their username) could never
-/// be resolved by `@username` afterward even once a caller *did* supply
-/// one — confirmed live: `/adduser` (the block commands' predecessor) via
-/// reply on a never-before-seen user, then `/adduser @username` on that
-/// same person,
-/// failed every time because the first call's row had `username = NULL`
-/// and nothing ever went back to fill it in.
+/// placeholder row if none exists yet.
 pub fn getOrCreateMinimal(pool: *PgPool, platform: Platform, native_id: []const u8, fallback_display_name: []const u8, username: ?[]const u8, is_bot: bool, now: i64) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -166,15 +148,7 @@ pub const IdentityRef = struct {
 };
 
 /// Exact-match (case-insensitive) username lookup, scoped to `platform` —
-/// usernames aren't guaranteed unique across platforms, so a bare username
-/// alone isn't enough to resolve an identity. Backs `@username` targeting
-/// for `/blockuser`, `/unblockuser`, `/addadmin`, `/removeadmin` — the
-/// leading `@` is stripped by the caller (command-argument-parsing
-/// concern, not a store concern). Unlike `chat_members.search`, this is
-/// NOT fuzzy and NOT chat-scoped: those commands act bot-wide (bot admin
-/// grants, blocks) or need a specific single target, not a list of
-/// candidates. Bot accounts are excluded, matching `chat_members.search`.
-/// `null` when no identity on this platform has that username.
+/// usernames aren't guaranteed unique across platforms.
 pub fn findByUsername(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform, username: []const u8) !?IdentityRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -195,12 +169,8 @@ pub fn findByUsername(pool: *PgPool, allocator: std.mem.Allocator, platform: Pla
     };
 }
 
-/// Exact lookup by (platform, native_id) — unlike `getOrCreateMinimal`,
-/// never creates a placeholder row. Backs read-only by-id lookups (e.g.
-/// `/whois`, and `resolveTargetIdentity`'s non-mutating callers) where
-/// fabricating a row for an id the bot has genuinely never seen would be a
-/// surprising side effect for what's meant to be a plain info command.
-/// `null` when no identity on this platform has that native id.
+/// Exact lookup by (platform, native_id) — unlike `getOrCreateMinimal`, never
+/// creates a placeholder row.
 pub fn findByNativeId(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform, native_id: []const u8) !?IdentityRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -229,11 +199,7 @@ pub const WhoisInfo = struct {
     is_bot: bool,
 };
 
-/// Full identity row by internal id — backs `/whois`, which needs every
-/// shared field (unlike `IdentityRef`'s minimal id/display_name/native_id,
-/// enough for targeting but not for a full profile view). `null` if `id`
-/// doesn't exist (shouldn't happen in practice: callers only ever have an
-/// `id` in hand via a prior successful lookup).
+/// Full identity row by internal id — backs `/whois`.
 pub fn getWhoisInfo(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?WhoisInfo {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -449,17 +415,11 @@ test "getOrCreateMinimal persists username on first creation, and backfills it l
     const found1 = (try findByUsername(&pool, a, .telegram, "alice_tg")).?;
     try testing.expectEqual(id1, found1.id);
 
-    // A reply-based command that only has a native id in hand (e.g. Telegram
-    // didn't surface a username for that reply) creates the row with no
-    // username at all — this is the exact shape that broke `@username`
-    // resolution for anyone first seen this way.
     const id2 = try getOrCreateMinimal(&pool, .telegram, "2", "Bob", null, false, 1000);
     try testing.expect(try findByUsername(&pool, a, .telegram, "bob_tg") == null);
 
-    // The same person is resolved again later, this time with their real
-    // username in hand (e.g. they were `@username`-targeted, or replied to
-    // again with Telegram now supplying it) — must backfill, not silently
-    // stay unresolvable forever.
+    // The same person is resolved again later, this time with their real username
+    // in hand.
     const id2_again = try getOrCreateMinimal(&pool, .telegram, "2", "Bob", "bob_tg", false, 2000);
     try testing.expectEqual(id2, id2_again);
     const found2 = (try findByUsername(&pool, a, .telegram, "bob_tg")).?;

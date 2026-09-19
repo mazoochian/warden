@@ -2,11 +2,8 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
-/// A web login session — DB-backed (not a stateless JWT) so it can be
-/// revoked server-side. See src/api/auth.zig for how the browser cookie
-/// (session id + an HMAC-SHA256 tag) maps onto this row, and
-/// /home/armin/claude/warden-ui/ARCHITECTURE.md §3.2 for why DB-backed was
-/// chosen over a pure stateless token.
+/// A web login session — DB-backed (not a stateless JWT) so it can be revoked
+/// server-side.
 pub const Session = struct {
     id: i64,
     account_id: i64,
@@ -33,10 +30,8 @@ pub fn create(pool: *PgPool, account_id: i64, now: i64, expires_at: i64, user_ag
     return stmt.columnInt64(0);
 }
 
-/// `null` if the session doesn't exist, is revoked, or has expired — the
-/// one function `src/api/auth.zig`'s middleware calls on every request, so
-/// "not currently valid" collapses to a single `null` case rather than
-/// making every caller separately check `revoked_at`/`expires_at`.
+/// `null` if the session doesn't exist, is revoked, or has expired — the one
+/// function `src/api/auth.zig`'s middleware calls on every request.
 pub fn getValid(pool: *PgPool, id: i64, now: i64) ?Session {
     const db = pool.acquire() catch return null;
     defer pool.release(db);

@@ -6,41 +6,15 @@ pub const c = @cImport({
     @cInclude("libpq-fe.h");
 });
 
-/// Max bound parameters any single query in this codebase uses. libpq has
-/// no incremental bind API like SQLite's `sqlite3_bind_*` — every parameter
-/// has to be handed to `PQexecParams` at once — so `Stmt` buffers bound
-/// values by index until `step()` first runs the query.
+/// Max bound parameters any single query in this codebase uses.
 const max_params = 16;
 
 /// How often `runWithDeadline` re-checks the background thread's done flag.
-/// The interval starts at `initial_poll_interval_ns` and doubles on every
-/// wakeup up to `max_poll_interval_ns`, rather than being the flat 100 ms it
-/// was until 2026-09-13.
-///
-/// A flat interval put a hard floor under *every* query in the process: the
-/// done flag is checked once, then the caller sleeps the whole interval
-/// before looking again, so a query that Postgres answered in 200 µs still
-/// cost 100 ms of wall clock. Measured cost to the test suite alone was
-/// ~5.5 s of pure sleeping per DB-backed test and 23 min over a full run,
-/// against 19 s of actual CPU — see `store/test_support.zig`'s `openTestDb`
-/// and `migrate.zig`.
-///
-/// Backing off rather than just picking a smaller flat value keeps both
-/// ends sane: a fast query is noticed in well under a millisecond, and a
-/// genuinely slow one (lock contention, a stalled link to Postgres) settles
-/// back to the same 100 ms cadence it always had instead of spinning
-/// thousands of pointless wakeups while it waits out the deadline.
 const initial_poll_interval_ns: u64 = 50 * std.time.ns_per_us;
 const max_poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
 /// Slack added on top of `statement_timeout_seconds` to get
-/// `Db.query_timeout_ns`. `statement_timeout` is a *server-side* clock that
-/// only starts once Postgres actually receives a query — it does nothing
-/// for a query lost in transit (see `db.zig`'s module-level `open` doc
-/// comment) — so the client-side deadline in `runWithDeadline` has to be
-/// somewhat longer than it, to give a query that *did* arrive time to hit
-/// its own server-side timeout and have the result travel back, rather
-/// than the client giving up first on an otherwise-healthy slow query.
+/// `Db.query_timeout_ns`.
 const query_timeout_slack_ns: u64 = 15 * std.time.ns_per_s;
 
 pub const Db = struct {
@@ -52,45 +26,11 @@ pub const Db = struct {
     /// Wall-clock deadline `runWithDeadline` enforces around every `exec`/
     /// `Stmt.step` on this connection — see `query_timeout_slack_ns`.
     query_timeout_ns: u64,
-    /// Set by `runWithDeadline` when a query blows its deadline. The
-    /// abandoned thread may still be mid-syscall on `conn` at any point in
-    /// the future, so once this is true `conn` must never be touched again
-    /// (no more queries, no `close`) — `PgPool.release` checks this and
-    /// retires the slot instead of returning it to the free list.
+    /// Set by `runWithDeadline` when a query blows its deadline.
     poisoned: bool = false,
 
     /// `statement_timeout_seconds` bounds every query run on this connection
-    /// server-side (via a session `SET` right after connecting) — without
-    /// it, a single wedged query (lock contention, a network stall between
-    /// warden and Postgres) blocks the calling thread forever with no
-    /// recourse: these are plain blocking `libpq` C calls, entirely outside
-    /// `Io`, so there's no cancellation or timeout wrapper possible from the
-    /// caller's side the way `http_util.zig` manages for HTTP — or rather,
-    /// there wasn't; `exec`/`Stmt.step` now run through `runWithDeadline`,
-    /// which gives them exactly that. Confirmed live (2026-07-22) as the
-    /// likely cause of a production hang where a message-handling task
-    /// never returned, never logged an error, and permanently froze its
-    /// platform's poll loop (see `PgPool`'s doc comment for the full
-    /// chain). A `connect_timeout` is applied the same way, so even the
-    /// initial TCP handshake can't hang indefinitely either.
-    ///
-    /// Confirmed live again (2026-07-23), on the same VPS: even with
-    /// `statement_timeout` and `connect_timeout` both in place, the bot
-    /// still wedged in a way only a Postgres *container* restart (not a
-    /// warden restart) cleared — the Postgres server had zero TCP
-    /// keepalives configured, and this DSN set none either, on a network
-    /// path (Docker bridge, behind a CGNAT-ish NAT — see
-    /// `warden-vps-ssh-keepalive`) already known to silently drop idle
-    /// connections with no FIN/RST. A connection that dies while sitting
-    /// idle in `PgPool` looks perfectly healthy right up until the next
-    /// query is sent into the void: Postgres never receives it, so
-    /// `statement_timeout`'s clock never starts, and the client blocks in a
-    /// raw `recv()` with nothing to interrupt it. `appendConnectionOptions`
-    /// below now adds `keepalives_*` so a dead peer gets detected in ~50s
-    /// instead of never, and `runWithDeadline` adds a client-side backstop
-    /// on top in case keepalives themselves are ever unavailable (e.g. a
-    /// LISTEN/NOTIFY-style long call, or the far side just never sending
-    /// keepalive ACKs back).
+    /// server-side (via a session `SET` right after connecting).
     pub fn open(allocator: std.mem.Allocator, io: Io, dsn: [:0]const u8, statement_timeout_seconds: i64) !Db {
         const dsn_with_options = try appendConnectionOptions(allocator, dsn);
         defer allocator.free(dsn_with_options);
@@ -116,30 +56,19 @@ pub const Db = struct {
         defer allocator.free(timeout_sql);
         db.exec(timeout_sql) catch |err| {
             log.warn("pg: failed to set statement_timeout: {t}", .{err});
-            // If setting the timeout is itself what blew the deadline,
-            // `conn` is now poisoned before it was ever handed to a caller
-            // — fail the open outright rather than returning a `Db` that
-            // looks fine but can never safely be queried.
+            // If setting the timeout is itself what blew the deadline, `conn` is now
+            // poisoned before it was ever handed to a caller.
             if (db.poisoned) return error.PgConnectFailed;
         };
         return db;
     }
 
     /// `libpq` accepts `connect_timeout` (seconds) and `keepalives_*` as DSN
-    /// keywords; a keyword/value DSN can just have them appended as more
-    /// space-separated pairs, and a URI-style DSN (`postgresql://...`)
-    /// accepts them as query parameters — both forms are handled by the
-    /// same `key=value` append since libpq's URI parser treats trailing
-    /// query parameters as connection options identically to the
-    /// keyword/value form. `connect_timeout=10` is generous for even a slow
-    /// LAN/VPN hop while still bounding what used to be an unbounded TCP
-    /// connect. `keepalives_idle=20`/`keepalives_interval=10`/
-    /// `keepalives_count=3` has the OS start probing an idle connection
-    /// after 20s of silence and give up (erroring out any blocked
-    /// send/recv) after 3 more unanswered probes 10s apart — ~50s to detect
-    /// a peer that's gone dark, instead of relying on OS defaults that can
-    /// take hours (see `open`'s doc comment for why this matters here
-    /// specifically).
+    /// keywords; a keyword/value DSN can just have them appended as more space-
+    /// separated pairs, and a URI-style DSN (`postgresql://...`) accepts them as
+    /// query parameters — both forms are handled by the same `key=value` append
+    /// since libpq's URI parser treats trailing query parameters as connection
+    /// options identically to the keyword/value form.
     fn appendConnectionOptions(allocator: std.mem.Allocator, dsn: [:0]const u8) ![:0]u8 {
         const is_uri = std.mem.startsWith(u8, dsn, "postgresql://") or std.mem.startsWith(u8, dsn, "postgres://");
         const first_sep: u8 = if (is_uri) (if (std.mem.indexOfScalar(u8, dsn, '?') != null) '&' else '?') else ' ';
@@ -156,9 +85,8 @@ pub const Db = struct {
         c.PQfinish(self.conn);
     }
 
-    /// Runs a statement with no bound parameters and no result rows (DDL,
-    /// multi-statement migration bodies, etc). For anything with bound
-    /// parameters, use `prepare`.
+    /// Runs a statement with no bound parameters and no result rows (DDL, multi-
+    /// statement migration bodies, etc).
     pub fn exec(self: *Db, sql: [:0]const u8) !void {
         try runWithDeadline(void, self, execBlocking, .{ self.conn, sql });
     }
@@ -195,15 +123,7 @@ fn execParamsBlocking(conn: *c.PGconn, sql: [:0]const u8, count: usize, ptrs: [m
 }
 
 /// Runs `func(args)` on a real `std.Thread` with a hard wall-clock deadline
-/// of `db.query_timeout_ns`, mirroring `http_util.zig`'s `fetchWithTimeout`
-/// — see that module's doc comment for why detaching-and-abandoning beats
-/// `Io.concurrent`+`Future.cancel` for a plain blocking C call with no
-/// `Io`-native cancellation point. `PQexecParams`/`PQexec` are exactly that:
-/// once a query is in flight there is no way to interrupt the underlying
-/// `send`/`recv` from here. On timeout the thread is detached (never
-/// joined, never touches `conn` from this side again) and `db.poisoned` is
-/// set so `PgPool.release` retires the connection instead of handing it
-/// back out — see `Db.poisoned`'s doc comment for why reuse isn't safe.
+/// of `db.query_timeout_ns`, mirroring `http_util.zig`'s `fetchWithTimeout`.
 fn runWithDeadline(comptime T: type, db: *Db, comptime func: anytype, args: anytype) !T {
     const Outcome = struct {
         done: std.atomic.Value(bool) = .init(false),
@@ -218,25 +138,7 @@ fn runWithDeadline(comptime T: type, db: *Db, comptime func: anytype, args: anyt
 
     const outcome = try db.allocator.create(Outcome);
     outcome.* = .{};
-    // No `errdefer` here, deliberately. An errdefer guards from its
-    // declaration to the end of the *enclosing function*, and both of this
-    // function's remaining exits return errors, so one here would fire on
-    // top of them:
-    //   - the completed-but-failed path below already has its own `defer`
-    //     destroy, so an errdefer would double-free `outcome` on every
-    //     query that merely returns an error. That is an ordinary outcome,
-    //     not a bug — a failing `CREATE EXTENSION`, a constraint violation,
-    //     a syntax error — and it crashed the process with
-    //     GeneralPurposeAllocator's "Invalid free" panic. Found 2026-08-04
-    //     when CI's Postgres turned out to lack pgvector: 149 tests
-    //     "crashed" that were really one double-free, repeated.
-    //   - the timeout path deliberately abandons `outcome` to the detached
-    //     thread, so freeing it there is a use-after-free on memory that
-    //     thread is still writing to — the exact opposite of what the
-    //     comment down there says happens.
-    // Spawn failure is the one case that does need cleanup, so it gets it
-    // explicitly. Same reasoning, same fix as `http_util.zig`'s
-    // `buildFetchShared`/`spawnFetch` split — see that doc comment.
+    // No `errdefer` here, deliberately.
     const thread = std.Thread.spawn(.{}, Runner.run, .{ args, outcome }) catch |err| {
         db.allocator.destroy(outcome);
         return err;
@@ -257,8 +159,7 @@ fn runWithDeadline(comptime T: type, db: *Db, comptime func: anytype, args: anyt
         return outcome.result;
     }
 
-    // Deliberately not joined, closed, or reused from here on — see this
-    // function's doc comment and `Db.poisoned`.
+    // Deliberately not joined, closed, or reused from here on (`Db.poisoned`).
     log.warn("query blew its {d}ms deadline, detaching and poisoning the connection", .{@divTrunc(db.query_timeout_ns, std.time.ns_per_ms)});
     thread.detach();
     db.poisoned = true;
@@ -287,9 +188,8 @@ pub const Stmt = struct {
         self.count = @max(self.count, i + 1);
     }
 
-    /// Binds a `bigint[]` in Postgres's text array literal form
-    /// (`{1,2,3}`) -- pair it with `= ANY($n::bigint[])` in the SQL. An
-    /// empty slice binds `{}`, which matches nothing.
+    /// Binds a `bigint[]` in Postgres's text array literal form (`{1,2,3}`) --
+    /// pair it with `= ANY($n::bigint[])` in the SQL.
     pub fn bindInt64Array(self: *Stmt, idx: c_int, values: []const i64) void {
         const i: usize = @intCast(idx - 1);
         var buf: std.Io.Writer.Allocating = .init(self.arena.allocator());
@@ -319,9 +219,8 @@ pub const Stmt = struct {
         self.count = @max(self.count, i + 1);
     }
 
-    /// Runs the query against whatever's been bound so far — called lazily
-    /// on the first `step()`, since libpq (unlike SQLite) executes all at
-    /// once rather than being fed parameters incrementally.
+    /// Runs the query against whatever's been bound so far — called lazily on the
+    /// first `step()`.
     fn ensureExecuted(self: *Stmt) !void {
         if (self.result != null) return;
 
@@ -336,9 +235,7 @@ pub const Stmt = struct {
         self.row_idx = -1;
     }
 
-    /// Returns true if a row is available, false when done. Mirrors
-    /// SQLite's step-per-row model even though libpq hands back the whole
-    /// result set at once — callers loop `while (try stmt.step())` either way.
+    /// Returns true if a row is available, false when done.
     pub fn step(self: *Stmt) !bool {
         try self.ensureExecuted();
         self.row_idx += 1;
@@ -349,9 +246,8 @@ pub const Stmt = struct {
         return std.fmt.parseInt(i64, self.columnText(idx), 10) catch 0;
     }
 
-    /// Empty slice for both SQL NULL and zero-length text columns — matches
-    /// the old SQLite wrapper's behavior so callers didn't need to change.
-    /// Use `columnIsNull` where NULL must be told apart from `""`.
+    /// Empty slice for both SQL NULL and zero-length text columns — matches the
+    /// old SQLite wrapper's behavior so callers didn't need to change.
     pub fn columnText(self: Stmt, idx: c_int) []const u8 {
         if (self.result == null or c.PQgetisnull(self.result.?, self.row_idx, idx) != 0) return "";
         return std.mem.span(c.PQgetvalue(self.result.?, self.row_idx, idx));
@@ -412,14 +308,8 @@ test "a failing query returns its error instead of double-freeing the deadline o
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
 
-    // `runWithDeadline` used to arm an `errdefer` that stayed live all the
-    // way to the bottom of the function, so this — a query that simply
-    // fails, which is an ordinary thing for a query to do — freed the
-    // outcome twice and aborted the process with "Invalid free" rather than
-    // returning. It went unnoticed locally because every query in the happy
-    // path succeeds; CI found it only because its Postgres lacked pgvector,
-    // so `CREATE EXTENSION vector` failed during migration and took down
-    // 149 tests at once.
+    // `runWithDeadline` used to arm an `errdefer` that stayed live all the way to
+    // the bottom of the function, so this — a query that simply fails.
     try testing.expectError(error.PgExecFailed, db.exec("SELECT * FROM a_table_that_does_not_exist;"));
 
     // Still usable afterwards: the failure path must not poison or corrupt

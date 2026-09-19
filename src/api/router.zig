@@ -1,9 +1,6 @@
-//! Method+path dispatch, JSON helpers, and session resolution for
-//! warden-ui's API — see /home/armin/claude/warden-ui/API.md for the
-//! endpoint contract this is built against. Deliberately a small
-//! hand-rolled matcher (a handful of exact-path `if`s), not a routing
-//! framework — the endpoint count doesn't remotely justify one yet, and
-//! this file is exactly the place to grow one later if it ever does.
+//! Method+path dispatch, JSON helpers, and session resolution for the web
+//! API — the endpoint contract lives in warden-ui's API.md (see
+//! docs/web-api.md).
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
@@ -49,9 +46,7 @@ const redact_feature = @import("../features/redact.zig");
 const convert_feature = @import("../features/convert.zig");
 const multipart = @import("multipart.zig");
 const audit_log = @import("../store/audit_log.zig");
-/// The bot's own permission-ladder module (owner check) -- aliased since
-/// `auth` above already names this file's own session-token module
-/// (`api/auth.zig`).
+/// The bot's own permission-ladder module (owner check).
 const perm_auth = @import("../auth.zig");
 const oauth_providers = @import("../store/oauth_providers.zig");
 const oidc = @import("oidc.zig");
@@ -90,29 +85,17 @@ const expenses_prefix = "/api/v1/expenses/";
 const budgets_prefix = "/api/v1/budgets/";
 const subscriptions_prefix = "/api/v1/subscriptions/";
 
-/// Reminder-message length cap -- mirrors `main.zig`'s own
-/// `max_reminder_message_len` for `/remind` (kept as a separate constant
-/// since `main.zig` is the one that imports this file, not the other way
-/// around -- importing it back here would be circular).
+/// Reminder-message length cap.
 const max_reminder_message_len = 500;
 
-/// Note-text length cap -- mirrors `main.zig`'s own `max_note_text_len`
-/// for `/note add`, same "kept separate to avoid a circular import" reason
-/// as `max_reminder_message_len` above.
+/// Note-text length cap -- mirrors `main.zig`'s own `max_note_text_len` for
+/// `/note add`.
 const max_note_text_len = 1000;
 
-/// Currency every finance row defaults to when a request omits one --
-/// mirrors `main.zig`'s own `default_currency` for `/expense`/`/budget`/
-/// `/subscription`, same "kept separate to avoid a circular import" reason
-/// as the two caps above. Also matches the `DEFAULT 'USD'` in migrations
-/// `0029`/`0030`/`0031`.
+/// Currency every finance row defaults to when a request omits one.
 const default_currency = "USD";
 
-/// API-level caps on the finance free-text fields. The `expenses`/
-/// `budgets`/`subscriptions` tables all declare these columns as bare
-/// `TEXT` with no length constraint (the bot's own command parsers bound
-/// them implicitly, by taking a single line of chat input), so without
-/// these an authenticated `POST` could store an arbitrarily large blob.
+/// API-level caps on the finance free-text fields.
 const max_expense_category_len = 64;
 const max_expense_description_len = 500;
 const max_subscription_name_len = 128;
@@ -124,31 +107,18 @@ const max_default_location_len = 100;
 /// Matches `/keyword add`'s own `max_keyword_len` in `main.zig`.
 const max_keyword_alert_len = 100;
 
-/// A hard ceiling on any single stored amount, in cents -- ~$1 trillion,
-/// far above any plausible real entry while still leaving `i64` arithmetic
-/// (`subscriptions.monthlyEquivalentCents` multiplies by 30, and
-/// `expenses.totalsByCategory` sums across rows) nowhere near overflow.
-/// The DB's own `CHECK (amount_cents > 0)` covers the lower bound; this is
-/// the upper one it has no opinion about.
+/// A hard ceiling on any single stored amount, in cents.
 const max_amount_cents: i64 = 100_000_000_000_000;
 
 /// Default/max page size, matching `API.md`'s pagination convention.
 const default_page_limit: i64 = 50;
 const max_page_limit: i64 = 200;
 
-/// One request's resolved caller — `null` `account_id` means
-/// unauthenticated (a missing/invalid/expired session cookie), which is a
-/// normal outcome for public endpoints (`GET /api/v1/auth/providers`,
-/// login callbacks), not itself an error. Endpoints that require auth
-/// check this themselves and respond `401` — there's no blanket
-/// auth-required-by-default middleware, matching how warden's own
-/// command handlers each apply their own `auth.zig` gate rather than a
-/// single global one.
+/// One request's resolved caller — `null` `account_id` means unauthenticated
+/// (a missing/invalid/expired session cookie).
 const RequestAuth = struct {
     account_id: ?i64,
-    /// The resolved session's own id — `null` whenever `account_id` is
-    /// `null`. Distinct from `account_id` since `/me/sessions` needs to
-    /// mark which listed row is "this device" without a second lookup.
+    /// The resolved session's own id — `null` whenever `account_id` is `null`.
     session_id: ?i64 = null,
 };
 
@@ -405,9 +375,7 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     if (method == .DELETE and std.mem.startsWith(u8, path, announcements_prefix)) {
         return handleCancelAnnouncement(ctx, request, path[announcements_prefix.len..]);
     }
-    // Finance (ROADMAP.md Phase 17). `/expenses/summary` is matched before
-    // the `expenses_prefix` catch-all below only incidentally -- that one
-    // is `DELETE`-only, so the two can't collide regardless of order.
+    // Finance.
     if (method == .GET and std.mem.eql(u8, path, "/api/v1/expenses")) {
         return handleListExpenses(ctx, request, target);
     }
@@ -451,25 +419,13 @@ pub fn dispatch(ctx: *const ServerContext, request: *http.Server.Request) !void 
     try respondError(request, .not_found, "not_found", "no such endpoint");
 }
 
-// ---------------------------------------------------------------------------
-// Endpoint handlers
-// ---------------------------------------------------------------------------
-
-/// `GET /api/v1/auth/session` — see API.md. The one endpoint that has to
-/// exist to prove the whole cookie -> session row -> account -> linked
-/// identities chain works end to end, even before any real login method
-/// is wired up.
+/// `GET /api/v1/auth/session` — see API.md.
 fn handleGetSession(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const a = resolveAuth(ctx, request);
     const account_id = a.account_id orelse {
         return respondJson(ctx, request, .ok, .{ .authenticated = false });
     };
 
-    // Both lookups reading a session's own just-resolved account_id
-    // failing would mean the account row vanished between the session
-    // being minted and now (never observed, no delete path exists yet) --
-    // treated as a hard error rather than silently downgrading to
-    // "unauthenticated", since that would mask a real data-integrity bug.
     const account = accounts.getById(ctx.pool, ctx.allocator, account_id) catch |err| {
         log.err("session: failed to load account {d}: {t}", .{ account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load session");
@@ -501,18 +457,7 @@ fn handleGetSession(ctx: *const ServerContext, request: *http.Server.Request) !v
     });
 }
 
-/// `GET /api/v1/auth/providers` — public, no auth required. Lets the
-/// login page render itself without hardcoding which login methods are
-/// actually configured server-side (see API.md). Google/generic OIDC
-/// aren't wired up yet (Phase 1 in progress), so those always come back
-/// empty for now.
-/// The Telegram Login Widget (HMAC-signed, `telegram_login.zig`) is gone
-/// as of 2026-07-28 -- Telegram itself now describes it as legacy/
-/// archived in favor of the real OIDC provider `oidc.zig` implements (see
-/// https://core.telegram.org/bots/telegram-login), and once that was
-/// live and confirmed working there was no reason to keep a second,
-/// weaker login path around. `google` stays for API-shape compatibility
-/// with what warden-ui's `Providers` type already expects.
+/// `GET /api/v1/auth/providers` — public, no auth required.
 fn handleGetProviders(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const OidcProvider = struct { id: []const u8, name: []const u8 };
     const Response = struct {
@@ -537,12 +482,6 @@ fn handleGetProviders(ctx: *const ServerContext, request: *http.Server.Request) 
 }
 
 /// Resolves (or creates) the warden account for a verified external login.
-/// Only the OIDC callback below calls this today (the older Telegram
-/// Login Widget that used to share it was removed 2026-07-28 in favor of
-/// OIDC), but this stays its own function rather than getting inlined --
-/// "how a verified external identity becomes a warden account" is exactly
-/// the kind of thing a future second login mechanism would need again
-/// unchanged. `null` means a response was already sent.
 fn resolveOrCreateAccountForLogin(
     ctx: *const ServerContext,
     request: *http.Server.Request,
@@ -571,19 +510,14 @@ fn resolveOrCreateAccountForLogin(
     };
 }
 
-/// `POST /api/v1/auth/dev-login` — see `Config.api_dev_login`'s doc
-/// comment for why this exists and why it must never be reachable
-/// outside a contributor's own machine. Body: `{"identity_id": <int>}`.
-/// Resolves or creates an account for that identity, mints a session,
-/// sets the cookie.
+/// `POST /api/v1/auth/dev-login`.
 fn handleDevLogin(ctx: *const ServerContext, request: *http.Server.Request) !void {
     if (!ctx.config.api_dev_login) {
         return respondError(request, .not_found, "not_found", "no such endpoint");
     }
     if (!try checkRateLimit(ctx, request, ctx.auth_limiter, "dev-login")) return;
 
-    // Must happen before `readJsonBody` below -- see
-    // `issueSessionAndRespond`'s doc comment.
+    // Must happen before `readJsonBody` below.
     const user_agent = findHeader(request, "user-agent");
 
     const Body = struct { identity_id: i64 };
@@ -629,10 +563,8 @@ fn handleLogout(ctx: *const ServerContext, request: *http.Server.Request) !void 
     });
 }
 
-/// `GET /api/v1/me/sessions` — every live session for the caller's
-/// account, most recent first, with `current: true` on whichever one the
-/// request itself is authenticated with (so the frontend can label "this
-/// device" instead of making the user guess by user-agent string).
+/// `GET /api/v1/me/sessions` — every live session for the caller's account,
+/// most recent first, with.
 fn handleListSessions(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const a = resolveAuth(ctx, request);
     const account_id = a.account_id orelse {
@@ -677,11 +609,7 @@ fn handleListSessions(ctx: *const ServerContext, request: *http.Server.Request) 
 }
 
 /// `DELETE /api/v1/me/sessions/:sessionId` — revokes a session, including
-/// (deliberately) the one making the request itself, which is just "log
-/// out" — same convention `API.md` documents. Refuses (`404`, not `403`,
-/// to avoid confirming *some* session exists at that id to a caller who
-/// doesn't own it) if `sessionId` doesn't resolve to a live session owned
-/// by the caller's own account.
+/// (deliberately) the one making the request itself.
 fn handleRevokeSession(ctx: *const ServerContext, request: *http.Server.Request, session_id_str: []const u8) !void {
     const a = resolveAuth(ctx, request);
     const account_id = a.account_id orelse {
@@ -710,15 +638,12 @@ fn handleRevokeSession(ctx: *const ServerContext, request: *http.Server.Request,
 }
 
 // ---------------------------------------------------------------------------
-// Admin — stats & directory (Phase 2, read-only)
-// ---------------------------------------------------------------------------
+// Admin.
 
 const Roles = struct { owner: bool, bot_admin: bool };
 
 /// An account's effective role is the union across every `identities` row
-/// linked to it (`ARCHITECTURE.md` §7) — most accounts have exactly one
-/// linked identity today (no account-linking flow exists yet), but this
-/// stays correct once one does.
+/// linked to it (`ARCHITECTURE.md` §7).
 fn computeRoles(ctx: *const ServerContext, account_id: i64) !Roles {
     const identity_ids = try accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id);
     defer ctx.allocator.free(identity_ids);
@@ -736,9 +661,7 @@ fn computeRoles(ctx: *const ServerContext, account_id: i64) !Roles {
     return roles;
 }
 
-/// Every `/api/v1/admin/*` handler starts with this. `null` means a
-/// response was already sent (`401` unauthenticated, `403` not owner/bot
-/// admin) — the caller just returns.
+/// Every `/api/v1/admin/*` handler starts with this.
 fn requireAdmin(ctx: *const ServerContext, request: *http.Server.Request) !?i64 {
     const a = resolveAuth(ctx, request);
     const account_id = a.account_id orelse {
@@ -753,11 +676,8 @@ fn requireAdmin(ctx: *const ServerContext, request: *http.Server.Request) !?i64 
     return account_id;
 }
 
-/// Stricter than `requireAdmin`: owner only, never `bot_admin` — for
-/// Storage Sense's admin surface, which can prune/resample real chat
-/// history and flip the ladder's autopilot switch, same trust tier
-/// `handleStorageCommand` reserves for the bot-chat `/storage` command
-/// (never extended to bot admins there either).
+/// Stricter than `requireAdmin`: owner only, never `bot_admin` — for Storage
+/// Sense's admin surface.
 fn requireOwner(ctx: *const ServerContext, request: *http.Server.Request) !?i64 {
     const a = resolveAuth(ctx, request);
     const account_id = a.account_id orelse {
@@ -773,8 +693,7 @@ fn requireOwner(ctx: *const ServerContext, request: *http.Server.Request) !?i64 
 }
 
 /// `?limit=` clamped to `[1, max_page_limit]`, defaulting to
-/// `default_page_limit`; `?cursor=` parsed as the last-seen id (`0` — the
-/// start of the table — if absent/unparseable).
+/// `default_page_limit`; `?cursor=` parsed as the last-seen id.
 fn paginationParams(target: []const u8) struct { after_id: i64, limit: i64 } {
     const after_id = if (queryParam(target, "cursor")) |c|
         std.fmt.parseInt(i64, c, 10) catch 0
@@ -896,10 +815,7 @@ fn handleAdminGetIdentity(ctx: *const ServerContext, request: *http.Server.Reque
     return respondJson(ctx, request, .ok, detail);
 }
 
-/// `GET /api/v1/admin/modules` — `known_modules` unioned with whatever's
-/// been explicitly toggled in `feature_flags` (a module never touched has
-/// no row and defaults to enabled, per `feature_flags.isEnabled`'s doc
-/// comment).
+/// `GET /api/v1/admin/modules`.
 fn handleAdminListModules(ctx: *const ServerContext, request: *http.Server.Request) !void {
     _ = (try requireAdmin(ctx, request)) orelse return;
 
@@ -950,14 +866,7 @@ fn handleAdminSetModule(ctx: *const ServerContext, request: *http.Server.Request
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// Never returns any part of `value` verbatim — only its last 4 characters
-/// (enough to help someone recognize "yes, that's the right key" without
-/// the API ever transmitting a secret that could be captured in a log,
-/// screenshot, or browser history). `"(not set)"` for an empty value
-/// (matches the `OpenAiCompatConfig.api_key` "empty if unset" convention).
-/// Always returns memory owned by `a` (even the fixed-text cases) so
-/// callers can unconditionally free every `ConfigEntry.value` the same
-/// way regardless of which branch produced it.
+/// Never returns any part of `value` verbatim.
 fn maskSecret(a: std.mem.Allocator, value: []const u8) []const u8 {
     if (value.len == 0) return a.dupe(u8, "(not set)") catch "(not set)";
     if (value.len <= 4) return a.dupe(u8, "••••") catch "••••";
@@ -972,14 +881,7 @@ const ConfigEntry = struct {
     is_override: ?bool,
 };
 
-/// `GET /api/v1/admin/config` — per ARCHITECTURE.md §6: secrets (masked,
-/// read live from `ctx.config`, never touching `dynamic_config`) plus
-/// every `dynamic_config.known_keys` entry with its current effective
-/// value and whether a DB override exists. Deliberately doesn't yet list
-/// identity/infra/restart-required fields (§6's other two categories) --
-/// those aren't editable either way today, and this endpoint's real job
-/// is surfacing what's actually live; a display-only catalog of the rest
-/// is a reasonable follow-up, not done here.
+/// `GET /api/v1/admin/config` — per ARCHITECTURE.md §6.
 fn handleAdminListConfig(ctx: *const ServerContext, request: *http.Server.Request) !void {
     _ = (try requireAdmin(ctx, request)) orelse return;
 
@@ -997,11 +899,9 @@ fn handleAdminListConfig(ctx: *const ServerContext, request: *http.Server.Reques
 
     try addSecret(&entries, ctx.allocator, "WARDEN_TELEGRAM_BOT_TOKEN", "Telegram bot token", ctx.config.telegram_bot_token);
     try addSecret(&entries, ctx.allocator, "WARDEN_POSTGRES_DSN", "Postgres connection string", ctx.config.postgres_dsn);
-    // Both, not just whichever `config.llm` selected as the startup
-    // default -- `WARDEN_LLM_PROVIDER` is hot-swappable now (see
-    // `llm/dynamic_provider.zig`), so an admin switching providers needs
-    // to see confirmation *both* keys are set, not just the one active
-    // when the process started.
+    // Both, not just whichever `config.llm` selected as the startup default --
+    // `WARDEN_LLM_PROVIDER` is hot-swappable now (see
+    // `llm/dynamic_provider.zig`).
     if (ctx.config.llm_anthropic) |c| try addSecret(&entries, ctx.allocator, "WARDEN_ANTHROPIC_API_KEY", "Anthropic API key", c.api_key);
     if (ctx.config.llm_openai_compat) |c| try addSecret(&entries, ctx.allocator, "WARDEN_OPENAI_API_KEY", "OpenAI-compatible API key", c.api_key);
     if (ctx.config.matrix) |m| try addSecret(&entries, ctx.allocator, "WARDEN_MATRIX_ACCESS_TOKEN", "Matrix access token", m.access_token);
@@ -1058,13 +958,7 @@ fn defaultForKnownKey(a: std.mem.Allocator, config: *const config_mod.Config, ke
     return a.dupe(u8, "");
 }
 
-/// `PATCH /api/v1/admin/config/:key` — body `{"value": "..."}`. Only
-/// accepts keys in `dynamic_config.known_keys`; `403` for anything else
-/// (secrets can never be written here — there's no endpoint that accepts
-/// them at all, matching "never accepted on write" from ARCHITECTURE.md
-/// §6 — and identity/infra/restart-required keys aren't wired to be read
-/// back live yet, so accepting a write for them would silently go
-/// nowhere).
+/// `PATCH /api/v1/admin/config/:key` — body `{"value": "..."}`.
 fn handleAdminSetConfig(ctx: *const ServerContext, request: *http.Server.Request, key: []const u8) !void {
     const account_id = (try requireAdmin(ctx, request)) orelse return;
 
@@ -1097,10 +991,7 @@ fn handleAdminSetConfig(ctx: *const ServerContext, request: *http.Server.Request
     }
 
     // WARDEN_LLM_PROVIDER specifically: only a provider that actually has
-    // credentials configured is a real value to switch to -- see
-    // `llm/dynamic_provider.zig`'s doc comment for why "accept anything,
-    // let the runtime silently fall back" would be worse than rejecting
-    // the write up front with a clear reason.
+    // credentials configured is a real value to switch to.
     if (std.mem.eql(u8, key, "WARDEN_LLM_PROVIDER")) {
         const configured = if (std.mem.eql(u8, body.value, "anthropic"))
             ctx.config.llm_anthropic != null
@@ -1122,23 +1013,12 @@ fn handleAdminSetConfig(ctx: *const ServerContext, request: *http.Server.Request
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// `GET /api/v1/admin/audit-log?action=&cursor=&limit=` — thin wrapper
-/// over `store/audit_log.zig`'s existing `list` (built in Phase 0, never
-/// exposed over HTTP until now). `action` narrows to exactly one action
-/// name at a time (matches `list`'s own single-filter shape) — the
-/// frontend's "recently changed" widget calls this once per action
-/// (`module.set`, `config.set`) and merges client-side; full multi-action
-/// filtering/browsing is Phase 7's job, not this endpoint's.
+/// `GET /api/v1/admin/audit-log?action=&cursor=&limit=`.
 fn handleAdminAuditLog(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     _ = (try requireAdmin(ctx, request)) orelse return;
 
-    // `paginationParams`'s `after_id` field name assumes ascending-by-id
-    // listings (`listChats`/`listIdentities`'s "id > cursor" shape) --
-    // `audit_log.list` is newest-first ("id < cursor" for the next,
-    // older, page) instead, but reusing the same parsed cursor value as
-    // its `before_id` argument still produces the correct "next page =
-    // strictly older rows" behavior: the SQL itself does `id < $1`
-    // regardless of what this local variable is named.
+    // `paginationParams`'s `after_id` field name assumes ascending-by-id listings
+    // (`listChats`/`listIdentities`'s "id > cursor" shape).
     const page = paginationParams(target);
     const action_filter = queryParam(target, "action");
 
@@ -1160,13 +1040,6 @@ fn handleAdminAuditLog(ctx: *const ServerContext, request: *http.Server.Request,
 }
 
 /// `GET /api/v1/admin/management-rooms` — every binding bot-wide.
-/// Admin-only: warden's own `/manage` command instead authorizes bind/
-/// unbind against the *target* chat's live admin status (no bot_admin/
-/// owner requirement), but this admin overview page deliberately takes the
-/// simpler, stricter tier every other `/admin/*` endpoint already uses,
-/// same accepted simplification as `chat_settings`'s `digest_enabled`
-/// field being admin-gated over the web despite `/digest` itself being
-/// open to any chat member.
 fn handleAdminListManagementRooms(ctx: *const ServerContext, request: *http.Server.Request) !void {
     _ = (try requireAdmin(ctx, request)) orelse return;
 
@@ -1188,10 +1061,7 @@ fn handleAdminListManagementRooms(ctx: *const ServerContext, request: *http.Serv
 
 const ManagementRoomBody = struct { control_chat_id: i64, target_chat_id: i64 };
 
-/// `POST /api/v1/admin/management-rooms` — mirrors `/manage bind`. Same
-/// cross-platform guard as the command (a control room can't watch a chat
-/// on a different platform); binding is otherwise a plain upsert (1:1 as
-/// of warden's Phase 20 — rebinding either side moves it, doesn't error).
+/// `POST /api/v1/admin/management-rooms` — mirrors `/manage bind`.
 fn handleAdminBindManagementRoom(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const account_id = (try requireAdmin(ctx, request)) orelse return;
 
@@ -1237,11 +1107,8 @@ fn handleAdminBindManagementRoom(ctx: *const ServerContext, request: *http.Serve
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// `DELETE /api/v1/admin/management-rooms?control_chat_id=&target_chat_id=`
-/// — mirrors `/manage unbind`. Both ids are required in the query string
-/// since a binding has no single surrogate id exposed over this API
-/// (`management_room_bindings.id` is internal-only, same as every other
-/// composite-keyed row in this codebase).
+/// `DELETE /api/v1/admin/management-rooms?control_chat_id=&target_chat_id=` —
+/// mirrors `/manage unbind`.
 fn handleAdminUnbindManagementRoom(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const account_id = (try requireAdmin(ctx, request)) orelse return;
 
@@ -1269,17 +1136,10 @@ fn handleAdminUnbindManagementRoom(ctx: *const ServerContext, request: *http.Ser
 }
 
 // ---------------------------------------------------------------------------
-// Storage Sense (owner-only admin surface, ROADMAP.md Phase 14). Strictly
-// `requireOwner`, never `requireAdmin` -- same tier `handleStorageCommand`
-// reserves for `/storage` on the bot-chat side (never extended to bot
-// admins there either), since this can prune/resample real chat history
-// and flip the ladder's autopilot switch.
-// ---------------------------------------------------------------------------
+// Storage Sense (owner-only admin surface).
 
 /// `GET /api/v1/admin/storage/status` -- a structured counterpart to
-/// `/storage status`'s text report (`storage_sense.buildStatusReport`),
-/// since a web dashboard wants real fields to build tiles from, not a
-/// pre-formatted string.
+/// `/storage status`'s text report (`storage_sense.buildStatusReport`).
 fn handleAdminStorageStatus(ctx: *const ServerContext, request: *http.Server.Request) !void {
     _ = (try requireOwner(ctx, request)) orelse return;
 
@@ -1350,14 +1210,8 @@ const CleanupMessagesBody = struct {
     before: ?[]const u8 = null,
 };
 
-/// `POST /api/v1/admin/storage/cleanup/messages` -- mirrors `/storage
-/// cleanup messages`. `chat_id` omitted means every chat (the ladder's
-/// own global sweep), deliberately not "the current chat" the command
-/// defaults to, since there's no such concept over the web. `keep_last`
-/// needs a concrete `chat_id` (pruning "keep the last N" only means
-/// something per-chat); `before` (a `YYYY-MM-DD` date) or neither
-/// (falls back to the configured prune-age default) both work bot-wide
-/// or per-chat.
+/// `POST /api/v1/admin/storage/cleanup/messages` -- mirrors `/storage cleanup
+/// messages`.
 fn handleAdminStorageCleanupMessages(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const account_id = (try requireOwner(ctx, request)) orelse return;
 
@@ -1404,9 +1258,8 @@ fn handleAdminStorageCleanupMessages(ctx: *const ServerContext, request: *http.S
 
 const CleanupResampleBody = struct { chat_id: ?i64 = null };
 
-/// `POST /api/v1/admin/storage/cleanup/resample` -- mirrors `/storage
-/// cleanup resample`. `chat_id` omitted means every chat, same "no
-/// current chat" reasoning as cleanup/messages above.
+/// `POST /api/v1/admin/storage/cleanup/resample` -- mirrors `/storage cleanup
+/// resample`.
 fn handleAdminStorageCleanupResample(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const account_id = (try requireOwner(ctx, request)) orelse return;
     const provider = ctx.llm_provider orelse {
@@ -1429,9 +1282,7 @@ fn handleAdminStorageCleanupResample(ctx: *const ServerContext, request: *http.S
 }
 
 // ---------------------------------------------------------------------------
-// Groups (Phase 4) — chat-scoped, gated to owner/bot_admin or a *live*
-// platform admin of that specific chat, per ARCHITECTURE.md §7 tier 3.
-// ---------------------------------------------------------------------------
+// Groups.
 
 fn findConnectorForPlatform(connectors: []const iface.Connector, platform: iface.Platform) ?iface.Connector {
     for (connectors) |c| {
@@ -1442,12 +1293,7 @@ fn findConnectorForPlatform(connectors: []const iface.Connector, platform: iface
 
 /// `true` if any of `identity_ids` is *currently* a live platform admin of
 /// `chat` — checked fresh via the matching connector every call, never
-/// cached, so a demotion on the platform itself takes effect here
-/// immediately (same freshness guarantee `auth.checkGroupAdminAccess`
-/// already gives the bot's own commands). An identity on a different
-/// platform than `chat`, or with no matching connector currently active,
-/// is silently skipped rather than erroring — it simply can't be a live
-/// admin of a chat on a platform it doesn't belong to.
+/// cached.
 fn isLiveAdminOfChat(ctx: *const ServerContext, identity_ids: []const i64, chat: chats_store.ChatRef) bool {
     for (identity_ids) |identity_id| {
         const info = (identities.getWhoisInfo(ctx.pool, ctx.allocator, identity_id) catch null) orelse continue;
@@ -1465,13 +1311,7 @@ fn isLiveAdminOfChat(ctx: *const ServerContext, identity_ids: []const i64, chat:
 }
 
 /// `true` if `account_id` is the owner, or is currently a live admin of
-/// `chat` — deliberately narrower than `requireChatAccess`'s "owner or
-/// bot_admin or live admin" ladder (see its doc comment): `bot_admin`
-/// isn't accepted here. Factored out for Bot View's send/ws gates (Phase
-/// 9's "Admin notices" — see `handleBotViewSend`), which need the same
-/// live-admin-of-a-specific-chat check `requireChatAccess` already does,
-/// but with `bot_admin` staying excluded per Bot View's own 2026-07-28
-/// scoping decision.
+/// `chat`.
 fn isOwnerOrLiveAdminOfChatAccount(ctx: *const ServerContext, account_id: i64, roles: Roles, chat: chats_store.ChatRef) bool {
     if (roles.owner) return true;
     const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, account_id) catch |err| {
@@ -1482,22 +1322,14 @@ fn isOwnerOrLiveAdminOfChatAccount(ctx: *const ServerContext, account_id: i64, r
     return isLiveAdminOfChat(ctx, identity_ids, chat);
 }
 
-/// Every request handler below starts with this. `null` means a response
-/// was already sent (`401`/`404`/`403`) — the caller just returns.
-/// Ownership: on success, the caller owns `chat.native_chat_id` and must
-/// free it.
+/// Every request handler below starts with this.
 fn requireChatAccess(ctx: *const ServerContext, request: *http.Server.Request, chat_id: i64) !?chats_store.ChatRef {
     const access = (try requireChatAccessWithAuth(ctx, request, chat_id)) orelse return null;
     return access.chat;
 }
 
 /// What `requireChatAccess` establishes about the caller on the way to its
-/// answer. Handlers that need the account id or roles again *after* reading
-/// the request body must take them from here rather than call `resolveAuth`
-/// a second time: `findCookie` iterates the request headers, and
-/// `std.http.Server` asserts the connection is still in its
-/// `received_head` state to do that -- once the body reader has been
-/// taken, that assert is a process abort in ReleaseSafe, not an error.
+/// answer.
 const ChatAccess = struct {
     chat: chats_store.ChatRef,
     account_id: i64,
@@ -1535,12 +1367,7 @@ fn requireChatAccessWithAuth(ctx: *const ServerContext, request: *http.Server.Re
     return null;
 }
 
-/// `GET /api/v1/chats?mine=true` — every chat the caller can manage: all
-/// of them for owner/bot_admin, or only the ones they're currently a live
-/// platform admin of otherwise (candidate set narrowed to chats they're
-/// at least a *member* of first, via `chat_members.listChatsForIdentity`
-/// — cheaper than live-checking every chat in the system, and correct
-/// since a live admin of a chat is necessarily also a member of it).
+/// `GET /api/v1/chats?mine=true` — every chat the caller can manage.
 fn handleListMyChats(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const a = resolveAuth(ctx, request);
     const account_id = a.account_id orelse {
@@ -1634,11 +1461,8 @@ const ChatSettingsBody = struct {
     autopin_announcements: bool,
     video_download_enabled: bool,
     video_download_lossy: bool,
-    /// `0` means off, same "0/absent both mean unset" convention
-    /// `rate_limits.zig`'s own doc comment describes -- backed by the
-    /// `rate_limits` table, not `chat_settings`, but grouped into this
-    /// same whole-object endpoint since it's just another per-chat
-    /// setting from the caller's perspective.
+    /// `0` means off (same "0/absent both mean unset" convention as
+    /// `rate_limits.zig`).
     slowmode_seconds: i64,
 };
 
@@ -1674,33 +1498,21 @@ fn handleGetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
     });
 }
 
-/// `true` if `next` differs from `current` -- used by `handleSetChatSettings`
-/// to tell "this owner-gated field is actually changing" from "the
-/// whole-object PATCH just echoed back what was already there," since a
-/// group admin submitting the rest of the form shouldn't get rejected for
-/// fields they never touched.
+/// `true` if `next` differs from `current`.
 fn optionalStringChanged(current: ?[]const u8, next: ?[]const u8) bool {
     if (current == null and next == null) return false;
     if (current == null or next == null) return true;
     return !std.mem.eql(u8, current.?, next.?);
 }
 
-/// `PATCH /api/v1/chats/:id/settings` — body is the *entire* settings
-/// object (`ChatSettingsBody`), not a sparse partial update: JSON has no
-/// clean way to distinguish "field omitted, leave unchanged" from "field
-/// explicitly null, clear it" without a wrapper type, and a settings-form
-/// PATCH (the only client this has) naturally submits every field anyway.
-/// `null` on `persona`/`magic_word`/`thinking_override` clears that
-/// override, matching each store setter's own `null`-clears convention.
+/// `PATCH /api/v1/chats/:id/settings` — body is the *entire* settings object
+/// (`ChatSettingsBody`), not a sparse partial update.
 fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
     };
     // Everything this handler needs to know about the caller is taken here,
-    // before the body read below -- see `ChatAccess`. The owner re-check and
-    // the audit row used to call `resolveAuth` again after the body, which
-    // aborted the process on every successful PATCH, after every setter had
-    // already committed.
+    // before the body read below -- see `ChatAccess`.
     const access = (try requireChatAccessWithAuth(ctx, request, chat_id)) orelse return;
     const chat = access.chat;
     defer ctx.allocator.free(chat.native_chat_id);
@@ -1731,11 +1543,7 @@ fn handleSetChatSettings(ctx: *const ServerContext, request: *http.Server.Reques
         return respondError(request, .bad_request, "bad_request", "slowmode_seconds must be 0 (off) or positive");
     }
 
-    // welcome_message/default_location are owner-only to change -- same
-    // tier as persona -- everything else in this object is fine at
-    // requireChatAccess's own live-group-admin tier. Only gated when the
-    // submitted value actually differs from what's stored (see
-    // `optionalStringChanged`'s doc comment).
+    // Welcome_message/default_location are owner-only to change.
     const current_welcome = chat_settings.getWelcomeMessage(ctx.pool, arena, chat_id);
     const current_location = chat_settings.getDefaultLocation(ctx.pool, arena, chat_id);
     if (optionalStringChanged(current_welcome, body.welcome_message) or optionalStringChanged(current_location, body.default_location)) {
@@ -1818,8 +1626,7 @@ fn handleListChatMembers(ctx: *const ServerContext, request: *http.Server.Reques
 }
 
 /// `GET /api/v1/chats/:id/keyword-alerts` -- open to any chat member, same
-/// view tier as `/keyword list` (unlike `handleListChatMembers` above,
-/// which needs live-admin access).
+/// view tier as `/keyword list`.
 fn handleListKeywordAlerts(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -1840,12 +1647,7 @@ fn handleListKeywordAlerts(ctx: *const ServerContext, request: *http.Server.Requ
 
 const CreateKeywordAlertBody = struct { keyword: []const u8, identity_id: ?i64 = null };
 
-/// `POST /api/v1/chats/:id/keyword-alerts` -- mirrors `/keyword add
-/// <word>`, open to any chat member (same `resolveCreateIdentity`
-/// authorization as reminders/alerts/notes/expenses) -- deliberately not
-/// admin-gated, matching `handleKeywordCommand`'s own doc comment on why
-/// this differs from `/watch`'s "anyone" removal model only on delete, not
-/// create.
+/// `POST /api/v1/chats/:id/keyword-alerts`.
 fn handleCreateKeywordAlert(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -1925,20 +1727,7 @@ fn handleDeleteKeywordAlert(ctx: *const ServerContext, request: *http.Server.Req
 }
 
 // ---------------------------------------------------------------------------
-// Group Administration actions (Phase 5b) — kick/ban/mute/unmute/pin/unpin/
-// promote/demote/redact, each routed through the *exact* existing
-// `auth.checkGroupAdminAccess`/`isOwnerOrSudoBotAdmin` functions the slash
-// commands and `/menu` already use — this endpoint is simply a third
-// independent entry point to the same actions (see API.md). Two deliberate
-// adaptations for the web, both judgment calls made here rather than
-// spelled out in API.md's original sketch:
-//   - `sudo_active` (normally "the sender is a bot admin AND prefixed their
-//     command with /sudo") maps to plain `roles.bot_admin` here — there's no
-//     text-prefix ritual in a web form, so being logged in as a bot admin
-//     and clicking the button *is* the deliberate elevation. Still sends the
-//     same "granted superuser permissions" message into the real chat, so
-//     the elevation is never silent, matching the original design intent.
-// ---------------------------------------------------------------------------
+// Group Administration actions.
 
 const ChatActionCtx = struct {
     ra: RequesterAuth,
@@ -1948,15 +1737,7 @@ const ChatActionCtx = struct {
     actor_identity_id: i64,
 };
 
-/// Every action handler below starts with this: logged in, the
-/// `group_admin` module enabled (same gate the slash commands and `/menu`
-/// both already apply), the chat exists and has an active connector, and a
-/// synthetic `iface.Message` standing in for "a message from the caller in
-/// this chat" -- built from the caller's own first linked identity (native
-/// id/platform; `.identity` populated too, for the sudo-grant message's
-/// display name). Everything here is allocated from `arena`, including
-/// `chat.native_chat_id` -- no manual frees needed. `null` means a response
-/// was already sent.
+/// Every action handler below starts with this.
 fn beginChatAction(ctx: *const ServerContext, request: *http.Server.Request, arena: std.mem.Allocator, chat_id: i64) !?ChatActionCtx {
     const ra = (try requireLoggedIn(ctx, request)) orelse return null;
 
@@ -2040,11 +1821,7 @@ fn readJsonBodyLeaky(request: *http.Server.Request, arena: std.mem.Allocator, co
     };
 }
 
-/// `GET /api/v1/chats/:id/members/:identityId/permissions` — no bot-chat
-/// equivalent exists (there's no "view a member's current bits" command;
-/// `/permission` only ever changes them), but a checkbox-per-bit editor
-/// needs to know the starting state from somewhere. Same live-group-admin
-/// tier as `handleListChatMembers`'s own `requireChatAccess` gate.
+/// `GET /api/v1/chats/:id/members/:identityId/permissions`.
 fn handleGetMemberPermissions(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -2061,14 +1838,7 @@ fn handleGetMemberPermissions(ctx: *const ServerContext, request: *http.Server.R
 
 const SetMemberPermissionsBody = struct { bits: u32, expires_at: ?i64 = null };
 
-/// `PATCH /api/v1/chats/:id/members/:identityId/permissions` — mirrors
-/// `/permission`, except the whole resulting bitmask is set explicitly
-/// rather than applying a `+`/`-<letters>` change: a checkbox-per-bit
-/// editor already knows the mask it wants, so there's no reason to make
-/// the client compute a diff just to re-derive what it already has. Same
-/// best-effort live enforcement as the command — `error.Unsupported` (no
-/// granular permission concept on this platform) is expected and silent;
-/// the bitmask itself is saved either way.
+/// `PATCH /api/v1/chats/:id/members/:identityId/permissions`.
 fn handleSetMemberPermissions(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -2106,14 +1876,8 @@ fn handleSetMemberPermissions(ctx: *const ServerContext, request: *http.Server.R
 
 const SetMemberTagBody = struct { title: []const u8 };
 
-/// `PATCH /api/v1/chats/:id/members/:identityId/tag` — mirrors `/tag
-/// <@user> <text>` / `/tag <@user> off` (`title: ""` is `off`, matching
-/// the command's own empty-string-clears convention exactly, not a
-/// separate `null` case). Telegram only, and only for targets who are
-/// already chat administrators there — surfaced as a real error rather
-/// than saved-anyway, since unlike `/permission` there's no bitmask to
-/// persist independent of live enforcement; the whole point of this
-/// action is the live call.
+/// `PATCH /api/v1/chats/:id/members/:identityId/tag` — mirrors `/tag <@user>
+/// <text>` / `/tag <@user> off`.
 fn handleSetMemberTag(ctx: *const ServerContext, request: *http.Server.Request, chat_id_str: []const u8, identity_id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -2149,9 +1913,7 @@ fn handleSetMemberTag(ctx: *const ServerContext, request: *http.Server.Request, 
 const ModTargetBody = struct { identity_id: i64 };
 
 /// Mirrors `group_admin.zig`'s own private `default_mute_seconds` -- kept as
-/// a separate constant since `main.zig` is what imports this file, not the
-/// other way around (see `max_reminder_message_len`'s doc comment for the
-/// same reasoning).
+/// a separate constant since `main.zig` is what imports this file.
 const default_mute_seconds: i64 = 3600;
 const MuteBody = struct { identity_id: i64, duration_seconds: ?i64 = null };
 const PinBody = struct { message_id: []const u8 };
@@ -2231,9 +1993,7 @@ fn handleChatActionMute(ctx: *const ServerContext, request: *http.Server.Request
 
     const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
     const duration = body.duration_seconds orelse default_mute_seconds;
-    // Unbounded before: a negative duration is a past `until_date`, which
-    // Telegram reads as a *permanent* mute, and a huge one overflowed the
-    // addition below.
+    // Unbounded before: a negative duration is a past `until_date`.
     if (duration <= 0 or duration > reminder_format.max_schedule_seconds) {
         return respondError(request, .bad_request, "bad_request", "duration_seconds must be positive and at most 366 days");
     }
@@ -2271,10 +2031,7 @@ fn handleChatActionUnmute(ctx: *const ServerContext, request: *http.Server.Reque
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// Owner-only, not `checkGroupAdminAccess` -- mirrors `group_admin.promote`'s
-/// doc comment exactly: granting real platform admin/moderator standing is
-/// more consequential than mute/kick/pin, and deliberately isn't extended to
-/// bot admins either.
+/// Owner-only, not `checkGroupAdminAccess` -- same rule as `group_admin.promote`.
 fn handleChatActionPromote(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -2300,7 +2057,7 @@ fn handleChatActionPromote(ctx: *const ServerContext, request: *http.Server.Requ
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// Owner-only -- see `handleChatActionPromote`'s doc comment.
+/// Owner-only.
 fn handleChatActionDemote(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -2327,11 +2084,7 @@ fn handleChatActionDemote(ctx: *const ServerContext, request: *http.Server.Reque
 }
 
 /// `{message_id}` -- a native platform message id, typed/pasted in by the
-/// caller. No message-browser UI backs this yet (the only place a chat's
-/// recent messages are exposed today, `GET /api/v1/admin/chats/:id`, is
-/// owner/bot-admin-only, while pin itself is open to any live platform
-/// admin of the chat too -- building that picker is follow-up work, not a
-/// blocker for the endpoint existing).
+/// caller.
 fn handleChatActionPin(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -2380,10 +2133,7 @@ fn handleChatActionUnpin(ctx: *const ServerContext, request: *http.Server.Reques
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// `{mode: "lastn"|"user"|"text"|"regex", ...}` -- see API.md. `regex` mode
-/// keeps its own stricter gate (`isOwnerOrSudoBotAdmin` -- excludes even a
-/// live platform admin), unchanged from `/redact regex`'s behavior; the
-/// other three modes use the same ladder as every other action here.
+/// `{mode: "lastn"|"user"|"text"|"regex", ...}` -- see API.md.
 fn handleChatActionRedact(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -2429,19 +2179,9 @@ fn handleChatActionRedact(ctx: *const ServerContext, request: *http.Server.Reque
 }
 
 // ---------------------------------------------------------------------------
-// Convert (Phase 5c) — not chat-scoped at all, unlike everything above:
-// `features/convert.zig`'s `convert()` is a stateless file-in/file-out
-// utility with no chat/persistence side effects, same as `tools/
-// convert_file.zig`'s LLM-tool wrapper around it. Just needs a login and
-// the `convert` module enabled, matching `/convert`'s own gate.
-// ---------------------------------------------------------------------------
+// Convert — not chat-scoped at all, unlike everything above.
 
-/// Matches `features/convert.zig`'s own extension tables — used only to
-/// pick a `Content-Type` for the response; `result.file_name` is always
-/// `"converted" + one of those known extensions` (see `convert()`'s doc
-/// comment), never attacker-influenced, since any target format that
-/// doesn't match a known extension is rejected by `convert()` itself
-/// before a file_name is ever constructed.
+/// Matches `features/convert.zig`'s own extension tables.
 fn mimeTypeForExt(ext: []const u8) []const u8 {
     const Entry = struct { ext: []const u8, mime: []const u8 };
     const table = [_]Entry{
@@ -2491,15 +2231,14 @@ fn respondFile(request: *http.Server.Request, status: http.Status, content_type:
     });
 }
 
-/// Max total request body (multipart headers/boundary overhead plus the
-/// file itself) -- matches `convert()`'s own 50MB cap on reading back the
-/// converted output, plus a little headroom for multipart framing.
+/// Max total request body (multipart headers/boundary overhead plus the file
+/// itself).
 const max_convert_upload_bytes: usize = 51 * 1024 * 1024;
 
 /// `POST /api/v1/convert` -- multipart with a `file` part (needs a
-/// `filename`) and a `target_format` text field; synchronous response is
-/// the converted file's bytes, same "one-shot, no interactive flow" shape
-/// as `/convert <format>` used as a caption (see API.md).
+/// `filename`) and a `target_format` text field; synchronous response is the
+/// converted file's bytes, same "one-shot, no interactive flow" shape as
+/// `/convert <format>` used as a caption (see API.md).
 fn handleConvert(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     if (!feature_flags.isEnabled(ctx.pool, "convert")) {
@@ -2518,17 +2257,7 @@ fn handleConvert(ctx: *const ServerContext, request: *http.Server.Request) !void
     const arena = arena_state.allocator();
 
     // `boundary` above borrows straight from `request.head_buffer` (via
-    // `findHeader`/`iterateHeaders`). `readerExpectNone` reuses that same
-    // connection-level read buffer for the body once it needs more bytes
-    // than `receiveHead` already had buffered — for any upload past a
-    // couple hundred bytes, that clobbers `boundary` out from under us
-    // *before* `multipart.parse` below ever reads it (confirmed by hand:
-    // a >~450-byte upload turned a real `----formdata-undici-...` boundary
-    // into garbage like `85--formdata-undici-...`, mid-string, which then
-    // never matches anything in the body and silently yields zero parts —
-    // surfacing as "missing a \"file\" part" for every upload past that
-    // size). Copying it into the arena *before* touching the body reader
-    // is the fix.
+    // `findHeader`/`iterateHeaders`).
     const boundary_owned = try arena.dupe(u8, boundary);
 
     var buf: [16 * 1024]u8 = undefined;
@@ -2593,29 +2322,11 @@ fn handleConvert(ctx: *const ServerContext, request: *http.Server.Request) !void
 }
 
 // ---------------------------------------------------------------------------
-// "Bot View" (Phase 6) -- lets the owner watch a chat's live incoming
-// messages and reply in the bot's own voice. Originally owner-only, not
-// extended to bot_admins -- see ARCHITECTURE.md §7/§8, decided 2026-07-28
-// (Armin) given how sensitive impersonating the bot's own voice is.
-//
-// Widened in Phase 9 ("Admin notices", see ROADMAP.md) to also admit a
-// chat's own live platform admins, scoped to only that chat -- `bot_admin`
-// stays excluded, same as before, since the 2026-07-28 reasoning about
-// impersonation sensitivity didn't change. The owner's own access/behavior
-// is completely unchanged: the newly-admitted admin tier is the one that
-// gets the "auto-pinned notice" treatment (see `handleBotViewSend` below)
-// to keep it visually distinct from the owner's plain sends.
-// ---------------------------------------------------------------------------
+// "Bot View".
 
 const BotViewSendBody = struct { chat_id: i64, text: []const u8 };
 
-/// `POST /api/v1/bot-view/send` — calls the exact same `connector.sendMessage`
-/// (owner tier) or `sendMessageReturningId`+`pinMessage` (admin tier, an
-/// "admin notice" per Phase 9 — pin failures are logged and swallowed
-/// rather than failing the whole send, since not every chat grants the bot
-/// pin rights) any real automated reply already goes through (no parallel
-/// send path to keep in sync). Always audit-logged: who, which chat, the
-/// text.
+/// `POST /api/v1/bot-view/send`.
 fn handleBotViewSend(ctx: *const ServerContext, request: *http.Server.Request) !void {
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
@@ -2658,9 +2369,8 @@ fn handleBotViewSend(ctx: *const ServerContext, request: *http.Server.Request) !
                 log.warn("bot-view-send: admin notice sent to chat {d} but pin failed: {t}", .{ body.chat_id, err });
             };
         } else {
-            // This platform's connector doesn't implement
-            // `sendMessageReturningId` (no id to pin) -- still deliver the
-            // text via the plain path rather than silently dropping it.
+            // This platform's connector doesn't implement `sendMessageReturningId` (no id
+            // to pin).
             connector.sendMessage(arena, chat.native_chat_id, body.text, null);
         }
     }
@@ -2675,12 +2385,7 @@ fn handleBotViewSend(ctx: *const ServerContext, request: *http.Server.Request) !
 
 const BotViewEventJson = struct { chat_id: i64, sender: []const u8, text: ?[]const u8, ts: i64 };
 
-/// Runs on its own thread for the lifetime of one Bot View WS connection --
-/// pops events off `sub`'s queue (blocking on its condition when empty) and
-/// forwards each as a JSON text frame, until `sub` is closed (see
-/// `bot_view.zig`'s `Subscriber.nextEvent`) or the write itself fails
-/// (client gone). The paired connection's own worker thread runs the
-/// read side (see `handleBotViewWs` below) purely to detect that.
+/// Runs on its own thread for the lifetime of one Bot View WS connection.
 fn botViewWriterLoop(allocator: std.mem.Allocator, ws: *http.Server.WebSocket, sub: *bot_view.Subscriber, io: Io) void {
     while (sub.nextEvent(io)) |ev| {
         defer sub.freeEvent(ev);
@@ -2696,20 +2401,7 @@ fn botViewWriterLoop(allocator: std.mem.Allocator, ws: *http.Server.WebSocket, s
 }
 
 /// `GET /api/v1/bot-view/ws?chat_id=<id>` — WebSocket upgrade streaming
-/// `bot_view.Broadcaster`'s live incoming-message feed for one chat. Auth
-/// happens on the plain HTTP request *before* the 101 upgrade -- once
-/// upgraded, a normal JSON error response can no longer be sent, so
-/// anything that can fail (login, role, chat_id) is checked first.
-///
-/// Concurrency: the calling worker thread becomes the "reader" -- it just
-/// blocks on `readSmallMessage` to detect the client closing/erroring,
-/// discarding whatever it reads (Bot View is send-only from the client's
-/// perspective; replies go through `handleBotViewSend` instead, over a
-/// normal HTTP POST, same as every other mutating action in this API).
-/// `botViewWriterLoop` runs on a second, spawned thread for the actual
-/// data path. Deliberately not `Io.Group.async`/`Io.concurrent` -- see
-/// `worker_pool.zig`'s module doc on why this codebase moved off those for
-/// exactly this kind of long-lived per-connection work.
+/// `bot_view.Broadcaster`'s live incoming-message feed for one chat.
 fn handleBotViewWs(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
 
@@ -2745,11 +2437,8 @@ fn handleBotViewWs(ctx: *const ServerContext, request: *http.Server.Request, tar
     };
 
     var ws = try request.respondWebSocket(.{ .key = key });
-    // `respondWebSocket` only writes the 101 response into the buffered
-    // writer, it never flushes it (confirmed reading the stdlib source --
-    // the *next* flush is `writeMessage`'s own, on the first outgoing
-    // frame). Without this, a client's handshake would hang until this
-    // chat's first published message, rather than completing immediately.
+    // `respondWebSocket` only writes the 101 response into the buffered writer,
+    // it never flushes it.
     try ws.output.flush();
 
     const sub = broadcaster.subscribe(chat_id) catch return;
@@ -2768,16 +2457,10 @@ fn handleBotViewWs(ctx: *const ServerContext, request: *http.Server.Request, tar
 }
 
 // ---------------------------------------------------------------------------
-// Personal settings (Phase 4) — pure UI on top of store/user_settings.zig,
-// already built in full during the reminders/timezone work.
-// ---------------------------------------------------------------------------
+// Personal settings.
 
-/// `GET /api/v1/me/settings` — resolves against the caller's *first*
-/// linked identity. Accounts can only ever have exactly one linked
-/// identity today (no account-linking flow exists yet — see
-/// `ARCHITECTURE.md` §3.3/§11), so this is a documented simplification,
-/// not a real gap yet; whichever identity ends up "first" once linking
-/// exists will need a real decision, not this arbitrary pick.
+/// `GET /api/v1/me/settings` — resolves against the caller's *first* linked
+/// identity.
 fn handleGetMySettings(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const a = resolveAuth(ctx, request);
     const account_id = a.account_id orelse {
@@ -2870,20 +2553,10 @@ fn handleSetMySettings(ctx: *const ServerContext, request: *http.Server.Request)
 }
 
 // ---------------------------------------------------------------------------
-// Personal-account (TDLib) connector login flow -- owner-only (not just any
-// logged-in account, unlike `/api/v1/me/settings` above): this connects
-// Warden to the operator's real Telegram account, so `handleTelegramUserX`
-// each require `roles.owner` specifically, same bar as `/api/v1/admin/*`'s
-// `requireAdmin` but *without* the `bot_admin` half of that gate -- a bot
-// admin has no business driving the owner's own personal login.
-// ---------------------------------------------------------------------------
+// Personal-account (TDLib) connector login flow.
 
-/// `null` means a response was already sent (401/403/404) -- same
-/// "caller just returns" convention as `requireAdmin`. The 404 case (no
-/// `ctx.telegram_user`) happens whenever `WARDEN_TELEGRAM_USER_*` isn't
-/// configured; treated as "no such endpoint" rather than a 5xx since from
-/// the caller's perspective this feature just doesn't exist on this
-/// deployment.
+/// `null` means a response was already sent (401/403/404) -- same "caller
+/// just returns" convention as `requireAdmin`.
 fn requireTelegramUserConnector(ctx: *const ServerContext, request: *http.Server.Request) !?*telegram_user_platform.TelegramUserConnector {
     const conn = ctx.telegram_user orelse {
         try respondError(request, .not_found, "not_found", "the personal-account connector isn't configured on this deployment");
@@ -2959,12 +2632,7 @@ fn handleTelegramUserCode(ctx: *const ServerContext, request: *http.Server.Reque
     if (conn.authState() != .wait_code) {
         return respondError(request, .conflict, "wrong_state", "not currently waiting for a login code");
     }
-    // No obfuscation-stripping here, unlike the bot-chat command path --
-    // this is warden-ui's own HTTPS form submitting straight to this API,
-    // never a Telegram message, so there's nothing for Telegram's own
-    // phishing detector to have invalidated the code over in the first
-    // place (see `platform/interface.zig`'s `Platform.telegram_user` doc
-    // comment).
+    // No obfuscation-stripping here, unlike the bot-chat command path.
     const outcome = conn.submitAuthCode(arena, ctx.io, body.code) catch {
         return respondError(request, .internal_server_error, "internal", "failed to submit the code");
     };
@@ -3003,13 +2671,8 @@ fn handleTelegramUserPassword(ctx: *const ServerContext, request: *http.Server.R
     }
 }
 
-/// `GET /api/v1/telegram-user/chats[?query=...]` — warden-ui's chat
-/// browser, backing the same data `/tdchats`/`/tdsearch` expose in Telegram
-/// itself. No pagination here (unlike `/tdchats`' button pager, which
-/// exists specifically to work around Telegram's message-length limit):
-/// a web table just scrolls, so the whole (sorted, optionally
-/// query-filtered) list goes back in one response and the client renders
-/// it directly.
+/// `GET /api/v1/telegram-user/chats[?query=...]` — warden-ui's chat browser,
+/// backing the same data `/tdchats`/`/tdsearch` expose in Telegram itself.
 fn handleTelegramUserListChats(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const conn = try requireTelegramUserConnector(ctx, request) orelse return;
     if (conn.authState() != .ready) {
@@ -3037,16 +2700,7 @@ fn handleTelegramUserListChats(ctx: *const ServerContext, request: *http.Server.
 
 const SummarizeTdChatBody = struct { chat_id: []const u8, all: bool = false };
 
-/// `POST /api/v1/telegram-user/chats/summarize` — warden-ui's trigger for
-/// the same unread-summary-and-mark-read action `/tdsummary` performs in
-/// Telegram, reusing `chat_summary.summarizeChat` (the exact same LLM
-/// round trip) rather than a second, subtly-divergent implementation.
-/// `chat_id` is expected to be an exact id from a prior `GET .../chats`
-/// response — this endpoint doesn't do `/tdsummary`'s name-substring
-/// resolution, since the client already has the exact id from the chat
-/// list it rendered. `all = true` is `/tdsummary <chat> --all`'s
-/// counterpart: the last `chat_summary.recent_window_limit` messages
-/// regardless of read state, no mark-as-read side effect.
+/// `POST /api/v1/telegram-user/chats/summarize`.
 fn handleTelegramUserSummarizeChat(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const conn = try requireTelegramUserConnector(ctx, request) orelse return;
     if (conn.authState() != .ready) {
@@ -3072,10 +2726,7 @@ fn handleTelegramUserSummarizeChat(ctx: *const ServerContext, request: *http.Ser
         return respondError(request, .bad_request, "bad_request", "chat_id is required");
     }
 
-    // Empty tool list, same as `digest.zig`'s own callers — this ToolContext
-    // exists only to satisfy `summarizeChat`'s signature, no tool ever
-    // actually runs against it, so every other field is fine left at its
-    // zero-value default.
+    // Empty tool list, same as `digest.zig`'s own callers.
     const tool_ctx = tool_registry.ToolContext{ .allocator = arena, .io = ctx.io };
     const summary = chat_summary.summarizeChat(conn, ctx.pool, provider, arena, ctx.io, tool_ctx, body.chat_id, body.all) catch {
         return respondError(request, .internal_server_error, "internal", "failed to summarize chat");
@@ -3085,11 +2736,8 @@ fn handleTelegramUserSummarizeChat(ctx: *const ServerContext, request: *http.Ser
 
 const SendTdMessageBody = struct { chat_id: []const u8, message: []const u8 };
 
-/// `POST /api/v1/telegram-user/chats/send` — warden-ui's trigger for the
-/// same manual send `/tdsend`/`/sendas` perform in Telegram. Like
-/// `handleTelegramUserSummarizeChat`, `chat_id` is expected to already be
-/// an exact id the client picked from `GET .../chats` — no name resolution
-/// here.
+/// `POST /api/v1/telegram-user/chats/send` — warden-ui's trigger for the same
+/// manual send `/tdsend`/`/sendas` perform in Telegram.
 fn handleTelegramUserSendMessage(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const conn = try requireTelegramUserConnector(ctx, request) orelse return;
     if (conn.authState() != .ready) {
@@ -3117,11 +2765,7 @@ fn handleTelegramUserSendMessage(ctx: *const ServerContext, request: *http.Serve
 }
 
 /// `POST /api/v1/telegram-user/logout` — mirrors `/tdlogout`/`/tdlogin
-/// logout`'s shared `performTdLogout` in `main.zig`. `.none` is refused
-/// rather than forwarded to `conn.logOut()` for the same reason that
-/// function documents: the connector's `client_id` is still null before
-/// any `ensureClient()` call has run, and a logout attempt would crash
-/// rather than no-op.
+/// logout`'s shared `performTdLogout` in `main.zig`.
 fn handleTelegramUserLogout(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const conn = try requireTelegramUserConnector(ctx, request) orelse return;
     if (conn.authState() == .none) {
@@ -3133,13 +2777,8 @@ fn handleTelegramUserLogout(ctx: *const ServerContext, request: *http.Server.Req
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// `GET /api/v1/telegram-user/autonomy` — mirrors `/autonomy`'s no-arg
-/// form: the owner's global `reply_autonomy` default. Resolved from the
-/// caller's own logged-in identity (`callersOwnIdentity`), not
-/// `config`'s `WARDEN_TELEGRAM_OWNER_ID` the way the bot-chat command
-/// does — `requireTelegramUserConnector` already establishes the caller
-/// *is* the owner, and this is the same identity the rest of the web
-/// settings surface (`/me/settings`) already resolves via the session.
+/// `GET /api/v1/telegram-user/autonomy` — mirrors `/autonomy`'s no-arg form:
+/// the owner's global `reply_autonomy` default.
 fn handleGetGlobalAutonomy(ctx: *const ServerContext, request: *http.Server.Request) !void {
     _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
     const a = resolveAuth(ctx, request);
@@ -3186,10 +2825,7 @@ fn handleSetGlobalAutonomy(ctx: *const ServerContext, request: *http.Server.Requ
 }
 
 /// `GET /api/v1/telegram-user/chats/:nativeChatId/autonomy` — mirrors
-/// `/autonomy <chat id>`'s implicit view (the command has no bare-view
-/// form for a single chat, only `list`-adjacent-via-`/tdchats`, but the
-/// override/effective split is exactly what `chat_settings.
-/// resolveReplyAutonomy`'s doc comment says the settings UI needs).
+/// `/autonomy <chat id>`'s implicit view.
 fn handleGetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
     _ = (try requireTelegramUserConnector(ctx, request)) orelse return;
     const a = resolveAuth(ctx, request);
@@ -3208,10 +2844,7 @@ fn handleGetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
 
     const override = chat_settings.getReplyAutonomy(ctx.pool, chat.id);
     const effective = chat_settings.resolveReplyAutonomy(ctx.pool, ctx.allocator, chat.id, identity_id);
-    // This chat's ghostwriter prompt override -- deliberately its own
-    // setting rather than `/persona`'s `system_prompt`, see
-    // `chat_settings.getReplyAutonomyPrompt`. `null` means "use the
-    // built-in write-as-the-owner prompt".
+    // This chat's ghostwriter prompt override.
     const prompt = chat_settings.getReplyAutonomyPrompt(ctx.pool, ctx.allocator, chat.id);
     defer if (prompt) |pr| ctx.allocator.free(pr);
     return respondJson(ctx, request, .ok, .{
@@ -3221,18 +2854,8 @@ fn handleGetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
     });
 }
 
-/// `prompt` needs three states — leave alone / clear / set — but only has
-/// two available, so the empty string is the "clear" sentinel:
-///
-///   * absent (or JSON `null`) — leave the ghostwriter prompt untouched, so
-///     a caller flipping only the autonomy level never clobbers it.
-///   * `""` — clear it, going back to the built-in ghostwriter prompt.
-///   * any other string — set it.
-///
-/// Not `??[]const u8`, which looks like it would express this and doesn't:
-/// std.json parses a present JSON `null` into the *outer* null, exactly like
-/// an absent field, so both collapse to the same value and "clear" would
-/// silently no-op. Verified against std.json rather than assumed.
+/// `prompt` needs three states — leave alone / clear / set — but only has two
+/// available, so the empty string is the "clear" sentinel.
 const SetChatAutonomyBody = struct {
     override: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
@@ -3251,9 +2874,8 @@ fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // Roomier than the 256 bytes this used to take: the body now also
-    // carries an optional free-text ghostwriter prompt, which is easily
-    // longer than that.
+    // Roomier than the 256 bytes this used to take: the body now also carries an
+    // optional free-text ghostwriter prompt, which is easily longer than that.
     var buf: [4096]u8 = undefined;
     const reader = request.readerExpectNone(&buf);
     const raw = reader.allocRemaining(arena, .limited(4096)) catch {
@@ -3281,9 +2903,8 @@ fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
         return respondError(request, .internal_server_error, "internal", "failed to save");
     };
     if (body.prompt) |prompt| {
-        // Present and non-null means the caller is deliberately setting or
-        // clearing it; an all-whitespace value is a clear, same as `""` --
-        // see SetChatAutonomyBody's doc comment.
+        // Present and non-null means the caller is deliberately setting or clearing
+        // it; an all-whitespace value is a clear, same as `""`.
         const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
         chat_settings.setReplyAutonomyPrompt(ctx.pool, chat.id, if (trimmed.len == 0) null else trimmed) catch |err| {
             log.err("set-chat-autonomy: failed to save the prompt for chat {d}: {t}", .{ chat.id, err });
@@ -3295,10 +2916,6 @@ fn handleSetChatAutonomy(ctx: *const ServerContext, request: *http.Server.Reques
 }
 
 /// `GET /api/v1/telegram-user/drafts` — mirrors `/drafts`.
-/// `GET /api/v1/feed` — the curated feed's settings plus its source list,
-/// mirroring `/feed`'s status output. `runnable` is the same
-/// `Settings.isRunnable` the scheduler checks, so the UI can say "enabled
-/// but not configured" without re-deriving the rule.
 fn handleGetFeed(ctx: *const ServerContext, request: *http.Server.Request) !void {
     _ = (try requireLoggedIn(ctx, request)) orelse return;
 
@@ -3334,10 +2951,7 @@ fn handleGetFeed(ctx: *const ServerContext, request: *http.Server.Request) !void
 }
 
 /// Every field optional so the UI can PATCH one dial without resending the
-/// rest. `target_native_chat_id` and `policy` accept `""` to clear, for the
-/// same reason the per-chat autonomy prompt does: std.json can't
-/// distinguish an explicit JSON null from an absent field, so a null would
-/// silently mean "leave alone" rather than "clear".
+/// rest.
 const SetFeedBody = struct {
     enabled: ?bool = null,
     target_native_chat_id: ?[]const u8 = null,
@@ -3394,9 +3008,8 @@ fn handleSetFeed(ctx: *const ServerContext, request: *http.Server.Request) !void
 
 const AddFeedSourceBody = struct { query: []const u8 };
 
-/// `POST /api/v1/feed/sources` — `{query}` is a TDLib chat id or a chat
-/// name, resolved the same way `/feed add` resolves it, so the UI doesn't
-/// have to make the user find a numeric id first.
+/// `POST /api/v1/feed/sources` — `{query}` is a TDLib chat id or a chat name,
+/// resolved the same way `/feed add` resolves it.
 fn handleAddFeedSource(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const conn = try requireTelegramUserConnector(ctx, request) orelse return;
     const ra = resolveAuth(ctx, request);
@@ -3444,8 +3057,6 @@ fn handleDeleteFeedSource(ctx: *const ServerContext, request: *http.Server.Reque
 }
 
 /// `POST /api/v1/feed/run` — one pass right now, mirroring `/feed run`.
-/// Synchronous: a pass is bounded (see `curated_feed`'s per-pass ceilings)
-/// and the caller wants to know what it produced.
 fn handleRunFeed(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const account_id = ra.account_id;
@@ -3497,9 +3108,8 @@ fn handleListDrafts(ctx: *const ServerContext, request: *http.Server.Request) !v
     return respondJson(ctx, request, .ok, .{ .items = items });
 }
 
-/// `POST /api/v1/telegram-user/chats/:nativeChatId/draft/approve` —
-/// mirrors `/approve <chat id>`: sends the draft exactly as generated,
-/// through the personal-account connector, no parallel send path.
+/// `POST /api/v1/telegram-user/chats/:nativeChatId/draft/approve` — mirrors
+/// `/approve <chat id>`.
 fn handleApproveDraft(ctx: *const ServerContext, request: *http.Server.Request, native_chat_id: []const u8) !void {
     const conn = try requireTelegramUserConnector(ctx, request) orelse return;
     const pending_drafts = ctx.pending_drafts orelse {
@@ -3523,10 +3133,8 @@ fn handleApproveDraft(ctx: *const ServerContext, request: *http.Server.Request, 
     }
 
     conn.connector().sendMessage(ctx.allocator, native_chat_id, draft.draft_text, draft.reply_to);
-    // Approving from the web UI has to clear the Telegram composer just
-    // like approving from a button or `/approve` does -- the draft was
-    // written into it when it was created, and leaving it there after
-    // sending invites sending the same message twice.
+    // Approving from the web UI has to clear the Telegram composer just like
+    // approving from a button or `/approve` does.
     telegram_user_platform.clearComposerDraftFor(ctx.telegram_user, ctx.allocator, ctx.io, native_chat_id);
     audit_log.record(ctx.pool, account_id, null, "telegram_user.draft.approve", native_chat_id, null);
     return respondJson(ctx, request, .ok, .{});
@@ -3553,13 +3161,7 @@ fn handleDiscardDraft(ctx: *const ServerContext, request: *http.Server.Request, 
 }
 
 // ---------------------------------------------------------------------------
-// Reminders / Alerts / Watches (Phase 5a) -- chat-scoped like Groups above,
-// but "open to anyone actually in the chat" like `/remind`/`/alert`/`/watch`
-// already are, not `requireChatAccess`'s group-admin ladder. Identity-scoped
-// by default (own reminders/alerts/watches across every chat); `chat_id`
-// narrows, `identity_id` (owner/bot_admin only) views/acts on behalf of
-// someone else -- see API.md's "Feature parity" section.
-// ---------------------------------------------------------------------------
+// Reminders / Alerts / Watches.
 
 const RequesterAuth = struct { account_id: i64, roles: Roles };
 
@@ -3593,13 +3195,7 @@ fn callersOwnIdentity(ctx: *const ServerContext, request: *http.Server.Request, 
     return identity_ids[0];
 }
 
-/// Every identity the caller *is*: the ones linked to their account, plus
-/// -- when the account is the owner's -- every configured owner identity
-/// (`Config.owners`) that has an `identities` row. Login only ever links
-/// the one identity the OIDC provider vouched for (Telegram), while the
-/// owner's notes/reminders/expenses on Matrix or XMPP are recorded against
-/// that platform's identity row for the same person -- before this, the
-/// "my notes" views only ever showed the Telegram half. Caller frees.
+/// Every identity the caller *is*: the ones linked to their account, plus.
 fn callersIdentityIds(ctx: *const ServerContext, ra: RequesterAuth) ![]i64 {
     var out: std.ArrayList(i64) = .empty;
     errdefer out.deinit(ctx.allocator);
@@ -3620,10 +3216,7 @@ fn callersIdentityIds(ctx: *const ServerContext, ra: RequesterAuth) ![]i64 {
 }
 
 /// Resolves the identities to scope a `GET` list by: an explicit
-/// `?identity_id=` (owner/bot_admin only -- viewing on behalf of someone
-/// else) as a one-element set, else every identity the caller is (see
-/// `callersIdentityIds`). `null` means a response was already sent;
-/// otherwise the caller frees the slice.
+/// `?identity_id=`.
 fn resolveListIdentities(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8, ra: RequesterAuth) !?[]i64 {
     if (queryParam(target, "identity_id")) |id_str| {
         if (!ra.roles.owner and !ra.roles.bot_admin) {
@@ -3649,12 +3242,7 @@ fn resolveListIdentities(ctx: *const ServerContext, request: *http.Server.Reques
     return ids;
 }
 
-/// Resolves the creator identity for a `POST` (create): an explicit
-/// `identity_id` in the body (owner/bot_admin only), else whichever of the
-/// caller's own identities (`callersIdentityIds`, so the owner's Matrix
-/// identity is found for a Matrix room) is a member of `chat_id` -- mirroring
-/// `/remind`/`/alert`/`/watch`'s own "open to anyone currently in the
-/// chat" authorization. Also verifies `chat_id` names a real chat.
+/// Resolves the creator identity for a `POST` (create).
 fn resolveCreateIdentity(ctx: *const ServerContext, request: *http.Server.Request, ra: RequesterAuth, chat_id: i64, explicit_identity_id: ?i64) !?i64 {
     const chat = (chats_store.getById(ctx.pool, ctx.allocator, chat_id) catch |err| {
         log.err("resolve-create-identity: failed to load chat {d}: {t}", .{ chat_id, err });
@@ -3687,7 +3275,7 @@ fn resolveCreateIdentity(ctx: *const ServerContext, request: *http.Server.Reques
     return null;
 }
 
-// --- Reminders ---
+// --- Reminders.
 
 const ReminderWhenBody = struct {
     kind: []const u8,
@@ -3708,10 +3296,7 @@ const CreateReminderBody = struct {
     when: ReminderWhenBody,
 };
 
-/// `GET /api/v1/reminders?chat_id=&identity_id=` -- see API.md. Scoped to
-/// one identity (default: the caller's own) unlike the bot's own in-chat
-/// `/reminders`, which lists every setter's pending reminders in that one
-/// chat -- a deliberate difference documented in API.md.
+/// `GET /api/v1/reminders?chat_id=&identity_id=` -- see API.md.
 fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
@@ -3775,10 +3360,7 @@ fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request,
 }
 
 /// Resolves a `ReminderWhenBody` to a concrete unix `due_at`, shared by
-/// `handleCreateReminder` and `handleCreateAnnouncement` -- the two kinds
-/// describe "when" identically (see `reminders.Kind`'s own doc comment on
-/// why the table itself doesn't distinguish them beyond that column).
-/// `null` (with a response already sent) on any validation failure.
+/// `handleCreateReminder` and `handleCreateAnnouncement`.
 fn resolveWhenDueAt(ctx: *const ServerContext, request: *http.Server.Request, when: ReminderWhenBody, identity_id: i64) !?i64 {
     if (std.mem.eql(u8, when.kind, "duration")) {
         const seconds = when.seconds orelse {
@@ -3820,8 +3402,7 @@ fn resolveWhenDueAt(ctx: *const ServerContext, request: *http.Server.Request, wh
 }
 
 /// `POST /api/v1/reminders` -- see API.md; `when` mirrors the `/menu`
-/// wizard's own step data (see `menu.zig`'s `ReminderDraft`) so this form
-/// and the wizard describe the same underlying moment two different ways.
+/// wizard's own step data.
 fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     if (!feature_flags.isEnabled(ctx.pool, "reminders")) {
@@ -3845,11 +3426,7 @@ fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request
         return respondError(request, .bad_request, "bad_request", "message must be 1-500 bytes");
     }
     if (body.recur_interval_seconds) |interval| {
-        // The upper bound matters as much as the lower one: `nextOccurrence`
-        // multiplies this by however many firings were missed, and an
-        // unbounded value used to overflow i64 there -- an abort in the
-        // scheduler, on a row that stayed due, so it repeated on every
-        // restart. See `reminder_format.max_schedule_seconds`.
+        // The upper bound matters as much as the lower one.
         if (interval <= 0 or interval > reminder_format.max_schedule_seconds) {
             return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive and at most 366 days");
         }
@@ -3868,9 +3445,7 @@ fn handleCreateReminder(ctx: *const ServerContext, request: *http.Server.Request
     return respondJson(ctx, request, .ok, .{ .id = id, .due_at = due_at });
 }
 
-/// `DELETE /api/v1/reminders/:id` -- same authorization as `/remind
-/// cancel`: whoever set it, or the bot owner (not bot_admin -- mirrors
-/// `handleRemindCommand`'s `auth.isOwner` check exactly).
+/// `DELETE /api/v1/reminders/:id` -- same authorization as `/remind cancel`.
 fn handleCancelReminder(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const id = std.fmt.parseInt(i64, id_str, 10) catch {
@@ -3904,23 +3479,12 @@ fn handleCancelReminder(ctx: *const ServerContext, request: *http.Server.Request
     return respondJson(ctx, request, .ok, .{});
 }
 
-// --- Announcements (ROADMAP.md Phase 16) -- chat-scoped, not identity-
-// scoped-across-chats like Reminders above: `reminders.listForIdentities`
-// is deliberately hard-filtered to `kind = 'reminder'` (see its own doc
-// comment), since a scheduled announcement is a chat-level admin object,
-// not a personal one. `reminders.listPending`, already built for
-// `/announce list`, fits this shape directly. ---
+// --- Announcements -- chat-scoped, not identity-
+// scoped-across-chats like Reminders above.
 
 const max_announcement_len = 1000;
 
-/// `GET /api/v1/chats/:id/announcements` -- mirrors `/announce list`,
-/// though gated at this endpoint's own live-group-admin tier
-/// (`requireChatAccess`) rather than open to any chat member the way the
-/// command's own `list` subcommand is -- same accepted "web slightly
-/// stricter" simplification `chat_settings.digest_enabled` already has,
-/// and this section only ever renders inside the Groups per-chat settings
-/// page, which nothing but a group admin/bot admin/owner can reach in the
-/// first place.
+/// `GET /api/v1/chats/:id/announcements`.
 fn handleListAnnouncements(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
@@ -3946,20 +3510,12 @@ const CreateAnnouncementBody = struct {
 };
 
 /// `POST /api/v1/chats/:id/announcements` -- mirrors `/announce at`/
-/// `/announce every`. Same live-group-admin tier as
-/// `handleListAnnouncements`, matching `checkGroupAdminAccess`'s ceiling
-/// on the command side (no token-spend fallback there either). Unlike a
-/// bare `/announce <text>` (send now, pinned), this endpoint always
-/// schedules -- an immediate send-and-pin is a connector-backed action in
-/// Bot View's territory, not a settings-page create form; deliberately
-/// out of scope here, same as ROADMAP.md's Phase 16 entry says.
+/// `/announce every`.
 fn handleCreateAnnouncement(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const chat_id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid chat id");
     };
-    // Taken before the body read -- see `ChatAccess`. This used to call
-    // `resolveAuth` again after the body to learn the account id, which
-    // aborted the process on every call.
+    // Taken before the body read -- see `ChatAccess`.
     const access = (try requireChatAccessWithAuth(ctx, request, chat_id)) orelse return;
     const chat = access.chat;
     defer ctx.allocator.free(chat.native_chat_id);
@@ -3983,11 +3539,7 @@ fn handleCreateAnnouncement(ctx: *const ServerContext, request: *http.Server.Req
         return respondError(request, .bad_request, "bad_request", "message must be 1-1000 bytes");
     }
     if (body.recur_interval_seconds) |interval| {
-        // The upper bound matters as much as the lower one: `nextOccurrence`
-        // multiplies this by however many firings were missed, and an
-        // unbounded value used to overflow i64 there -- an abort in the
-        // scheduler, on a row that stayed due, so it repeated on every
-        // restart. See `reminder_format.max_schedule_seconds`.
+        // The upper bound matters as much as the lower one.
         if (interval <= 0 or interval > reminder_format.max_schedule_seconds) {
             return respondError(request, .bad_request, "bad_request", "recur_interval_seconds must be positive and at most 366 days");
         }
@@ -4014,9 +3566,6 @@ fn handleCreateAnnouncement(ctx: *const ServerContext, request: *http.Server.Req
 }
 
 /// `DELETE /api/v1/announcements/:id` -- mirrors `/announce cancel`.
-/// Gated at the *target chat's* live-group-admin tier, looked up from the
-/// row itself since the bare id doesn't say which chat it belongs to —
-/// same tier `checkGroupAdminAccess` gives the command.
 fn handleCancelAnnouncement(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const id = std.fmt.parseInt(i64, id_str, 10) catch {
         return respondError(request, .bad_request, "bad_request", "invalid announcement id");
@@ -4046,7 +3595,7 @@ fn handleCancelAnnouncement(ctx: *const ServerContext, request: *http.Server.Req
     return respondJson(ctx, request, .ok, .{});
 }
 
-// --- Alerts ---
+// --- Alerts.
 
 const CreateAlertBody = struct {
     chat_id: i64,
@@ -4112,9 +3661,7 @@ fn handleListAlerts(ctx: *const ServerContext, request: *http.Server.Request, ta
     return respondJson(ctx, request, .ok, .{ .items = out });
 }
 
-/// `POST /api/v1/alerts` -- see API.md. `currency` isn't accepted from the
-/// client, same as `/alert`: always `"usd"` for `crypto`, `null`
-/// otherwise (see `handleAlertCommand`).
+/// `POST /api/v1/alerts` -- see API.md.
 fn handleCreateAlert(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     if (!feature_flags.isEnabled(ctx.pool, "alerts")) {
@@ -4188,7 +3735,7 @@ fn handleCancelAlert(ctx: *const ServerContext, request: *http.Server.Request, i
     return respondJson(ctx, request, .ok, .{});
 }
 
-// --- Watches ---
+// --- Watches.
 
 const CreateWatchBody = struct {
     chat_id: i64,
@@ -4196,10 +3743,7 @@ const CreateWatchBody = struct {
     feed_url: []const u8,
 };
 
-/// `GET /api/v1/watches?chat_id=&identity_id=` -- same scoping rules as
-/// `handleListReminders`; note this shows watches *added by* the scoped
-/// identity, but (matching `/unwatch`) removing one isn't restricted to
-/// its adder -- see `handleDeleteWatch`.
+/// `GET /api/v1/watches?chat_id=&identity_id=`.
 fn handleListWatches(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
@@ -4260,8 +3804,7 @@ fn handleCreateWatch(ctx: *const ServerContext, request: *http.Server.Request) !
 }
 
 /// `DELETE /api/v1/watches/:id` -- open to anyone currently in the watch's
-/// chat, not restricted to whoever added it (mirrors `/unwatch`'s own
-/// authorization -- see `feed_watches.remove`'s doc comment).
+/// chat.
 fn handleDeleteWatch(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const id = std.fmt.parseInt(i64, id_str, 10) catch {
@@ -4302,10 +3845,8 @@ fn handleDeleteWatch(ctx: *const ServerContext, request: *http.Server.Request, i
     return respondJson(ctx, request, .ok, .{});
 }
 
-// --- Notes (Phase 11) -- same identity-scoped-by-default shape as
-// Reminders/Alerts/Watches above; deletion is creator-or-owner, same as
-// `/note delete` (`handleNoteCommand` in main.zig), not "anyone in the
-// chat" like Watches' removal is. ---
+// --- Notes -- same identity-scoped-by-default shape as
+// Reminders/Alerts/Watches above; deletion is creator-or-owner.
 
 const CreateNoteBody = struct {
     chat_id: i64,
@@ -4314,9 +3855,7 @@ const CreateNoteBody = struct {
 };
 
 /// `GET /api/v1/notes?chat_id=&identity_id=` -- same scoping rules as
-/// `handleListReminders`. Unlike the bot's own in-chat `/notes` (chat-scoped,
-/// every contributor's notes together), this is "my notes across every
-/// chat" by default -- see `notes_store.NoteForIdentity`'s doc comment.
+/// `handleListReminders`.
 fn handleListNotes(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
@@ -4379,9 +3918,7 @@ fn handleCreateNote(ctx: *const ServerContext, request: *http.Server.Request) !v
     return respondJson(ctx, request, .ok, .{ .id = id });
 }
 
-/// `DELETE /api/v1/notes/:id` -- same authorization as `/note delete`:
-/// whoever added it, or the bot owner (not bot_admin -- mirrors
-/// `handleNoteCommand`'s `auth.isOwner` check exactly).
+/// `DELETE /api/v1/notes/:id` -- same authorization as `/note delete`.
 fn handleDeleteNote(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const id = std.fmt.parseInt(i64, id_str, 10) catch {
@@ -4415,17 +3952,7 @@ fn handleDeleteNote(ctx: *const ServerContext, request: *http.Server.Request, id
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// `GET /api/v1/memory` -- mirrors `/memory list`. Strictly the caller's
-/// own identity, same as `/memory list` itself: unlike every other
-/// identity-scoped list endpoint in this file, there is deliberately
-/// **no** `?identity_id=` admin-override here. warden's own
-/// `MemoryToolAdapter.forgetFn` refuses even the bot owner permission to
-/// forget someone else's memory (`mem.identity_id != self.identity_id`,
-/// no `isOwner` fallback at all — see `main.zig`'s `/memory forget`
-/// handler) — a memory is a private fact about one person, not a shared
-/// chat record, and extending admin visibility to it over the web would
-/// be a real privacy regression beyond what the underlying feature
-/// intends, not just an inconsistency.
+/// `GET /api/v1/memory` -- mirrors `/memory list`.
 fn handleListMemory(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const identity_ids = callersIdentityIds(ctx, ra) catch |err| {
@@ -4445,10 +3972,7 @@ fn handleListMemory(ctx: *const ServerContext, request: *http.Server.Request) !v
     return respondJson(ctx, request, .ok, .{ .items = items });
 }
 
-/// `DELETE /api/v1/memory/:id` -- mirrors `/memory forget`. Same strict
-/// authorization as `MemoryToolAdapter.forgetFn`: only an identity linked
-/// to the caller's own account, never the bot owner acting on someone
-/// else's behalf (see `handleListMemory`'s doc comment for why).
+/// `DELETE /api/v1/memory/:id` -- mirrors `/memory forget`.
 fn handleDeleteMemory(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const id = std.fmt.parseInt(i64, id_str, 10) catch {
@@ -4481,18 +4005,9 @@ fn handleDeleteMemory(ctx: *const ServerContext, request: *http.Server.Request, 
     return respondJson(ctx, request, .ok, .{});
 }
 
-// --- Finance: expenses, budgets, subscriptions (ROADMAP.md Phase 17) ---
+// --- Finance: expenses, budgets, subscriptions.
 
-/// Percent-decodes a query-parameter value into `arena`. `queryParam`
-/// returns the raw, still-encoded slice; every caller written before this
-/// one only ever parsed integers out of it, where encoding can't matter,
-/// but the expense `category` filter is free text -- "eating out & drinks"
-/// arrives as `eating%20out%20%26%20drinks` and would match no row at all
-/// without this. `+` decodes to a space too, since form-encoded query
-/// strings still use it. Malformed escapes (a trailing `%`, non-hex
-/// digits) are passed through as literal characters rather than raising --
-/// a filter value is not worth failing a whole request over, and a
-/// nonsense category simply matches nothing.
+/// Percent-decodes a query-parameter value into `arena`.
 fn percentDecode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -4524,19 +4039,7 @@ fn percentDecode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
 }
 
 /// Chat-scoped *read* access, reused by the finance endpoints and
-/// `handleListKeywordAlerts`: true if the caller is a member of `chat_id`
-/// through any of their linked identities, or is owner/bot_admin. `false`
-/// means a response was already sent.
-///
-/// Deliberately **not** `requireChatAccess` -- that one means "live
-/// platform admin of this chat," the right bar for changing a chat's
-/// settings but the wrong one for reading a shared ledger every member can
-/// already see in-chat via `/expense summary`/`/budget list` (both of
-/// which are open to the whole chat; only *changing* a budget is
-/// owner-gated). Reuses the same `chat_members.isMember` primitive
-/// `resolveCreateIdentity` already authorizes finance *writes* with, so
-/// this is that existing check reused for reads, not a second
-/// authorization path.
+/// `handleListKeywordAlerts`.
 fn requireChatMember(ctx: *const ServerContext, request: *http.Server.Request, ra: RequesterAuth, chat_id: i64) !bool {
     const chat = (chats_store.getById(ctx.pool, ctx.allocator, chat_id) catch |err| {
         log.err("chat-member: failed to load chat {d}: {t}", .{ chat_id, err });
@@ -4563,12 +4066,7 @@ fn requireChatMember(ctx: *const ServerContext, request: *http.Server.Request, r
     return false;
 }
 
-/// Validates a client-supplied amount. Every finance amount crosses this
-/// API as an **integer cent count**, never a decimal string or float --
-/// the client does its own string -> cents conversion (see warden-ui's
-/// `parseAmountCents` in `src/lib/money.ts`) so that no float ever touches
-/// a money value on either side of the wire, which is the same standard
-/// ROADMAP.md Phase 17 held the bot-side code to.
+/// Validates a client-supplied amount.
 fn validAmountCents(cents: i64) bool {
     return cents > 0 and cents <= max_amount_cents;
 }
@@ -4609,10 +4107,7 @@ const CreateSubscriptionBody = struct {
     currency: ?[]const u8 = null,
 };
 
-/// `GET /api/v1/expenses?chat_id=&identity_id=&category=&since=&limit=` --
-/// same identity scoping as `handleListNotes` ("my spending across every
-/// chat" by default). Unlike the bot's own `/expense list`, which is
-/// chat-scoped and shows every contributor's entries together.
+/// `GET /api/v1/expenses?chat_id=&identity_id=&category=&since=&limit=`.
 fn handleListExpenses(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
@@ -4654,19 +4149,7 @@ fn handleListExpenses(ctx: *const ServerContext, request: *http.Server.Request, 
     return respondJson(ctx, request, .ok, .{ .items = items });
 }
 
-/// `GET /api/v1/expenses/summary?chat_id=&since=` -- chat-scoped totals by
-/// category cross-referenced against that chat's budgets, the web version
-/// of `/expense summary`. Chat-scoped (not identity-scoped like the list
-/// above) because a budget is chat-wide policy: "am I over budget" is only
-/// a meaningful question against the whole chat's spending, which is
-/// exactly what the bot's own summary reports.
-///
-/// `since` is required from the caller rather than defaulted to "this
-/// calendar month" server-side the way `/expense summary` does -- the
-/// month boundary depends on the viewer's UTC offset, which the frontend
-/// already knows from `GET /api/v1/me/settings`; guessing it here would
-/// silently report the wrong window for anyone not on UTC. Omitting it
-/// means all time.
+/// `GET /api/v1/expenses/summary?chat_id=&since=`.
 fn handleExpenseSummary(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
 
@@ -4722,10 +4205,7 @@ fn handleExpenseSummary(ctx: *const ServerContext, request: *http.Server.Request
             .over = if (budget_cents) |b| t.total_cents > b else false,
         });
     }
-    // Then any budget with no spending at all in this window -- `/budget
-    // list` shows these too, and dropping them would make a configured
-    // budget silently vanish from the panel until someone spends against
-    // it.
+    // Then any budget with no spending at all in this window.
     for (budget_rows) |b| {
         var already = false;
         for (totals) |t| {
@@ -4756,8 +4236,7 @@ fn handleExpenseSummary(ctx: *const ServerContext, request: *http.Server.Request
 }
 
 /// `POST /api/v1/expenses` -- mirrors `/expense add <amount> <category>
-/// [description]`, open to anyone in the chat (same
-/// `resolveCreateIdentity` authorization as reminders/alerts/notes).
+/// [description]`.
 fn handleCreateExpense(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     if (!feature_flags.isEnabled(ctx.pool, "finance")) {
@@ -4812,10 +4291,7 @@ fn handleCreateExpense(ctx: *const ServerContext, request: *http.Server.Request)
     return respondJson(ctx, request, .ok, .{ .id = id });
 }
 
-/// `DELETE /api/v1/expenses/:id` -- same authorization as `/expense
-/// delete`: whoever recorded it, or the bot owner (not bot_admin --
-/// mirrors `handleExpenseCommand`'s `auth.isOwner` check exactly, same as
-/// `handleDeleteNote`).
+/// `DELETE /api/v1/expenses/:id` -- same authorization as `/expense delete`.
 fn handleDeleteExpense(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const id = std.fmt.parseInt(i64, id_str, 10) catch {
@@ -4852,8 +4328,7 @@ fn handleDeleteExpense(ctx: *const ServerContext, request: *http.Server.Request,
 }
 
 /// `GET /api/v1/budgets?chat_id=` -- chat-scoped, readable by any member,
-/// exactly like the bot's own `/budget list`. No identity scoping at all:
-/// a budget is chat-wide policy, not a personal record.
+/// exactly like the bot's own `/budget list`.
 fn handleListBudgets(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
 
@@ -4876,13 +4351,7 @@ fn handleListBudgets(ctx: *const ServerContext, request: *http.Server.Request, t
 }
 
 /// `PUT /api/v1/budgets` -- upsert keyed by `(chat_id, category)`, mirroring
-/// `/budget set <category> <amount>`. `PUT`, not `POST`, because
-/// `budgets.set` is an upsert rather than a create: sending the same
-/// category twice replaces the amount instead of adding a second row.
-///
-/// **Owner only** -- `handleBudgetCommand` gates set/remove behind
-/// `auth.isOwner` (not bot_admin), since a budget is chat-wide policy in
-/// the same tier as a system-prompt override. Viewing stays open, above.
+/// `/budget set <category> <amount>`.
 fn handleSetBudget(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     if (!feature_flags.isEnabled(ctx.pool, "finance")) {
@@ -4913,9 +4382,7 @@ fn handleSetBudget(ctx: *const ServerContext, request: *http.Server.Request) !vo
     }
     const currency = (try resolveCurrency(request, body.currency)) orelse return;
 
-    // Owner-only above, so there's no membership question left to answer --
-    // but the chat still has to exist, or this would create a budget
-    // dangling off a nonexistent chat id.
+    // Owner-only above, so there's no membership question left to answer.
     if (!try requireChatMember(ctx, request, ra, body.chat_id)) return;
 
     const id = budgets_store.set(ctx.pool, body.chat_id, body.category, body.amount_cents, currency) catch |err| {
@@ -4929,8 +4396,6 @@ fn handleSetBudget(ctx: *const ServerContext, request: *http.Server.Request) !vo
 }
 
 /// `DELETE /api/v1/budgets/:id` -- owner only, same as `handleSetBudget`.
-/// Addressed by integer id rather than by category the way `/budget remove
-/// <category>` is; see `budgets.getById`'s doc comment for why.
 fn handleDeleteBudget(ctx: *const ServerContext, request: *http.Server.Request, id_str: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     if (!ra.roles.owner) {
@@ -4960,11 +4425,8 @@ fn handleDeleteBudget(ctx: *const ServerContext, request: *http.Server.Request, 
     return respondJson(ctx, request, .ok, .{});
 }
 
-/// `GET /api/v1/subscriptions?chat_id=&identity_id=` -- same identity
-/// scoping as `handleListNotes`. Each row carries `monthly_equivalent_cents`
-/// so the panel doesn't have to reimplement
-/// `subscriptions.monthlyEquivalentCents`'s 30-day-month normalization and
-/// risk drifting from what `/subscription list` reports in chat.
+/// `GET /api/v1/subscriptions?chat_id=&identity_id=` -- same identity scoping
+/// as `handleListNotes`.
 fn handleListSubscriptions(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
@@ -5021,12 +4483,8 @@ fn handleListSubscriptions(ctx: *const ServerContext, request: *http.Server.Requ
     });
 }
 
-/// `POST /api/v1/subscriptions` -- mirrors `/subscription add <name>
-/// <amount> every <interval>`. Takes `interval_days` as an integer rather
-/// than the bot's `1mo`/`2w` shorthand: `parseIntervalDays` lives in
-/// `main.zig` (which imports this file, so importing it back would be
-/// circular), and a picker in the panel is a better fit for the web than
-/// re-parsing a shorthand string here.
+/// `POST /api/v1/subscriptions` -- mirrors `/subscription add <name> <amount>
+/// every <interval>`.
 fn handleCreateSubscription(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
     if (!feature_flags.isEnabled(ctx.pool, "finance")) {
@@ -5052,9 +4510,6 @@ fn handleCreateSubscription(ctx: *const ServerContext, request: *http.Server.Req
     if (body.name.len == 0 or body.name.len > max_subscription_name_len) {
         return respondError(request, .bad_request, "bad_request", "name must be 1-128 bytes");
     }
-    // Upper bound mirrors `parseIntervalDays`'s own reachable maximum
-    // (`/subscription add ... every 100y`-scale input) while keeping
-    // `monthlyEquivalentCents`'s `amount_cents * 30` division safe.
     if (body.interval_days <= 0 or body.interval_days > 36_500) {
         return respondError(request, .bad_request, "bad_request", "interval_days must be between 1 and 36500");
     }
@@ -5135,21 +4590,7 @@ test "percentDecode handles escapes, plus-as-space, and passes malformed escapes
 }
 
 /// `user_agent` must have been captured by the caller *before* it read the
-/// request body (if any) — `findHeader`/`iterateHeaders` requires the
-/// request reader to still be in its post-head, pre-body state; calling it
-/// from here (after callers like `handleDevLogin` already read the body)
-/// crashed with `assertion failure` in `std.http.Server.Request.iterateHeaders`
-/// (found 2026-07-28, in a local full-DB test run — not the pre-existing
-/// http_util.zig flake, a real bug in this file, fixed by moving capture
-/// earlier in every caller instead of doing it here).
-///
-/// Returns the `Set-Cookie` header value for the new session, or `null` if
-/// minting failed (a response has NOT been sent in that case — every
-/// caller must still send one). Shared core of `issueSessionAndRespond`
-/// (a JSON body, for the widget's `fetch()`-driven login) and
-/// `issueSessionAndRedirect` (a 302, for a browser-navigation login like
-/// the OIDC callback) — both mint the exact same kind of session, they
-/// just need to hand it back to the browser two different ways.
+/// request body (if any).
 fn mintSessionCookie(ctx: *const ServerContext, account_id: i64, user_agent: ?[]const u8) !?[]const u8 {
     const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
     const expires_at = now + 30 * 24 * 3600; // 30 days
@@ -5161,9 +4602,8 @@ fn mintSessionCookie(ctx: *const ServerContext, account_id: i64, user_agent: ?[]
     audit_log.record(ctx.pool, account_id, null, "auth.login", null, null);
 
     const secret = ctx.config.api_session_secret orelse {
-        // Unreachable in practice: `Config.load` refuses to start the API
-        // at all without this set (see config.zig) — this branch exists
-        // only so the type system doesn't need an artificial `.?`.
+        // Unreachable in practice: `Config.load` refuses to start the API at all
+        // without this set (see config.zig).
         return null;
     };
     const token = auth.sign(ctx.allocator, session_id, secret) catch return null;
@@ -5195,9 +4635,7 @@ fn issueSessionAndRespond(ctx: *const ServerContext, request: *http.Server.Reque
 }
 
 /// The OIDC callback's sibling to `issueSessionAndRespond`: the browser
-/// itself navigated here (following the provider's redirect), so the
-/// response is a 302 back into the app, not a JSON body for a `fetch()`
-/// caller to parse.
+/// itself navigated here (following the provider's redirect).
 fn issueSessionAndRedirect(ctx: *const ServerContext, request: *http.Server.Request, account_id: i64, user_agent: ?[]const u8, location: []const u8) !void {
     const cookie_value = (try mintSessionCookie(ctx, account_id, user_agent)) orelse {
         return respondError(request, .internal_server_error, "internal", "failed to create session");
@@ -5214,27 +4652,15 @@ fn issueSessionAndRedirect(ctx: *const ServerContext, request: *http.Server.Requ
 }
 
 // ---------------------------------------------------------------------------
-// Generic OIDC login (`oauth_providers`, `oidc.zig`) — Authorization Code
-// + PKCE against a provider stored in `oauth_providers`. The in-flight
-// flow's PKCE verifier and anti-CSRF state travel in a short-lived,
-// HMAC-signed cookie (`oidc_pkce_cookie_name`) between `.../start` and
-// `.../callback` — no server-side session-in-progress table needed, same
-// "we're the only ones who need to trust this" reasoning as
-// `api/auth.zig`'s session token signing.
-// ---------------------------------------------------------------------------
+// Generic OIDC login (`oauth_providers`, `oidc.zig`).
 
 const oidc_pkce_cookie_name = "warden_oidc_pkce";
-/// How long the PKCE cookie survives — generous for a real login flow
-/// (Telegram's own authorization page, a user reading/approving it) but
-/// still short enough that a leaked/replayed cookie is only ever a
-/// narrow window.
+/// How long the PKCE cookie survives.
 const oidc_flow_max_age_seconds: i64 = 600;
 
 /// Packs `provider_id:state:verifier` and HMAC-signs it — same
 /// `<payload>.<base64url(HMAC-SHA256)>` shape as `api/auth.zig`'s session
-/// tokens. `state`/`verifier` are themselves base64url (see `oidc.zig`'s
-/// `generateState`/`generateVerifier`), so they can never contain `:` —
-/// safe to split the payload on that character with no escaping needed.
+/// tokens.
 fn signOidcFlowCookie(allocator: std.mem.Allocator, provider_id: i64, state: []const u8, verifier: []const u8, secret: []const u8) ![]const u8 {
     const payload = try std.fmt.allocPrint(allocator, "{d}:{s}:{s}", .{ provider_id, state, verifier });
 
@@ -5276,21 +4702,13 @@ fn verifyOidcFlowCookie(cookie_value: []const u8, secret: []const u8) ?OidcFlowS
     return .{ .provider_id = provider_id, .state = state, .verifier = verifier };
 }
 
-/// Our own callback URL for `provider_id` — reconstructed from the
-/// inbound request's own `Host` header (trusted: production is one
-/// reverse-proxied domain terminating TLS in front of this process, see
-/// ARCHITECTURE.md §2) rather than a hardcoded config value, so this
-/// works unmodified behind whatever domain Traefik/the proxy is actually
-/// serving. Always `https://` — a provider's "Allowed URLs" registration
-/// (BotFather, for Telegram) only ever lists the real production origin.
+/// Our own callback URL for `provider_id` — reconstructed from the inbound
+/// request's own `Host` header.
 fn oidcRedirectUri(allocator: std.mem.Allocator, host: []const u8, provider_id: i64) ![]const u8 {
     return std.fmt.allocPrint(allocator, "https://{s}/api/v1/auth/oidc/{d}/callback", .{ host, provider_id });
 }
 
-/// `GET /api/v1/auth/oidc/:providerId/start` — see API.md. Looks up the
-/// provider, fetches its OIDC discovery document, generates a fresh PKCE
-/// verifier/challenge and anti-CSRF state, stashes them in a signed
-/// cookie, and 302s the browser to the provider's own authorization page.
+/// `GET /api/v1/auth/oidc/:providerId/start` — see API.md.
 fn handleOidcStart(ctx: *const ServerContext, request: *http.Server.Request, provider_id_str: []const u8) !void {
     if (!try checkRateLimit(ctx, request, ctx.auth_limiter, "oidc-start")) return;
     const host = findHeader(request, "host") orelse {
@@ -5355,30 +4773,11 @@ fn handleOidcStart(ctx: *const ServerContext, request: *http.Server.Request, pro
     });
 }
 
-/// `GET /api/v1/auth/oidc/:providerId/callback` — see API.md. Verifies
-/// the PKCE cookie set by `.../start` (signature, provider match, `state`
-/// match against the query param), exchanges `code` at the provider's
-/// token endpoint, verifies the returned `id_token` against the
-/// provider's own JWKS (`oidc.verifyIdToken` — ES256 only, see that
-/// file's module doc comment), then resolves/creates an account exactly
-/// like the Telegram widget does.
-///
-/// Telegram-issuer special case: Telegram's own OIDC provider shares the
-/// *same* user-id space as the bot platform itself (the `id` claim IS a
-/// real Telegram user id) — so a login through this provider resolves to
-/// a real `.telegram` identity, the same row the widget or the bot itself
-/// would use for that person, not a separate "web-only" identity. A
-/// genuinely external IdP (Google, some other org's SSO) has no
-/// corresponding bot platform to map onto and would need the account-
-/// *linking* path (`POST /api/v1/auth/link/:method/start` in API.md's
-/// sketch) instead — not implemented yet, and out of scope for what this
-/// provider needs, so this handler refuses any issuer it doesn't
-/// recognize rather than guessing.
+/// `GET /api/v1/auth/oidc/:providerId/callback` — see API.md.
 fn handleOidcCallback(ctx: *const ServerContext, request: *http.Server.Request, provider_id_str: []const u8, target: []const u8) !void {
     if (!try checkRateLimit(ctx, request, ctx.auth_limiter, "oidc-callback")) return;
-    // Must happen before any body-touching call -- none needed for this
-    // GET, but captured up front anyway to match the established
-    // convention (see `issueSessionAndRespond`'s doc comment).
+    // Must happen before any body-touching call -- none needed for this GET, but
+    // captured up front anyway to match the established convention.
     const user_agent = findHeader(request, "user-agent");
     const host = findHeader(request, "host") orelse {
         return respondError(request, .bad_request, "bad_request", "missing host header");
@@ -5424,8 +4823,6 @@ fn handleOidcCallback(ctx: *const ServerContext, request: *http.Server.Request, 
     if (!provider.enabled) {
         return respondError(request, .not_found, "not_found", "no such provider");
     }
-    // See this function's doc comment -- only Telegram's own OIDC issuer
-    // is understood right now.
     if (std.mem.indexOf(u8, provider.issuer_url, "telegram") == null) {
         log.err("oidc-callback: provider {d} has an unsupported (non-Telegram) issuer {s}", .{ provider_id, provider.issuer_url });
         return respondError(request, .internal_server_error, "internal", "this login provider isn't supported yet");
@@ -5488,10 +4885,6 @@ fn handleOidcCallback(ctx: *const ServerContext, request: *http.Server.Request, 
     return issueSessionAndRedirect(ctx, request, account_id, user_agent, "/");
 }
 
-// ---------------------------------------------------------------------------
-// Session resolution
-// ---------------------------------------------------------------------------
-
 fn resolveAuth(ctx: *const ServerContext, request: *http.Server.Request) RequestAuth {
     const secret = ctx.config.api_session_secret orelse return .{ .account_id = null };
     const token = findCookie(request, auth.cookie_name) orelse return .{ .account_id = null };
@@ -5501,11 +4894,8 @@ fn resolveAuth(ctx: *const ServerContext, request: *http.Server.Request) Request
     return .{ .account_id = session.account_id, .session_id = session_id };
 }
 
-/// Scans the request's `Cookie` header(s) for `name=value`, returning the
-/// raw value (not yet URL-decoded — session tokens here are already
-/// URL-safe base64 plus digits/a dot, so decoding was never needed). Thin
-/// wrapper around `parseCookieValue` (split out so the actual parsing
-/// logic is unit-testable without needing a real `http.Server.Request`).
+/// Scans the request's `Cookie` header(s) for `name=value`, returning the raw
+/// value.
 fn findCookie(request: *http.Server.Request, name: []const u8) ?[]const u8 {
     var it = request.iterateHeaders();
     while (it.next()) |header| {
@@ -5515,11 +4905,7 @@ fn findCookie(request: *http.Server.Request, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// First matching header value, or `null`. Used for `User-Agent` when
-/// minting a session (see `issueSessionAndRespond`) — IP isn't captured
-/// yet since the real client IP behind the eventual reverse proxy needs
-/// `X-Forwarded-For` handling, deferred to `ROADMAP.md` Phase 7 rather
-/// than recording the proxy's own address as if it were the client's.
+/// First matching header value, or `null`.
 fn findHeader(request: *http.Server.Request, name: []const u8) ?[]const u8 {
     var it = request.iterateHeaders();
     while (it.next()) |header| {
@@ -5556,10 +4942,7 @@ test "parseCookieValue handles a single cookie, extra whitespace, and an empty h
 }
 
 /// Minimal `Connector` stub for `isLiveAdminOfChat`, same shape as
-/// `auth.zig`'s own `StubConnector` (kept separate rather than shared —
-/// this file has no existing dependency on `auth.zig`'s test internals,
-/// and duplicating ~15 lines here is cheaper than exporting a test-only
-/// type across files for one caller).
+/// `auth.zig`'s own `StubConnector`.
 const StubConnector = struct {
     is_group_admin: bool = false,
 
@@ -5628,9 +5011,7 @@ test "isLiveAdminOfChat: true only when the matching platform's connector confir
         const ctx = ServerContext{ .allocator = a, .io = testing.io, .pool = &pool, .config = &config, .connectors = &connectors };
         try testing.expect(!isLiveAdminOfChat(&ctx, &.{telegram_identity}, chat));
     }
-    // Identity is on a different platform than the chat -- skipped, not
-    // matched, even though the stub connector (matched by platform in the
-    // slice below) would say "true" if consulted at all.
+    // Identity is on a different platform than the chat -- skipped.
     {
         var connectors = [_]iface.Connector{admin_stub.connector()};
         const ctx = ServerContext{ .allocator = a, .io = testing.io, .pool = &pool, .config = &config, .connectors = &connectors };
@@ -5716,10 +5097,6 @@ test "defaultForKnownKey formats every known key's env-sourced default" {
     }
 }
 
-// ---------------------------------------------------------------------------
-// JSON helpers
-// ---------------------------------------------------------------------------
-
 fn respondJson(ctx: *const ServerContext, request: *http.Server.Request, status: http.Status, value: anytype) !void {
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, value, .{});
     defer ctx.allocator.free(body);
@@ -5741,11 +5118,8 @@ fn respondError(request: *http.Server.Request, status: http.Status, code: []cons
     });
 }
 
-/// `true` if `key` is under `limiter`'s budget (and this call counts
-/// toward it) -- `false` means a `429` was already sent and the caller
-/// should return immediately. `limiter == null` (every test that doesn't
-/// specifically exercise rate limiting, see `ServerContext.auth_limiter`'s
-/// doc comment) always allows.
+/// `true` if `key` is under `limiter`'s budget (and this call counts toward
+/// it).
 fn checkRateLimit(ctx: *const ServerContext, request: *http.Server.Request, limiter: ?*rate_limit.Limiter, key: []const u8) !bool {
     const l = limiter orelse return true;
     const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
@@ -5754,18 +5128,7 @@ fn checkRateLimit(ctx: *const ServerContext, request: *http.Server.Request, limi
     return false;
 }
 
-/// Reads and parses the full request body as JSON `T` — fine for the
-/// small control-plane payloads this API deals with (nothing here is a
-/// large file upload; Convert's multipart handling will need its own
-/// streaming path when Phase 5c gets built, not this).
-///
-/// CAUTION: only safe for `T`s made entirely of value types (ints, bools,
-/// enums) — the parsed result is returned *after* `parsed.deinit()` frees
-/// the arena backing any `[]const u8`/nested-allocation fields, so a `T`
-/// with a string field would return a dangling slice. None of Phase 0's
-/// bodies need strings yet; the first caller that does must switch to
-/// `std.json.parseFromSliceLeaky` with its own caller-supplied arena
-/// instead of reaching for this helper unchanged.
+/// Reads and parses the full request body as JSON `T`.
 fn readJsonBody(ctx: *const ServerContext, request: *http.Server.Request, comptime T: type) !T {
     var buf: [16 * 1024]u8 = undefined;
     const reader = request.readerExpectNone(&buf);

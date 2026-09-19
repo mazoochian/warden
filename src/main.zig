@@ -5,13 +5,7 @@ const logging = @import("log.zig");
 const log = logging.scoped("main");
 
 /// `log_level` is left permissive (`.debug`) so `std.log`'s own comptime
-/// filter never intercepts a message before it reaches `logging.stdLogFn` —
-/// filtering by `WARDEN_LOG_LEVEL` happens once, at runtime, inside
-/// `log.zig` itself (see its module doc for why: `std.options.log_level` is
-/// a comptime value, so it can't respond to an env var on its own). This
-/// also means every pre-existing `std.log.err`/`.warn`/`.info`/`.debug` call
-/// site elsewhere in the codebase (not yet migrated to `log.zig`'s own
-/// `scoped()`) still renders through the same tabular formatter.
+/// filter never intercepts a message before it reaches `logging.stdLogFn`.
 pub const std_options: std.Options = .{
     .log_level = .debug,
     .logFn = logging.stdLogFn,
@@ -129,19 +123,18 @@ const base_tools = [_]tool_registry.ToolDef{
     @import("tools/get_bulletin.zig").tool,
 };
 const web_search_tool = @import("tools/web_search.zig").tool;
-// Same "only join the tool list when configured" reasoning as
-// `web_search_tool` above -- see `Config.delegates`'s doc comment.
+// Only join the tool list when configured, like `web_search_tool` above.
 const ask_delegate_tool = @import("tools/ask_delegate.zig").tool;
 const delegate_generate_image_tool = @import("tools/delegate_generate_image.zig").tool;
 
 /// Published via `Connector.setCommands` at startup so commands show up in
 /// the platform's own UI (Telegram's "/" autocomplete / attachment menu)
-/// instead of only working for people who already know the exact text to
-/// type — see `handleHelp`/`help_text` below for the fuller reference,
-/// including the owner/bot-admin-only `/scraper /blockuser /unblockuser
-/// /blockchat /unblockchat /addadmin /removeadmin /sudo /storage`
-/// deliberately left out of this public menu (see their own dispatch-table
-/// gates in `handleMessage`).
+/// instead of only working for people who already know the exact text to type
+/// — see `handleHelp`/`help_text` below for the fuller reference, including
+/// the owner/bot-admin-only `/scraper /blockuser /unblockuser /blockchat
+/// /unblockchat /addadmin /removeadmin /sudo /storage` deliberately left out
+/// of this public menu (see their own dispatch-table gates in
+/// `handleMessage`).
 const public_commands = [_]iface.CommandSpec{
     .{ .name = "help", .description = "Show available commands and how to talk to Warden." },
     .{ .name = "menu", .description = "Open a button-driven menu of every module (alerts, watches, stats, admin, settings, help)." },
@@ -210,13 +203,8 @@ const public_commands = [_]iface.CommandSpec{
     .{ .name = "as", .description = "<chat id> <command> -- run an admin command against a chat you're an admin of; the reply comes back here. Admins only." },
 };
 
-/// Commands deliberately left out of `public_commands` (see its own doc
-/// comment) but still reserved -- an alias must never shadow one of these
-/// either. Every name the dispatch chain in `handleMessage` matches on
-/// belongs in one list or the other: the personal-account and draft
-/// commands below were missing for a while, which let any allowed user
-/// `/alias add sendas ...` in a chat and have the owner's own later
-/// `/sendas` there expand into text of the aliaser's choosing.
+/// Commands deliberately left out of `public_commands` but still reserved --
+/// an alias must never shadow one of these either.
 const reserved_command_names_extra = [_][]const u8{
     "scraper",  "blockuser",   "unblockuser", "blockchat",  "unblockchat",
     "addadmin", "removeadmin", "sudo",        "storage",    "feed",
@@ -226,9 +214,7 @@ const reserved_command_names_extra = [_][]const u8{
 };
 
 /// True if `name` (no leading slash) is a real built-in command -- checked
-/// case-insensitively, same as `normalizeCommandMention`'s own qualifier
-/// matching. `/alias add`/`/alias`'s expansion-lookup step both use this:
-/// an alias may never shadow a real command (ROADMAP.md's Phase 19).
+/// case-insensitively.
 fn isReservedCommandName(name: []const u8) bool {
     for (public_commands) |c| {
         if (std.ascii.eqlIgnoreCase(c.name, name)) return true;
@@ -256,10 +242,7 @@ test "isReservedCommandName covers both the public menu and the owner-only extra
 }
 
 /// `/help`'s reply — kept as a single static string (matches `reply()`'s
-/// `comptime txt` parameter) rather than built from `public_commands`, since
-/// it also covers the owner-only commands deliberately left out of that
-/// public menu, group-chat-only commands, and the free-form LLM path, none
-/// of which fit `CommandSpec`'s flat name/description shape.
+/// `comptime txt` parameter) rather than built from `public_commands`.
 const help_text =
     \\I'm Warden. Talk to me by mentioning me, replying, or (in a group)
     \\saying this chat's magic word -- see /magicword. Ask anything and
@@ -319,14 +302,6 @@ const help_text =
 ;
 
 /// The second half of `/help`, sent as its own message.
-///
-/// Splitting was forced rather than chosen: the combined text crossed
-/// Telegram's 4096-byte cap when `/as` was added (ROADMAP.md's Phase 9
-/// slice 2), and shaving bytes off entries would only have moved the
-/// ceiling a few commands further out. The split point is where the
-/// audience changes -- everything above is for whoever is using the bot,
-/// everything here is moderation, trust and operations -- so each message
-/// is coherent on its own rather than being an arbitrary cut at N bytes.
 const help_text_admin =
     \\Group moderation (chat admins only, most by replying to a message)
     \\/mute, /unmute, /pin, /unpin, /delete -- reply to the target
@@ -381,12 +356,7 @@ const help_text_admin =
     \\  drop a drafted reply (reply_autonomy = draft)
 ;
 
-/// Sends `/help` as two messages (see `help_text_admin`), appending a note
-/// about the `/command@botusername` qualified form (see
-/// `normalizeCommandMention`) to the second one using this connector's
-/// *actual* username when known, rather than baking a guessed example into
-/// the static text — relevant mainly when two bot instances share one group
-/// chat.
+/// Sends `/help` as two messages.
 fn handleHelp(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message) void {
     reply(connector, a, msg.chat_id, msg.message_id, help_text);
 
@@ -403,9 +373,8 @@ fn handleHelp(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Messa
 }
 
 test "each /help message stays under Telegram's 4096-byte cap" {
-    // A Telegram username is at most 32 bytes, so 200 bytes of slack is
-    // generous for the "Sharing this group..." suffix `handleHelp` appends
-    // to the second message.
+    // A Telegram username is at most 32 bytes, so 200 bytes of slack is generous
+    // for the "Sharing this group...
     try std.testing.expect(help_text.len < 4096);
     try std.testing.expect(help_text_admin.len < 4096 - 200);
 }
@@ -414,19 +383,11 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    // As early as possible — before the healthcheck branch, before config
-    // load — so every log line from here on (including config-load
-    // failures) has a real timestamp and respects `WARDEN_LOG_LEVEL`.
+    // As early as possible — before the healthcheck branch, before config load.
     logging.init(io, init.environ_map);
 
     // Docker's `HEALTHCHECK` (see `Dockerfile`) spawns this same binary as a
-    // brand-new process on a timer rather than reaching into the running
-    // one — there was previously no liveness signal at all, so a fully
-    // wedged-but-still-running process (see `PgPool`'s and `WorkerPool`'s
-    // doc comments for how that happened in production) looked identical to
-    // a healthy one from `docker ps`'s point of view. Checked before
-    // anything else (config load included) so a healthcheck probe never
-    // waits on, or fails because of, the bot's own startup dependencies.
+    // brand-new process on a timer rather than reaching into the running one.
     if (wantsHealthcheck(init.minimal.args)) runHealthcheck(gpa, io, init.environ_map);
 
     const config = config_mod.Config.load(init.environ_map, init.arena.allocator(), io) catch |err| {
@@ -434,12 +395,8 @@ pub fn main(init: std.process.Init) !void {
     };
     log.notice("log level = {s} (set WARDEN_LOG_LEVEL to change)", .{@tagName(logging.currentLevel())});
 
-    // Every configured delegate (see `Config.delegates`) gets its own
-    // always-on `llm.Provider` instance -- heap-allocated, process-lifetime
-    // singletons, same shape as `anthropic_provider`/`openai_provider`
-    // below, but never subject to `WARDEN_LLM_PROVIDER`'s hot-swap: a
-    // delegate is a fixed, explicitly-named target the model asks for by
-    // name, not "whichever provider is currently active".
+    // Every configured delegate (see `Config.delegates`) gets its own always-on
+    // `llm.Provider` instance -- heap-allocated, process-lifetime singletons.
     const delegates_buf = try gpa.alloc(delegates_mod.Delegate, config.delegates.len);
     for (config.delegates, 0..) |dc, i| {
         const delegate_provider: llm.Provider = switch (dc.kind) {
@@ -463,9 +420,8 @@ pub fn main(init: std.process.Init) !void {
     }
     const active_delegates: []const delegates_mod.Delegate = delegates_buf;
 
-    // web_search/ask_delegate/delegate_generate_image only join the tool
-    // list when their backend is actually configured, so the model never
-    // sees a tool that's guaranteed to fail.
+    // Web_search/ask_delegate/delegate_generate_image only join the tool list
+    // when their backend is actually configured.
     var tools_buf: [base_tools.len + 3]tool_registry.ToolDef = undefined;
     @memcpy(tools_buf[0..base_tools.len], &base_tools);
     var tools_len: usize = base_tools.len;
@@ -495,9 +451,7 @@ pub fn main(init: std.process.Init) !void {
     defer telegram_adapter.deinit();
 
     // Matrix only joins the active connector list when configured (see
-    // `config.zig`'s `matrix` field) — `matrix_adapter` lives in `main`'s own
-    // stack frame for the whole run, so `&matrix_adapter.?` below stays valid
-    // for as long as its `Connector` does.
+    // `config.zig`'s `matrix` field).
     var matrix_adapter: ?matrix_platform.MatrixConnector = if (config.matrix) |mc|
         matrix_platform.MatrixConnector.init(gpa, io, mc.homeserver_url, mc.access_token)
     else
@@ -515,24 +469,12 @@ pub fn main(init: std.process.Init) !void {
         null;
     defer if (xmpp_adapter) |*x| x.deinit();
 
-    // Same shape as Matrix/XMPP above. Unlike them, there's no `deinit()`
-    // to call on a clean shutdown — TDLib persists its own session state to
-    // `session_dir` as it goes (that's the whole point: a later process
-    // restart pointed at the same directory reaches `authorizationStateReady`
-    // again with no re-login), so there's nothing this process needs to
-    // flush on exit.
     var telegram_user_adapter: ?telegram_user_platform.TelegramUserConnector = if (config.telegram_user) |tc|
         telegram_user_platform.TelegramUserConnector.init(gpa, io, tc.api_id, tc.api_hash, tc.session_dir)
     else
         null;
 
-    // Hoisted above `connectors_buf` (it lived after it, right before the
-    // Matrix E2EE setup below, until this connector needed it earlier too)
-    // since this is the first connector that needs the Postgres pool
-    // already at construction time (session/device-profile persistence,
-    // see `platform/instagram/session.zig`) -- nothing between here and its old
-    // location actually depended on connector construction happening
-    // first.
+    // Hoisted above `connectors_buf`.
     var pool = store_pool.PgPool.init(
         gpa,
         io,
@@ -587,11 +529,8 @@ pub fn main(init: std.process.Init) !void {
     const connectors: []const iface.Connector = connectors_buf[0..connectors_len];
     const max_message_len = effectiveMaxMessageLength(connectors);
 
-    // Device key creation/upload plus ongoing encrypt/decrypt for Matrix
-    // E2E encryption (see src/platform/matrix/olm.zig,
-    // src/platform/matrix/crypto.zig, ROADMAP.md's Phase 2b) — only active
-    // when `WARDEN_MATRIX_PICKLE_KEY` is set; a failure here is logged, not
-    // fatal, since plaintext-room Matrix functionality doesn't depend on it.
+    // Device key creation/upload plus ongoing encrypt/decrypt for Matrix E2E
+    // encryption.
     if (matrix_adapter) |*m| {
         if (config.matrix_pickle_key) |pickle_key| {
             m.enableCrypto(gpa, io, &pool, pickle_key) catch |err| {
@@ -603,10 +542,7 @@ pub fn main(init: std.process.Init) !void {
     var pending_confirmations = group_admin.PendingConfirmations.init(gpa, io, config.confirm_timeout_seconds);
     defer pending_confirmations.deinit();
 
-    // 24h, not `config.confirm_timeout_seconds` -- reaching for an audit-log
-    // undo well after the fact is a reasonable thing to want, unlike a
-    // ban/kick confirmation where seconds matter. See `audit_notify.
-    // PendingUndos`'s own doc comment.
+    // 24h, not `config.confirm_timeout_seconds`.
     var pending_undos = audit_notify.PendingUndos.init(gpa, io, 24 * 3600);
     defer pending_undos.deinit();
 
@@ -624,47 +560,26 @@ pub fn main(init: std.process.Init) !void {
     var menu_sessions = menu.Sessions.init(gpa, io, config.menu_timeout_seconds);
     defer menu_sessions.deinit();
 
-    // 10 minutes: a purely defensive backstop (normal flow always
-    // unregisters itself via `replyWithAnswer`'s own cleanup, well before
-    // this) — see `cancel_request.InFlightRequests`'s doc comment.
+    // 10 minutes: a purely defensive backstop (normal flow always unregisters
+    // itself via `replyWithAnswer`'s own cleanup, well before this).
     var in_flight_requests = cancel_request.InFlightRequests.init(gpa, io, 600);
     defer in_flight_requests.deinit();
 
-    // Phase D of the plan sent to the owner: `reply_autonomy = .draft`
-    // drafts a reply through the personal-account connector but holds it
-    // here instead of sending it, until `/approve`/`/discard` (see
-    // `handleApproveCommand`/`handleDiscardCommand`). 24h, same "reasonable
-    // to reach for well after the fact" reasoning as `pending_undos` above
-    // — unlike a ban/kick confirmation, replying to a text a few hours
-    // later is completely normal for a personal account. Backed by the
-    // `reply_drafts` table rather than memory precisely because of that
-    // window: a restart or deploy inside it used to silently drop every
-    // pending draft the owner had been notified about (see
-    // `reply_drafts.PendingDrafts`'s doc comment).
+    // `reply_autonomy = .draft` drafts a reply through the personal-account
+    // connector but holds it here instead of sending it, until
+    // `/approve`/`/discard`.
     var pending_drafts = reply_drafts.PendingDrafts.init(&pool, 24 * 3600);
 
     var bot_view_broadcaster = bot_view.Broadcaster.init(gpa, io);
     defer bot_view_broadcaster.deinit();
 
-    // Phase 7 hardening -- see `rate_limit.zig`'s doc comment. Generous
-    // limits (this stops naive flooding, not determined abuse from many
-    // IPs, since there's no per-IP key yet): 20 auth-flow attempts/min is
-    // well above any legitimate login retry pattern, 10 bot-view sends/min
-    // per account is well above any legitimate human typing speed for
-    // "reply as the bot" messages.
     var auth_limiter = rate_limit.Limiter.init(gpa, io, 20, 60);
     defer auth_limiter.deinit();
     var bot_view_send_limiter = rate_limit.Limiter.init(gpa, io, 10, 60);
     defer bot_view_send_limiter.deinit();
 
-    // Heap-allocated, process-lifetime singletons -- fine to leave for the
-    // OS to reclaim on exit rather than threading a deinit through here.
-    // Unlike before `WARDEN_LLM_PROVIDER` became hot-swappable, *both*
-    // providers get constructed whenever both have credentials (not just
-    // whichever `config.llm` selected as the startup default) -- see
-    // `config.zig`'s `Config.llm_anthropic`/`Config.llm_openai_compat`
-    // doc comments for why, and `llm/dynamic_provider.zig` for the
-    // wrapper that actually does the per-call re-resolution.
+    // Heap-allocated, process-lifetime singletons -- fine to leave for the OS to
+    // reclaim on exit rather than threading a deinit through here.
     var anthropic_provider: ?llm.Provider = null;
     if (config.llm_anthropic) |a| {
         const p = try gpa.create(AnthropicProvider);
@@ -677,11 +592,8 @@ pub fn main(init: std.process.Init) !void {
         p.* = OpenAiCompatProvider.init(gpa, io, o.base_url, o.api_key, o.model);
         openai_provider = p.provider();
     }
-    // `Config.load` already guarantees at least one of the two above
-    // exists (same "fails if neither is configured" contract as before
-    // this refactor) -- `config.llm`'s active tag tells us which one to
-    // treat as the fallback/default, and it's always the one that was
-    // just constructed for that tag, never null here.
+    // `Config.load` already guarantees at least one of the two above exists (same
+    // "fails if neither is configured" contract as before this refactor).
     const default_provider_name: []const u8 = if (config.llm == .openai_compat) "openai_compat" else "anthropic";
     const fallback_provider = if (config.llm == .openai_compat) openai_provider.? else anthropic_provider.?;
 
@@ -696,29 +608,20 @@ pub fn main(init: std.process.Init) !void {
     const llm_provider: llm.Provider = dynamic_provider.provider();
 
     // Same "heap-allocated, process-lifetime singleton" shape as the LLM
-    // providers above -- null when `WARDEN_EMBEDDINGS_URL` isn't set,
-    // which every downstream consumer (the `remember_memory` tool,
-    // `qa.zig`'s retrieval step) treats as "the memory feature is off"
-    // rather than an error.
+    // providers above -- null when `WARDEN_EMBEDDINGS_URL` isn't set.
     var embeddings_client: ?*embeddings.EmbeddingsClient = null;
     if (config.embeddings_url) |url| {
         const ec = try gpa.create(embeddings.EmbeddingsClient);
         ec.* = embeddings.EmbeddingsClient.init(gpa, io, url, config.embeddings_api_key, config.embeddings_model);
         embeddings_client = ec;
     } else {
-        // Say so out loud. Memory works either way now, but which mode it's
-        // in is otherwise invisible, and the previous behaviour here
-        // (no endpoint => the remember_memory tool silently not existing)
-        // was undiagnosable from the outside: the model would agree to
-        // remember something and nothing was ever stored.
         log.info("memory: WARDEN_EMBEDDINGS_URL isn't set — long-term memory still records and recalls facts, ranked by keyword/recency/salience; semantic (meaning-based) recall is off until an embeddings endpoint is configured", .{});
     }
 
     log.info("warden started, {d} connector(s), {d} owner(s) configured", .{ connectors.len, config.owners.len });
 
-    // Best-effort: a platform without the concept (or a transient API
-    // failure) just means commands don't autocomplete, not a startup
-    // failure — the commands themselves work regardless via `handleMessage`.
+    // Best-effort: a platform without the concept (or a transient API failure)
+    // just means commands don't autocomplete, not a startup failure.
     for (connectors) |connector| {
         connector.setCommands(gpa, &public_commands) catch |err| {
             if (err != error.Unsupported) {
@@ -727,85 +630,25 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    // One timestamp per connector (last successful `poll()` return) plus
-    // one for `main`'s own scheduler loop below — the only cross-process
-    // liveness signal that exists (see `runHealthcheck`/`selfWatchdogLoop`).
-    // Sized/allocated before any poll loop starts so every connector has a
-    // slot regardless of whether its own startup below succeeds; a
-    // connector that never starts simply never stamps its slot, which
-    // correctly reads as permanently unhealthy rather than "absent."
+    // One timestamp per connector (last successful `poll()` return) plus one for
+    // `main`'s own scheduler loop below.
     var heartbeat = Heartbeat.init(gpa, io, connectors) catch |err| {
         log.fatal("failed to allocate heartbeat state: {t}", .{err});
     };
 
-    // One persistent poll loop per connector, running concurrently —
-    // previously a single loop polled every connector in turn, so one
-    // connector's slow or failing poll (a ~25s long-poll timeout, or
-    // XMPP's connection retries) delayed every other connector's turn by
-    // however long it took. Each connector already owns its own
-    // independent state (`since`/`offset` tokens, sockets), so there was
-    // never a data-race reason for the round-robin — it was simply how the
-    // loop looked before Matrix/XMPP joined Telegram as second and third
-    // connectors, and never got revisited.
-    //
-    // Real OS threads (`std.Thread.spawn`), deliberately NOT
-    // `Io.Group.async`: `Io.Threaded`'s async/group pool is bounded
-    // (`cpu_count - 1` slots — see its `async_limit`), and once that pool
-    // is exhausted, a further `.async()` call doesn't queue, it runs the
-    // function *synchronously inline on the calling thread* instead.
-    // These loops never return, so spawning them into that same bounded
-    // pool would permanently occupy slots meant for short-lived concurrent
-    // work — confirmed live: doing that once caused the "thinking"
-    // ticker's edits and the LLM call itself to silently start blocking
-    // instead of running concurrently, hanging real requests. Raw threads
-    // sidestep the pool entirely; `io` itself is safe to call from any
-    // thread; `.detach()` since these run forever and are never joined,
-    // matching how nothing here ever joins a `WorkerPool`'s tasks either.
-    //
-    // Each connector also gets its own `MessageWorkerPool` — real
-    // `std.Thread`s sized off `config.workers_per_platform` (floor of 2
-    // regardless of detected cores) — replacing the old single, process-
-    // wide `Io.Group` that funneled every platform's messages through
-    // Zig's own implicit, unconfigurable `Io.Threaded` async pool (bounded
-    // to `cpu_count - 1` slots — `0` on the production VPS's single vCPU,
-    // which silently defeated per-message concurrency entirely; see
-    // `worker_pool.zig`'s module doc for the full story). Isolated per
-    // platform so a Telegram backlog can never starve Matrix/XMPP
-    // processing or vice versa, same isolation principle as the dedicated
-    // poll thread itself. A pool that fails to start (thread-spawn
-    // failure — the process is already in a bad way) skips that
-    // connector's poll loop too rather than aborting every platform.
-    // Computed once, outside the loop below, and handed identically to
-    // every connector's poll loop — `/tdlogin` (see `handleTdloginCommand`)
-    // can be typed from whichever connector the owner is actually talking
-    // to the bot on (almost always the Bot API one, not the personal
-    // account itself, since driving the personal account's own login *from*
-    // the personal account makes no sense), not necessarily the one this
-    // pointer "belongs to".
+    // One persistent poll loop per connector, running concurrently — previously a
+    // single loop polled every connector in turn.
     const telegram_user_ptr: ?*telegram_user_platform.TelegramUserConnector = if (telegram_user_adapter) |*t| t else null;
 
     // Same reasoning as `telegram_user_ptr` above -- `/iglogin` can be typed
     // from whichever connector the owner is actually talking to the bot on.
     const instagram_ptr: ?*instagram_platform.InstagramConnector = if (instagram_adapter) |*i| i else null;
 
-    // A `reply_autonomy = .draft` notification (see `pending_drafts` above)
-    // always needs to reach the owner through the Bot API chat they
-    // actually operate Warden from, regardless of which connector's poll
-    // loop is running `handleMessage` at the time — same "computed once,
-    // handed identically to every connector's poll loop" shape as
-    // `telegram_user_ptr` right above, for the same reason: the personal
-    // connector's own poll loop is exactly the one that needs this most
-    // (that's where an incoming message that might need a draft arrives),
-    // and it's never the Bot API connector's own loop.
+    // A `reply_autonomy = .draft` notification.
     const owner_notify_connector = telegram_adapter.connector();
 
-    // `storage_sense.tick`'s notification target — resolved once here
-    // rather than per-tick, same "computed once, handed identically to
-    // every connector's poll loop" shape as `owner_notify_connector` right
-    // above. `null` only if, somehow, no `.telegram` owner entry exists
-    // (shouldn't happen -- `Config.load` always adds one); the scheduler
-    // loop below simply skips `tick` for that tick if so, logging once
-    // rather than looping a warning every ~30s forever.
+    // `storage_sense.tick`'s notification target — resolved once here rather than
+    // per-tick.
     const storage_owner_native_id = ownerTelegramNativeId(&config);
     if (storage_owner_native_id == null) {
         log.warn("storage sense: no telegram owner configured, disk monitoring won't run", .{});
@@ -851,28 +694,15 @@ pub fn main(init: std.process.Init) !void {
         log.notice("{t}: poll loop started", .{connector.platform()});
     }
 
-    // Guarantees recovery even if nothing external is watching the
-    // `Dockerfile` HEALTHCHECK's result — Docker does not restart a
-    // container merely because it reports unhealthy, only
-    // `restart: unless-stopped` (already set in `compose.yaml`) reacting to
-    // the *process* actually exiting does that. Generous stale threshold
-    // (well above any legitimate poll/scheduler cadence) so this never
-    // fires on a merely slow, still-alive bot. A failure to even start this
-    // thread is logged, not fatal — the bot still runs, just without the
-    // extra self-healing safety net.
+    // Guarantees recovery even if nothing external is watching the `Dockerfile`
+    // HEALTHCHECK's result.
     if (std.Thread.spawn(.{}, selfWatchdogLoop, .{ io, &heartbeat })) |thread| {
         thread.detach();
     } else |err| {
         log.warn("failed to start self-watchdog thread: {t}", .{err});
     }
 
-    // warden-ui's HTTP+WebSocket API (see /home/armin/claude/warden-ui) —
-    // entirely off unless WARDEN_API_PORT is set (see `Config.api_port`'s
-    // doc comment for why this stays opt-in while still under active
-    // development). A failure to start it is logged, not fatal — same
-    // convention as the self-watchdog thread above; the bot itself must
-    // never fail to start because of a problem in this newer, optional
-    // surface.
+    // The web API for warden-ui, off unless WARDEN_API_PORT is set.
     if (config.api_port) |port| {
         const api_ctx = try gpa.create(api_server.ServerContext);
         api_ctx.* = .{
@@ -895,10 +725,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Due-digest/reminder/alert/feed checks used to piggyback on the old
-    // round-robin loop's natural ~30s-ish cadence; now that connectors
-    // poll independently (no shared "lap" to hang off of), this is its own
-    // explicit ~30s ticker instead — same granularity as before.
     const scheduler_log = logging.scoped("scheduler");
     while (true) {
         const tick_started = Io.Timestamp.now(io, .real);
@@ -927,10 +753,7 @@ pub fn main(init: std.process.Init) !void {
         heartbeat.writeToFile(io, gpa, config.tmp_dir);
         const tick_ms = @divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - tick_started.toNanoseconds(), std.time.ns_per_ms);
         // A tick well past its own ~30s cadence is a real signal something
-        // downstream (a query, an HTTP call inside one of the due-item
-        // checks above) is running slow — WARN instead of DEBUG so it's
-        // visible even at the default log level, not just when actively
-        // digging with WARDEN_LOG_LEVEL=debug.
+        // downstream.
         if (tick_ms > 10_000) {
             scheduler_log.warn("tick took {d}ms (longer than expected)", .{tick_ms});
         } else {
@@ -941,44 +764,26 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Filename (under `Config.tmp_dir`) `Heartbeat.writeToFile` writes to and
-/// `runHealthcheck` reads back — the only cross-process liveness signal
-/// that exists, since Docker's `HEALTHCHECK` (see `Dockerfile`) spawns a
-/// brand-new instance of this same binary rather than reaching into the
-/// running one.
+/// `runHealthcheck` reads back.
 const heartbeat_filename = "heartbeat";
 
 /// How stale a heartbeat line can get before `--healthcheck` reports
-/// unhealthy — a generous multiple of the ~30s scheduler cadence that
-/// writes it, so a merely slow (not stuck) tick never trips this.
+/// unhealthy — a generous multiple of the ~30s scheduler cadence that writes
+/// it.
 const healthcheck_stale_seconds: i64 = 120;
 
-/// How stale before the in-process watchdog gives up waiting for an
-/// external monitor and self-exits instead (see `selfWatchdogLoop`) — much
-/// more generous than `healthcheck_stale_seconds` since this is the last
-/// resort, not the first signal.
+/// How stale before the in-process watchdog gives up waiting for an external
+/// monitor and self-exits instead (see `selfWatchdogLoop`).
 const watchdog_stale_seconds: i64 = 300;
 
 /// One timestamp per connector (index-aligned with `main`'s `connectors`
-/// slice) plus one for the top-level scheduler loop — see `main`'s call
-/// sites for where each gets stamped. `std.atomic.Value` since connector
-/// poll threads, the scheduler loop, and the self-watchdog thread all touch
-/// this concurrently with no other synchronization.
+/// slice) plus one for the top-level scheduler loop.
 const Heartbeat = struct {
     connector_platforms: []const iface.Platform,
     connector_last_ok: []std.atomic.Value(i64),
     scheduler_last_tick: std.atomic.Value(i64) = .init(0),
 
-    /// Seeds every timestamp to `now` (startup time), not `0` — seeding to
-    /// `0` made `allFreshInMemory`'s `now - slot` come out astronomically
-    /// large (decades) for any connector/the scheduler that hasn't
-    /// stamped yet, so a connector merely slow to complete its first poll
-    /// (e.g. retrying a flaky `getUpdates` a few times) read as "stale for
-    /// over 300s" the very first time `selfWatchdogLoop` checked at
-    /// startup+60s, killing a perfectly healthy fresh process. Confirmed
-    /// live 2026-07-27: this crash-looped a just-started container every
-    /// ~60-90s. Seeding to `now` gives every connector/the scheduler the
-    /// full `watchdog_stale_seconds` grace period from actual startup,
-    /// same as it already gets for every check after the first.
+    /// Seeds every timestamp to `now` (startup time), not `0`.
     fn init(gpa: std.mem.Allocator, io: Io, connectors: []const iface.Connector) !Heartbeat {
         const now = Io.Timestamp.now(io, .real).toSeconds();
         const last_ok = try gpa.alloc(std.atomic.Value(i64), connectors.len);
@@ -996,10 +801,7 @@ const Heartbeat = struct {
         self.scheduler_last_tick.store(now, .release);
     }
 
-    /// `true` if every tracked timestamp is within `stale_seconds` of `now`
-    /// — shared logic between `runHealthcheck` (reading a written file, a
-    /// separate process) and `selfWatchdogLoop` (reading this same live
-    /// struct in-process).
+    /// `true` if every tracked timestamp is within `stale_seconds` of `now`.
     fn allFreshInMemory(self: *const Heartbeat, now: i64, stale_seconds: i64) bool {
         if (now - self.scheduler_last_tick.load(.acquire) > stale_seconds) return false;
         for (self.connector_last_ok) |*slot| {
@@ -1009,12 +811,7 @@ const Heartbeat = struct {
     }
 
     /// Serializes every timestamp to `<tmp_dir>/heartbeat` as plain
-    /// `name=unix_timestamp` lines — read back by `runHealthcheck` in a
-    /// separate process invocation. Best-effort: a write failure (disk
-    /// full, permissions) shouldn't crash the bot, just skip this cycle's
-    /// external health visibility — the in-process `selfWatchdogLoop` still
-    /// covers actual recovery regardless of whether this file is ever
-    /// read.
+    /// `name=unix_timestamp` lines.
     fn writeToFile(self: *const Heartbeat, io: Io, gpa: std.mem.Allocator, tmp_dir: []const u8) void {
         Io.Dir.cwd().createDirPath(io, tmp_dir) catch |err| {
             log.warn("heartbeat: couldn't create tmp_dir '{s}': {t}", .{ tmp_dir, err });
@@ -1044,9 +841,8 @@ const Heartbeat = struct {
     }
 };
 
-/// `true` if any argument (skipping argv[0]) is exactly `--healthcheck` —
-/// the flag `Dockerfile`'s `HEALTHCHECK` passes to probe liveness (see
-/// `runHealthcheck`).
+/// `true` if any argument (skipping argv[0]) is exactly `--healthcheck` — the
+/// flag `Dockerfile`'s `HEALTHCHECK` passes to probe liveness.
 fn wantsHealthcheck(args: std.process.Args) bool {
     var it = std.process.Args.Iterator.init(args);
     _ = it.skip(); // argv[0]
@@ -1056,13 +852,7 @@ fn wantsHealthcheck(args: std.process.Args) bool {
     return false;
 }
 
-/// Reads `<WARDEN_TMP_DIR>/heartbeat` (same env var `Config.load` uses,
-/// read directly here since a healthcheck probe shouldn't have to satisfy
-/// every other config requirement, e.g. a bot token, just to check
-/// liveness) and exits `0` if every recorded timestamp is fresh, `1`
-/// otherwise — including when the file is missing/unreadable (a normal
-/// state during the container's `--start-period` grace window, which
-/// Docker itself already accounts for on its side). Never returns.
+/// Reads `<WARDEN_TMP_DIR>/heartbeat`.
 fn runHealthcheck(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map) noreturn {
     const tmp_dir = env.get("WARDEN_TMP_DIR") orelse "data/tmp";
     const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ tmp_dir, heartbeat_filename }) catch std.process.exit(1);
@@ -1088,12 +878,7 @@ fn runHealthcheck(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
 }
 
 /// Reads the same in-process `Heartbeat` the poll loops/scheduler stamp
-/// directly (no file round-trip needed here, unlike `runHealthcheck`) and
-/// self-exits if anything has gone stale past `watchdog_stale_seconds` —
-/// guarantees actual recovery via `compose.yaml`'s `restart: unless-stopped`
-/// even if nothing external is watching the `Dockerfile` HEALTHCHECK's
-/// result (Docker itself does not restart a container merely because it
-/// reports unhealthy). Never returns under normal operation.
+/// directly.
 fn selfWatchdogLoop(io: Io, heartbeat: *Heartbeat) void {
     while (true) {
         Io.sleep(io, .fromSeconds(60), .awake) catch return;
@@ -1105,20 +890,14 @@ fn selfWatchdogLoop(io: Io, heartbeat: *Heartbeat) void {
 }
 
 /// Thread entry point for `api_server.run` — a thin wrapper only because
-/// `std.Thread.spawn`'s function must return `void`, not `!void`. A
-/// startup failure here (e.g. the port is already in use) is logged, not
-/// fatal to the whole bot — same convention as every other optional
-/// subsystem's own thread spawn.
+/// `std.Thread.spawn`'s function must return `void`, not `!void`.
 fn apiServerThread(ctx: *const api_server.ServerContext, port: u16, workers: usize) void {
     api_server.run(ctx, port, workers) catch |err| {
         log.err("api server exited: {t}", .{err});
     };
 }
 
-/// One connector's own poll-forever loop (see the call site's doc comment
-/// on why this replaced a single round-robin loop over every connector).
-/// Never returns under normal operation, same as `main`'s own top-level
-/// loop it runs alongside.
+/// One connector's own poll-forever loop.
 fn connectorPollLoop(
     connector: iface.Connector,
     config: *const config_mod.Config,
@@ -1153,30 +932,21 @@ fn connectorPollLoop(
 
         const polled_messages = connector.poll(poll_a) catch |err| {
             switch (err) {
-                // A long poll whose connection died or never came up is
-                // operationally an empty poll: updates queue server-side
-                // until the next successful getUpdates, so nothing is
-                // lost. Flaky networks kill idle connections at the ~30s
-                // long-poll mark and drop TLS handshakes during rough
-                // patches routinely — warn, don't alarm.
+                // A long poll whose connection died or never came up is operationally an
+                // empty poll: updates queue server-side until the next successful getUpdates.
                 error.HttpConnectionClosing,
                 error.TlsInitializationFailed,
                 => log.warn("poll connection dropped (will re-poll): {t}", .{err}),
                 else => log.err("poll failed: {t}", .{err}),
             }
-            // A failed poll returns immediately instead of blocking for
-            // the ~30s long-poll window, so during an outage this loop
-            // would otherwise spin against a dead network. Cool off before
-            // the next attempt — this connector's own cooldown, no longer
-            // one that stalls every other connector's turn too.
+            // A failed poll returns immediately instead of blocking for the ~30s long-
+            // poll window.
             Io.sleep(io, .fromSeconds(5), .awake) catch {};
             continue;
         };
 
-        // Stamped on every successful cycle, whether or not it returned any
-        // messages — an empty-but-successful poll already proves this
-        // connector isn't wedged, which is all `runHealthcheck`/
-        // `selfWatchdogLoop` need to know.
+        // Stamped on every successful cycle, whether or not it returned any messages
+        // — an empty-but-successful poll already proves this connector isn't wedged.
         heartbeat.stampConnector(connector_idx, Io.Timestamp.now(io, .real).toSeconds());
         if (polled_messages.len > 0) {
             log.debug("{t}: poll returned {d} message(s)", .{ connector.platform(), polled_messages.len });
@@ -1185,12 +955,7 @@ fn connectorPollLoop(
         for (polled_messages) |msg| {
             const ts = Io.Timestamp.now(io, .real).toSeconds();
 
-            // Each task owns an arena for its whole lifetime, created here
-            // (not shared with `poll_arena`, which this cycle frees as
-            // soon as every message in it has been queued) and freed by the
-            // task itself when it's done. `msg` is duped into it right
-            // away, before `poll_arena` can be freed out from under a task
-            // that hasn't started yet.
+            // Each task owns an arena for its whole lifetime, created here.
             const task_arena = gpa.create(std.heap.ArenaAllocator) catch |err| {
                 log.err("failed to allocate task arena: {t}", .{err});
                 continue;
@@ -1203,13 +968,8 @@ fn connectorPollLoop(
                 continue;
             };
 
-            // Enqueued onto this connector's own `MessageWorkerPool` instead
-            // of spawned via `Io.Group.async` — `push` never blocks on
-            // processing, so this loop always gets straight back to
-            // `connector.poll()` regardless of how backed up the queue is,
-            // and a stuck message only ever occupies one of N worker
-            // threads instead of this poll loop's own thread (see
-            // `worker_pool.zig`'s module doc).
+            // Enqueued onto this connector's own `MessageWorkerPool` instead of spawned
+            // via `Io.Group.async` — `push` never blocks on processing.
             msg_pool.push(.{
                 .connector = connector,
                 .config = config,
@@ -1237,10 +997,8 @@ fn connectorPollLoop(
                 .owner_notify = owner_notify,
                 .instagram = instagram,
             }) catch |err| {
-                // Queueing itself failed (OOM growing the queue's backing
-                // array) — `processMessageTask` never got a chance to free
-                // `task_arena`, so this is the one place that has to do it
-                // instead of leaking it.
+                // Queueing itself failed (OOM growing the queue's backing array) —
+                // `processMessageTask` never got a chance to free `task_arena`.
                 log.err("failed to queue message for chat {s}: {t}", .{ msg.chat_id, err });
                 task_arena.deinit();
                 gpa.destroy(task_arena);
@@ -1249,10 +1007,7 @@ fn connectorPollLoop(
     }
 }
 
-/// Finds the connector whose platform matches `platform` among `connectors`
-/// — the lookup `checkAndSendDueDigests`/`checkAndSendDueReminders` need to
-/// deliver a due item through the right connector once more than one is
-/// active (see `chats.ChatRef`'s doc comment).
+/// Finds the connector whose platform matches `platform` among `connectors`.
 fn findConnector(connectors: []const iface.Connector, platform: iface.Platform) ?iface.Connector {
     for (connectors) |c| {
         if (c.platform() == platform) return c;
@@ -1260,18 +1015,10 @@ fn findConnector(connectors: []const iface.Connector, platform: iface.Platform) 
     return null;
 }
 
-/// Fallback used when no connector declares a `maxMessageLength` (shouldn't
-/// happen today — Telegram always does) — Telegram's own limit, the
-/// tightest of any platform actually implemented so far (see
-/// `iface.Connector.VTable.maxMessageLength`'s doc comment).
+/// Fallback used when no connector declares a `maxMessageLength`.
 const default_max_message_length: usize = 4096;
 
-/// The tightest `maxMessageLength` across every active connector. A single
-/// deployment could eventually run more than one platform connector at
-/// once, each with its own limit (see `iface.Platform`); capping generated
-/// text to the smallest of them keeps it valid everywhere without the
-/// answer/digest generation paths needing to know which platforms are
-/// actually active.
+/// The tightest `maxMessageLength` across every active connector.
 fn effectiveMaxMessageLength(connectors: []const iface.Connector) usize {
     var min_len: usize = default_max_message_length;
     for (connectors) |c| {
@@ -1281,9 +1028,7 @@ fn effectiveMaxMessageLength(connectors: []const iface.Connector) usize {
 }
 
 /// Sends `text` normally if it fits within `max_len`, otherwise attaches it
-/// as a `.txt` file instead — the fallback for text too long for the
-/// active platform(s)' limit (LLM answers, digests). `filename` names the
-/// attachment when the fallback fires.
+/// as a `.txt` file instead.
 fn sendTextOrFile(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to: ?[]const u8, max_len: usize, filename: []const u8) void {
     if (text.len <= max_len) {
         connector.sendMessage(a, chat_id, text, reply_to);
@@ -1292,16 +1037,11 @@ fn sendTextOrFile(connector: iface.Connector, a: std.mem.Allocator, chat_id: []c
     connector.sendDocument(a, chat_id, text, filename, "That was too long for a single message — attached as a file.");
 }
 
-/// One connector's own per-message `WorkerPool` (see `connectorPollLoop`'s
-/// call site doc comment for why each connector gets its own instead of
-/// sharing one process-wide pool).
+/// One connector's own per-message `WorkerPool`.
 const MessageWorkerPool = worker_pool.WorkerPool(MessageTask);
 
 /// Bundles every argument `processMessageTask` needs into one plain-data
-/// value so it can travel through `MessageWorkerPool`'s queue (see
-/// `worker_pool.zig`'s doc comment on `Item`) — the pool's worker threads
-/// call `MessageTask.run` directly instead of the old
-/// `worker_group.async(io, processMessageTask, .{...})` call.
+/// value so it can travel through `MessageWorkerPool`'s queue.
 const MessageTask = struct {
     connector: iface.Connector,
     config: *const config_mod.Config,
@@ -1361,9 +1101,7 @@ const MessageTask = struct {
 };
 
 /// Body of one queued per-message task (see `MessageWorkerPool`/
-/// `MessageTask` above). Owns `task_arena` end-to-end: created by the
-/// caller right before queueing (so `duped_msg` has somewhere stable to
-/// live), destroyed here once this message is fully handled.
+/// `MessageTask` above).
 fn processMessageTask(
     connector: iface.Connector,
     config: *const config_mod.Config,
@@ -1395,13 +1133,8 @@ fn processMessageTask(
         task_arena.deinit();
         gpa.destroy(task_arena);
     }
-    // Declared after the arena-cleanup defer above so it runs *before* that
-    // one (defers unwind in reverse declaration order) — `msg.chat_id`
-    // below lives in `task_arena`, so the arena must still be alive when
-    // this reads it. This is the single most useful log line for diagnosing
-    // "the bot died, what was it doing at the time": a task that starts but
-    // never logs its completion is exactly the one that was in flight when
-    // the process went away.
+    // Declared after the arena-cleanup defer above so it runs *before* that one
+    // (defers unwind in reverse declaration order).
     const task_started = Io.Timestamp.now(io, .real);
     log.debug("{t}: processing message from chat {s}, user {s}", .{ connector.platform(), msg.chat_id, msg.user_id });
     defer {
@@ -1419,12 +1152,7 @@ fn processMessageTask(
         return;
     };
 
-    // Housekeeping: synthetic lifecycle signals from a connector (see
-    // `iface.Message.chat_left`/`migrated_to_native_chat_id`/
-    // `chat_ingest_only`'s doc comments), not real conversational content —
-    // handled and returned early, before identity resolution/recording/LLM
-    // dispatch, same as `choice_picked` being excluded from `recordMessage`
-    // a few lines below.
+    // Housekeeping: synthetic lifecycle signals from a connector.
     if (msg.chat_ingest_only) return;
     if (msg.migrated_to_native_chat_id) |new_id| {
         chats.renameNativeChatId(pool, chat_id, new_id) catch |err| {
@@ -1439,71 +1167,39 @@ fn processMessageTask(
         return;
     }
 
-    // ROADMAP.md's Phase 16: welcome messages. A join service message has
-    // no `text`, so it would never reach `handleMessage`'s command
-    // dispatch below -- checked here instead, alongside the other
-    // housekeeping signals above, before normal message handling.
     sendWelcomeMessages(connector, a, pool, chat_id, msg);
 
     // Every group member's message counts toward this chat's local record
-    // (stats/content recall), regardless of who sent it — only
-    // replies/actions are owner-gated below. A button press/reaction
-    // (`choice_picked`) isn't real conversational content — skip logging it
-    // so it doesn't show up as a stray empty-text row in /wordcloud or the
-    // LLM's history window.
+    // (stats/content recall), regardless of who sent it.
     const identity_id = resolveSenderIdentity(pool, connector, msg, ts) catch |err| {
         log.err("failed to resolve identity for user {s}: {t}", .{ msg.user_id, err });
         return;
     };
     if (msg.choice_picked == null) {
-        // ROADMAP.md's Phase 24: warden's own slow-mode enforcement, ahead
-        // of recordMessage/keyword-alerts/dispatch below -- a rate-limited
-        // message is deleted right here and the rest of this task never
-        // runs for it (same early-exit shape `choice_picked` gets above).
-        // See `checkSlowMode`'s doc comment for why this can't just read
-        // `chat_members.last_seen`.
+        // Warden's own slow-mode enforcement, ahead of recordMessage/keyword-
+        // alerts/dispatch below.
         if (checkSlowMode(connector, a, config, pool, chat_id, identity_id, msg, ts)) return;
 
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
         recordMessage(pool, chat_id, identity_id, msg.message_id, msg.text, ts, retention_messages);
 
-        // Read-only tap for Bot View's live incoming-message feed (see
-        // bot_view.zig's doc comment) -- a cheap no-op when nobody's
-        // subscribed to this chat, and never influences how/whether this
-        // message actually gets answered.
+        // Read-only tap for Bot View's live incoming-message feed.
         const sender_display_name = if (msg.identity) |identity| identity.display_name else msg.username orelse msg.user_id;
         bcast.publish(chat_id, sender_display_name, msg.text, ts);
 
-        // ROADMAP.md's Phase 16: keyword alerts. A plain string scan (no
-        // LLM call), fires for any sender -- see `checkKeywordAlerts`'s own
-        // doc comment for why this sits at the same "passive content
-        // observation" tier as `recordMessage`/`bcast.publish` above rather
-        // than behind the owner-only gate real Q&A uses.
         if (feature_flags.isEnabled(pool, "keyword_alerts")) {
             if (msg.text) |t| checkKeywordAlerts(connector, a, pool, chat_id, msg, t);
         }
 
-        // ROADMAP.md's Phase 25: video auto-download. Same passive-
-        // observation tier as `checkKeywordAlerts` right above (no LLM
-        // call, fires for any sender), but gated by both the bot-wide
-        // `video_download` feature flag and a per-chat opt-in (off by
-        // default -- see `chat_settings.getVideoDownloadEnabled`'s doc
-        // comment) rather than firing unconditionally the way keyword
-        // alerts do, since this changes what happens with any link any
-        // member posts, not just something a user asked to be notified
-        // about.
+        // Video auto-download.
         if (feature_flags.isEnabled(pool, "video_download") and chat_settings.getVideoDownloadEnabled(pool, chat_id)) {
             if (msg.text) |t| checkVideoDownload(connector, a, io, config, pool, chat_id, msg, t);
         }
     }
     recordObservedUsers(pool, chat_id, msg.observed_users);
 
-    // Downloaded eagerly (not lazily on first tool use) since it's cheap
-    // relative to the LLM round trip this task is about to make anyway, and
-    // keeps `convert_file`'s execute() simple (just read ctx.attachment_path,
-    // never fetch bytes itself). Deleted once this task is done regardless
-    // of whether any tool actually touched it — `task_arena`'s deinit only
-    // frees memory, not files on disk.
+    // Downloaded eagerly (not lazily on first tool use) since it's cheap relative
+    // to the LLM round trip this task is about to make anyway.
     var attachment_cleanup_path: ?[]const u8 = null;
     defer if (attachment_cleanup_path) |p| Io.Dir.cwd().deleteFile(io, p) catch {};
     const attachment_path = if (msg.attachment) |att| blk: {
@@ -1563,24 +1259,7 @@ fn processMessageTask(
         .chat_id = chat_id,
         .now = ts,
     };
-    // The three adapters below act *as the owner* -- sending from the
-    // owner's personal account, reading and marking-read their DMs, moving
-    // their bulletin cursor -- so they're only wired when the sender is the
-    // owner, same as `.memory`'s "absent means the tool can't run" rule
-    // below. Every bot admin, and every user whenever
-    // `WARDEN_LLM_OWNER_ONLY=false`, reaches this code path; before this
-    // gate they all got these sinks, with their own identity as "owner".
-    // `filterEnabledTools` also stops offering the tools to the model when
-    // the sink is null, so a non-owner never sees them rather than
-    // watching them fail. The owner identity is resolved the way the
-    // `/autonomy`/reply_autonomy command side does, so the cursor and
-    // defaults land on one identity no matter which platform the owner
-    // asked from -- but only when they're *not* on the Telegram bot, where
-    // `identity_id` already is that row (`resolveOwnerIdentityId` is the
-    // same `getOrCreateMinimal(.telegram, owner id)` lookup that produced
-    // it) and the extra query would be a wasted round trip on every owner
-    // message. If it can't be resolved, the asker's own identity is the
-    // same fallback it always was.
+    // The three adapters below act *as the owner*.
     const is_owner = auth.isOwner(config, connector.platform(), msg.user_id);
     const owner_identity_id = if (is_owner and connector.platform() != .telegram)
         resolveOwnerIdentityId(pool, config, ts) catch identity_id
@@ -1615,15 +1294,8 @@ fn processMessageTask(
         .notes = note_adapter.sink(),
         .convert_flow = convert_flow_adapter.sink(),
         .member_directory = member_directory_adapter.sink(),
-        // Null (not just a sink whose calls would fail) whenever the
-        // feature isn't configured at all -- matches every other
-        // `?Sink = null` field's own "absent means the tool can't run"
-        // convention, rather than surfacing a runtime error from inside
-        // the tool for something that's a deploy-time config choice.
-        // Always wired, unlike before: memory no longer requires an
-        // embeddings endpoint (see `MemoryToolAdapter.createFn`), and
-        // gating the tool on one was what made remembering silently
-        // impossible without it.
+        // Null (not just a sink whose calls would fail) whenever the feature isn't
+        // configured at all.
         .memory = memory_adapter.sink(),
         .chat_history = chat_history_adapter.sink(),
         .expenses = expense_adapter.sink(),
@@ -1641,13 +1313,7 @@ fn processMessageTask(
 }
 
 /// Downloads `att`'s bytes into `tmp_dir` and returns the local file path
-/// (allocated in `allocator`), or null on any failure (connector doesn't
-/// support downloads, network error, disk write error) — all logged, none
-/// propagated, since a failed download shouldn't stop the rest of message
-/// handling (LLM Q&A, other tools) from running; `convert_file` just
-/// reports "no file attached" when `ctx.attachment_path` ends up null.
-/// Written straight to disk rather than kept in memory and handed back,
-/// since document/video attachments can run tens of MB.
+/// (allocated in `allocator`).
 fn downloadAttachment(connector: iface.Connector, io: Io, allocator: std.mem.Allocator, tmp_dir: []const u8, att: iface.Attachment) ?[]const u8 {
     const bytes = connector.downloadFile(allocator, att.file_id) catch |err| {
         log.warn("attachment: download failed for file_id {s}: {t}", .{ att.file_id, err });
@@ -1681,10 +1347,8 @@ fn downloadAttachment(connector: iface.Connector, io: Io, allocator: std.mem.All
     return path;
 }
 
-/// Best-effort extension (leading dot included) for a downloaded
-/// attachment's local file name — prefers the original filename's own
-/// extension when Telegram sent one, falling back to a kind-appropriate
-/// default so `convert_file` still has something plausible to dispatch on.
+/// Best-effort extension (leading dot included) for a downloaded attachment's
+/// local file name.
 fn extensionFor(att: iface.Attachment) []const u8 {
     if (att.file_name) |name| {
         if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i..];
@@ -1698,9 +1362,8 @@ fn extensionFor(att: iface.Attachment) []const u8 {
     };
 }
 
-/// Stand-in `qa.answer` question for a captionless attachment, so the
-/// model's `user_content` still names what just arrived instead of reading
-/// "Question: " with nothing after it.
+/// Stand-in `qa.answer` question for a captionless attachment, so the model's
+/// `user_content` still names what just arrived instead of reading "Question.
 fn attachmentPlaceholder(allocator: std.mem.Allocator, att: iface.Attachment) ![]const u8 {
     const kind_desc = switch (att.kind) {
         .photo => "a photo",
@@ -1715,18 +1378,11 @@ fn attachmentPlaceholder(allocator: std.mem.Allocator, att: iface.Attachment) ![
     return std.fmt.allocPrint(allocator, "[The user sent {s}, with no caption.]", .{kind_desc});
 }
 
-/// The question text `qa.answer` gets for this message. A captionless
-/// voice message is transcribed (via a configured `whisper-server`) and the
-/// transcript becomes the question, same role Telegram's own `text` field
-/// plays for a typed message — falling back to the generic
-/// `attachmentPlaceholder` on any failure (whisper not configured, the
-/// attachment didn't download, the transcription call itself failed, or
-/// came back empty) rather than ever blocking the reply on it.
+/// The question text `qa.answer` gets for this message.
 const ResolvedQuestion = struct {
     text: []const u8,
-    /// Set when a "🎙️ Transcribing…" placeholder was already sent — handed
-    /// into `replyWithAnswer` so it morphs into the "🤔 Thinking..."
-    /// placeholder instead of a second message appearing right after it.
+    /// Set when a "🎙️ Transcribing…" placeholder was already sent — handed into
+    /// `replyWithAnswer` so it morphs into the "🤔 Thinking...
     placeholder_id: ?[]const u8 = null,
 };
 
@@ -1735,9 +1391,8 @@ fn resolveQuestion(connector: iface.Connector, a: std.mem.Allocator, io: Io, con
     const att = msg.attachment orelse return .{ .text = text };
 
     if (att.kind == .voice) {
-        // Disabled falls back to the generic attachment placeholder below,
-        // same as "whisper not configured" already does -- not a special
-        // error path, just one more reason transcription doesn't happen.
+        // Disabled falls back to the generic attachment placeholder below, same as
+        // "whisper not configured" already does.
         if (config.whisper_url != null and !feature_flags.isEnabled(pool, "voice_transcription")) {
             return .{ .text = attachmentPlaceholder(a, att) catch text };
         }
@@ -1761,11 +1416,7 @@ fn resolveQuestion(connector: iface.Connector, a: std.mem.Allocator, io: Io, con
 }
 
 /// Resolves (upserting as needed) the internal `identities.id` for a
-/// message's sender. Prefers the full `Identity`/`TelegramProfile` the
-/// connector already built from the platform's wire format; falls back to a
-/// minimal placeholder (e.g. `msg.identity` unset because `msg.from` was
-/// absent) so a message never fails to log just because identity data was
-/// thin.
+/// message's sender.
 fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, msg: iface.Message, ts: i64) !i64 {
     const identity_id = blk: {
         if (msg.identity) |identity| {
@@ -1789,11 +1440,8 @@ fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, m
         }
         break :blk try identities.getOrCreateMinimal(pool, connector.platform(), msg.user_id, msg.username orelse msg.user_id, msg.username, false, ts);
     };
-    // Completes a grant queued by `/blockuser`/`/addadmin` against a
-    // `@username` the bot had no identity for yet — checked on every
-    // message that carries a username, before `handleMessage`'s blocklist
-    // gate ever runs, so this same (this person's very first) message
-    // already sees the completed grant. See `store/bot_pending_grants.zig`.
+    // Completes a grant queued by `/blockuser`/`/addadmin` against a `@username`
+    // the bot had no identity for yet.
     if (msg.username) |username| {
         completePendingGrants(pool, connector.platform(), username, identity_id);
     }
@@ -1824,12 +1472,8 @@ fn completePendingGrants(pool: *store_pool.PgPool, platform: iface.Platform, use
     }
 }
 
-/// Registers every identity a message revealed *besides* its own sender
-/// (see `iface.Message.observed_users`'s doc comment) into this chat's
-/// roster, so `find_chat_member` can resolve them later even if they never
-/// send a message of their own. Uses `chat_members.ensureKnown`, not
-/// `touch` — being mentioned or replied to isn't the same as having spoken.
-/// Errors are logged, not propagated, same reasoning as `recordMessage`.
+/// Registers every identity a message revealed *besides* its own sender into
+/// this chat's roster.
 fn recordObservedUsers(pool: *store_pool.PgPool, chat_id: i64, observed: []const Identity) void {
     for (observed) |identity| {
         const identity_id = identities.upsertIdentity(pool, identity) catch |err| {
@@ -1844,8 +1488,6 @@ fn recordObservedUsers(pool: *store_pool.PgPool, chat_id: i64, observed: []const
 
 /// Logs one message and bumps the sender's chat-membership record, then
 /// prunes to the retention window — replaces the old `ChatStore.record`.
-/// Errors are logged, not propagated: a storage hiccup shouldn't take down
-/// the poll loop.
 fn recordMessage(pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, message_id: ?[]const u8, text: ?[]const u8, ts: i64, retention: i64) void {
     messages.insert(pool, chat_id, identity_id, message_id, text, ts) catch |err| {
         log.err("failed to insert message for chat {d}: {t}", .{ chat_id, err });
@@ -1859,32 +1501,7 @@ fn recordMessage(pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, messa
     };
 }
 
-/// ROADMAP.md's Phase 24 slow mode: warden's own per-(chat, member)
-/// cooldown between messages — Telegram's Bot API has no method exposing a
-/// chat's native slow-mode delay to bots (client-UI-only setting), so this
-/// is warden's own logic, enforced the same way on Telegram and Matrix via
-/// `Connector.deleteMessage` (already in the vtable for both) and left a
-/// no-op on XMPP, whose vtable has no moderation slots at all — the
-/// `deleteMessage` call below simply reports `error.Unsupported` there,
-/// logged and otherwise harmless.
-///
-/// Deliberately checked *before* `recordMessage` runs (see the call site in
-/// `processMessageTask`): `chat_members.last_seen` gets bumped by
-/// `recordMessage`'s own `chat_members.touch` for every inbound message,
-/// including the one currently being checked, so reading it here would
-/// always see "now" — `store/rate_limits.zig`'s own
-/// `member_message_cooldowns` table exists specifically so this check has
-/// something to compare against that isn't already clobbered.
-///
-/// Returns `true` if the message was rate-limited (and thus already
-/// deleted — the deletion is the feedback, no separate reply is sent) and
-/// the caller should stop processing this message entirely; `false`
-/// otherwise (slow mode off, sender exempt, within the cooldown boundary,
-/// or no `message_id` to delete).
-///
-/// Owner and any live platform admin of this chat are exempt — an admin's
-/// own moderation commands (e.g. running `/slowmode` itself) shouldn't get
-/// rate-limited by a slow mode they just set.
+/// Warden's own per-(chat, member) cooldown between messages.
 fn checkSlowMode(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, msg: iface.Message, now: i64) bool {
     const min_seconds = rate_limits.getSlowModeSeconds(pool, chat_id);
     if (min_seconds <= 0) return false;
@@ -1909,18 +1526,8 @@ fn checkSlowMode(connector: iface.Connector, a: std.mem.Allocator, config: *cons
     return false;
 }
 
-/// Rebuilds the in-memory enabled-chat set from every known chat's
-/// persisted `chat_settings.digest_enabled` — so digests opted into before
-/// a restart keep firing rather than silently going quiet.
-/// One curated-feed tick (see `features/curated_feed.zig`). Its own
-/// interval, stored with the feed's settings rather than taken from the
-/// scheduler loop's cadence: reading channels and summarising them is far
-/// more expensive than the other checks in this loop, and an hourly digest
-/// is the point of the feature — running it every loop iteration would be
-/// both useless and costly.
-///
-/// Its own arena, freed each tick: a pass allocates every post, prompt and
-/// summary it touches, none of which outlives the digest it produces.
+/// Rebuilds the in-memory enabled-chat set from every known chat's persisted
+/// `chat_settings.digest_enabled`.
 fn checkCuratedFeed(
     gpa: std.mem.Allocator,
     io: Io,
@@ -1971,10 +1578,7 @@ fn loadDigestScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, 
 }
 
 /// Delivers through whichever of `connectors` actually owns each due chat's
-/// platform (see `findConnector`) — a chat whose platform has no active
-/// connector (shouldn't normally happen; guards against a stale/removed
-/// platform's leftover `chat_settings` row) is skipped with a log line
-/// rather than silently misdelivered through an unrelated connector.
+/// platform (see `findConnector`).
 fn checkAndSendDueDigests(
     connectors: []const iface.Connector,
     gpa: std.mem.Allocator,
@@ -2006,9 +1610,8 @@ fn checkAndSendDueDigests(
         defer arena.deinit();
         const a = arena.allocator();
 
-        // `chat_type`/`title` null: this isn't a fresh inbound message, just
-        // a scheduled check, and `upsertChat` preserves whatever's already
-        // stored for those columns when passed null (see its doc comment).
+        // `chat_type`/`title` null: this isn't a fresh inbound message, just a
+        // scheduled check.
         const chat_id = chats.upsertChat(pool, connector.platform(), native_chat_id, null, null) catch |err| {
             log.err("digest: failed to resolve chat {s}: {t}", .{ native_chat_id, err });
             continue;
@@ -2038,8 +1641,7 @@ fn checkAndSendDueDigests(
     }
 }
 
-/// Same restore-on-restart shape as `loadDigestScheduleFromDisk` above --
-/// see its own doc comment.
+/// Same restore-on-restart shape as `loadDigestScheduleFromDisk` above.
 fn loadBriefingScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool, briefing_scheduler: *scheduler.BriefingScheduler) void {
     const refs = chats.listAll(pool, gpa) catch |err| {
         log.err("briefing: failed to scan existing chats: {t}", .{err});
@@ -2059,14 +1661,8 @@ fn loadBriefingScheduleFromDisk(gpa: std.mem.Allocator, pool: *store_pool.PgPool
     }
 }
 
-/// One formatted weather line for a chat's default location, or `null` if
-/// the chat has none set, the lookup failed, or the place didn't geocode.
-///
-/// Every failure path returns `null` rather than propagating: a briefing
-/// that can't reach Open-Meteo should still deliver its reminders and
-/// alerts, not fail wholesale over the one section that needs the network.
-/// Kept here rather than inside `briefing.generate` so that function stays
-/// pure composition and its tests stay offline -- see its doc comment.
+/// One formatted weather line for a chat's default location, or `null` if the
+/// chat has none set, the lookup failed, or the place didn't geocode.
 fn briefingWeatherLine(a: std.mem.Allocator, io: Io, pool: *store_pool.PgPool, chat_id: i64) ?[]const u8 {
     const location = chat_settings.getDefaultLocation(pool, a, chat_id) orelse return null;
     const weather = @import("tools/weather.zig");
@@ -2087,9 +1683,7 @@ fn briefingWeatherLine(a: std.mem.Allocator, io: Io, pool: *store_pool.PgPool, c
 }
 
 /// Same shape as `checkAndSendDueDigests` above, minus the `llm_provider`
-/// param that one needs -- `briefing.generate` is pure composition over
-/// already-stored data, no tool-call loop involved. `io` is needed only for
-/// the optional weather section (see `briefingWeatherLine`).
+/// param that one needs.
 fn checkAndSendDueBriefings(
     connectors: []const iface.Connector,
     gpa: std.mem.Allocator,
@@ -2153,13 +1747,7 @@ const LlmDynamicSettings = struct {
 };
 
 /// One `dynamic_config.listAll` fetch instead of six separate
-/// `getBool`/`getI64` round trips for every free-form LLM turn — see
-/// `store/dynamic_config.zig`'s `listAll`/`findBool`/`findI64` doc
-/// comments for why that matters here specifically (this codebase has
-/// already hit real Postgres pool exhaustion under load once). Each field
-/// falls back to `config`'s own env-sourced default when no DB row exists,
-/// same "missing row means default" convention as everywhere else
-/// `dynamic_config`/`feature_flags` is read.
+/// `getBool`/`getI64` round trips for every free-form LLM turn.
 fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, config: *const config_mod.Config) LlmDynamicSettings {
     const rows = dynamic_config.listAll(pool, a) catch &.{};
     defer {
@@ -2170,10 +1758,8 @@ fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, con
         a.free(rows);
     }
 
-    // `WARDEN_LLM_MAX_TOKENS=0` (or any non-positive value) is treated the
-    // same as "no override" -- a real max-tokens value is never
-    // meaningfully zero or negative, so this is an unambiguous sentinel
-    // rather than a separate "is this key even set" lookup.
+    // `WARDEN_LLM_MAX_TOKENS=0` (or any non-positive value) is treated the same
+    // as "no override".
     const max_tokens_default: i64 = if (config.llm_max_tokens_override) |v| v else 0;
     const max_tokens_raw = dynamic_config.findI64(rows, "WARDEN_LLM_MAX_TOKENS", max_tokens_default);
 
@@ -2186,9 +1772,7 @@ fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, con
         .skip_trivial_messages = dynamic_config.findBool(rows, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", config.skip_trivial_messages),
         .vision_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_VISION", config.llm_vision_enabled),
         .documents_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_DOCUMENTS", config.llm_documents_enabled),
-        // Clamped rather than trusted: a negative value would wrap when
-        // cast to u32 and turn "no retries" into billions of them, and an
-        // absurd positive one would keep a dead request alive for hours.
+        // Clamped rather than trusted.
         .max_retries = blk: {
             const raw = dynamic_config.findI64(rows, "WARDEN_LLM_MAX_RETRIES", config.llm_max_retries);
             break :blk @intCast(std.math.clamp(raw, 0, 10));
@@ -2203,14 +1787,7 @@ const ModeArgSplit = struct {
     text: []const u8,
 };
 
-/// Parses a "messaging mode" command's argument shape (ROADMAP.md's Phase
-/// 14: /translate, /rewrite) — `<modifier> [text...]`, where `modifier` is
-/// the first whitespace-delimited token (a target language, a tone) and
-/// everything after it is the text to operate on. When no text follows the
-/// modifier, falls back to `reply_to_text` — so `/translate spanish` as a
-/// reply to someone else's message translates *that* message without
-/// needing to repeat it. Returns null when there's neither a modifier, nor
-/// any text to fall back to (caller replies with its own usage message).
+/// Parses a "messaging mode" command's argument shape.
 fn splitModeArgs(arg: []const u8, reply_to_text: ?[]const u8) ?ModeArgSplit {
     const trimmed = std.mem.trim(u8, arg, " \t");
     if (trimmed.len == 0) return null;
@@ -2224,28 +1801,15 @@ fn splitModeArgs(arg: []const u8, reply_to_text: ?[]const u8) ?ModeArgSplit {
 
 /// Same "explicit text, or fall back to the replied-to message" shape as
 /// `splitModeArgs`, minus the leading modifier token — for /eli5 and
-/// /brainstorm, which take just a body of text/topic. Returns null when
-/// there's neither.
+/// /brainstorm.
 fn modeArgOrReplyText(arg: []const u8, reply_to_text: ?[]const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, arg, " \t");
     if (trimmed.len > 0) return trimmed;
     return reply_to_text;
 }
 
-/// Shared entry point for the Phase 14 "messaging mode" commands
-/// (/translate, /rewrite, /eli5, /brainstorm) — each one just builds a
-/// mode-specific instruction as `question` (see the dispatch table in
-/// `handleMessage`) and routes it through the exact same LLM-answering
-/// pipeline plain addressed Q&A uses: the dynamic owner-only gate,
-/// /persona and /thinking overrides, the placeholder+ticker flow, tool-
-/// calling, streaming — all via `replyWithAnswer`, same as
-/// `isAddressedToBot`'s own branch. Deliberately skips that branch's
-/// mention-detection and trivial-message short circuit: typing an explicit
-/// `/translate ...` is already unambiguous address, and is never itself a
-/// trivial greeting. `replied_to` (the "user is replying to your earlier
-/// message" framing `qa.answer` adds) is left null here since any relevant
-/// replied-to text is already folded straight into `question` by the
-/// caller, not carried as separate context.
+/// Shared entry point for the "messaging mode" commands (/translate,
+/// /rewrite, /eli5, /brainstorm).
 fn handleModeCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -2307,22 +1871,15 @@ test "modeArgOrReplyText prefers explicit text, falls back to reply_to_text, els
 const create_poll_max_options = 10;
 
 /// One `|`-delimited part parsed by `parsePollCommand`, still owning the
-/// whole allocation (`parts`) that `question`/`options` are views into --
-/// callers that need to free it (tests using `testing.allocator` directly;
-/// production call sites pass a per-message arena and never bother) must
-/// free `parts` as a whole, not `options` alone, since `options` is a
-/// sub-slice starting at index 1, not its own allocation.
+/// whole allocation (`parts`) that `question`/`options` are views into.
 const ParsedPoll = struct {
     question: []const u8,
     options: [][]const u8,
     parts: [][]const u8,
 };
 
-/// Parses `/poll <question> | <option1> | <option2> | ...` (ROADMAP.md's
-/// Phase 16) into a question and 2-10 trimmed options, or an error string
-/// to reply with. `|`-delimited rather than `/remind`-style keyword
-/// parsing since a poll question or option could legitimately contain
-/// almost any word.
+/// Parses `/poll <question> | <option1> | <option2> | ...` into a question
+/// and 2-10 trimmed options.
 fn parsePollCommand(a: std.mem.Allocator, arg: []const u8) union(enum) { ok: ParsedPoll, err: []const u8 } {
     var parts: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, arg, '|');
@@ -2389,17 +1946,8 @@ pub const Route = enum {
     ignored,
 };
 
-/// Warden's own Bot API user id, parsed out of the `<user id>:<secret>`
-/// shape every Telegram bot token has. Used to recognize the personal
-/// account's DM with Warden itself (see `routeIncoming`).
-///
-/// Derived from the token rather than read from `Connector.selfId()`
-/// deliberately: `selfId` is populated by `getMe`, so it's `null` until
-/// that first call resolves and stays `null` if it ever fails -- and this
-/// check has to fail *closed* (treat the chat as the bot's own and stay
-/// out of it) exactly when identity is unknown, because failing open is
-/// the self-drafting loop. The token is present from startup, needs no
-/// network, and its prefix is the same id `getMe` would return.
+/// Warden's own Bot API user id, parsed out of the `<user id>:<secret>` shape
+/// every Telegram bot token has.
 pub fn telegramBotUserId(token: []const u8) ?[]const u8 {
     const colon = std.mem.indexOfScalar(u8, token, ':') orelse return null;
     const id = token[0..colon];
@@ -2408,18 +1956,8 @@ pub fn telegramBotUserId(token: []const u8) ?[]const u8 {
     return id;
 }
 
-/// Whether `native_chat_id` is Warden's own DM with the owner, seen from
-/// the personal account. A Telegram private chat's id *is* the peer's user
-/// id, so the bot's own DM is the chat whose native id equals the bot's.
-///
-/// Takes the **native** chat id -- the `chat_id` field of `iface.Message`,
-/// not `handleMessage`'s `chat_id` parameter. Those are two different
-/// numbers: the parameter is the internal `chats` row id, the native one is
-/// what Telegram calls the chat. The first version of this check compared
-/// the row id against the bot's user id, which are never equal, so the
-/// guard silently never fired and the self-drafting loop carried on through
-/// a deploy. Hence a named function with its own tests over the real ids
-/// rather than two lines inlined at the call site.
+/// Whether `native_chat_id` is Warden's own DM with the owner, seen from the
+/// personal account.
 pub fn isOwnBotDm(platform: iface.Platform, native_chat_id: []const u8, bot_token: []const u8) bool {
     if (platform != .telegram_user) return false;
     const bot_id = telegramBotUserId(bot_token) orelse return false;
@@ -2429,9 +1967,8 @@ pub fn isOwnBotDm(platform: iface.Platform, native_chat_id: []const u8, bot_toke
 test "telegramBotUserId: parses the id prefix, rejects anything malformed" {
     try std.testing.expectEqualStrings("8807952951", telegramBotUserId("8807952951:AAHreal-looking-secret").?);
     try std.testing.expectEqualStrings("123", telegramBotUserId("123:x").?);
-    // No colon, empty id, and a non-numeric id all have to come back null
-    // rather than a wrong id -- a wrong one here would stop guarding the
-    // real self-DM while blocking some innocent chat instead.
+    // No colon, empty id, and a non-numeric id all have to come back null rather
+    // than a wrong id.
     try std.testing.expect(telegramBotUserId("no-colon-here") == null);
     try std.testing.expect(telegramBotUserId(":secret") == null);
     try std.testing.expect(telegramBotUserId("notanumber:secret") == null);
@@ -2448,16 +1985,12 @@ test "isOwnBotDm: matches the bot's own DM by its native chat id" {
     try std.testing.expect(!isOwnBotDm(.telegram_user, "-1003974181733", token));
     try std.testing.expect(!isOwnBotDm(.telegram_user, "101573604", token));
 
-    // The regression that shipped: `handleMessage`'s `chat_id` parameter is
-    // the internal `chats` row id, a small integer nothing like the bot's
-    // user id. Passing one of those must not match -- and equally must not
-    // accidentally match some other chat's row id.
+    // The regression that shipped: `handleMessage`'s `chat_id` parameter is the
+    // internal `chats` row id, a small integer nothing like the bot's user id.
     try std.testing.expect(!isOwnBotDm(.telegram_user, "7", token));
     try std.testing.expect(!isOwnBotDm(.telegram_user, "1", token));
 
-    // Only the personal-account connector: the owner talking to the bot in
-    // that same DM arrives on the `telegram` bot connector and must keep
-    // working normally.
+    // Only the personal-account connector.
     try std.testing.expect(!isOwnBotDm(.telegram, "8807952951", token));
     try std.testing.expect(!isOwnBotDm(.instagram, "8807952951", token));
 
@@ -2466,61 +1999,8 @@ test "isOwnBotDm: matches the bot's own DM by its native chat id" {
     try std.testing.expect(!isOwnBotDm(.telegram_user, "8807952951", "malformed-token"));
 }
 
-/// The single decision about how far an incoming message gets, extracted
-/// from `handleMessage` so it can actually be tested — the bug it encodes
-/// the fix for was invisible precisely because it lived inline in a
-/// 600-line dispatch function and failed silently.
-///
-/// The personal-account connector is the special case, and both halves of
-/// how it's special matter:
-///
-///   * **It never takes `command_and_qa`.** `telegram_user.convertNewMessage`
-///     drops the account's own outgoing messages, so every message that
-///     connector delivers is from *someone else*. A contact who DM'd the
-///     owner typing `/stats` (or `/kick`, or `/sudo ...`) must not have it
-///     dispatched as a command, because any reply would be composed and sent
-///     out under the owner's own identity.
-///   * **It never takes `ignored` on access-list grounds either.** That
-///     same "never the owner" property means `auth.isOwner` — which
-///     compares `msg.user_id` against `WARDEN_TELEGRAM_USER_OWNER_ID`, the
-///     owner's *own* id — can never match here, and neither can
-///     `bot_admins`. Under the old allowlist, routing this through the
-///     normal gate dropped every single personal-account message on the
-///     floor, which silently made `reply_autonomy` dead code: `/autonomy
-///     draft` and `/autonomy auto` stored and read back fine and then never
-///     once fired. Fixed 2026-09-03. The blocklist that replaced it is
-///     skipped here for the same reason -- a block is about the *bot's*
-///     chats, not the owner's own account.
-///
-///   * **It never manages Warden's own DM with the owner.** The personal
-///     account has a direct chat with Warden's Bot API account like any
-///     other contact, and `convertNewMessage`'s "drop our own outgoing
-///     messages" rule doesn't help here: in *that* chat the bot is the
-///     other party, so every draft notification the bot posts arrives back
-///     as an ordinary inbound message. With autonomy on, drafting a reply
-///     to it produced another notification, which arrived as another
-///     inbound message, and so on -- the bot drafting at itself in a loop,
-///     each round burning an LLM call. Observed in production 2026-09-04
-///     ("I can see there's a recursive loop happening in this chat
-///     history", drafted into chat 8807952951, which is the bot's own id).
-///     Identified by id rather than by title or username: `chat_title` is
-///     whatever the owner renamed the chat to, and a username can change,
-///     but the numeric id can't -- the same "compare the numeric id, never
-///     the username" rule `auth.isOwner` already follows.
-///
-/// Skipping the access gate is safe here and only here, because
-/// `reply_autonomy` is its own deliberate opt-in and is fail-closed (`.off`
-/// resolves until the owner turns a chat on). That is emphatically not true
-/// of a bot connector, where the blocklist (and the owner-only LLM gate
-/// further down) is what stands between a stranger and the LLM — which is
-/// why this tests for `.telegram_user` specifically rather than "is a
-/// personal-account platform": the Instagram connector has no
-/// `reply_autonomy` path, so exempting it would just hand its DMs straight
-/// to `isAddressedToBot`.
-///
-/// `blocked` is "this sender, or this whole chat, is on the blocklist" --
-/// the bot answers everyone else. Owners and bot admins can't be blocked
-/// (the check is short-circuited before it's even queried).
+/// The single decision about how far an incoming message gets, extracted from
+/// `handleMessage` so it can actually be tested.
 pub fn routeIncoming(
     platform: iface.Platform,
     is_owner: bool,
@@ -2538,12 +2018,8 @@ pub fn routeIncoming(
 }
 
 test "routeIncoming: a personal-account message reaches autonomy whatever its sender's standing" {
-    // The exact shape of the original bug: an inbound DM on the owner's
-    // personal account is always from someone else, so is_owner/
-    // is_bot_admin are false -- and it must STILL be routed to the autonomy
-    // path rather than dropped. Routing it through the normal gate is what
-    // made draft/auto mode silently do nothing. A block doesn't change
-    // that either.
+    // The exact shape of the original bug: an inbound DM on the owner's personal
+    // account is always from someone else, so is_owner/ is_bot_admin are false.
     try std.testing.expectEqual(
         Route.personal_account_autonomy,
         routeIncoming(.telegram_user, false, false, false, false),
@@ -2555,10 +2031,8 @@ test "routeIncoming: a personal-account message reaches autonomy whatever its se
 }
 
 test "routeIncoming: a personal-account message is never dispatched as a command, whoever it looks like it's from" {
-    // A contact DMing the personal account must never reach the command
-    // chain: a reply to `/stats` there would go out under the owner's own
-    // identity. True for every combination, including the ones that would
-    // grant full access on any other platform.
+    // A contact DMing the personal account must never reach the command chain: a
+    // reply to `/stats` there would go out under the owner's own identity.
     for ([_]bool{ false, true }) |is_owner| {
         for ([_]bool{ false, true }) |is_bot_admin| {
             for ([_]bool{ false, true }) |blocked| {
@@ -2572,11 +2046,7 @@ test "routeIncoming: a personal-account message is never dispatched as a command
 }
 
 test "routeIncoming: bot connectors answer everyone except the blocked; owner and bot admins can't be blocked" {
-    // Every non-personal platform: a stranger gets through by default now,
-    // a blocked sender/chat doesn't, and the owner/bot-admin tiers ignore
-    // the block entirely. The personal-account carve-out must not have
-    // changed this for anyone else -- Instagram especially, since it has no
-    // reply_autonomy path of its own.
+    // Every non-personal platform.
     for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
         try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, false, false));
         try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, true, false));
@@ -2586,11 +2056,8 @@ test "routeIncoming: bot connectors answer everyone except the blocked; owner an
 }
 
 test "routeIncoming: the personal account's DM with Warden's own bot is left alone" {
-    // The production loop: with autonomy on, the bot drafted a reply to its
-    // own draft notification, whose delivery produced another notification.
-    // Every other flag is the same as a normal inbound personal-account DM
-    // -- only is_own_bot_dm separates the two -- so this must be decided on
-    // that alone.
+    // The production loop: with autonomy on, the bot drafted a reply to its own
+    // draft notification, whose delivery produced another notification.
     try std.testing.expectEqual(
         Route.ignored,
         routeIncoming(.telegram_user, false, false, false, true),
@@ -2609,10 +2076,8 @@ test "routeIncoming: the personal account's DM with Warden's own bot is left alo
 }
 
 test "routeIncoming: the self-DM carve-out is scoped to the personal account" {
-    // is_own_bot_dm is only ever computed for `.telegram_user`, but it must
-    // not change any other platform's routing even if it were set -- the
-    // owner talking to the bot in that same DM arrives on the `telegram`
-    // bot connector and has to keep working exactly as before.
+    // Is_own_bot_dm is only ever computed for `.telegram_user`, but it must not
+    // change any other platform's routing even if it were set.
     for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
         try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, false, false, true));
         try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, false, true));
@@ -2621,10 +2086,7 @@ test "routeIncoming: the self-DM carve-out is scoped to the personal account" {
 }
 
 /// Returns whether this message's attachment (if any) was claimed by the
-/// interactive `/convert` flow — `processMessageTask` must not delete a
-/// claimed file via its own attachment-cleanup `defer` (see
-/// `features/convert_flow.zig`'s `PendingConversions`, which owns cleanup
-/// for a claimed file from here on).
+/// interactive `/convert` flow.
 fn handleMessage(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -2647,78 +2109,35 @@ fn handleMessage(
     now: i64,
     max_message_len: usize,
     msg: iface.Message,
-    /// True only on the recursive call `/as` makes to replay a command
-    /// against another chat (see `resolveAsCommand`). Its one job is to
-    /// stop `/as` from relaying `/as`: without it, a `/alias` whose
-    /// expansion begins with `/as` would recurse without bound, since
-    /// alias expansion re-runs inside every relayed dispatch. Deliberately
-    /// a parameter rather than something inferred from `connector`
-    /// (`ReplyRedirect` builds a per-instance vtable, so there is no stable
-    /// vtable pointer to compare against) or from `msg` (a relayed message
-    /// is intentionally indistinguishable from a real one — that's the
-    /// whole point of the re-dispatch).
+    /// True only on the recursive call `/as` makes to replay a command against
+    /// another chat (see `resolveAsCommand`).
     relayed: bool,
-    /// The personal-account connector, if `WARDEN_TELEGRAM_USER_*` is
-    /// configured — `null` otherwise. Threaded alongside `connector` rather
-    /// than reached for via `config`/a global, same "explicit dependency,
-    /// not ambient state" convention every other shared resource here
-    /// (`pool`, `pending`, `digest_scheduler`, ...) already follows. Only
-    /// `/tdlogin`'s handler touches this; every other command ignores it.
+    /// The personal-account connector, if `WARDEN_TELEGRAM_USER_*` is configured
+    /// — `null` otherwise.
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
-    /// Phase D's `reply_autonomy = .draft` staging area — see
-    /// `reply_drafts.PendingDrafts`'s doc comment. Touched by the
-    /// `.telegram_user` auto-reply branch (`handleTelegramUserAutoReply`)
-    /// and by `/approve`/`/discard`/`/drafts`.
+    /// `reply_autonomy = .draft` staging area.
     pending_drafts: *reply_drafts.PendingDrafts,
-    /// The Bot API connector to notify the owner through when a draft is
-    /// ready for review — see `main`'s `owner_notify_connector` doc comment
-    /// for why this can't just be `connector` (the connector that actually
-    /// received the message being drafted for is the *personal* one, not
-    /// the one the owner reviews drafts on).
+    /// The Bot API connector to notify the owner through when a draft is ready
+    /// for review.
     owner_notify: iface.Connector,
     /// The Instagram personal-account connector, if `WARDEN_INSTAGRAM_*` is
-    /// configured — `null` otherwise. Same "explicit dependency, threaded
-    /// alongside `connector`" reasoning as `telegram_user` above; only
-    /// `/iglogin`'s handler touches this.
+    /// configured — `null` otherwise.
     instagram: ?*instagram_platform.InstagramConnector,
 ) bool {
-    // Coarse "how far does this message get" gate, checked before anything
-    // else in this function (including the choice_picked/attachment-
-    // continuation paths below, for uniformity: a disallowed sender gets no
-    // action taken on any kind of message, not just slash commands).
-    // `routeIncoming` owns the decision and documents the reasoning,
-    // including why the personal-account connector skips both the blocklist
-    // and the command chain entirely.
-    //
-    // The bot talks to everyone by default; a sender is turned away only if
-    // they, or the whole chat, are on the blocklist (`/blockuser`,
-    // `/blockchat`). Owners and bot admins are never blocked. Silent — this
-    // is "will the bot talk here at all", not a moderation decision, so it
-    // doesn't announce itself. Message recording/stats
-    // (`recordMessage`/`recordObservedUsers`) already ran earlier in
-    // `processMessageTask`, before `handleMessage`, and are unaffected by
-    // any of this.
+    // Coarse "how far does this message get" gate.
     const is_owner = auth.isOwner(config, connector.platform(), msg.user_id);
-    // The owner is the highest privilege there is and shouldn't need a
-    // redundant `bot_admins` row on top of that — before this, `is_bot_admin`
-    // was DB-only, so the owner had to `/addadmin` themselves before
-    // anything gated specifically on `is_bot_admin` (e.g. `/sudo`) would
-    // recognize them as one. `or` short-circuits, so the owner's messages
-    // never even pay for the `bot_admins` query.
+    // The owner is the highest privilege there is and shouldn't need a redundant
+    // `bot_admins` row on top of that — before this, `is_bot_admin` was DB-only.
     const is_bot_admin = is_owner or bot_admins.isBotAdmin(pool, identity_id);
     const platform = connector.platform();
-    // Warden's own DM with the owner, seen from the personal account. Not a
-    // chat to be managed -- see `routeIncoming`'s doc comment for the
-    // self-drafting loop this prevents.
+    // Warden's own DM with the owner, seen from the personal account.
     const is_own_bot_dm = isOwnBotDm(platform, msg.chat_id, config.telegram_bot_token);
     switch (routeIncoming(
         platform,
         is_owner,
         is_bot_admin,
-        // `and` short-circuits, so the blocklist is only actually queried
-        // for a non-owner, non-admin on a bot connector. The leading
-        // platform check keeps the lookups off the personal-account path,
-        // whose route ignores this argument entirely.
+        // `and` short-circuits, so the blocklist is only actually queried for a non-
+        // owner, non-admin on a bot connector.
         platform != .telegram_user and !is_owner and !is_bot_admin and
             (bot_blocklist.isUserBlocked(pool, identity_id) or bot_blocklist.isChatBlocked(pool, chat_id)),
         is_own_bot_dm,
@@ -2727,9 +2146,8 @@ fn handleMessage(
         .personal_account_autonomy => {
             const incoming = msg.text orelse return false;
             if (incoming.len == 0) return false;
-            // Storage sense's flood-watermark sleep still applies, same as
-            // it does to the LLM paths below — a nearly-full disk shouldn't
-            // be spending LLM calls drafting replies either.
+            // Storage sense's flood-watermark sleep still applies, same as it does to the
+            // LLM paths below.
             if (storage_sense.isSleepModeActive(pool, a)) return false;
             handleTelegramUserAutoReply(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, msg, incoming, owner_notify, pending_drafts, telegram_user);
             return false;
@@ -2740,42 +2158,26 @@ fn handleMessage(
     // A button press / reaction pick has neither text nor an attachment of
     // its own, so this must run before the "neither" bail-out just below.
     if (msg.choice_picked) |picked| {
-        // Phase 20's "Undo" button on an audit-log entry — keyed by
-        // (control room, prompt message) rather than (chat, user), so it's
-        // checked on its own first rather than folded into the
-        // isAwaitingFormat/else split below; returns `false` (not handled)
-        // for anything that isn't its own button, so a stray pick still
-        // falls through to convert_flow/menu normally.
+        // "Undo" button on an audit-log entry — keyed by (control room, prompt
+        // message) rather than (chat, user).
         if (audit_notify.handleUndoPicked(connector, a, pending_undos, now, msg, picked)) {
             return false;
         }
-        // Same "checked on its own first, false for anything not its own"
-        // shape again — the "🛑 Cancel" button `replyWithAnswer` attaches
-        // to the thinking placeholder (see `features/cancel_request.zig`).
+        // Same "checked on its own first, false for anything not its own" shape
+        // again.
         if (cancel_request.handleCancelPicked(connector, a, in_flight, now, msg, picked)) {
             return false;
         }
-        // Same "checked on its own first, false for anything not its own"
-        // shape as the Undo button above — the Approve/Discard buttons on a
-        // `reply_autonomy = .draft` notification (see
-        // `handleTelegramUserAutoReply`/`handleDraftChoicePicked`).
+        // Same "checked on its own first, false for anything not its own" shape as
+        // the Undo button above.
         if (handleDraftChoicePicked(connector, a, io, config, telegram_user, pending_drafts, now, msg, picked)) {
             return false;
         }
-        // Same shape again — `/tdchats`' Prev/Next pager buttons. Checked
-        // by `callback_data` prefix rather than any stored pending state
-        // (see `handleTdChatsPagePicked`'s doc comment on why it's
-        // stateless), so ordering relative to the two checks above doesn't
-        // matter beyond "somewhere before the isAwaitingFormat split".
         if (handleTdChatsPagePicked(connector, a, config, telegram_user, msg, picked)) {
             return false;
         }
-        // Both flows key their pending state the same way ((chat, user)),
-        // so only one of them should ever actually claim a given pick --
-        // `isAwaitingFormat` decides which, rather than trying `menu` only
-        // when `convert_flow` misses (that would make convert_flow's own
-        // "prompt isn't active anymore" reply fire on a pick that was
-        // actually meant for the menu).
+        // Both flows key their pending state the same way ((chat, user)), so only one
+        // of them should ever actually claim a given pick.
         if (pending_conversions.isAwaitingFormat(now, msg.chat_id, msg.user_id)) {
             convert_flow.handleChoicePicked(connector, a, io, config.tmp_dir, pending_conversions, now, msg, picked);
         } else {
@@ -2785,28 +2187,15 @@ fn handleMessage(
         return false;
     }
 
-    // A photo/document/voice/audio/video with no caption has no `text` at
-    // all (Telegram never sets it for those), but it still deserves a
-    // reply when addressed to the bot — the attachment alone is enough for
-    // e.g. convert_file to have something to work with. Only bail when
-    // there's neither text nor an attachment to react to.
+    // A photo/document/voice/audio/video with no caption has no `text` at all
+    // (Telegram never sets it for those).
     const raw_text = msg.text orelse "";
     if (raw_text.len == 0 and msg.attachment == null) return false;
 
-    // See `normalizeCommandMention`'s doc comment: makes `/ping@warden_bot`
-    // dispatch exactly like `/ping`, and drops a command explicitly
-    // addressed to a different bot instance sharing this chat.
     var text = normalizeCommandMention(a, raw_text, connector.selfUsername()) orelse return false;
 
-    // Storage sense's flood-watermark sleep mode (`storage_sense.zig`):
-    // pauses everything below this point except the owner's own `/storage`
-    // commands, so they can check status/disable autopilot/clean up by hand
-    // without SSH. `recordMessage`/`bcast.publish`/keyword alerts already
-    // ran in `processMessageTask` before `handleMessage` was ever called
-    // (see this function's own doc comment on the owner/blocklist gate
-    // above), so message history is preserved through a sleep episode --
-    // only the write-heavier stuff below (LLM replies, tool calls, command
-    // dispatch) is what's actually skipped.
+    // Storage sense's flood-watermark sleep mode (`storage_sense.zig`): pauses
+    // everything below this point except the owner's own `/storage` commands.
     if (storage_sense.isSleepModeActive(pool, a)) {
         const is_storage_cmd = std.mem.eql(u8, text, "/storage") or std.mem.startsWith(u8, text, "/storage ");
         if (!(is_owner and is_storage_cmd)) {
@@ -2817,34 +2206,15 @@ fn handleMessage(
         }
     }
 
-    // `/sudo <command>` lets a bot admin override a platform-level
-    // permission check for one command — see `auth.checkGroupAdminAccess`'s
-    // doc comment for the full ladder. Rewriting `text` here (rather than
-    // threading a separate "sudo command" string through the whole dispatch
-    // chain below) is the minimal-diff mechanism: every existing
-    // `std.mem.eql(u8, text, "/foo")`/`startsWith` site keeps working
-    // unchanged, just possibly seeing the de-sudo'd command instead of the
-    // original. A non-bot-admin's "/sudo foo" is deliberately left
-    // untouched here — it matches no command below and falls through to
-    // the existing "unrecognized slash command" silent-ignore path, so no
-    // special-casing is needed for that case.
+    // `/sudo <command>` lets a bot admin override a platform-level permission
+    // check for one command.
     var sudo_active = false;
     if (std.mem.startsWith(u8, text, "/sudo ") and is_bot_admin) {
         sudo_active = true;
         text = std.fmt.allocPrint(a, "/{s}", .{std.mem.trim(u8, text["/sudo ".len..], " ")}) catch text;
     }
 
-    // Custom command aliases (ROADMAP.md's Phase 19) -- "/gm" re-dispatches
-    // as if the user had typed its saved expansion (plus any trailing text
-    // typed after the alias name) directly. Expanded exactly once, not
-    // recursively: if the expansion itself happens to start with another
-    // alias's name, it's dispatched as literal text from here on rather
-    // than re-expanded -- a simple, safe rule that rules out alias loops
-    // by construction, not by a depth counter. `isReservedCommandName`
-    // means a real built-in command is never shadowable: `/alias add`
-    // refuses those names, and the lookup below skips them too, so a row
-    // that predates a name being reserved (or was written straight into
-    // Postgres) still can't change what a built-in command does.
+    // Custom command aliases.
     if (feature_flags.isEnabled(pool, "power_tools") and text.len > 1 and text[0] == '/') {
         const cmd_end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
         const cmd_name = text[1..cmd_end];
@@ -2859,13 +2229,7 @@ fn handleMessage(
         }
     }
 
-    // A plain message (or reply) arriving while (chat, user) has an open
-    // `/menu` prompt waiting on free-form input (e.g. Group Administration's
-    // "reply with the person you want to kick") — consumed here, before
-    // normal dispatch, so it never needs its own slash command. `/cancel`
-    // is deliberately exempted so it always reaches its own handler below
-    // (one of whose fallback tiers is exactly this session), rather than
-    // being swallowed as a failed target-resolution attempt.
+    // A plain message (or reply) arriving while.
     var menu_live_admin_cache: ?bool = null;
     if (!std.mem.eql(u8, text, "/cancel") and
         menu_sessions.handleAwaitingInputMessage(menu_runner, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos, is_owner, is_bot_admin, &menu_live_admin_cache)))
@@ -2873,12 +2237,8 @@ fn handleMessage(
         return false;
     }
 
-    // An attachment arriving while (chat, user) is mid-flow, waiting for a
-    // file — claimed here, before the big dispatch chain and before
-    // `isAddressedToBot`, so a captionless upload in a group (no mention/
-    // reply) isn't silently dropped by that gate the way it would be
-    // otherwise. Excludes the protected one-shot `/convert <format>`
-    // caption, which keeps working completely unchanged below.
+    // An attachment arriving while (chat, user) is mid-flow, waiting for a file —
+    // claimed here, before the big dispatch chain and before `isAddressedToBot`.
     if (msg.attachment != null and !isOneShotConvertCaption(text) and
         pending_conversions.isAwaitingFile(a, now, msg.chat_id, msg.user_id))
     {
@@ -2887,17 +2247,8 @@ fn handleMessage(
         // fall through to normal dispatch below.
     }
 
-    // Phase 21: a command typed directly in a room bound to a target chat
-    // (`/manage bind`, 1:1 as of Phase 20) runs against that target with no
-    // `/as <id>` prefix — same allow-list and authorization `/as` itself
-    // uses, via the identical relay/redirect mechanism. Checked once here,
-    // before the big dispatch chain, since it needs to match any of
-    // `as_relayable_commands` generically rather than one literal string;
-    // returns `null` silently for anything that isn't both bound and
-    // allow-listed, so ordinary chatting (or an unbound room, or a
-    // non-relayable command) falls straight through to normal dispatch
-    // below, unchanged. `feature_flags.isEnabled(pool, "management_rooms")`
-    // gates this the same as `/manage`/`/as` themselves.
+    // A command typed directly in a room bound to a target chat (`/manage bind`)
+    // runs against that target with no `/as <id>` prefix.
     if (feature_flags.isEnabled(pool, "management_rooms")) {
         if (resolveDirectRoomCommand(connector, a, config, pool, chat_id, msg, text, relayed)) |relay| {
             var redirect = reply_redirect.ReplyRedirect.init(connector, relay.target_native_chat_id, msg.chat_id, msg.message_id);
@@ -2938,9 +2289,8 @@ fn handleMessage(
         handleHelp(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/menu")) {
         if (!feature_flags.isEnabled(pool, "menu")) return false;
-        // `!menu` already reaches here as `/menu` too --
-        // `normalizeCommandMention` rewrites any leading `!` to `/` for
-        // every platform, not just Matrix's requested trigger.
+        // `!menu` already reaches here as `/menu` too -- `normalizeCommandMention`
+        // rewrites any leading `!` to `/` for every platform.
         menu_sessions.open(menu_runner, menuCtx(connector, a, pool, config, chat_id, identity_id, now, msg, io, digest_scheduler, pending_conversions, pending_undos, is_owner, is_bot_admin, &menu_live_admin_cache));
     } else if (std.mem.eql(u8, text, "/stats")) {
         replyWithStats(connector, a, pool, chat_id, msg.chat_id, msg.message_id);
@@ -2953,9 +2303,8 @@ fn handleMessage(
         if (!feature_flags.isEnabled(pool, "briefings")) return false;
         handleBriefingCommand(connector, a, io, pool, chat_id, briefing_scheduler, now, max_message_len, msg.chat_id, msg.message_id, text);
     } else if (std.mem.eql(u8, text, "/summary") or std.mem.startsWith(u8, text, "/summary ")) {
-        // Gated with `/digest` rather than on its own flag: it's the same
-        // summarizer over a caller-named window (see `handleSummaryCommand`),
-        // so a chat that has turned summarization off means both.
+        // Gated with `/digest` rather than on its own flag: it's the same summarizer
+        // over a caller-named window (see `handleSummaryCommand`).
         if (!feature_flags.isEnabled(pool, "digest")) return false;
         handleSummaryCommand(connector, a, pool, chat_id, llm_provider, tool_ctx, now, max_message_len, msg, text);
     } else if (std.mem.eql(u8, text, "/announce") or std.mem.startsWith(u8, text, "/announce ")) {
@@ -2999,12 +2348,7 @@ fn handleMessage(
         group_admin.deleteMessage(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/promote") or std.mem.startsWith(u8, text, "/promote ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        // Owner-only, not `checkGroupAdminAccess` — granting real admin
-        // rights is more consequential than mute/kick/pin, and Telegram's
-        // own admin flag doesn't tell us whether a given admin actually has
-        // permission to add further admins themselves (see
-        // `group_admin.promote`'s doc comment). Deliberately not extended
-        // to bot admins/`/sudo` either, same reasoning.
+        // Owner-only, not `checkGroupAdminAccess`.
         if (!is_owner) return false;
         const vis = resolveVisibility(pool, a, chat_id, std.mem.trim(u8, text["/promote".len..], " "), is_bot_admin);
         group_admin.promote(connector, a, msg, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
@@ -3026,13 +2370,8 @@ fn handleMessage(
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "confirm")) return false;
         group_admin.confirm(connector, a, pending, now, msg);
     } else if (std.mem.eql(u8, text, "/cancel")) {
-        // Three tiers, tried in order — a pending conversion or an open
-        // `/menu` prompt waiting on input are both per-user, not a
-        // moderation action, so either can only ever affect something the
-        // sender themselves started (no admin gate needed for those two).
-        // Falls through to the existing admin-gated ban/kick cancel,
-        // unchanged, only when there's nothing of the sender's own to
-        // cancel.
+        // Three tiers, tried in order — a pending conversion or an open `/menu`
+        // prompt waiting on input are both per-user, not a moderation action.
         if (pending_conversions.cancel(a, msg.chat_id, msg.user_id)) {
             reply(connector, a, msg.chat_id, msg.message_id, "Conversion cancelled.");
         } else if (menu_sessions.cancel(msg.chat_id, msg.user_id)) {
@@ -3043,9 +2382,7 @@ fn handleMessage(
             group_admin.cancel(connector, a, pending, msg);
         }
     } else if (std.mem.eql(u8, text, "/slowmode") or std.mem.startsWith(u8, text, "/slowmode ")) {
-        // ROADMAP.md's Phase 24. Gated with the same "group_admin" flag as
-        // /mute/etc -- it's the same moderation-tier feature set, not its
-        // own toggle.
+        // It's the same moderation-tier feature set, not its own toggle.
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "slowmode")) return false;
         handleSlowmodeCommand(connector, a, pool, chat_id, msg, text);
@@ -3076,39 +2413,23 @@ fn handleMessage(
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleRemoveAdminCommand(connector, a, pool, now, msg, text);
     } else if (std.mem.eql(u8, text, "/storage") or std.mem.startsWith(u8, text, "/storage ")) {
-        // Hidden, owner-only -- same `/sudo` pattern as
-        // `reserved_command_names_extra`'s own doc comment describes:
-        // never in `public_commands`, never in `help_text`/`help_text_admin`,
-        // reserved only so `/alias` can't shadow it. Strictly owner, not
-        // extended to bot admins/`/sudo` -- this can prune/resample real
-        // chat history and flip the ladder's autopilot switch, more
-        // consequential than anything a bot admin is trusted with elsewhere.
+        // Hidden, owner-only; reserved so `/alias` can't shadow it.
         if (!is_owner) return false;
         handleStorageCommand(connector, a, config, pool, io, llm_provider, chat_id, identity_id, msg, text, now);
     } else if (std.mem.eql(u8, text, "/whois") or std.mem.startsWith(u8, text, "/whois ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleWhoisCommand(connector, a, config, pool, now, msg, text);
     } else if (std.mem.eql(u8, text, "/chatinfo") or std.mem.startsWith(u8, text, "/chatinfo ")) {
-        // Chat-scoped admin tier, not `/whois`'s bot-wide one: this answers
-        // a question about *this* chat, and its whole purpose is to feed
-        // `/manage bind`, which authorizes against the target chat's admins.
-        // No token fallback — a token buys one moderation action (see
-        // `checkGroupAdminAccess`), not a lookup.
+        // Chat-scoped admin tier, not `/whois`'s bot-wide one: this answers a
+        // question about *this* chat, and its whole purpose is to feed `/manage
+        // bind`.
         if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "chatinfo")) return false;
         handleChatInfoCommand(connector, a, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/manage") or std.mem.startsWith(u8, text, "/manage ")) {
         if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
         handleManageCommand(connector, a, config, pool, chat_id, identity_id, msg, text);
     } else if (std.mem.eql(u8, text, "/as") or std.mem.startsWith(u8, text, "/as ")) {
-        // ROADMAP.md's Phase 9 slice 2 (widened in Phase 20: no binding
-        // required any more). Everything that can reject the request
-        // (parsing, the relayable-command allow-list, and the target-chat
-        // admin check) happens in `resolveAsCommand`;
-        // if it returns a plan, the command is replayed by calling this
-        // very function again, with the *target* chat's ids in place and a
-        // `ReplyRedirect`-wrapped connector so the relayed handler's own
-        // `sendMessage(a, msg.chat_id, ...)` surfaces back here instead of
-        // in the target chat. No handler knows any of this happened.
+        // No binding required any more).
         if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
         const relay = resolveAsCommand(connector, a, config, pool, chat_id, msg, text, relayed) orelse return false;
         var redirect = reply_redirect.ReplyRedirect.init(connector, relay.target_native_chat_id, msg.chat_id, msg.message_id);
@@ -3141,9 +2462,8 @@ fn handleMessage(
             instagram,
         );
     } else if (std.mem.eql(u8, text, "/redact") or std.mem.startsWith(u8, text, "/redact ")) {
-        // Per-mode gating happens inside handleRedactCommand itself (regex
-        // mode is stricter than the other modes) rather than here, since
-        // which gate applies depends on parsing the mode first.
+        // Per-mode gating happens inside handleRedactCommand itself (regex mode is
+        // stricter than the other modes) rather than here.
         handleRedactCommand(connector, a, config, pool, chat_id, identity_id, now, msg, text, sudo_active);
     } else if (std.mem.eql(u8, text, "/magicword") or std.mem.startsWith(u8, text, "/magicword ")) {
         handleMagicWord(connector, a, config, pool, chat_id, msg, text);
@@ -3304,10 +2624,8 @@ fn handleMessage(
         if (!feature_flags.isEnabled(pool, "watches")) return false;
         handleWatchCheckCommand(connector, a, pool, io, llm_provider, chat_id, msg, text, now);
     } else if (std.mem.eql(u8, text, "/translate") or std.mem.startsWith(u8, text, "/translate ")) {
-        // Phase 14 (ROADMAP.md): messaging assistance modes -- thin,
-        // reliable command surfaces over the existing Q&A path (the model
-        // already translates zero-shot; this just makes it a documented,
-        // predictable command rather than relying on natural language).
+        // Messaging assistance modes -- thin, reliable command surfaces over the
+        // existing Q&A path.
         if (!feature_flags.isEnabled(pool, "messaging_modes")) return false;
         const split = splitModeArgs(text["/translate".len..], msg.reply_to_text) orelse {
             reply(connector, a, msg.chat_id, msg.message_id, "Usage: /translate <language> <text>, or reply to a message with /translate <language>.");
@@ -3340,11 +2658,7 @@ fn handleMessage(
         const question = std.fmt.allocPrint(a, "Brainstorm this: give a short list of concrete ideas or options. If it reads like a decision between choices, briefly weigh the trade-offs too:\n\n{s}", .{source}) catch return false;
         handleModeCommand(connector, a, config, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, io, now, max_message_len, is_owner, is_bot_admin, msg, question, in_flight);
     } else if (std.mem.eql(u8, text, "/poll") or std.mem.startsWith(u8, text, "/poll ")) {
-        // ROADMAP.md's Phase 16: group/Telegram quality-of-life. No LLM call
-        // involved (plain string splitting + a native API call), so unlike
-        // the messaging-mode commands above this needs no owner-only
-        // gate -- same "open to anyone in the chat" tier as
-        // /wordcloud//stats.
+        // Group/Telegram quality-of-life.
         if (!feature_flags.isEnabled(pool, "polls")) return false;
         handlePollCommand(connector, a, msg, text);
     } else if (text.len > 0 and text[0] == '/') {
@@ -3352,38 +2666,25 @@ fn handleMessage(
         // LLM as if it were a question.
         return false;
     } else if (isAddressedToBot(a, pool, chat_id, msg, text)) {
-        // A message that's *just* a YouTube/Instagram/X link is already
-        // handled by `checkVideoDownload` in `processMessageTask` (if
-        // enabled) -- asking the LLM to also comment on a bare URL burns a
-        // real API call for nothing. Only skips when the link IS the whole
-        // message (after trimming whitespace); a link with real commentary
-        // around it ("what do you think of this: <url>") still gets a
-        // normal answer, since that's a real question, not just a drop.
+        // A message that's *just* a YouTube/Instagram/X link is already handled by
+        // `checkVideoDownload` in `processMessageTask` (if enabled).
         if (video_download.findLink(text)) |link| {
             if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), link)) return false;
         }
 
-        // One bulk dynamic_config fetch for every setting this branch
-        // reads, instead of six separate round trips -- see
-        // `resolveLlmDynamicSettings`'s doc comment.
+        // One bulk dynamic_config fetch for every setting this branch reads, instead
+        // of six separate round trips.
         const dyn = resolveLlmDynamicSettings(pool, a, config);
 
-        // A greeting/ack/sign-off addressed to the bot doesn't need a real
-        // (paid) LLM call to answer meaningfully — short-circuit with an
-        // instant canned reply instead. Checked before the owner-only gate
-        // below: this costs nothing, so it isn't subject to it (a random
-        // user's "hi" gets a friendly reply regardless of whether they're
-        // privileged enough for real Q&A).
+        // A greeting/ack/sign-off addressed to the bot doesn't need a real (paid) LLM
+        // call to answer meaningfully.
         if (dyn.skip_trivial_messages and trivial_reply.isTrivialMessage(a, text)) {
             const canned = trivial_reply.pickResponse(@intCast(now));
             connector.sendMessage(a, msg.chat_id, canned, msg.message_id);
             return false;
         }
         // The bot's free-form LLM Q&A is owner-only by default (toggle via
-        // WARDEN_LLM_OWNER_ONLY) — every other command above this stays
-        // open to anyone (unchanged). Silent, not an error reply: an
-        // unaddressed mention from someone else shouldn't announce "I only
-        // answer my owner" to the whole group.
+        // WARDEN_LLM_OWNER_ONLY).
         const is_privileged = is_owner or is_bot_admin;
         if (dyn.owner_only and !is_privileged) return false;
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
@@ -3391,14 +2692,9 @@ fn handleMessage(
         // Per-chat /persona override, falling back to the global default —
         // see `store/chat_settings.zig`'s `getSystemPromptOverride`.
         const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
-        // Per-chat /thinking override, falling back to the dynamic_config-
-        // or-env global default — see `store/chat_settings.zig`'s
-        // `getShowThinkingOverride`.
+        // Per-chat /thinking override, falling back to the dynamic_config- or-env
+        // global default — see `store/chat_settings.zig`'s `getShowThinkingOverride`.
         const show_thinking = chat_settings.getShowThinkingOverride(pool, chat_id) orelse dyn.show_thinking;
-        // Prefers the full `Identity` the connector built from the
-        // platform's own user object; falls back to the thinner
-        // `iface.Message` fields for a platform/message that didn't
-        // populate one (see `resolveSenderIdentity`'s same fallback).
         const asker: qa.Asker = if (msg.identity) |identity| .{
             .display_name = identity.display_name,
             .username = identity.username,
@@ -3415,29 +2711,7 @@ fn handleMessage(
 }
 
 /// Strips a Telegram-style `@botusername` qualifier off the leading
-/// `/command` token, so `/ping` and `/ping@warden_bot` dispatch
-/// identically — the qualified form is how Telegram clients disambiguate
-/// which bot a command is for once two or more bots share a chat, and every
-/// bot in the chat receives the update regardless of which one it names.
-/// Returns the original `text` unchanged when there's no qualifier, the
-/// leading token isn't a command at all, or this connector doesn't know its
-/// own username yet; returns `null` when the qualifier explicitly names a
-/// *different* bot (this command isn't for us — the caller should bail out
-/// entirely rather than fall through to the "unrecognized command" path,
-/// so two Warden instances in one group don't both act on it); otherwise
-/// returns a freshly allocated copy of `text` with the qualifier removed,
-/// leaving any arguments after it intact. A `text` starting with a `/` but
-/// with no matching qualifier reaching `allocator` (out of memory) falls
-/// back to the original, unqualified-looking `text`, which simply won't
-/// match any known command below — a safe degrade, not a crash.
-/// Matrix (and most other chat clients) intercept a leading `/` as their
-/// own client-side slash command before it ever reaches the bot — `/ping`
-/// typed in Element never arrives as message text. `!` is accepted as an
-/// equivalent command indicator everywhere (not just Matrix) for exactly
-/// this reason: `!ping` dispatches identically to `/ping`, rewritten to a
-/// leading `/` up front so every check below (and the rest of
-/// `handleMessage`'s dispatch chain) only ever has to know about one
-/// prefix.
+/// `/command` token, so `/ping` and `/ping@warden_bot` dispatch identically.
 fn normalizeCommandMention(allocator: std.mem.Allocator, text: []const u8, self_username: ?[]const u8) ?[]const u8 {
     const bang_rewritten = text.len > 0 and text[0] == '!';
     const slash_text: []const u8 = if (bang_rewritten)
@@ -3507,18 +2781,15 @@ test "normalizeCommandMention treats a leading '!' the same as '/'" {
     try std.testing.expectEqualStrings("/ping", out3);
 }
 
-/// True for the protected one-shot `/convert <format>` caption path (a
-/// non-empty argument after "/convert ") — must be excluded from the
-/// multi-stage flow's attachment-claim check so it keeps working exactly
-/// as before.
+/// True for the protected one-shot `/convert <format>` caption path (a non-
+/// empty argument after "/convert ").
 fn isOneShotConvertCaption(text: []const u8) bool {
     if (!std.mem.startsWith(u8, text, "/convert ")) return false;
     return std.mem.trim(u8, text["/convert ".len..], " ").len > 0;
 }
 
 /// A non-command message deserves a reply when it's a DM, mentions the bot,
-/// replies to one of the bot's messages, or says the chat's configured
-/// magic word (a per-chat setting; see /magicword).
+/// replies to one of the bot's messages.
 fn isAddressedToBot(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) bool {
     if (!msg.is_group) return true;
     if (msg.mentions_me or msg.reply_to_is_me) return true;
@@ -3528,22 +2799,11 @@ fn isAddressedToBot(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64
 }
 
 const magic_word_key = "magic_word";
-/// Generous enough for "San Francisco, California, United States" while
-/// still bounding what gets sent to the geocoder. Unlike the magic word
-/// this deliberately allows spaces -- almost every real place name has one.
+/// Generous enough for "San Francisco, California, United States" while still
+/// bounding what gets sent to the geocoder.
 const max_location_len = 100;
 
-/// `/location` (view) / `/location <place>` (set) / `/location off`
-/// (clear). Viewing is open to anyone in the chat, changing is owner-only,
-/// the same split `/magicword` and `/persona` already use.
-///
-/// The place name is stored verbatim and only resolved at briefing time by
-/// Open-Meteo's geocoder, so this deliberately does *not* validate that the
-/// place exists: that would mean a network round trip on every `/location`
-/// call, and a geocoder outage would then block setting a location at all.
-/// A place that never resolves simply produces briefings with no weather
-/// section (see `briefingWeatherLine`), which is the same degradation as a
-/// transient lookup failure.
+/// `/location` (view) / `/location <place>` (set) / `/location off` (clear).
 fn handleLocationCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -3644,11 +2904,8 @@ fn handleMagicWord(
 
 const max_persona_len = 4000;
 
-/// Sets (or clears, or shows) this chat's own system-prompt override for
-/// the LLM Q&A path — viewing is open to anyone (no secret involved, unlike
-/// /scraper), but setting/clearing is owner-only, same precedent as
-/// /magicword: a chat member rewriting the bot's entire personality is a
-/// bigger lever than a magic word.
+/// Sets (or clears, or shows) this chat's own system-prompt override for the
+/// LLM Q&A path.
 fn handlePersonaCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -3669,11 +2926,7 @@ fn handlePersonaCommand(
         return;
     }
 
-    // Viewing (above) stays available even when disabled -- matches the
-    // reminders/alerts/watches list commands' own policy elsewhere in this
-    // file (a module toggle blocks *creating*/*changing* things, not
-    // looking at what's already there). Only the actual set/clear path
-    // below is gated.
+    // Viewing (above) stays available even when disabled.
     if (!feature_flags.isEnabled(pool, "persona")) return;
 
     if (!auth.isOwner(config, connector.platform(), msg.user_id)) {
@@ -3704,12 +2957,7 @@ fn handlePersonaCommand(
 
 const max_welcome_len = 1000;
 
-/// `/welcome <text>` / `/welcome off` — see ROADMAP.md's Phase 16. Same
-/// view-open-to-anyone/change-owner-only access model as `/persona`: a
-/// welcome message posts automatically whenever someone new joins, so
-/// letting any chat member rewrite it is a bigger lever than a magic word.
-/// `{name}` in `text` is a literal placeholder, substituted per new member
-/// at send time by `sendWelcomeMessages` below -- not expanded here.
+/// `/welcome <text>` / `/welcome off`.
 fn handleWelcomeCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -3761,12 +3009,7 @@ fn handleWelcomeCommand(
 }
 
 /// Sends this chat's configured welcome message (if any) once per newly-
-/// joined member in `msg.joined_users` -- called from `processMessageTask`
-/// right after the housekeeping checks, before normal dispatch (a join
-/// service message has no `text`, so it would never reach `handleMessage`'s
-/// command chain anyway). A no-op, not an error, when no welcome message is
-/// configured or the chat's `welcome_messages` module is disabled -- most
-/// chats never opt in, and this runs on every join regardless.
+/// joined member in `msg.joined_users`.
 fn sendWelcomeMessages(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message) void {
     if (msg.joined_users.len == 0) return;
     if (!feature_flags.isEnabled(pool, "welcome_messages")) return;
@@ -3837,20 +3080,13 @@ test "sendWelcomeMessages substitutes {name} per joined member, no-ops without a
     try std.testing.expectEqual(@as(usize, 2), state.sent.items.len);
 }
 
-// ---------------------------------------------------------------------
-// Phase 17 (ROADMAP.md): finance trackers -- expenses, budgets,
-// subscriptions. Shared parsing/formatting helpers for all three below;
-// command handlers follow after `handleThinkingCommand`.
-// ---------------------------------------------------------------------
+// --------------------------------------------------------------------- Phase
+// 17: finance trackers -- expenses, budgets, subscriptions.
 
 const default_currency = "USD";
 
-/// Parses a plain decimal amount ("12", "12.5", "12.50") into integer
-/// cents -- real money, so this is a hand-rolled parser rather than
-/// `std.fmt.parseFloat` + rounding, which would reintroduce exactly the
-/// float-precision risk `0029_expenses.sql`'s doc comment explicitly
-/// rejects. Rejects negative/zero, more than 2 fractional digits, and
-/// anything that isn't plain digits and at most one `.`.
+/// Parses a plain decimal amount ("12", "12.5", "12.50") into integer cents
+/// -- real money.
 fn parseAmountCents(s: []const u8) ?i64 {
     if (s.len == 0) return null;
     const dot = std.mem.indexOfScalar(u8, s, '.');
@@ -3866,11 +3102,7 @@ fn parseAmountCents(s: []const u8) ?i64 {
     } else if (frac_str.len == 2) {
         frac = std.fmt.parseInt(i64, frac_str, 10) catch return null;
     }
-    // Checked, not `whole * 100 + frac`: `/expense add 9223372036854775807
-    // food` overflowed i64 here, and an overflow is an abort in
-    // `-Doptimize=ReleaseSafe`. Also caps the amount -- past this, a "12"
-    // that was meant to be dollars is indistinguishable from a mistake, and
-    // no real expense is a quadrillion dollars.
+    // Checked, not `whole * 100 + frac`.
     const cents = std.math.add(i64, std.math.mul(i64, whole, 100) catch return null, frac) catch return null;
     if (cents <= 0 or cents > tool_registry.max_expense_cents) return null;
     return cents;
@@ -3894,17 +3126,7 @@ test "parseAmountCents handles whole numbers, one and two decimal digits, and re
 }
 
 /// "1250 USD" -> "12.50 USD" -- always shows the ISO currency code rather
-/// than guessing a symbol, matching how `tools/currency.zig`/`weather.zig`
-/// already handle units elsewhere in this codebase (explicit codes, no
-/// locale guessing).
-///
-/// The fractional part is cast to `u8` before formatting -- zero-padding a
-/// *signed* integer via `{d:0>2}` makes Zig 0.16's formatter print an
-/// explicit `+` for non-negative values (to stay unambiguous with a
-/// zero-padded negative), which every other zero-padded `{d:0>2}` call
-/// elsewhere in this codebase (`civil_time.zig`, `menu.zig`, `log.zig`)
-/// never hit because they all format already-unsigned `u8` clock fields.
-/// Found by this file's own test, not by inspection.
+/// than guessing a symbol.
 fn formatMoney(a: std.mem.Allocator, cents: i64, currency: []const u8) ![]const u8 {
     const frac: u8 = @intCast(@mod(cents, 100));
     return std.fmt.allocPrint(a, "{d}.{d:0>2} {s}", .{ @divTrunc(cents, 100), frac, currency });
@@ -3921,12 +3143,8 @@ test "formatMoney pads single-digit cents and always includes the currency code"
     try std.testing.expectEqualStrings("0.05 USD", y);
 }
 
-/// Parses a subscription's recurrence shorthand -- "30d", "1w", "1mo",
-/// "1y" -- into a plain day count. Longest-suffix-first ("mo" checked
-/// before a bare unit) so "1mo" doesn't parse as "1m" + trailing "o".
-/// Deliberately a different, smaller unit set than
-/// `reminder_format.zig`'s own duration parser (seconds/minutes/hours),
-/// since a subscription's cadence is always day-or-longer.
+/// Parses a subscription's recurrence shorthand -- "30d", "1w", "1mo", "1y"
+/// -- into a plain day count.
 fn parseIntervalDays(s: []const u8) ?i64 {
     const suffixes = [_]struct { suffix: []const u8, days: i64 }{
         .{ .suffix = "mo", .days = 30 },
@@ -3956,9 +3174,7 @@ test "parseIntervalDays handles d/w/mo/y suffixes and rejects unknown units or n
 }
 
 /// Unix timestamp for the first moment of the current UTC calendar month
-/// containing `now` -- backs `/expense summary`'s and `/budget list`'s
-/// "this month" window. Naive UTC, same tradeoff `ctx.now`'s other
-/// consumers (digests, scheduler) already make.
+/// containing `now`.
 fn startOfMonthUnix(now: i64) i64 {
     const c = civil_time.localFromUnix(now, 0);
     return civil_time.unixFromLocal(.{ .year = c.year, .month = c.month, .day = 1 }, 0);
@@ -3975,26 +3191,13 @@ test "startOfMonthUnix returns midnight UTC on the 1st of the month containing n
     try std.testing.expectEqual(@as(u8, 0), c.hour);
 }
 
-/// Generic "creator or the bot owner" authorization for any chat-shared,
-/// per-record feature (expenses, subscriptions, aliases, templates) --
-/// same "shared, but only whoever added it (or the owner) may remove"
-/// model `/note delete`/`/keyword remove` already use.
+/// Generic "creator or the bot owner" authorization for any chat-shared, per-
+/// record feature (expenses, subscriptions, aliases, templates).
 fn isRecordOwnerOrCreator(config: *const config_mod.Config, connector: iface.Connector, msg: iface.Message, identity_id: i64, record_identity_id: i64) bool {
     return record_identity_id == identity_id or auth.isOwner(config, connector.platform(), msg.user_id);
 }
 
-/// Per-chat expense tracker (ROADMAP.md's Phase 17) -- `/expense add
-/// <amount> <category> [description...]`, `/expense list [category]`,
-/// `/expense summary [all]` (defaults to this calendar month), `/expense
-/// delete <id>`. No currency conversion or per-chat currency setting in
-/// v1 -- every amount is recorded in `default_currency` (USD) and sums
-/// add across whatever's actually recorded, same documented limitation
-/// `store/expenses.zig`'s own doc comment flags. Receipt logging ("log
-/// this receipt" with a photo attached) needs no separate OCR plumbing
-/// here -- Phase 10's vision support already lets the model read the
-/// photo during normal Q&A; it just calls `set_expense` (see
-/// `tools/set_expense.zig`) with what it read, the same as if the user
-/// had typed the amount themselves.
+/// Per-chat expense tracker.
 fn handleExpenseCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /expense add <amount> <category> [description], /expense list [category], /expense summary [all], or /expense delete <id>";
     const arg = std.mem.trim(u8, text["/expense".len..], " ");
@@ -4101,13 +3304,7 @@ fn formatExpenseList(a: std.mem.Allocator, listed: []const expenses.Expense) []c
     return buf.writer.buffered();
 }
 
-/// Per-category breakdown + grand total since `since_ts` (null = all
-/// time), each category's line also showing its budget (if one's set)
-/// and whether it's over -- reuses `expenses.totalsByCategory`/
-/// `budgets.listForChat` rather than a joined SQL query, since both
-/// lists are already small (a personal chat's category count) and this
-/// keeps `store/expenses.zig`/`store/budgets.zig` independent of each
-/// other.
+/// Per-category breakdown + grand total since `since_ts` (null = all time).
 fn formatExpenseSummary(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, since_ts: ?i64) []const u8 {
     const totals = expenses.totalsByCategory(pool, a, chat_id, since_ts) catch |err| {
         log.err("expense: summary failed for chat {d}: {t}", .{ chat_id, err });
@@ -4141,12 +3338,8 @@ fn formatExpenseSummary(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id:
     return buf.writer.buffered();
 }
 
-/// Per-chat monthly budgets (ROADMAP.md's Phase 17) -- `/budget set
+/// Per-chat monthly budgets -- `/budget set
 /// <category> <amount>`, `/budget list`, `/budget remove <category>`.
-/// Same view-open-to-anyone/change-owner-only access model as `/persona`/
-/// `/welcome`: a budget is a shared chat-wide policy, not a personal
-/// item, so letting any member rewrite it is a bigger lever than logging
-/// their own expense.
 fn handleBudgetCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /budget set <category> <amount>, /budget list, or /budget remove <category>";
     const arg = std.mem.trim(u8, text["/budget".len..], " ");
@@ -4235,11 +3428,7 @@ fn formatBudgetList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64
     return buf.writer.buffered();
 }
 
-/// Per-chat subscription/recurring-cost ledger (ROADMAP.md's Phase 17) --
-/// `/subscription add <name> <amount> every <interval>`, `/subscription
-/// list` (each entry's monthly-equivalent cost plus a running total),
-/// `/subscription remove <id>`. See `store/subscriptions.zig`'s doc
-/// comment for why this deliberately doesn't also fire its own reminders.
+/// Per-chat subscription/recurring-cost ledger.
 fn handleSubscriptionCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /subscription add <name> <amount> every <interval e.g. 1mo>, /subscription list, or /subscription remove <id>";
     const arg = std.mem.trim(u8, text["/subscription".len..], " ");
@@ -4292,12 +3481,8 @@ fn handleSubscriptionCommand(connector: iface.Connector, a: std.mem.Allocator, c
         return;
     }
 
-    // "<name...> <amount> every <interval>" -- name may be multiple words
-    // (e.g. "Amazon Prime"), so this parses from the *end*: the last two
-    // tokens must be "every <interval>", the token before that the
-    // amount, and everything before that the name. Same "join everything
-    // between fixed anchors" shape `/alert`'s own multi-word-subject
-    // parsing already uses.
+    // "<name...> <amount> every <interval>" -- name may be multiple words (e.g.
+    // "Amazon Prime"), so this parses from the *end*.
     const rest = std.mem.trim(u8, it.rest(), " ");
     const every_idx = std.mem.lastIndexOf(u8, rest, " every ") orelse {
         reply(connector, a, msg.chat_id, msg.message_id, usage);
@@ -4357,18 +3542,11 @@ fn formatSubscriptionList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_i
     return buf.writer.buffered();
 }
 
-// ---------------------------------------------------------------------
-// Phase 19 (ROADMAP.md): power-user tools -- custom command aliases and
-// saved prompt templates. Joke/riddle/trivia/word-of-day/motivate are
-// implemented directly in `handleMessage`'s dispatch chain above (they're
-// thin one-liners over the existing `handleModeCommand` from Phase 14,
-// with no state of their own worth a dedicated handler function).
-// ---------------------------------------------------------------------
+// --------------------------------------------------------------------- Phase
+// 19: power-user tools.
 
 /// `/alias add <name> <command/text>` / `/alias list` / `/alias remove
-/// <name>` -- see the alias-expansion step in `handleMessage` for how a
-/// saved alias actually gets used. Same "shared, but only whoever added
-/// it (or the owner) may remove" model `/note delete` already uses.
+/// <name>`.
 fn handleAliasCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /alias add <name> <command or text>, /alias list, or /alias remove <name>";
     const arg = std.mem.trim(u8, text["/alias".len..], " ");
@@ -4454,13 +3632,8 @@ fn formatAliasList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64)
     return buf.writer.buffered();
 }
 
-/// `/template save <name> <text>` / `/template list` / `/template use
-/// <name> [extra text]` / `/template delete <name>` -- `use` routes the
-/// saved text (plus any extra text appended) through the exact same
-/// `handleModeCommand` pipeline `/eli5`/`/brainstorm` use, since "use a
-/// saved prompt" is just another way of asking a question. Same "shared,
-/// but only whoever added it (or the owner) may delete" access model
-/// `/alias remove` uses.
+/// `/template save <name> <text>` / `/template list` / `/template use <name>
+/// [extra text]` / `/template delete <name>`.
 fn handleTemplateCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -4587,25 +3760,7 @@ fn formatTemplateList(a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i
 }
 
 /// Per-chat override for whether a reasoning model's chain-of-thought is
-/// shown — same view-open-to-anyone/change-owner-only access model as
-/// `/persona` (a chat member flipping this is a smaller lever than a full
-/// persona rewrite, but still not something to leave open to anyone).
-/// `/tdlogin status|phone <number>|code <digits>|password <password>` —
-/// bot-chat fallback for driving the personal-account connector's login
-/// (see `platform/telegram/user_connector.zig`'s doc comment; warden-ui's own
-/// login form at `/api/v1/telegram-user/*` is the primary path). Owner-only,
-/// checked here rather than at the dispatch site since every sibling
-/// owner-only command (`/scraper`, etc.) follows the same "check inside the
-/// handler" shape.
-///
-/// The `code` subcommand strips every non-digit character before passing
-/// the result to `submitAuthCode` — this is the obfuscation workaround
-/// itself (see `Platform.telegram_user`'s doc comment and the plan sent to
-/// the owner): Telegram's own anti-phishing detection can silently
-/// invalidate a login code the moment its bare digits appear as a message
-/// in *any* Telegram chat, including one with this bot, so the owner is
-/// expected to type it with digits separated ("1 2 3 4 5") or otherwise
-/// broken up rather than as the bare code Telegram displayed.
+/// shown.
 fn handleTdloginCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -4738,13 +3893,8 @@ fn handleTdloginCommand(
     reply(connector, a, msg.chat_id, msg.message_id, "Unknown /tdlogin subcommand — use status, phone, code, password, or logout.");
 }
 
-/// `/iglogin status|start <username> <password>|challenge <digits>|code <digits>|2fa <digits>|logout`
-/// — drives the Instagram connector's login/challenge/2FA state machine
-/// (`platform/instagram/auth.zig`), same owner-only/bot-chat-fallback shape as
-/// `/tdlogin` above. The password is typed directly into this trusted
-/// chat (same trust boundary `/tdlogin`'s phone number and every other
-/// owner-only command already relies on) and is never logged or persisted
-/// — see `platform/instagram/auth.zig`'s `AuthClient.login` doc comment.
+/// `/iglogin status|start <username> <password>|challenge <digits>|code
+/// <digits>|2fa <digits>|logout`.
 fn handleIgloginCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -4876,14 +4026,7 @@ fn handleIgloginCommand(
     reply(connector, a, msg.chat_id, msg.message_id, "Unknown /iglogin subcommand — use status, start, challenge, 2fa, resume, or logout.");
 }
 
-/// Shared by `/tdlogin logout` and the standalone `/tdlogout` alias (same
-/// command, two spellings — `/tdlogout` because that's what got asked for
-/// directly, `/tdlogin logout` because it fits the existing status/phone/
-/// code/password subcommand family). `.none` is refused rather than
-/// forwarded to `conn.logOut()`: the connector's `client_id` is still null
-/// at that point (no `ensureClient()` call has run yet), and `send()`
-/// unconditionally unwraps `client_id.?` — a real crash, not just a
-/// pointless no-op, if this ever raced a fresh startup.
+/// Shared by `/tdlogin logout` and the standalone `/tdlogout` alias.
 fn performTdLogout(connector: iface.Connector, a: std.mem.Allocator, conn: *telegram_user_platform.TelegramUserConnector, msg: iface.Message) void {
     if (conn.authState() == .none) {
         reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector hasn't started yet — nothing to log out of.");
@@ -4893,31 +4036,7 @@ fn performTdLogout(connector: iface.Connector, a: std.mem.Allocator, conn: *tele
     reply(connector, a, msg.chat_id, msg.message_id, "Logging out of the personal-account session — Telegram will clear it locally and end it server-side, same as removing the device from your active sessions list. Log back in any time with /tdlogin phone <number>.");
 }
 
-/// `/sendas <chat_id> <text...>` / `/tdsend <chat_id> <text...>` — same
-/// command, two spellings, one implementation (`command_prefix` is which
-/// one the caller matched). `/sendas` is Phase C of the plan sent to the
-/// owner: a manual, owner-only command that sends a real message through
-/// the personal-account connector, proving the send path (and, longer
-/// term, rate-limiting) before any auto-drafting/autonomous send existed.
-/// `/tdsend` is the same thing under the `/td*` family's naming
-/// convention (`/tdlogin`/`/tdchats`/`/tdsearch`/`/tdsummary`/`/tdlogout`),
-/// added by direct request once that family existed and `/sendas` was the
-/// one outlier not matching it — both are kept working rather than
-/// breaking `/sendas` for anyone already using it.
-///
-/// `chat_id` is TDLib's own native chat id (not the Bot API's — see
-/// `Platform.telegram_user`'s doc comment on why these are different
-/// numbering schemes for "the same" real-world chat) — findable via
-/// `/tdchats`/`/tdsearch`, warden-ui's admin chat list, or simply by seeing
-/// which chat a real inbound message from that contact recorded once one
-/// arrives, since `store/chats.upsertChat` runs for every connector
-/// uniformly. Deliberately id-only, not name-resolved like `/tdsummary`
-/// (`chat_summary.resolveChat`): a name can contain spaces, which would
-/// make "where does the target end and the message begin" ambiguous for a
-/// two-argument command the way it isn't for `/tdsummary`'s single
-/// argument. Name-based targeting instead lives in the `send_personal_
-/// message` LLM tool, where `chat`/`message` are already separate
-/// structured fields with no such ambiguity.
+/// `/sendas <chat_id> <text...>` / `/tdsend <chat_id> <text...>`.
 fn handleSendAsCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -4954,27 +4073,15 @@ fn handleSendAsCommand(
     reply(connector, a, msg.chat_id, msg.message_id, "Sent.");
 }
 
-/// Chats-per-page for `/tdchats`' pager and its Prev/Next buttons —
-/// direct-user-request feature (2026-08-18, an account with "dozens of
-/// chats" made the old single-message dump with a "... and N more (not
-/// shown)" tail actually lose information). 15 keeps a page's button
-/// message comfortably under Telegram's 4096-char limit even for long
-/// titles, while still fitting several pages' worth of a merely
-/// medium-sized chat list without excessive tapping.
+/// Chats-per-page for `/tdchats`' pager and its Prev/Next buttons.
 const tdchats_per_page = 15;
 
 /// `callback_data` prefix for a `/tdchats` pager button — see
-/// `handleTdChatsPagePicked`. The page number is everything after the
-/// colon, so `"tdchats_page:2"` means "render page index 2 (0-based)".
+/// `handleTdChatsPagePicked`.
 const tdchats_page_prefix = "tdchats_page:";
 
 /// Builds one page's message text + Prev/Next buttons from an already-
-/// resolved chat list — shared by `/tdchats`' initial send,
-/// `handleTdChatsPagePicked`'s re-render on a button press, and (as a
-/// single un-paginated call with `page = 0`) `/tdsearch`'s typically-short
-/// result list. `chats` is assumed already sorted (see
-/// `chat_summary.allChatsSortedByTitle`) — this function only slices and
-/// renders, it never reorders.
+/// resolved chat list.
 fn renderTdChatsPage(a: std.mem.Allocator, chat_list: []const chat_summary.ChatMatch, page: usize) struct { text: []const u8, choices: []const iface.Choice } {
     const total_pages = if (chat_list.len == 0) 1 else std.math.divCeil(usize, chat_list.len, tdchats_per_page) catch 1;
     const clamped_page = @min(page, total_pages - 1);
@@ -5001,14 +4108,7 @@ fn renderTdChatsPage(a: std.mem.Allocator, chat_list: []const chat_summary.ChatM
     return .{ .text = out.writer.buffered(), .choices = choices.items };
 }
 
-/// A `/tdchats` pager button press — consumed the same way
-/// `handleDraftChoicePicked` consumes a draft Approve/Discard press
-/// (checked against `msg.choice_picked` right alongside it in
-/// `handleMessage`'s dispatch, "false for anything not mine" contract).
-/// Stateless by design: the page number lives entirely in the button's own
-/// `callback_data`, so there's no per-owner pager session to expire or
-/// leak — a re-render just re-fetches and re-sorts the current chat list
-/// fresh, same as a brand new `/tdchats` would.
+/// A `/tdchats` pager button press.
 fn handleTdChatsPagePicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5085,11 +4185,7 @@ test "renderTdChatsPage: an out-of-range page clamps to the last one" {
 }
 
 /// `/tdchats` — lists the personal account's known chats (id + title),
-/// paginated (see `tdchats_per_page`) with Prev/Next buttons, so the owner
-/// can find a `/sendas`/`/tdsummary` target without already knowing a raw
-/// TDLib chat id. Owner-only, same bar as every other `/td*`/`/sendas`
-/// command. `/tdsearch <name>` (see `handleTdSearchCommand`) narrows this
-/// down directly instead of paging through it.
+/// paginated (see `tdchats_per_page`) with Prev/Next buttons.
 fn handleTdchatsCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5126,15 +4222,7 @@ fn handleTdchatsCommand(
     };
 }
 
-/// `/tdsearch <name>` — direct-user-request companion to `/tdchats`' pager:
-/// jump straight to the chats matching a name instead of paging through
-/// everything. Deliberately un-paginated (unlike `/tdchats`) — a
-/// case-insensitive title substring is expected to narrow things down to a
-/// handful of chats, not dozens, so `renderTdChatsPage`'s single-page call
-/// here almost always has no Next button at all; a search somehow matching
-/// enough to need a second page still gets one (`renderTdChatsPage` doesn't
-/// care where its input came from), it just isn't the common case this
-/// command is built for.
+/// `/tdsearch <name>` — direct-user-request companion to `/tdchats`' pager.
 fn handleTdSearchCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5178,13 +4266,8 @@ fn handleTdSearchCommand(
     };
 }
 
-/// `/tdsummary <chat id or name>` — direct-user-request feature: summarize
-/// a personal-account chat's unread messages on demand and mark them read,
-/// so opening Telegram afterward shows a clean chat rather than a pile the
-/// owner already got the gist of from Warden. `<chat>` accepts the same raw
-/// TDLib id `/tdchats` prints, or (see `chat_summary.resolveChat`) any
-/// case-insensitive substring of a chat's title — ambiguous matches list
-/// their titles back rather than guessing.
+/// `/tdsummary <chat id or name>` — direct-user-request feature: summarize a
+/// personal-account chat's unread messages on demand and mark them read.
 fn handleTdSummaryCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5238,12 +4321,7 @@ fn handleTdSummaryCommand(
     }
 }
 
-/// Splits a trailing `--all` token off `/tdsummary`'s argument text —
-/// direct owner request (2026-08-19) for a way to summarize the last 100
-/// messages regardless of read state instead of just unread ones. A
-/// trailing, space-separated token specifically (not a bare substring
-/// match) so a chat literally named "...--all" can't accidentally trip
-/// this — vanishingly unlikely, but free to guard against.
+/// Splits a trailing `--all` token off `/tdsummary`'s argument text.
 fn stripAllFlag(text: []const u8) struct { query: []const u8, all: bool } {
     const trimmed = std.mem.trim(u8, text, " ");
     if (std.mem.eql(u8, trimmed, "--all")) return .{ .query = "", .all = true };
@@ -5272,9 +4350,7 @@ test "stripAllFlag: strips a trailing --all token, leaves a bare query alone" {
 }
 
 /// The Bot API owner's own native chat id (private-chat id == user id on
-/// Telegram) — `null` if, somehow, no `.telegram` entry exists in
-/// `config.owners` (shouldn't happen: `Config.load` always adds one
-/// unconditionally from `WARDEN_TELEGRAM_OWNER_ID`).
+/// Telegram).
 fn ownerTelegramNativeId(config: *const config_mod.Config) ?[]const u8 {
     for (config.owners) |entry| {
         if (entry.platform == .telegram) return entry.owner_id;
@@ -5283,27 +4359,14 @@ fn ownerTelegramNativeId(config: *const config_mod.Config) ?[]const u8 {
 }
 
 /// The `identities` row for the Bot API owner — the identity
-/// `user_settings.reply_autonomy_default` (the global `/autonomy` dial) and
-/// every other personal-settings row is keyed on, same identity the
-/// settings UI resolves via its own login session. Not cached: this is one
-/// cheap upsert-or-fetch, called at most once per incoming personal-account
-/// message.
+/// `user_settings.reply_autonomy_default`.
 fn resolveOwnerIdentityId(pool: *store_pool.PgPool, config: *const config_mod.Config, now: i64) !i64 {
     const native_id = ownerTelegramNativeId(config) orelse return error.NoTelegramOwnerConfigured;
     return identities.getOrCreateMinimal(pool, .telegram, native_id, "Owner", null, false, now);
 }
 
 /// `/autonomy` — Phase D of the plan sent to the owner: the off/draft/auto
-/// dial for `reply_autonomy` (migration `0043_reply_autonomy.sql`). Three
-/// forms:
-///   `/autonomy` — shows the current global default.
-///   `/autonomy <off|draft|auto>` — sets the global default.
-///   `/autonomy <chat id> <off|draft|auto|clear>` — sets (or clears) a
-///     per-chat override. `<chat id>` is TDLib's own native chat id, the
-///     same id space `/sendas`/`/tdchats`/`/approve`/`/discard` all use —
-///     the override can only attach to a chat Warden already has a `chats`
-///     row for (see `store/chats.getByNative`), i.e. one that's exchanged
-///     at least one message with the personal account already.
+/// dial for `reply_autonomy` (migration `0043_reply_autonomy.sql`).
 fn handleAutonomyCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5362,9 +4425,6 @@ fn handleAutonomyCommand(
     }
 
     // `/autonomy <chat id> prompt [<text>]` — this chat's ghostwriter voice.
-    // Separate from `/persona`, which styles Warden answering as *itself*;
-    // see `chat_settings.getReplyAutonomyPrompt` for why sharing one setting
-    // was a bug. No argument shows the current one; `off` clears it.
     if (std.mem.eql(u8, level_text, "prompt") or std.mem.startsWith(u8, level_text, "prompt ")) {
         const prompt_arg = std.mem.trim(u8, level_text["prompt".len..], " ");
         if (prompt_arg.len == 0) {
@@ -5403,21 +4463,7 @@ fn handleAutonomyCommand(
 }
 
 /// `/drafts` — lists every pending `reply_autonomy = .draft` draft (see
-/// `reply_drafts.PendingDrafts`), so the owner doesn't have to remember
-/// which chats have one waiting.
-/// `/feed` — the curated-feed control surface (see
-/// `features/curated_feed.zig`). Owner-only throughout: it reads channels
-/// through the owner's personal account and posts under their identity.
-///
-///   /feed                      — status
-///   /feed add <chat id|name>   — watch a channel
-///   /feed remove <chat id>     — stop watching one
-///   /feed list                 — what's watched
-///   /feed target <chat id>     — where digests go
-///   /feed policy <text>        — the natural-language filter
-///   /feed every <duration>     — how often a digest is posted
-///   /feed on | /feed off       — enable/disable
-///   /feed run                  — run a pass right now
+/// `reply_drafts.PendingDrafts`).
 fn handleFeedCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5472,9 +4518,6 @@ fn handleFeedCommand(
             reply(connector, a, msg.chat_id, msg.message_id, "The personal-account connector isn't configured on this deployment.");
             return;
         };
-        // Same resolver /tdsummary uses, so a channel can be named rather
-        // than looked up as a raw id, and an ambiguous name lists the
-        // candidates instead of silently picking one.
         const resolution = chat_summary.resolveChat(conn, a, arg) catch {
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't look that chat up.");
             return;
@@ -5677,9 +4720,7 @@ fn handleDraftsListCommand(
 }
 
 /// `/approve <chat id>` — sends a pending `reply_autonomy = .draft` draft
-/// exactly as generated, through the personal-account connector, and
-/// removes it from `pending_drafts`. `<chat id>` is TDLib's native chat id
-/// (see /tdchats or /drafts).
+/// exactly as generated, through the personal-account connector.
 fn handleApproveCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5745,10 +4786,7 @@ fn handleDiscardCommand(
 }
 
 /// The reply-as-me default when no per-chat `/persona` override exists for
-/// this chat — deliberately NOT `config.system_prompt`, which describes
-/// Warden the bot ("You are Warden, an assistant...") and would produce
-/// replies that out themselves as an AI. Used by
-/// `handleTelegramUserAutoReply` only.
+/// this chat — deliberately NOT `config.system_prompt`.
 const default_reply_as_owner_prompt =
     \\You are ghostwriting a reply on behalf of the owner of this Telegram
     \\account, to one of their real contacts, in the owner's voice, as if
@@ -5780,13 +4818,7 @@ const default_reply_as_owner_prompt =
 ;
 
 /// Appended to whichever `reply_autonomy` system prompt is in force, so it
-/// survives a per-chat override set through `/autonomy prompt`. `qa.zig`'s
-/// `default_system_prompt` carries its own "match the language the user
-/// wrote in" line, but that prompt is *replaced* on this path rather than
-/// extended -- both `default_reply_as_owner_prompt` and a custom override
-/// are passed to `qa.answer` as the whole system prompt, so the rule has to
-/// be re-stated here or it silently doesn't apply. That gap is why a Persian
-/// "سلام" came back as an English reply.
+/// survives a per-chat override set through `/autonomy prompt`.
 const reply_language_rule =
     \\
     \\
@@ -5801,22 +4833,12 @@ const reply_language_rule =
 ;
 
 /// `Choice.value` prefixes for the Approve/Discard buttons on a
-/// `reply_autonomy = .draft` notification — see `handleTelegramUserAutoReply`
-/// (sends them) and `handleDraftChoicePicked` (consumes them). The target
-/// native chat id is appended verbatim after the prefix.
+/// `reply_autonomy = .draft` notification.
 const draft_approve_prefix = "draft_approve:";
 const draft_discard_prefix = "draft_discard:";
 
-/// Owner-configured `reply_autonomy` for an incoming personal-account
-/// message (Phase D of the plan sent to the owner). `.off` (the resolved
-/// default until the owner ever touches `/autonomy`) is a pure no-op — see
-/// the `.telegram_user` dispatch branch's doc comment in `handleMessage`
-/// for exactly why this can't just fall through to `isAddressedToBot`.
-/// `.draft` generates a reply and stashes it in `pending_drafts` for
-/// `/approve`/`/discard` instead of sending it; `.auto` sends it straight
-/// back through `connector` — safe to do unconditionally here since the
-/// caller only reaches this function when `connector.platform() ==
-/// .telegram_user`.
+/// Owner-configured `reply_autonomy` for an incoming personal-account message
+/// (Phase D of the plan sent to the owner).
 fn handleTelegramUserAutoReply(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5849,16 +4871,7 @@ fn handleTelegramUserAutoReply(
         trivial_reply.pickResponse(@intCast(now))
     else blk: {
         // `reply_autonomy`'s own per-chat prompt override, NOT `/persona`'s.
-        // These read as the same thing and want opposite outcomes: `/persona`
-        // styles *Warden answering as itself* in a chat, while this path is
-        // ghostwriting as the owner, where sounding like a bot persona is
-        // exactly the failure mode `default_reply_as_owner_prompt` exists to
-        // prevent. Sharing one column meant setting a persona on a chat
-        // silently made its ghostwritten replies out themselves as an AI.
         const base_prompt = chat_settings.getReplyAutonomyPrompt(pool, a, chat_id) orelse default_reply_as_owner_prompt;
-        // Concatenated rather than baked into the default text so a per-chat
-        // `/autonomy prompt` override can restyle the voice without being
-        // able to drop the language rule.
         const system_prompt = std.fmt.allocPrint(a, "{s}{s}", .{ base_prompt, reply_language_rule }) catch base_prompt;
         const asker: qa.Asker = if (msg.identity) |identity| .{
             .display_name = identity.display_name,
@@ -5884,17 +4897,7 @@ fn handleTelegramUserAutoReply(
         .draft => {
             const chat_title = msg.chat_title orelse msg.chat_id;
 
-            // Write the draft straight into that chat's Telegram composer,
-            // so opening the conversation on any device shows it already
-            // typed and ready to edit or send — the whole point of `draft`
-            // mode being "have something waiting for me", rather than
-            // "send me a notification I then have to act on elsewhere".
-            //
-            // Whatever the owner had already typed there is read first and
-            // carried into the notification (and the drafts page) instead of
-            // being silently destroyed: overwriting is deliberate — the AI
-            // draft should definitely be there when the chat is opened — but
-            // losing a half-typed message with no trace is not.
+            // Write the draft straight into that chat's Telegram composer.
             var replaced_draft: ?[]const u8 = null;
             if (telegram_user) |tu| {
                 if (std.fmt.parseInt(i64, msg.chat_id, 10)) |native_id| {
@@ -5903,10 +4906,8 @@ fn handleTelegramUserAutoReply(
                         break :blk_draft null;
                     };
                     if (!tu.setChatDraft(a, io, native_id, answer, now)) {
-                        // The notification and the drafts page below still
-                        // work, so this degrades rather than fails: the
-                        // owner just has to approve from one of those
-                        // instead of finding the text pre-typed.
+                        // The notification and the drafts page below still work, so this degrades
+                        // rather than fails.
                         log.warn("reply_autonomy: couldn't prefill the composer for chat {s}; falling back to notification-only", .{msg.chat_id});
                         replaced_draft = null;
                     }
@@ -5933,14 +4934,8 @@ fn handleTelegramUserAutoReply(
                 "\u{1f4ac} Draft reply ready\nChat: {s} ({s})\nThey said: \"{s}\"\n\nDraft: \"{s}\"{s}",
                 .{ chat_title, msg.chat_id, incoming_preview, answer, replaced_note },
             ) catch return;
-            // Buttons, not "type /approve <chat id>" — see
-            // `handleDraftChoicePicked` for what picking one does.
-            // `Choice.value` becomes Telegram's `callback_data` verbatim
-            // (`Connector.sendChoicePrompt`'s doc comment), so the target
-            // chat id travels on the button itself; no separate
-            // (control chat, prompt message) lookup is needed the way
-            // `audit_notify.PendingUndos` needs one; `pending_drafts` is
-            // already keyed by this same native chat id.
+            // Buttons, not "type /approve <chat id>" — see `handleDraftChoicePicked` for
+            // what picking one does.
             const approve_value = std.fmt.allocPrint(a, "{s}{s}", .{ draft_approve_prefix, msg.chat_id }) catch return;
             const discard_value = std.fmt.allocPrint(a, "{s}{s}", .{ draft_discard_prefix, msg.chat_id }) catch return;
             const choices = [_]iface.Choice{
@@ -5955,20 +4950,7 @@ fn handleTelegramUserAutoReply(
 }
 
 /// Consumes a `ChoicePicked` that's an Approve/Discard button press on a
-/// `reply_autonomy = .draft` notification (see `handleTelegramUserAutoReply`
-/// and the `draft_approve_prefix`/`draft_discard_prefix` doc comment) —
-/// returns `false` for anything else (a stray pick, or one of
-/// `audit_notify`/`convert_flow`/`menu`'s own buttons) so `handleMessage`
-/// falls through to its other `choice_picked` consumers unchanged, same
-/// contract as `audit_notify.handleUndoPicked`.
-///
-/// Owner-only, checked here and not left to "the buttons are only ever
-/// posted to the owner's chat": Telegram lets any client send arbitrary
-/// `callback_data` for any bot message, so a `draft_approve:<chat>` value
-/// arriving from someone else is a forged press, and approving it would
-/// send the unreviewed draft from the owner's own personal account. A
-/// forged press is still consumed (`true`) so it can't fall through to
-/// another button consumer, but it does nothing and gets no reply.
+/// `reply_autonomy = .draft` notification.
 fn handleDraftChoicePicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -5998,9 +4980,8 @@ fn handleDraftChoicePicked(
             return true;
         };
         conn.connector().sendMessage(a, native_chat_id, draft.draft_text, draft.reply_to);
-        // The composer still holds this exact text (that's how the owner
-        // saw it in the first place) -- leaving it there after sending
-        // invites sending the same message twice.
+        // The composer still holds this exact text (that's how the owner saw it in
+        // the first place).
         telegram_user_platform.clearComposerDraftFor(telegram_user, a, io, native_chat_id);
         const confirmation = std.fmt.allocPrint(a, "Sent to {s}.", .{draft.chat_title}) catch "Sent.";
         connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
@@ -6078,9 +5059,7 @@ fn handleThinkingCommand(
 }
 
 /// Owner-only, unlike /magicword: the whole command (including viewing) is
-/// gated in the dispatcher above, since the config here can include a
-/// remote endpoint/API key that shouldn't be visible to random chat
-/// members. Bot-wide, not per-chat — see `store/bot_config.zig`.
+/// gated in the dispatcher above.
 fn handleScraperCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -6164,34 +5143,11 @@ fn handleScraperCommand(
 }
 
 /// Resolves a command's target identity, in order: a reply to the target's
-/// message; failing that, an `@username` argument (`identities.
-/// findByUsername` — exact-match, platform-scoped); failing that, a bare
-/// argument treated as the target's raw platform-native id (Telegram's
-/// numeric id, Matrix's `@user:server`, an XMPP JID, ...) — the same string
-/// `Message.user_id`/`reply_to_user_id` carry, for when the bot has no
-/// `@username` to go on (or the target has none at all).
-///
-/// `create_if_missing` controls what happens when the raw-id branch finds no
-/// existing row: `true` (every mutating call site below) creates a minimal
-/// placeholder via `getOrCreateMinimal`, same as the reply-target branch
-/// already does — a raw id is, unlike a username, always enough on its own
-/// to address that platform user, so there's nothing to "wait and see" for.
-/// `false` (read-only lookups, e.g. `/whois`) uses `findByNativeId` instead,
-/// which never creates a row — fabricating one just to answer an info
-/// command about someone the bot has genuinely never seen would be a
-/// surprising side effect. The `@username` branch is never create-on-miss
-/// either way, since a username alone doesn't carry a native id to create
-/// the row with.
-///
-/// `null` when nothing is present/resolvable. Shared by `/blockuser`,
-/// `/unblockuser`, `/addadmin`, `/removeadmin`, `/kick`, `/ban`, `/whois`.
+/// message; failing that, an `@username` argument.
 fn resolveTargetIdentity(pool: *store_pool.PgPool, connector: iface.Connector, a: std.mem.Allocator, now: i64, msg: iface.Message, target_arg: []const u8, create_if_missing: bool) !?identities.IdentityRef {
     if (replyTarget(msg)) |target| {
-        // `msg.reply_to_username` (not `target.label`, which already
-        // substituted the raw user id when no username is known) — passing
-        // the raw, possibly-null value through lets `getOrCreateMinimal`
-        // persist/backfill the real username so a later `@username` lookup
-        // for this same person can actually find them.
+        // `msg.reply_to_username` (not `target.label`, which already substituted the
+        // raw user id when no username is known).
         const id = try identities.getOrCreateMinimal(pool, connector.platform(), target.user_id, target.label, msg.reply_to_username, false, now);
         return .{ .id = id, .display_name = target.label, .native_id = target.user_id };
     }
@@ -6209,28 +5165,14 @@ fn resolveTargetIdentity(pool: *store_pool.PgPool, connector: iface.Connector, a
 }
 
 /// The six bot-management commands (`/blockuser /unblockuser /blockchat
-/// /unblockchat /addadmin /removeadmin`) share this shape: resolve a
-/// target identity (reply-or-`@username`), call one store mutation, reply
-/// with a plain confirmation. Gate (`auth.isOwnerOrBotAdmin`) is checked by
-/// the caller in every case; `granted_by`/`blocked_by` is always the acting
-/// identity (`identity_id`, already resolved by `processMessageTask` before
-/// `handleMessage` runs).
-/// A bare `@username` argument (not a reply) — used as the fallback path
-/// when `resolveTargetIdentity` can't find an existing identity for that
-/// username, to queue (or cancel) a pending grant instead of just failing.
-/// `null` for a reply-based call (no separate username argument to queue)
-/// or an empty/non-`@` argument.
+/// /unblockchat /addadmin /removeadmin`) share this shape.
 fn usernameFromArg(arg: []const u8) ?[]const u8 {
     if (arg.len > 1 and arg[0] == '@') return arg[1..];
     return null;
 }
 
 /// `/kick`/`/ban [@username | user_id]` — same reply-or-`@username`-or-raw-id
-/// targeting as `/blockuser`/`/addadmin` (via `resolveTargetIdentity`), which
-/// `group_admin.zig`'s `requestConfirmation` never had: it only ever
-/// resolved a reply, so `/kick @spammer`/`/kick 123456789` silently matched
-/// no dispatch branch at all (see the exact-`eql` match this replaced).
-/// Permission is already checked by the caller before this runs.
+/// targeting as `/blockuser`/`/addadmin` (via `resolveTargetIdentity`).
 fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, pending_undos: *audit_notify.PendingUndos, is_superuser: bool, now: i64, msg: iface.Message, text: []const u8, comptime prefix: []const u8, kind: group_admin.ActionKind) void {
     const raw_arg = std.mem.trim(u8, text[prefix.len..], " ");
     const vis = resolveVisibility(pool, a, chat_id, raw_arg, is_superuser);
@@ -6246,11 +5188,7 @@ fn handleKickBanCommand(connector: iface.Connector, a: std.mem.Allocator, pool: 
 }
 
 /// `/slowmode <seconds>` sets warden's own per-chat cooldown between a
-/// member's messages, `/slowmode off` clears it (stored as 0, same
-/// "0/absent both mean unset" convention as `rate_limits.zig`'s doc
-/// comment). Permission is already checked by the caller. See
-/// `checkSlowMode` (in `processMessageTask`) for where this is actually
-/// enforced.
+/// member's messages, `/slowmode off` clears it.
 fn handleSlowmodeCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
     const arg = std.mem.trim(u8, text["/slowmode".len..], " ");
     if (arg.len == 0) {
@@ -6291,11 +5229,8 @@ fn handleSlowmodeCommand(connector: iface.Connector, a: std.mem.Allocator, pool:
     connector.sendMessage(a, msg.chat_id, message, msg.message_id);
 }
 
-/// Order-independent tokenizer for `/permission`'s arg string, same style
-/// as `parseBalanceAndUsernameArgs` above -- a `@`-prefixed token is the
-/// target, a `+`/`-`-prefixed token is the permission spec, and the first
-/// remaining token (there's at most one meaningful one) is the optional
-/// duration.
+/// Order-independent tokenizer for `/permission`'s arg string, same style as
+/// `parseBalanceAndUsernameArgs` above.
 fn parsePermissionArgs(arg: []const u8) struct { duration_str: []const u8, spec: []const u8, target_arg: []const u8 } {
     var duration_str: []const u8 = "";
     var spec: []const u8 = "";
@@ -6320,12 +5255,7 @@ const permission_usage =
     "Duration uses the same grammar as /remind: <n>m (minutes), <n>h (hours), <n>d (days) -- no week/month shorthand.\n" ++
     "Enforcement is partial: w/p/v/f/m/o/d/s/l/e/i are enforced on Telegram (best-effort on Matrix: only w); r/a/t are stored but not enforceable on any platform today; nothing is enforced on XMPP.";
 
-/// `/permission [<duration>] <+|-><letters> <@user|reply>` — see
-/// `permission_usage` for the full grammar/enforcement-gap text (also sent
-/// back verbatim on every successful change, since the plan for this
-/// command was explicit that partial enforcement must be said plainly
-/// rather than implied to be complete). Permission (admin-tier) is already
-/// checked by the caller.
+/// `/permission [<duration>] <+|-><letters> <@user|reply>`.
 fn handlePermissionCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
     const arg = std.mem.trim(u8, text["/permission".len..], " ");
     if (arg.len == 0) {
@@ -6372,11 +5302,7 @@ fn handlePermissionCommand(connector: iface.Connector, a: std.mem.Allocator, poo
         return;
     };
 
-    // Best-effort live enforcement -- `error.Unsupported` (no granular
-    // permission concept on this platform at all, e.g. XMPP) is expected
-    // and not worth alarming about; anything else is a real failure worth
-    // a log line, but the bitmask itself is already saved either way (see
-    // `interface.zig`'s `restrictChatMemberPermissions` doc comment).
+    // Best-effort live enforcement.
     connector.restrictChatMemberPermissions(a, msg.chat_id, target.native_id, new_bits, if (expires_at) |e| e else 0) catch |err| {
         if (err == error.Unsupported) {
             log.debug("permission: platform has no granular permission enforcement for {s} in chat {s} (bitmask stored only)", .{ target.native_id, msg.chat_id });
@@ -6394,13 +5320,8 @@ fn handlePermissionCommand(connector: iface.Connector, a: std.mem.Allocator, poo
     connector.sendMessage(a, msg.chat_id, message, msg.message_id);
 }
 
-/// `/tag @user <text>` / `/tag @user off` (or reply to the target's
-/// message instead of `@user`) — Telegram's `setChatAdministratorCustomTitle`,
-/// which only works on chat *administrators* (no Bot API concept of a
-/// custom title for an ordinary member); Matrix/XMPP have no equivalent
-/// primitive at all (`Connector.setChatAdminTitle`'s vtable slot is null
-/// for both, so this always reports `error.Unsupported` there). Permission
-/// is already checked by the caller.
+/// `/tag @user <text>` / `/tag @user off` (or reply to the target's message
+/// instead of `@user`) — Telegram's `setChatAdministratorCustomTitle`.
 fn handleTagCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
     const arg = std.mem.trim(u8, text["/tag".len..], " ");
     if (arg.len == 0) {
@@ -6461,9 +5382,8 @@ fn handleBlockUserCommand(connector: iface.Connector, a: std.mem.Allocator, conf
         log.err("blockuser: failed to resolve target: {t}", .{err});
         return;
     }) |target| {
-        // A block on the owner or a bot admin would be a no-op at the gate
-        // (they're checked before the blocklist) -- refuse it outright
-        // rather than store a row that silently does nothing.
+        // A block on the owner or a bot admin would be a no-op at the gate (they're
+        // checked before the blocklist).
         if (auth.isOwner(config, connector.platform(), target.native_id) or bot_admins.isBotAdmin(pool, target.id)) {
             const message = std.fmt.allocPrint(a, "{s} is the owner or a bot admin and can't be blocked.", .{target.display_name}) catch return;
             connector.sendMessage(a, msg.chat_id, message, msg.message_id);
@@ -6477,10 +5397,8 @@ fn handleBlockUserCommand(connector: iface.Connector, a: std.mem.Allocator, conf
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
         return;
     }
-    // Not a reply, and no identity exists yet for this @username (the bot
-    // has never seen a message from them) — queue the block instead of
-    // failing; it completes automatically the moment they do message (see
-    // `resolveSenderIdentity`/`completePendingGrants`).
+    // Not a reply, and no identity exists yet for this @username (the bot has
+    // never seen a message from them).
     if (usernameFromArg(arg)) |username| {
         bot_pending_grants.addPending(pool, connector.platform(), username, .blocked_user, identity_id) catch |err| {
             log.err("blockuser: failed to queue pending block for @{s}: {t}", .{ username, err });
@@ -6600,9 +5518,7 @@ const storage_usage =
     \\chat's id (that's warden's own id, not the platform's).
 ;
 
-/// `/storage` dispatch — hidden, owner-only (checked by the caller). See
-/// `storage_sense.zig`'s module doc comment for the ladder this manages and
-/// `storage_usage` above for the exact subcommand shapes.
+/// `/storage` dispatch — hidden, owner-only (checked by the caller).
 fn handleStorageCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -6669,10 +5585,8 @@ fn handleStorageCleanupCommand(
     rest: []const u8,
     now: i64,
 ) void {
-    // No `/storage cleanup versions` -- Docker image/build-cache cleanup
-    // stays a host-side ops concern (a cron/script outside the container),
-    // not something warden reaches for via a Docker socket it deliberately
-    // doesn't have.
+    // No `/storage cleanup versions` -- Docker image/build-cache cleanup stays a
+    // host-side ops concern (a cron/script outside the container).
     if (std.mem.startsWith(u8, rest, "messages")) {
         handleStorageCleanupMessages(connector, a, config, pool, chat_id, msg, std.mem.trim(u8, rest["messages".len..], " "), now);
     } else if (std.mem.startsWith(u8, rest, "resample")) {
@@ -6684,11 +5598,7 @@ fn handleStorageCleanupCommand(
     }
 }
 
-/// Parses an optional leading `<chat id>` token off `rest` (warden's own
-/// internal id, same convention `/manage bind`/`/chatinfo` use), defaulting
-/// to the current chat when absent — mirrors `/autonomy`'s existing
-/// "no argument means here" convention rather than inventing a `here`
-/// keyword. Returns the resolved chat id and whatever's left of `rest`.
+/// Parses an optional leading `<chat id>` token off `rest`.
 fn stripLeadingChatId(rest: []const u8, default_chat_id: i64) struct { chat_id: i64, rest: []const u8 } {
     var it = std.mem.tokenizeAny(u8, rest, " \t");
     const first = it.peek() orelse return .{ .chat_id = default_chat_id, .rest = rest };
@@ -6805,26 +5715,6 @@ fn platformLabel(platform: iface.Platform) []const u8 {
 }
 
 /// `/chatinfo [native chat id]` — the chat-side counterpart to `/whois`.
-/// With no argument it reports the chat it was sent in; with one it looks up
-/// a chat on this platform by its platform-native id.
-///
-/// Exists because warden's internal `chats.id` had no discoverable surface.
-/// `/manage bind <chat id>` takes that internal id (see
-/// `handleManageCommand`'s doc comment for why it can't take a native one),
-/// but the only place internal ids were ever printed was `/manage list`,
-/// which lists chats *already bound to this room* — so binding the first
-/// chat meant querying Postgres by hand to translate a native id nobody
-/// could otherwise resolve. That is the gap this closes, and the argument
-/// form is the translation step itself.
-///
-/// Read-only, and deliberately resolves through `chats.getByNative` rather
-/// than `upsertChat`: asking about a chat warden has never seen must answer
-/// "no record", not create one (same reasoning as `/whois`'s
-/// `create_if_missing = false`).
-///
-/// Platform is always the caller's own — a native id is only meaningful
-/// within its platform, and cross-platform management is unsupported
-/// everywhere else too (see `handleManageCommand`).
 fn handleChatInfoCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
     const arg = std.mem.trim(u8, text["/chatinfo".len..], " ");
 
@@ -6860,18 +5750,7 @@ fn handleChatInfoCommand(connector: iface.Connector, a: std.mem.Allocator, pool:
     connector.sendMessage(a, msg.chat_id, buf.writer.buffered(), msg.message_id);
 }
 
-/// `/whois [@username | user_id]` (or reply) — looks a known identity up and
-/// reports every field `identities` tracks about it, including the two
-/// derived-not-stored trust flags (`bot admin`, `superuser`) so this doubles
-/// as a way to sanity-check the access-control state described in the
-/// README's "Access control" section. Gated owner-or-bot-admin, same tier as
-/// `/blockuser`/`/addadmin` (see the caller in `handleMessage`).
-///
-/// Uses `resolveTargetIdentity`'s `create_if_missing = false` path for a
-/// bare-id argument — unlike `/kick`/`/blockuser`/etc., this is a read-only
-/// info command, so a native id the bot has genuinely never seen should
-/// report "no record" rather than fabricate a placeholder row just to
-/// answer the lookup.
+/// `/whois [@username | user_id]` (or reply).
 fn handleWhoisCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
     const arg = std.mem.trim(u8, text["/whois".len..], " ");
     const target = (resolveTargetIdentity(pool, connector, a, now, msg, arg, false) catch |err| {
@@ -6889,8 +5768,7 @@ fn handleWhoisCommand(connector: iface.Connector, a: std.mem.Allocator, config: 
         return;
     };
     // Superuser is always the highest privilege there is and isn't stored in
-    // `bot_admins` at all (see the `is_bot_admin` fix in `handleMessage`) —
-    // computed the same way here, straight from `config.owners`.
+    // `bot_admins` at all (see the `is_bot_admin` fix in `handleMessage`).
     const is_superuser = auth.isOwner(config, info.platform, info.native_id);
     const is_admin = is_superuser or bot_admins.isBotAdmin(pool, target.id);
     const message = std.fmt.allocPrint(a,
@@ -6912,13 +5790,7 @@ fn handleWhoisCommand(connector: iface.Connector, a: std.mem.Allocator, config: 
     connector.sendMessage(a, msg.chat_id, message, msg.message_id);
 }
 
-/// `/manage bind|unbind <chat id>` / `/manage list` — see ROADMAP.md's
-/// Phase 9. `<chat id>` is warden's own internal `chats.id` (see
-/// `/manage list`), not the platform-native chat id — no chat has a stable,
-/// always-present short handle a human could type otherwise (Telegram
-/// channels/private groups often have no public @username). bind/unbind are
-/// authorized against the *target* chat's admin status, not the current
-/// (control) room's — see `auth.isOwnerOrLiveAdminOfChat`'s doc comment.
+/// `/manage bind|unbind <chat id>` / `/manage list`.
 fn handleManageCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /manage bind <chat id> | /manage unbind <chat id> | /manage list\nRun /chatinfo in the chat you want to bind to get its id.";
     const arg = std.mem.trim(u8, text["/manage".len..], " ");
@@ -6993,49 +5865,9 @@ fn handleManageCommand(connector: iface.Connector, a: std.mem.Allocator, config:
     }
 }
 
-/// Commands `/as <chat id> <command>` will replay against a chat, and (as
-/// of Phase 21) that a bound management room's own direct dispatch
-/// (`resolveDirectRoomCommand`) will run with no `/as` prefix at all — an
-/// explicit allow-list, not a deny-list, because this is the one surface
-/// that lets someone drive an admin action in a chat they aren't sitting
-/// in: anything not thought about here fails closed.
-///
-/// A command qualifies when both of these hold:
-///
-///   1. Its effect is *chat-scoped* — it acts on, configures, or reports on
-///      one chat, which is what "run this against chat #7" can even mean.
-///      (`/whois`, `/memory`, `/addadmin` and friends are bot-wide or
-///      per-identity; relaying them would be a no-op dressed up as an
-///      action.)
-///   2. It doesn't need a *message* in the target chat to point at.
-///      `asRelayedMessage` carries the operator's reply target *user*
-///      across (a user id means the same thing in any chat) but drops the
-///      reply target *message* (a message id doesn't), so `/pin` and
-///      `/delete` have nothing to bite on and are left out rather than
-///      silently misfiring. `/redact` was excluded here too until Phase
-///      21 — re-reading `handleRedactCommand`, none of its four modes
-///      (regex/text/reply-scoped-last-N/plain-last-N) actually need a
-///      *message* id, only ever a user id (via `replyTarget`) or a plain
-///      count/pattern, both of which survive the relay fine — so it's
-///      included now; the earlier exclusion was overcautious, not a real
-///      technical block.
-///
-/// Deliberately excluded beyond those two rules:
-///   * `/as` itself — see `handleMessage`'s `relayed` parameter.
-///   * `/sudo` — a privilege prefix, and one whose grant message names the
-///     chat it was used in; it must be typed at top level where it is.
-///   * `/menu`, `/convert`, `/cancel`, `/confirm` — stateful flows keyed by
-///     (chat, user). Relayed, the state would be filed under the target
-///     chat while the operator's follow-up message arrives from wherever
-///     `/as` was typed, so the flow could be started but never finished.
-///   * The LLM-backed commands (`/joke`, `/translate`, `/note`, ...) —
-///     they spend real API budget and produce conversation, not administration.
-///     Nothing about them is unsafe to relay; they're simply out of scope
-///     for a management-room surface, and the list is cheap to widen later.
+/// Commands `/as <chat id> <command>` will replay against a chat.
 const as_relayable_commands = [_][]const u8{
-    // Smoke test for the relay itself — replies "pong" back to wherever
-    // `/as` was typed, proving the redirect works, with no effect on the
-    // target chat at all.
+    // Smoke test for the relay itself.
     "ping",
     // Moderation that targets a *user*, not a message.
     "kick",
@@ -7072,12 +5904,8 @@ const as_relayable_commands = [_][]const u8{
     "watches",
 };
 
-/// The bare command name in `text` (no leading `/` or `!`, no
-/// `@botusername` qualifier, no arguments), or null if `text` isn't a
-/// command at all. Accepts `!` as well as `/` because
-/// `normalizeCommandMention` only rewrites the *leading* indicator of the
-/// whole message — the relayed half of `!as 7 !kick x` still arrives with
-/// its own `!`.
+/// The bare command name in `text` (no leading `/` or `!`, no `@botusername`
+/// qualifier, no arguments), or null if `text` isn't a command at all.
 fn asCommandName(text: []const u8) ?[]const u8 {
     if (text.len < 2 or (text[0] != '/' and text[0] != '!')) return null;
     var end: usize = 1;
@@ -7104,31 +5932,8 @@ const AsRelay = struct {
     command: []const u8,
 };
 
-/// Parses and fully authorizes `/as <chat id> <command>`, returning the
-/// plan for `handleMessage` to replay, or null (having already explained
-/// why) if the request is refused. See ROADMAP.md's Phase 9 slice 2 and
-/// Phase 20 (which dropped the bound-room requirement below — `/as` now
-/// works from any chat or DM, not just a room bound to the target).
-///
-/// Stacks *on top of* whatever the relayed command checks for itself
-/// rather than replacing it:
-///
-///   1. Not already inside a relay (no `/as` inside `/as`).
-///   2. The command is on `as_relayable_commands`.
-///   3. The target chat exists and is on this connector's platform
-///      (cross-platform `/as` is still unsupported, same as slice 1).
-///   4. The sender is the owner or a **live admin of the target chat**,
-///      re-checked against the platform on every single `/as`, never
-///      cached and never inferred from their standing in whatever chat
-///      `/as` was typed in (`auth.isOwnerOrLiveAdminOfChat`). No `/sudo`
-///      or token fallback tier here, exactly as `/manage` has none.
-///
-/// Then the relayed command runs its *own* gate too (e.g. `/kick` still
-/// calls `auth.checkGroupAdminAccess`), which — because
-/// `ReplyRedirect` passes `isGroupAdmin` through unchanged — asks about the
-/// target chat, not the control room. So `/as` is strictly narrowing: it
-/// can never authorize something typing the same command in the target
-/// chat wouldn't have.
+/// Parses and fully authorizes `/as <chat id> <command>`, returning the plan
+/// for `handleMessage` to replay.
 fn resolveAsCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -7193,10 +5998,8 @@ fn resolveAsCommand(
     };
 }
 
-/// Bundles what `group_admin.mute`/`unmute`/`promote`/`demote` need to log
-/// an audit entry — `msg.username orelse msg.user_id` is a cheap,
-/// no-DB-read actor label, good enough for a log line (see
-/// `group_admin.AuditContext`'s own doc comment).
+/// Bundles what `group_admin.mute`/`unmute`/`promote`/`demote` need to log an
+/// audit entry.
 fn auditCtx(pool: *store_pool.PgPool, pending_undos: *audit_notify.PendingUndos, chat_id: i64, identity_id: i64, msg: iface.Message) group_admin.AuditContext {
     return .{
         .pool = pool,
@@ -7207,20 +6010,14 @@ fn auditCtx(pool: *store_pool.PgPool, pending_undos: *audit_notify.PendingUndos,
     };
 }
 
-/// Same as `auditCtx`, plus Phase 23's `-s`/`-p` visibility.
+/// Same as `auditCtx`, plus the `-s`/`-p` visibility.
 fn auditCtxWithVisibility(pool: *store_pool.PgPool, pending_undos: *audit_notify.PendingUndos, chat_id: i64, identity_id: i64, msg: iface.Message, visibility: group_admin.Visibility) group_admin.AuditContext {
     var ctx = auditCtx(pool, pending_undos, chat_id, identity_id, msg);
     ctx.visibility = visibility;
     return ctx;
 }
 
-/// Parses Phase 23's `-s`/`-p` flag out of `arg` (see
-/// `group_admin.parseVisibility`'s doc comment for the token-stripping
-/// rule and the `-p`-without-superuser downgrade), then folds in the
-/// chat's own `/silent on` default (`chat_settings.getSilentByDefault`) —
-/// a chat default only ever *upgrades* `.normal` to `.silent`; an explicit
-/// `-s`/`-p` flag always wins as typed, and `-p` from a superuser is never
-/// downgraded by a chat default that only knows about `-s`.
+/// Parses the `-s`/`-p` flag out of `arg`.
 fn resolveVisibility(pool: *store_pool.PgPool, a: std.mem.Allocator, chat_id: i64, arg: []const u8, is_superuser: bool) struct { visibility: group_admin.Visibility, rest: []const u8 } {
     const parsed = group_admin.parseVisibility(a, arg, is_superuser);
     const visibility: group_admin.Visibility = if (parsed.visibility == .normal and chat_settings.getSilentByDefault(pool, chat_id))
@@ -7230,23 +6027,8 @@ fn resolveVisibility(pool: *store_pool.PgPool, a: std.mem.Allocator, chat_id: i6
     return .{ .visibility = visibility, .rest = parsed.rest };
 }
 
-/// Phase 21: a command typed *directly* in a bound management room, no
-/// `/as <id>` prefix needed. Resolves to the same `AsRelay` plan `/as`
-/// itself builds — same allow-list, same target-chat authorization,
-/// reusing `asRelayedMessage`/`ReplyRedirect` identically — just with the
-/// target read from `management_rooms.getBoundTarget` (1:1 as of Phase 20,
-/// so "the" target is unambiguous) instead of parsed from an explicit id.
-///
-/// Returns `null` silently (no reply at all) for anything that should fall
-/// through to ordinary same-chat dispatch instead: this chat isn't
-/// currently bound to a target, the command isn't on
-/// `as_relayable_commands`, or we're already inside a relay (`relayed`,
-/// to keep `/as` and direct-room dispatch from compounding). Returns
-/// `null` *after* explaining why only for the one case that's bound and
-/// allow-listed but still refused: the sender isn't authorized against the
-/// target — silently falling through there would risk the command running
-/// against the room itself instead, which is never what a denied operator
-/// wants.
+/// A command typed *directly* in a bound management room, no `/as <id>`
+/// prefix needed.
 fn resolveDirectRoomCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -7282,30 +6064,7 @@ fn resolveDirectRoomCommand(
 }
 
 /// Rebuilds the operator's `/as` message as the message the relayed command
-/// should see: same sender, same platform profile, but addressed to the
-/// target chat and carrying only the relayed command as its text.
-///
-/// The field-by-field choices are the interesting part:
-///   * `chat_id` becomes the target's native id — this is what makes every
-///     handler's `connector.<action>(a, msg.chat_id, ...)` act on the right
-///     chat, and what `ReplyRedirect` matches its sends against.
-///   * `message_id` stays the operator's own. It's only ever used as a
-///     `reply_to` for outbound sends, all of which come back to the control
-///     room, where it's exactly the right thing to thread under.
-///   * `reply_to_user_id`/`reply_to_username` carry over: "the person I
-///     replied to" identifies a human, and a human is the same human in
-///     every chat. This is what makes `/as 7 /mute` (as a reply) work.
-///   * `reply_to_message_id`/`reply_to_text` are dropped: a message id only
-///     means something inside the chat it was sent in, so carrying it over
-///     would have `/pin` pin a control-room message id into the target
-///     chat. (Those commands are also kept off `as_relayable_commands`;
-///     this is the second, structural half of the same decision.)
-///   * `chat_type`/`chat_title` are dropped rather than copied — they
-///     describe the control room, and `handleMessage` has no business
-///     persisting them against the target. `is_group` is forced true: a
-///     management target is a group or a channel, never a 1:1.
-///   * `attachment`/`choice_picked`/`observed_users`/`joined_users` are
-///     dropped — an upload or a button press isn't something `/as` relays.
+/// should see: same sender.
 fn asRelayedMessage(msg: iface.Message, target_native_chat_id: []const u8, command: []const u8) iface.Message {
     return .{
         .chat_id = target_native_chat_id,
@@ -7343,12 +6102,11 @@ test "the /as allow-list admits chat-scoped admin commands and refuses everythin
     try std.testing.expect(isRelayableUnderAs("welcome"));
     // Case-insensitive, same as `isReservedCommandName`.
     try std.testing.expect(isRelayableUnderAs("KICK"));
-    // Added in Phase 21 -- none of these need a message id (see the
-    // allow-list's own doc comment for `/redact`'s re-examined reasoning).
+    // None of these need a message id.
     try std.testing.expect(isRelayableUnderAs("redact"));
     try std.testing.expect(isRelayableUnderAs("announce"));
     try std.testing.expect(isRelayableUnderAs("blockchat"));
-    // Added in Phase 22 -- none of these act on a message either.
+    // None of these act on a message either.
     try std.testing.expect(isRelayableUnderAs("photo"));
     try std.testing.expect(isRelayableUnderAs("title"));
     try std.testing.expect(isRelayableUnderAs("description"));
@@ -7376,9 +6134,8 @@ test "the /as allow-list admits chat-scoped admin commands and refuses everythin
 }
 
 test "every /as-relayable command name is a real built-in" {
-    // Guards against a typo in `as_relayable_commands` silently making a
-    // command unrelayable (or, worse, looking relayable and then falling
-    // through to the unrecognized-command path inside the relay).
+    // Guards against a typo in `as_relayable_commands` silently making a command
+    // unrelayable.
     for (as_relayable_commands) |name| {
         std.testing.expect(isReservedCommandName(name)) catch |err| {
             std.debug.print("as_relayable_commands lists unknown command /{s}\n", .{name});
@@ -7426,15 +6183,7 @@ test "asRelayedMessage re-addresses the message but keeps who sent it" {
     try std.testing.expect(relayed.choice_picked == null);
 }
 
-/// `/redact` — parses which of the five modes (see `features/redact.zig`'s
-/// doc comments) applies, gates per-mode (regex is stricter — bot-admin/
-/// owner only, via `/sudo` if not otherwise a bot admin — than the other
-/// four, which use the same platform-admin-or-higher ladder as `/kick` et
-/// al., minus the token fallback: bulk deletion isn't something a token
-/// alone should unlock), then dispatches into `features/redact.zig`. Does
-/// its own gating internally (like `handleMagicWord`/`handlePersonaCommand`)
-/// rather than a single gate at the dispatch call site, since which gate
-/// applies depends on the parsed mode.
+/// `/redact` — parses which of the five modes applies, gates per-mode.
 fn handleRedactCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -7547,8 +6296,7 @@ fn handleDigestCommand(
 }
 
 /// Same on/off/now shape as `handleDigestCommand` above, minus the
-/// `llm_provider`/`tool_ctx` params that one needs -- `briefing.generate`
-/// is pure composition over already-stored data, no LLM call involved.
+/// `llm_provider`/`tool_ctx` params that one needs.
 fn handleBriefingCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -7614,12 +6362,8 @@ fn handleBriefingCommand(
 const max_reminder_message_len = 500;
 
 /// `/remind <duration|clock-time> <message>` sets a one-off reminder;
-/// `/remind every <interval> <message>` sets a recurring one; `/remind
-/// cancel <id>` cancels one. Open to anyone in the chat to create
-/// (utility-level, like /wordcloud), but only its own creator or the bot
-/// owner may cancel it — matches `/token`'s reply-to-target pattern of
-/// trusting the sender's own identity_id rather than requiring group-admin
-/// standing.
+/// `/remind every <interval> <message>` sets a recurring one; `/remind cancel
+/// <id>` cancels one.
 fn handleRemindCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -7726,47 +6470,16 @@ fn handleRemindCommand(
     connector.sendMessage(a, msg.chat_id, confirmation, msg.message_id);
 }
 
-// ---------------------------------------------------------------------
-// Phase 16 (ROADMAP.md), slice 4: scheduled announcements. Deliberately a
-// presentation layer over `store/reminders.zig` rather than a second
-// scheduler -- see `reminders.Kind` and `0035_announcements.sql`. The
-// scheduling grammar below is `/remind`'s, verbatim and on purpose: an
-// admin who already knows `/remind every 1d ...` knows this too.
-// ---------------------------------------------------------------------
+// --------------------------------------------------------------------- Phase
+// 16, slice 4: scheduled announcements.
 
 /// Longer than `max_reminder_message_len` (500): an announcement is a
-/// prepared broadcast to a whole group -- rules, an event notice, a weekly
-/// standup prompt -- not a personal one-liner, and 1000 bytes is the same
-/// ceiling `/welcome` and `/persona`-adjacent text settings already use.
+/// prepared broadcast to a whole group.
 const max_announcement_len = 1000;
 
 /// `/announce <text>` sends `<text>` into this chat right now and pins it
-/// (Phase 21 merged the old standalone `/notice <chat id> <text>` into
-/// this bare-text form -- ROADMAP.md's Phase 9 gave `/notice` its own
-/// command specifically because it needed to target a *different* chat
-/// than the one the operator was typing in, and its send-then-pin pair
-/// wasn't safe to relay through `/as`; both of those blockers are gone now
-/// that `/as`/direct-room dispatch (Phase 20/21) can run any relayable
-/// command, `/announce` included, against another chat with no separate
-/// mechanism needed -- "send a notice to chat #7" is just
-/// `/as 7 /announce <text>`). `/announce at <when> <text>` schedules a
-/// one-off announcement for later; `/announce every <interval> <text>` a
-/// recurring one; `/announce list` and `/announce cancel <id>` manage
-/// scheduled ones. The `at`/`every` keywords are what disambiguate "this
-/// is a time expression" from "this is just the start of the announcement
-/// text" -- a bare `/announce 30 people are coming` sends literally that
-/// text now, rather than trying (and failing) to parse "30" as a time.
-///
-/// **Access**: chat-admin tier via `auth.checkGroupAdminAccess`, with the
-/// token fallback *off* -- unlike `/remind` (open to anyone, delivers one
-/// message to the person who asked for it), an announcement makes the bot
-/// broadcast arbitrary text into the whole group, so it belongs with
-/// `/mute`/`/pin` rather than with `/remind`. Token-spending is excluded
-/// for the same reason `/redact regex` excludes it: a token buys one
-/// moderation action against a known target, not the ability to broadcast
-/// bot-authored messages. `list` is exempt from the gate (reading what's
-/// scheduled for a chat you're in isn't privileged), matching
-/// `/reminders`/`/alerts` being open.
+/// (merged the old standalone `/notice <chat id> <text>` into this bare-text
+/// form -- ROADMAP.md's gave `/notice` its own command.
 fn handleAnnounceCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -7815,11 +6528,8 @@ fn handleAnnounceCommand(
             reply(connector, a, msg.chat_id, msg.message_id, "No scheduled announcement with that id.");
             return;
         };
-        // A reminder id passed to `/announce cancel` is told apart from a
-        // nonexistent one on purpose -- they're different mistakes, and
-        // silently refusing to cancel something that demonstrably exists
-        // reads like a bug. `/remind cancel` is the right tool for that id,
-        // and it applies its own creator-or-owner check.
+        // A reminder id passed to `/announce cancel` is told apart from a nonexistent
+        // one on purpose.
         if (row.chat_id != chat_id or row.kind != .announcement) {
             reply(connector, a, msg.chat_id, msg.message_id, "No scheduled announcement with that id (if that's a reminder id, use /remind cancel).");
             return;
@@ -7852,12 +6562,8 @@ fn handleAnnounceCommand(
             reply(connector, a, msg.chat_id, msg.message_id, "Couldn't parse that interval — use e.g. 30m, 2h, or 1d.");
             return;
         };
-        // "every <interval>" alone means "first one an interval from now" --
-        // same shorthand `/remind every` uses. An admin wanting a recurring
-        // announcement to start at a specific wall-clock time schedules the
-        // first one with `at` and repeats it with `every` after; documented
-        // in ROADMAP.md as a known sharp edge inherited from `/remind`
-        // rather than papered over only here.
+        // "every <interval>" alone means "first one an interval from now" -- same
+        // shorthand `/remind every` uses.
         due_at = now + recur_interval.?;
         announcement = std.mem.trim(u8, it.rest(), " ");
     } else if (std.mem.eql(u8, first_word, "at")) {
@@ -7915,9 +6621,7 @@ fn handleAnnounceCommand(
 }
 
 /// `/announce list`'s rendering — same per-setter-timezone rule
-/// `formatPendingReminders` documents, since a chat's announcements can
-/// have been scheduled by different admins each meaning their own local
-/// "09:00".
+/// `formatPendingReminders` documents.
 fn formatPendingAnnouncements(a: std.mem.Allocator, pool: *store_pool.PgPool, pending: []const reminders.PendingReminder, now: i64) []const u8 {
     if (pending.len == 0) return "No scheduled announcements. Schedule one with /announce <time> <text> (chat admins only).";
 
@@ -7940,24 +6644,7 @@ fn formatPendingAnnouncements(a: std.mem.Allocator, pool: *store_pool.PgPool, pe
     return buf.writer.buffered();
 }
 
-/// `/autopin` shows this chat's setting; `/autopin on|off` changes it —
-/// ROADMAP.md's Phase 16 "auto-pin important messages", built as narrowly
-/// as that item can defensibly be built.
-///
-/// **What it pins**: only a scheduled announcement (see
-/// `handleAnnounceCommand`), and only as the bot posts it. That is the
-/// whole trigger. It is not a heuristic, it never reads or scores anyone
-/// else's messages, and there is no "the bot decided this was important"
-/// path at all — every pin traces back to a specific admin having typed a
-/// specific `/announce`. Phase 8's backlog rejects spam/toxicity
-/// auto-moderation because acting on messages the bot wasn't addressed in
-/// is a trust-model change; an "importance" classifier over every message
-/// would be the same change wearing a friendlier hat, so it isn't built.
-/// The alternatives considered and rejected are recorded in ROADMAP.md.
-///
-/// Viewing is open to anyone (matching `/persona`/`/welcome`); changing it
-/// takes the same chat-admin tier `/announce` itself does, since the two
-/// are one feature.
+/// `/autopin` shows this chat's setting; `/autopin on|off` changes it.
 fn handleAutopinCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8005,10 +6692,7 @@ fn handleAutopinCommand(
     }
 }
 
-/// `/silent on|off` — ROADMAP.md's Phase 23. Sets this chat's default for
-/// managerial commands' `-s` flag, so an admin who always wants quiet
-/// moderation doesn't have to type it every time. Same shape as
-/// `/autopin`; view is open to anyone, changing it is admin-tier.
+/// `/silent on|off`.
 fn handleSilentCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8056,14 +6740,8 @@ fn handleSilentCommand(
     }
 }
 
-/// `/photo` (send an image with this as its caption) sets the chat's
-/// photo; `/photo remove` clears it — ROADMAP.md's Phase 22. Only the
-/// caption form is supported, not "reply to an existing image with
-/// /photo": `iface.Message`'s reply fields carry the replied-to user/text,
-/// never a replied-to *attachment*, so there's no plumbing today to fetch
-/// bytes for a message this one merely replies to (unlike `/redact`'s
-/// reply-scoped mode, which only ever needs a user id). A real gap if it
-/// turns out to matter, not solved this phase.
+/// `/photo` (send an image with this as its caption) sets the chat's photo;
+/// `/photo remove` clears it.
 fn handlePhotoCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8115,11 +6793,7 @@ fn handlePhotoCommand(
     if (vis.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Photo updated.");
 }
 
-/// `/title <text>` — ROADMAP.md's Phase 22. Runnable directly in the group
-/// by its own live admins (unlike moderation commands, there's no "keep it
-/// out of the group" reason to gate this to a bound room/`/as`), and also
-/// relayable through both, same as everything else on
-/// `as_relayable_commands`.
+/// `/title <text>`.
 fn handleTitleCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8152,9 +6826,7 @@ fn handleTitleCommand(
     if (vis.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Title updated.");
 }
 
-/// `/description <text>` — same shape as `/title`. An empty argument
-/// clears the description (Telegram/Matrix both treat an empty
-/// description/topic as "no description" natively).
+/// `/description <text>` — same shape as `/title`.
 fn handleDescriptionCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8188,9 +6860,7 @@ fn handleDescriptionCommand(
     }
 }
 
-/// Shared failure reply for the three chat-settings commands above —
-/// same "distinguish unsupported-platform from a real failure" shape
-/// `group_admin.reportFailure` uses for moderation commands.
+/// Shared failure reply for the three chat-settings commands above.
 fn reportChatSettingFailure(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, reply_to: ?[]const u8, action: []const u8, err: anyerror) void {
     log.err("{s} failed: {t}", .{ action, err });
     if (err == error.Unsupported) {
@@ -8202,9 +6872,7 @@ fn reportChatSettingFailure(connector: iface.Connector, a: std.mem.Allocator, ch
 }
 
 /// `/videodownload` shows this chat's setting; `/videodownload on|off`
-/// changes it — same shape as `handleAutopinCommand` right above (view is
-/// open to anyone, changing it is admin-tier via `auth.checkGroupAdminAccess`,
-/// no token fallback, same `chat_settings` `ON CONFLICT` idiom).
+/// changes it.
 fn handleVideoDownloadCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8253,12 +6921,7 @@ fn handleVideoDownloadCommand(
 }
 
 /// `/videoquality` shows this chat's video-auto-download delivery mode;
-/// `/videoquality lossy|lossless` changes it — same shape as
-/// `handleVideoDownloadCommand` right above (view is open to anyone,
-/// changing it is admin-tier via `auth.checkGroupAdminAccess`, no token
-/// fallback, same `chat_settings` `ON CONFLICT` idiom). A sub-setting of
-/// `video_download` itself, not a separate feature -- gated on the same
-/// `video_download` feature flag at the dispatch site, no flag of its own.
+/// `/videoquality lossy|lossless` changes it.
 fn handleVideoQualityCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8306,19 +6969,11 @@ fn handleVideoQualityCommand(
     }
 }
 
-/// How often `videoProgressTickerLoop` may edit the placeholder message --
-/// longer than QA's `ticker_interval_ms` (1200ms) since downloads run far
-/// longer than an LLM call and there's no need to poll/edit as often.
+/// How often `videoProgressTickerLoop` may edit the placeholder message.
 const video_progress_ticker_interval_ms: i64 = 3500;
 
 /// Shared between `videoDownloadWorker` (which owns it) and
-/// `videoProgressTickerLoop`. Unlike `TickerState`, progress here is
-/// *pulled* by the ticker polling the filesystem each tick
-/// (`video_download.pollCurrentBytes`) rather than *pushed* by another
-/// thread, so no mutex-guarded status field is needed -- otherwise the same
-/// shape, heap-allocated on `page_allocator` (not stack-local) for the same
-/// reason `TickerState` is; see `tickerLoop`'s doc comment for the full
-/// stop/done-atomic rationale, which applies here unchanged.
+/// `videoProgressTickerLoop`.
 const VideoProgressState = struct {
     io: Io,
     tmp_dir: []const u8,
@@ -8329,16 +6984,7 @@ const VideoProgressState = struct {
     done: std.atomic.Value(bool) = .init(false),
 };
 
-/// Runs on its own detached `std.Thread`, exactly like `tickerLoop` --
-/// cooperative `state.stop` checked before *and* after each sleep,
-/// deliberately not `Future.cancel()` (see `tickerLoop`'s doc comment for
-/// the production wedge that pattern avoids; the same risk applies to any
-/// detached thread blocked in an in-flight `editMessage`). Each tick polls
-/// the growing download file's size (`pollCurrentBytes`) and formats a
-/// status line (`formatProgressText`), deduping against the last text it
-/// actually sent -- unlike `tickerLoop`'s static strings, this text is
-/// freshly allocated every tick, so the dedupe copy must be owned and freed
-/// here rather than just compared by reference.
+/// Runs on its own detached `std.Thread`, exactly like `tickerLoop`.
 fn videoProgressTickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []const u8, state: *VideoProgressState) void {
     defer state.done.store(true, .release);
     const a = std.heap.page_allocator;
@@ -8365,31 +7011,7 @@ fn videoProgressTickerLoop(connector: iface.Connector, chat_id: []const u8, mess
     }
 }
 
-/// ROADMAP.md's Phase 25: passive auto-download of YouTube/Instagram/X
-/// links. Same "passive content observation" tier as `checkKeywordAlerts`
-/// (plain substring scan, no LLM call, fires for any sender) — but unlike
-/// every other check at that call site, a match here can trigger a
-/// genuinely slow, network-bound external process (`yt-dlp`, plus in lossy
-/// mode possibly `ffmpeg`/`ffprobe` too), far past `processMessageTask`'s
-/// own ~15s expected budget (see its own timing-log comment). So this does
-/// not run inline: it hands off to a detached `std.Thread`
-/// (`videoDownloadWorker`) and returns immediately, the same "don't occupy
-/// a `WorkerPool` worker for a slow background op" reasoning `qa.zig`'s
-/// thinking-ticker (`tickerLoop`) already uses for its own detached thread.
-///
-/// XMPP has no `sendDocument` support at all (see
-/// `platform/xmpp/connector.zig`'s vtable — no `sendDocument` slot is wired
-/// up there). Checked up front, before spending several minutes on a download
-/// nobody could receive — logged plainly rather than left silent. Calling
-/// `connector.sendDocument` unconditionally instead would have
-/// `Connector.sendDocument`'s own "platform doesn't support this" fallback
-/// post a visible chat message for *every* video link a group posts, exactly
-/// the per-link error spam this
-/// feature's fail-closed philosophy exists to avoid — so that fallback is
-/// deliberately never reached here. `sendVideo` (lossy mode's preferred
-/// delivery) is intentionally NOT gated the same way: it's strictly
-/// additive on top of this baseline check, with `videoDownloadWorker`
-/// itself falling back to `sendDocument` when a connector lacks it.
+/// Passive auto-download of YouTube/Instagram/X links.
 fn checkVideoDownload(connector: iface.Connector, a: std.mem.Allocator, io: Io, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
     const url = video_download.findLink(text) orelse return;
 
@@ -8398,14 +7020,7 @@ fn checkVideoDownload(connector: iface.Connector, a: std.mem.Allocator, io: Io, 
         return;
     }
 
-    // Reuses `storage_sense.zig` rather than a separate check: once the
-    // ladder's own low watermark is hit, a multi-minute video fetch is
-    // exactly the kind of write this shouldn't be doing. Lives here (not
-    // inside `video_download.zig`) since this call site already owns the
-    // `pool`/`dynamic_config` reads, keeping that module free of a `PgPool`
-    // dependency. Best-effort: a failed disk check doesn't block the
-    // download (same fail-open reasoning `feature_flags.isEnabled` uses) --
-    // storage pressure should degrade this feature, not a `df` hiccup.
+    // Reuses `storage_sense.zig` rather than a separate check.
     if (storage_sense.checkDiskUsage(a, io, config.tmp_dir)) |usage| {
         const low = dynamic_config.getI64(pool, a, storage_sense.low_watermark_key, config.storage_sense_low_watermark_pct);
         if (usage.used_pct >= @as(f64, @floatFromInt(low))) {
@@ -8417,17 +7032,10 @@ fn checkVideoDownload(connector: iface.Connector, a: std.mem.Allocator, io: Io, 
     }
 
     const quality: video_download.Quality = if (chat_settings.getVideoDownloadLossy(pool, chat_id)) .lossy else .lossless;
-    // Generated here, not inside `video_download.download`, so
-    // `videoProgressTickerLoop` (spawned by `videoDownloadWorker`) can poll
-    // the same `tmp_dir/video_download_{ts}*` prefix `download` writes to.
+    // Generated here, not inside `video_download.download`.
     const ts = Io.Timestamp.now(io, .real).toNanoseconds();
 
-    // `page_allocator`-owned dupes, NOT `task_arena`-backed: `task_arena`
-    // is destroyed the moment `processMessageTask` returns, long before
-    // this detached thread (which can run for several minutes in lossy
-    // mode) is done with them — same reasoning `tickerLoop`'s own doc
-    // comment gives for never touching the per-message arena from a
-    // detached thread.
+    // `page_allocator`-owned dupes, NOT `task_arena`-backed.
     const native_chat_id = std.heap.page_allocator.dupe(u8, msg.chat_id) catch |err| {
         log.warn("video_download: couldn't allocate for chat {s}: {t}", .{ msg.chat_id, err });
         return;
@@ -8437,10 +7045,8 @@ fn checkVideoDownload(connector: iface.Connector, a: std.mem.Allocator, io: Io, 
         std.heap.page_allocator.free(native_chat_id);
         return;
     };
-    // Reply-threads the placeholder to the original link message, so it's
-    // clear which link is being fetched if several are posted in quick
-    // succession -- best-effort, `null` (no threading) on any allocation
-    // failure rather than aborting the whole download over it.
+    // Reply-threads the placeholder to the original link message, so it's clear
+    // which link is being fetched if several are posted in quick succession.
     const reply_to_dup: ?[]const u8 = if (msg.message_id) |mid| std.heap.page_allocator.dupe(u8, mid) catch null else null;
 
     const thread = std.Thread.spawn(.{}, videoDownloadWorker, .{ connector, io, config.tmp_dir, native_chat_id, url_dup, reply_to_dup, quality, ts }) catch |err| {
@@ -8453,25 +7059,7 @@ fn checkVideoDownload(connector: iface.Connector, a: std.mem.Allocator, io: Io, 
     thread.detach();
 }
 
-/// Body of the detached thread `checkVideoDownload` spawns. Owns (and
-/// frees) `native_chat_id`/`url`/`reply_to`, all `page_allocator` dupes
-/// taken before spawning — see `checkVideoDownload`'s doc comment for why
-/// they can't be `task_arena`-backed.
-///
-/// Sends a "⬇️ Downloading…" placeholder immediately, animates it via
-/// `videoProgressTickerLoop` while `video_download.download` runs, then on
-/// success deletes the placeholder and sends the real result as a fresh
-/// message (`editMessage` is text-only and can never attach media to an
-/// existing message, so unlike the QA flow's placeholder, this one is
-/// never "edited into" the final video). On failure the placeholder is
-/// instead edited into a short failure notice, same shape
-/// `replyWithAnswer` already uses for its own error case -- a placeholder
-/// went out for every trigger-pattern match already, real video or not
-/// (see `checkVideoDownload`'s own doc comment), so silently deleting it
-/// with zero explanation reads as broken rather than as the intended
-/// "ordinary non-video link, nothing to see" case. Previously deleted the
-/// placeholder silently instead; changed after a live report of exactly
-/// that looking like a bug (2026-08-09).
+/// Body of the detached thread `checkVideoDownload` spawns.
 fn videoDownloadWorker(connector: iface.Connector, io: Io, tmp_dir: []const u8, native_chat_id: []const u8, url: []const u8, reply_to: ?[]const u8, quality: video_download.Quality, ts: i96) void {
     const a = std.heap.page_allocator;
     defer a.free(native_chat_id);
@@ -8486,9 +7074,9 @@ fn videoDownloadWorker(connector: iface.Connector, io: Io, tmp_dir: []const u8, 
     var ticker_thread: ?std.Thread = null;
     var progress_state: ?*VideoProgressState = null;
     if (placeholder_id) |pid| {
-        // Lossless mode's own fetch doesn't use `estimateSize`'s ~720p
-        // format selector, so its estimate would be meaningless -- only
-        // ask for one in lossy mode, same as `downloadLossy` itself.
+        // Lossless mode's own fetch doesn't use `estimateSize`'s ~720p format
+        // selector, so its estimate would be meaningless -- only ask for one in lossy
+        // mode.
         const estimate = if (quality == .lossy) video_download.estimateSize(a, io, url) else null;
 
         const s = a.create(VideoProgressState) catch |err| blk: {
@@ -8507,10 +7095,7 @@ fn videoDownloadWorker(connector: iface.Connector, io: Io, tmp_dir: []const u8, 
 
     const result = video_download.download(a, io, tmp_dir, url, quality, ts);
 
-    // Stop the ticker before touching the placeholder ourselves -- same
-    // bounded stop-then-join-or-detach dance `replyWithAnswer` uses for
-    // `tickerLoop`, for the same reason (see `tickerLoop`'s doc comment on
-    // the production wedge this avoids).
+    // Stop the ticker before touching the placeholder ourselves.
     if (progress_state) |state| {
         state.stop.store(true, .release);
         var waited_ms: i64 = 0;
@@ -8566,22 +7151,8 @@ const default_summary_hours: i64 = 24;
 /// summarization surfaces can't disagree about what "too much history" is.
 const max_summary_hours: i64 = 24 * 14;
 
-/// `/summary [hours]` — ROADMAP.md's Phase 16 "group summaries", composing
-/// `digest.summarizeWindow` (the same summarizer `/digest` uses) rather
-/// than adding a third prompt.
-///
-/// **Why it exists next to `/digest now` and `catch_me_up`**: `/digest now`
-/// summarizes "since the last digest" and moves that cursor as a side
-/// effect, so it can't answer "what happened this morning" without
-/// disturbing the schedule; `catch_me_up` is an LLM *tool*, reachable only
-/// by addressing the bot in natural language and only when the asker clears
-/// the owner-only gate on free-form Q&A. This is the plain, predictable
-/// command form: name a window, get a summary, change nothing.
-///
-/// **Access** deliberately matches `/digest now` (open to anyone in the
-/// chat) rather than the messaging-mode commands' owner-only gate: it
-/// summarizes only this chat's own already-logged history and can't be
-/// steered into arbitrary generation.
+/// `/summary [hours]`, composing
+/// `digest.summarizeWindow`.
 fn handleSummaryCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8629,13 +7200,7 @@ fn handleRemindersList(
     connector.sendMessage(a, native_chat_id, formatPendingReminders(a, pool, pending, now), reply_to);
 }
 
-/// True when this `/note` is really "save my voice message as a note":
-/// the message carries a voice attachment and the command was given with no
-/// text of its own (bare `/note`, or `/note add` with nothing after it).
-///
-/// Split out as a pure function purely so it can be tested without a
-/// connector, a pool, or a whisper server -- the transcription itself needs
-/// all three, so the decision logic is the part worth covering offline.
+/// True when this `/note` is really "save my voice message as a note".
 fn isVoiceNoteRequest(kind: ?iface.AttachmentKind, arg: []const u8) bool {
     const k = kind orelse return false;
     if (k != .voice) return false;
@@ -8666,11 +7231,6 @@ test "isVoiceNoteRequest: only voice attachments qualify" {
 }
 
 /// Transcribes a voice message and stores the transcript as a note.
-///
-/// Every failure replies with something specific rather than the generic
-/// usage string -- "whisper isn't configured" and "I couldn't make out any
-/// speech" are very different problems for the person holding the phone,
-/// and a voice note that silently does nothing is the worst outcome here.
 fn handleVoiceNote(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -8696,10 +7256,8 @@ fn handleVoiceNote(
         return;
     };
 
-    // Sent only once the checks above have passed, so a misconfiguration
-    // never leaves a "Transcribing…" message stranded. Everything after
-    // this point reports through `settleVoiceNote`, which edits this
-    // message rather than adding a second one.
+    // Sent only once the checks above have passed, so a misconfiguration never
+    // leaves a "Transcribing…" message stranded.
     const placeholder_id = connector.sendMessageReturningId(a, msg.chat_id, "🎙️ Transcribing your voice note…", msg.message_id) catch |err| blk: {
         log.warn("voice note: couldn't send a placeholder for chat {s}: {t}", .{ msg.chat_id, err });
         break :blk null;
@@ -8716,9 +7274,6 @@ fn handleVoiceNote(
     }
 
     // A typed `/note` rejects over-long text so the sender can shorten it.
-    // A transcript can't be edited before sending, and re-recording to fit
-    // a byte budget is a miserable ask -- so this truncates instead, on a
-    // codepoint boundary (transcripts are routinely non-ASCII), and says so.
     const stored = truncateUtf8(transcript, max_note_text_len);
     const was_truncated = stored.len < transcript.len;
 
@@ -8736,11 +7291,7 @@ fn handleVoiceNote(
     settleVoiceNote(connector, a, msg, placeholder_id, confirm);
 }
 
-/// Replaces the "Transcribing…" placeholder with the final outcome, or
-/// sends it as a new message when there's no placeholder to edit (a
-/// platform without `editMessage`, or a placeholder send that failed).
-/// Falls back to sending if the edit itself fails, so the user always gets
-/// the result even if the placeholder is somehow gone.
+/// Replaces the "Transcribing…" placeholder with the final outcome.
 fn settleVoiceNote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, placeholder_id: ?[]const u8, text: []const u8) void {
     if (placeholder_id) |pid| {
         if (connector.editMessage(a, msg.chat_id, pid, text)) |_| {
@@ -8754,26 +7305,13 @@ fn settleVoiceNote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.
 
 const max_note_text_len = 1000;
 
-/// `/note add <text>` / `/note delete <id>` — see ROADMAP.md's Phase 11.
-/// A generic freeform-text knowledge base (notes, shopping lists,
-/// wishlists, ...), so unlike `/remind`'s implicit "first word is either
-/// `cancel` or a time expression" parsing, this requires an explicit
-/// `add`/`delete` keyword — a note's own text could otherwise legitimately
-/// start with a word like "list" or "delete" ("delete the old files"),
-/// which would be ambiguous under `/remind`'s shape.
+/// `/note add <text>` / `/note delete <id>`.
 fn handleNoteCommand(connector: iface.Connector, a: std.mem.Allocator, io: Io, config: *const config_mod.Config, pool: *store_pool.PgPool, tool_ctx: tool_registry.ToolContext, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /note add <text>, /note list, or /note delete <id>";
     const arg = std.mem.trim(u8, text["/note".len..], " ");
 
-    // Phase 11's deferred voice notes: `/note` sent as the *caption* of a
-    // voice message means "transcribe this and save it". Checked before the
-    // empty-arg usage reply below, which is what a bare `/note` would
-    // otherwise hit. Telegram delivers a caption in `msg.caption`, which
-    // `platform/telegram/connector.zig` maps onto `text` -- so a captioned
-    // voice message never reaches `resolveQuestion`'s transcription path
-    // (that one only fires for *captionless* attachments), which is exactly
-    // why this needed its own hook rather than falling out of the existing
-    // one.
+    // Deferred voice notes: `/note` sent as the *caption* of a voice message
+    // means "transcribe this and save it".
     if (isVoiceNoteRequest(if (msg.attachment) |att| att.kind else null, arg)) {
         handleVoiceNote(connector, a, io, config, pool, tool_ctx, chat_id, identity_id, now, msg);
         return;
@@ -8863,11 +7401,7 @@ fn handleNotesList(
 }
 
 /// `/keyword add <word>` / `/keyword list` / `/keyword remove <id>` — see
-/// ROADMAP.md's Phase 16. Same add/list/delete-by-id shape as
-/// `handleNoteCommand`, including its creator-or-owner delete
-/// authorization -- deliberately not open to "anyone in the chat" like
-/// `/watch`/`/digest on`, since a keyword alert firing on every mention
-/// is more disruptive than a shared feed subscription.
+/// .
 fn handleKeywordCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /keyword add <word>, /keyword list, or /keyword remove <id>";
     const arg = std.mem.trim(u8, text["/keyword".len..], " ");
@@ -8961,17 +7495,7 @@ fn formatKeywordAlerts(a: std.mem.Allocator, listed: []const keyword_alerts.Keyw
 }
 
 /// Scans one incoming message's text against `chat_id`'s tracked keyword
-/// alerts (whole-word, case-insensitive -- `containsWordIgnoreCase`, same
-/// matcher the magic-word check already uses) and, on any hit, posts one
-/// combined flag message naming every keyword that matched -- not one
-/// message per match, so a message that happens to contain several
-/// tracked words doesn't spam the chat. Fires for *any* sender (this is a
-/// passive content observation, same "every message is logged regardless
-/// of who sent it" tier as recording itself, not a privileged action), and
-/// is a plain string scan -- no LLM call, so no owner-only gate either.
-/// Errors loading the tracked list are logged and swallowed, same "never
-/// let a side feature block the main flow" convention `bcast.publish`'s
-/// own call site uses.
+/// alerts.
 fn checkKeywordAlerts(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message, text: []const u8) void {
     if (text.len == 0) return;
     const tracked = keyword_alerts.listForChat(pool, a, chat_id) catch |err| {
@@ -8992,12 +7516,7 @@ fn checkKeywordAlerts(connector: iface.Connector, a: std.mem.Allocator, pool: *s
     connector.sendMessage(a, msg.chat_id, buf.writer.buffered(), msg.message_id);
 }
 
-/// `/memory list` / `/memory forget <id>` — see ROADMAP.md's Phase 12.
-/// Deliberately no `/memory remember <text>` counterpart: creation is
-/// meant to happen contextually through conversation (the model deciding
-/// what's worth keeping via the `remember_memory` tool), matching the
-/// ChatGPT-Memory framing this feature is modeled on, not a manually
-/// curated list a person edits directly.
+/// `/memory list` / `/memory forget <id>`.
 fn handleMemoryCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, identity_id: i64, msg: iface.Message, text: []const u8) void {
     const usage = "Usage: /memory list, or /memory forget <id>";
     const arg = std.mem.trim(u8, text["/memory".len..], " ");
@@ -9050,10 +7569,7 @@ fn handleMemoryCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *
 }
 
 /// `/alert <crypto|weather|aqi> <subject> <above|below> <threshold>` sets a
-/// standing alert; `/alert cancel <id>` cancels one. Subject may contain
-/// spaces (city names) — everything between the kind and the trailing
-/// `<above|below> <threshold>` pair is joined back together. Same
-/// open-to-create/creator-or-owner-to-cancel authorization as `/remind`.
+/// standing alert; `/alert cancel <id>` cancels one.
 fn handleAlertCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -9161,10 +7677,7 @@ fn handleAlertsList(
     connector.sendMessage(a, native_chat_id, formatPendingAlerts(a, pending), reply_to);
 }
 
-/// `/watch <feed_url>` adds an RSS/Atom watch for this chat. Open to
-/// anyone in the chat, same as `/digest on|off` — not restricted to
-/// whoever added it (see `store/feed_watches.zig`'s doc comment on why
-/// `/unwatch` works the same way).
+/// `/watch <feed_url>` adds an RSS/Atom watch for this chat.
 fn handleWatchCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -9180,12 +7693,6 @@ fn handleWatchCommand(
         return;
     }
     if (!std.mem.startsWith(u8, feed_url, "http://") and !std.mem.startsWith(u8, feed_url, "https://")) {
-        // Found live 2026-07-21: typo'd input meant for `/unwatch` (e.g.
-        // "/watch cancel 1") got stored verbatim as a feed_url and
-        // fetch-failed on every poll tick forever — see
-        // feed_watches.bumpLastChecked's doc comment for the other half of
-        // this fix. Reject obviously-not-a-URL input before it ever reaches
-        // the DB instead of relying on the watcher loop to survive garbage.
         reply(connector, a, msg.chat_id, msg.message_id, "That doesn't look like a feed URL. Usage: /watch <feed url> (to stop watching, use /unwatch <feed url>)");
         return;
     }
@@ -9250,17 +7757,7 @@ fn handleWatchesList(
 }
 
 /// Forces an immediate check of one watch already set up in this chat,
-/// bypassing its `check_interval_seconds` wait — for testing/debugging a
-/// watch that doesn't seem to be firing, without needing DB or log access.
-/// Runs the exact same fetch/parse/dedupe/notify pipeline
-/// `checkAndNotifyFeeds`'s scheduled loop uses (`feed_watcher.checkNow`,
-/// sharing `checkOne` with it) — if there genuinely are new items, this
-/// posts the real notification, same as an automatic check would. Either
-/// way, replies with a summary of what happened, since "0 new items" and
-/// "the feed didn't parse as RSS/Atom at all" would otherwise look
-/// identical from outside (see `feed_watcher.zig`'s `CheckOutcome` doc
-/// comment — this is the tool for telling those apart without grepping
-/// logs).
+/// bypassing its `check_interval_seconds` wait.
 fn handleWatchCheckCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -9277,11 +7774,7 @@ fn handleWatchCheckCommand(
         reply(connector, a, msg.chat_id, msg.message_id, "Usage: /watchcheck <feed url>");
         return;
     }
-    // A single-element connector list is enough here (unlike the scheduled
-    // batch loop, which needs every connector since it's checking watches
-    // across every chat/platform at once): this command always runs from
-    // within the exact chat the watch belongs to, so `fw.platform` can
-    // only ever match `connector`'s own platform.
+    // A single-element connector list is enough here.
     const outcome = feed_watcher.checkNow(&.{connector}, a, io, pool, llm_provider, chat_id, feed_url, now) catch |err| {
         log.err("watchcheck: failed for {s} in chat {d}: {t}", .{ feed_url, chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't run that check, try again.");
@@ -9303,13 +7796,7 @@ fn handleWatchCheckCommand(
     connector.sendMessage(a, msg.chat_id, summary, msg.message_id);
 }
 
-/// Direct entry point to `convert_file` (see `tools/convert_file.zig`) for
-/// people who'd rather type an explicit command than phrase a request in
-/// natural language — same file (`tool_ctx.attachment_path`, downloaded by
-/// `processMessageTask` before `handleMessage` ever runs) and same
-/// conversion logic, just skipping the LLM round trip. `text` is the
-/// caption Telegram delivered on the attached photo/document/voice/audio/
-/// video, e.g. "/convert pdf".
+/// Direct entry point to `convert_file`.
 fn handleConvertCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -9338,10 +7825,6 @@ fn handleConvertCommand(
 }
 
 /// Shared by `/reminders` and the `set_reminder` LLM tool's `action=list`.
-/// Renders each reminder's absolute due moment in *its own setter's*
-/// timezone/format (`store/user_settings.zig`), not the viewer's — a chat's
-/// pending reminders can belong to several people, and each one set their
-/// own "14:30" meaning their own local 14:30.
 fn formatPendingReminders(a: std.mem.Allocator, pool: *store_pool.PgPool, pending: []const reminders.PendingReminder, now: i64) []const u8 {
     if (pending.len == 0) return "No pending reminders. Set one with /remind <duration, clock time, or date> <message> (or just ask).";
 
@@ -9365,10 +7848,7 @@ fn formatPendingReminders(a: std.mem.Allocator, pool: *store_pool.PgPool, pendin
 }
 
 /// Wires the `set_reminder` LLM tool (see `tools/remind.zig`) to real
-/// Postgres-backed reminders for one specific message's chat/sender —
-/// constructed fresh per message in `processMessageTask` since `chat_id`/
-/// `identity_id`/`is_owner` all vary per sender, then handed to the tool
-/// loop as a `registry.ReminderSink`.
+/// Postgres-backed reminders for one specific message's chat/sender.
 const ReminderToolAdapter = struct {
     pool: *store_pool.PgPool,
     chat_id: i64,
@@ -9418,11 +7898,8 @@ fn formatAllNotes(a: std.mem.Allocator, listed: []const notes.Note) []const u8 {
     return buf.writer.buffered();
 }
 
-/// Wires the `set_note` LLM tool (see `tools/set_note.zig`) to real
-/// Postgres-backed notes for one specific message's chat/sender —
-/// constructed fresh per message in `processMessageTask` since `chat_id`/
-/// `identity_id`/`is_owner` all vary per sender, then handed to the tool
-/// loop as a `registry.NoteSink`. Same shape as `ReminderToolAdapter`.
+/// Wires the `set_note` LLM tool (see `tools/set_note.zig`) to real Postgres-
+/// backed notes for one specific message's chat/sender.
 const NoteToolAdapter = struct {
     pool: *store_pool.PgPool,
     chat_id: i64,
@@ -9463,10 +7940,7 @@ const NoteToolAdapter = struct {
 };
 
 /// Wires the `set_expense` LLM tool (see `tools/set_expense.zig`) to real
-/// Postgres-backed expenses — same shape/reasoning as `NoteToolAdapter`
-/// (ROADMAP.md's Phase 17). `amount_cents` arrives already converted from
-/// the tool's own dollar-amount input, so this adapter, like `formatAllNotes`'
-/// counterpart below, only ever handles the integer-cents unit.
+/// Postgres-backed expenses.
 const ExpenseToolAdapter = struct {
     pool: *store_pool.PgPool,
     chat_id: i64,
@@ -9557,11 +8031,7 @@ const AlertToolAdapter = struct {
 
 /// Wires the `begin_file_conversion` LLM tool (see
 /// `tools/begin_conversion.zig`) to `PendingConversions` for one specific
-/// message's chat/sender — same per-message construction as
-/// `ReminderToolAdapter`/`AlertToolAdapter`. `chat_id`/`user_id` here are
-/// the native platform strings (`msg.chat_id`/`msg.user_id`), matching
-/// `PendingConversions`' own composite-key scheme, not the internal
-/// integer ids the other two adapters use.
+/// message's chat/sender.
 const ConvertFlowToolAdapter = struct {
     pending: *convert_flow.PendingConversions,
     now: i64,
@@ -9583,13 +8053,7 @@ const ConvertFlowToolAdapter = struct {
 };
 
 /// Wires the `find_chat_member` LLM tool (see `tools/find_chat_member.zig`)
-/// to the local roster — same per-message construction as the other tool
-/// adapters above. Before searching, best-effort refreshes this chat's admin
-/// list via the connector (Telegram's `getChatAdministrators` — see
-/// `iface.Connector.listChatAdmins`'s doc comment for why that's the only
-/// bulk membership call bots get) so admins who've never spoken still show
-/// up; a platform/failure that can't supply one just searches whatever's
-/// already known instead of failing the tool call.
+/// to the local roster.
 const MemberDirectoryToolAdapter = struct {
     pool: *store_pool.PgPool,
     connector: iface.Connector,
@@ -9629,8 +8093,7 @@ const MemberDirectoryToolAdapter = struct {
 };
 
 /// Wires the `catch_me_up` LLM tool (see `tools/catch_me_up.zig`) to this
-/// chat's own logged history — same per-message construction as the other
-/// tool adapters above (ROADMAP.md's Phase 14).
+/// chat's own logged history.
 const ChatHistoryToolAdapter = struct {
     pool: *store_pool.PgPool,
     chat_id: i64,
@@ -9652,27 +8115,14 @@ const ChatHistoryToolAdapter = struct {
 };
 
 /// Hard row ceiling for `catch_me_up`, independent of its own hour-window
-/// cap — a very chatty chat over even a modest window could otherwise
-/// return an unbounded amount of text (see `messages.recentSinceFormatted`'s
-/// own doc comment for why both bounds exist together).
+/// cap.
 const catch_me_up_row_limit = 2000;
 
 /// Hard cap on how many chats `list_personal_chats` hands the model in one
-/// call — same "don't blow out the model's context on an account in a lot
-/// of chats" reasoning as `catch_me_up_row_limit` above, just for chat
-/// count instead of message count.
+/// call.
 const list_personal_chats_limit = 60;
 
-/// Backs the personal-account (TDLib) LLM tools —
-/// `summarize_unread_chat`/`list_personal_chats`/`send_personal_message` —
-/// unlike `ChatHistoryToolAdapter` (this Bot-API chat's own logged
-/// Postgres history), these reach the personal-account TDLib connector,
-/// which may not be configured at all on this deployment. Always
-/// constructed and always wired into `ToolContext` (never gated to `null`
-/// the way `.memory` is) so the model gets a plain explanatory string back
-/// either way — "not configured"/"not logged in yet" are normal runtime
-/// states worth relaying to the owner directly, not a raw tool error to
-/// work around.
+/// Backs the personal-account (TDLib) LLM tools.
 const PersonalAccountToolAdapter = struct {
     telegram_user: ?*telegram_user_platform.TelegramUserConnector,
     pool: *store_pool.PgPool,
@@ -9780,26 +8230,15 @@ const MonitoringToolAdapter = struct {
                 return out.writer.buffered();
             },
             .one => |m| {
-                // Monitoring is forward-looking (a subscription to future
-                // messages), not a report over history that already
-                // exists -- so unlike e.g. reply_to_message (which
-                // inherently needs a real prior message to target),
-                // there's no reason to require this chat to have ever
-                // recorded one yet. `upsertChat` creates the row if it's
-                // missing rather than requiring it already exist (direct
-                // owner report, 2026-08-26: the old `getByNative`-or-fail
-                // guard here blocked subscribing to a chat with no
-                // history, which is a perfectly normal thing to want).
+                // Monitoring is forward-looking (a subscription to future messages), not a
+                // report over history that already exists.
                 const chat_id = try chats.upsertChat(self.pool, .telegram_user, m.native_chat_id, null, m.title);
                 try chat_settings.setMonitorImportance(self.pool, chat_id, parsed_importance);
                 if (parsed_importance == .off) {
                     return std.fmt.allocPrint(allocator, "Stopped monitoring \"{s}\".", .{m.title});
                 }
-                // The only real consequence of subscribing a chat with no
-                // recorded history yet: an immediate get_bulletin has
-                // nothing from it until a new message actually arrives --
-                // surfaced as a heads-up rather than blocking the
-                // subscription itself.
+                // The only real consequence of subscribing a chat with no recorded history
+                // yet.
                 if (!messages.hasAny(self.pool, chat_id)) {
                     return std.fmt.allocPrint(
                         allocator,
@@ -9853,18 +8292,8 @@ fn formatMemories(a: std.mem.Allocator, listed: []const facts.Memory) []const u8
     return buf.writer.buffered();
 }
 
-/// Wires the `remember_memory` LLM tool (see `tools/remember_memory.zig`)
-/// to real Postgres-backed memories for one specific message's sender —
-/// constructed fresh per message in `processMessageTask`, same shape as
-/// `NoteToolAdapter`, except scoped to `identity_id` alone (no `chat_id`/
-/// `is_owner` — see `registry.zig`'s `MemorySink` doc comment for why
-/// there's no "or the owner" escape hatch here). `embeddings_client` is
-/// `null` exactly when `config.embeddings_url` is unset — which is now a
-/// fully supported way to run: the fact is stored without a vector and
-/// ranked on keyword/recency/salience instead. `tool_ctx.memory` is
-/// therefore always wired to this adapter's sink (it used to be wired only
-/// when an embeddings client existed, which is what made remembering
-/// silently impossible without one).
+/// Wires the `remember_memory` LLM tool (see `tools/remember_memory.zig`) to
+/// real Postgres-backed memories for one specific message's sender.
 const MemoryToolAdapter = struct {
     pool: *store_pool.PgPool,
     identity_id: i64,
@@ -9883,18 +8312,7 @@ const MemoryToolAdapter = struct {
 
     fn createFn(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8) anyerror!i64 {
         const self: *MemoryToolAdapter = @ptrCast(@alignCast(ptr));
-        // An embedding is an enhancement, not a prerequisite. This used to
-        // `return error.EmbeddingsNotConfigured` here, and the sink wasn't
-        // even wired up without a client (see `processMessageTask`), so on
-        // a deployment with no WARDEN_EMBEDDINGS_URL the `remember_memory`
-        // tool simply didn't exist: the model would say it had remembered
-        // something and nothing was ever written, with nothing anywhere to
-        // say why. Storing the fact matters more than being able to rank it
-        // by cosine distance later.
-        //
-        // A configured-but-failing endpoint degrades the same way rather
-        // than losing the fact -- logged, since that one IS a
-        // misconfiguration worth seeing, unlike simply not having one.
+        // An embedding is an enhancement, not a prerequisite.
         const vector: ?[]const f32 = if (self.embeddings_client) |client|
             client.embed(allocator, text) catch |err| blk: {
                 log.warn("memory: embedding failed, storing without a vector (semantic recall will skip it): {t}", .{err});
@@ -9935,10 +8353,7 @@ fn formatPendingAlerts(a: std.mem.Allocator, pending: []const alert_store.Pendin
 }
 
 /// Delivers through whichever of `connectors` owns each due reminder's
-/// platform — see `checkAndSendDueDigests`'s doc comment for the same
-/// reasoning. A reminder whose platform has no active connector is left
-/// undelivered (not marked delivered) so it retries next cycle instead of
-/// being silently lost.
+/// platform.
 fn checkAndSendDueReminders(
     connectors: []const iface.Connector,
     gpa: std.mem.Allocator,
@@ -9967,10 +8382,8 @@ fn checkAndSendDueReminders(
         defer arena.deinit();
         const a = arena.allocator();
 
-        // The only difference between the two kinds at delivery time is the
-        // framing and, for announcements, the optional pin -- see
-        // `reminders.Kind`. One loop delivers both because the scheduling
-        // half is genuinely identical.
+        // The only difference between the two kinds at delivery time is the framing
+        // and, for announcements, the optional pin -- see `reminders.Kind`.
         const text = switch (r.kind) {
             .reminder => std.fmt.allocPrint(a, "⏰ Reminder: {s}", .{r.message}) catch continue,
             .announcement => std.fmt.allocPrint(a, "📣 {s}", .{r.message}) catch continue,
@@ -9994,15 +8407,8 @@ fn checkAndSendDueReminders(
     }
 }
 
-/// ROADMAP.md's Phase 24: reverts a timed `/permission <duration> ...`
-/// grant/revoke back to the default (unrestricted) bitmask once its
-/// `expires_at` passes — same polling-loop shape as
-/// `checkAndSendDueReminders` above. Attempts the live platform call
-/// first (best-effort, same as `handlePermissionCommand`'s own
-/// enforcement — logged, not fatal, since the bitmask itself is the
-/// source of truth) and clears the DB row regardless of whether that live
-/// call succeeded, so a persistent platform error (e.g. the bot no longer
-/// being an admin) can't wedge this in a retry loop forever.
+/// Reverts a timed `/permission <duration> ...` grant/revoke back to the
+/// default (unrestricted) bitmask once its `expires_at` passes.
 fn checkAndRevertExpiredPermissions(
     connectors: []const iface.Connector,
     gpa: std.mem.Allocator,
@@ -10041,20 +8447,8 @@ fn checkAndRevertExpiredPermissions(
     }
 }
 
-/// Posts a scheduled announcement into a chat that has `/autopin on` and
-/// pins it, degrading rather than failing at each step that can go wrong:
-///
-/// - `sendMessageReturningId` is an optional vtable slot that returns null
-///   *without sending* when a platform doesn't implement it (Matrix and
-///   XMPP today), so the fallback has to do the plain send itself.
-/// - The pin can fail on its own — most likely because the bot simply
-///   hasn't been given pin permission in that group, which is a
-///   configuration fact about the chat, not an error worth losing the
-///   announcement over. It's logged at warn and the announcement stands.
-///
-/// Either way the message goes out exactly once, which is what matters:
-/// the delivery loop marks the row delivered (or reschedules it)
-/// regardless of whether the pin landed.
+/// Posts a scheduled announcement into a chat that has `/autopin on` and pins
+/// it, degrading rather than failing at each step that can go wrong.
 fn sendAndPinAnnouncement(connector: iface.Connector, a: std.mem.Allocator, native_chat_id: []const u8, text: []const u8) void {
     const sent_id = connector.sendMessageReturningId(a, native_chat_id, text, null) catch |err| {
         log.err("announce: send failed for chat {s}: {t}", .{ native_chat_id, err });
@@ -10070,12 +8464,7 @@ fn sendAndPinAnnouncement(connector: iface.Connector, a: std.mem.Allocator, nati
 }
 
 /// Housekeeping retention sweep: hard-deletes any chat that's been marked
-/// left (see `store/chats.zig`'s `markLeft`, set from a `chat_left`
-/// synthetic message — the bot was removed, left, or the chat was
-/// deleted) for longer than the retention window. Cascades to every FK'd
-/// table via `ON DELETE CASCADE` (`deleteLeftBefore`'s own doc comment
-/// has the full list). Runs every scheduler tick like its neighbors — a
-/// `DELETE` matching zero rows is cheap, no separate cadence needed.
+/// left.
 const chat_retention_seconds: i64 = 30 * 24 * 3600;
 
 fn checkAndPurgeLeftChats(pool: *store_pool.PgPool, now: i64) void {
@@ -10087,57 +8476,27 @@ fn checkAndPurgeLeftChats(pool: *store_pool.PgPool, now: i64) void {
 }
 
 /// Shown while waiting on the model with nothing more specific to show (see
-/// `TickerState`/`tickerLoop`). Used to cycle through several dot-count
-/// frames, re-editing the message every tick — but that meant the ticker
-/// kept hitting Telegram's edit rate limit even when nothing had actually
-/// changed, sometimes causing edits (including the final answer) to get
-/// dropped. Now static, so `tickerLoop`'s dedupe against `last_sent` means
-/// no edit is sent at all until real progress (a tool call) has something
-/// new to show.
+/// `TickerState`/`tickerLoop`).
 const thinking_text = "🤔 Thinking...";
 /// Shown by `tickerLoop` once `TickerState.cancelled` flips, overriding
-/// whatever status was showing — the immediate feedback for a "🛑 Cancel"
-/// press, ahead of `toolcall.run` actually noticing at its next
-/// loop-iteration boundary (see `toolcall.Progress.cancelled`'s doc
-/// comment for why that can lag this).
+/// whatever status was showing.
 const cancelling_text = "🛑 Cancelling...";
 /// Telegram's edits are throttled to roughly 1/sec per chat in practice;
 /// this keeps a comfortable margin under that.
 const ticker_interval_ms: i64 = 1200;
 
-/// Shared between `replyWithAnswer` (which owns it), the ticker task, and
-/// the `toolcall.Progress` callback that updates it — all touching `status`
-/// only through the mutex, since the ticker runs as an independent
-/// concurrent task. `allocator` backs the "using X" text `onProgressEvent`
-/// formats; `onProgressEvent` only ever runs on the main per-message task
-/// (synchronously inside `qa.answer`/`toolcall.run`), never the ticker
-/// task, so it's safe for this to be the same per-message arena the rest
-/// of that task uses — see `tickerLoop`'s doc comment for why the ticker
-/// itself must NOT share it.
-///
-/// Heap-allocated on `std.heap.page_allocator` by `replyWithAnswer`
-/// (**not** stack-local, unlike its pre-2026-08-01 shape) — `stop`/`done`
-/// let the ticker thread outlive `replyWithAnswer`'s own stack frame when
-/// it can't be joined promptly (see `tickerLoop`'s doc comment), so nothing
-/// referencing `state` may be on that frame.
-/// One child line under the "🤔 Thinking..." header. A union rather than a
-/// bare tool name so the tree can also carry non-tool progress (a retry),
-/// and so a repeated tool call can be collapsed into a count instead of
-/// stacking identical lines.
+/// Shared between `replyWithAnswer` (which owns it), the ticker task, and the
+/// `toolcall.Progress` callback that updates it.
 const TreeEntry = union(enum) {
-    /// `input_digest` is the fingerprint of the most recent call's
-    /// arguments (see `toolcall.hashToolInput`) — kept so the *next*
-    /// report for the same tool can tell "same call again" (ignore it)
-    /// from "different arguments" (bump `count`).
+    /// `input_digest` is the fingerprint of the most recent call's arguments (see
+    /// `toolcall.hashToolInput`).
     tool: struct { name: []const u8, input_digest: u64, count: u32 },
     retry: struct { attempt: u32, max: u32 },
 };
 
 /// Per-tool icon for the progress tree, falling back to the generic wrench
-/// for anything not listed (including a tool added later and not mapped
-/// here yet — a missing icon should never be a missing line). Grouped by
-/// what the tool *does* rather than one arbitrary glyph each, so a family
-/// of related tools reads as a family.
+/// for anything not listed (including a tool added later and not mapped here
+/// yet — a missing icon should never be a missing line).
 fn toolEmoji(name: []const u8) []const u8 {
     const table = .{
         // Reaching out to the network
@@ -10190,42 +8549,26 @@ fn toolEmoji(name: []const u8) []const u8 {
 const TickerState = struct {
     io: Io,
     allocator: std.mem.Allocator,
-    /// Cooperative stop signal — `replyWithAnswer` sets this once it's done
-    /// with the model call; `tickerLoop` checks it instead of relying on
-    /// `Future.cancel()`/preemption (see `tickerLoop`'s doc comment for why).
+    /// Cooperative stop signal — `replyWithAnswer` sets this once it's done with
+    /// the model call; `tickerLoop` checks it instead of relying on
+    /// `Future.cancel()`/preemption.
     stop: std.atomic.Value(bool) = .init(false),
-    /// Set by `tickerLoop` right before it returns — `replyWithAnswer`
-    /// polls this (bounded) instead of blocking on `std.Thread.join()`,
-    /// since the ticker may be wedged inside an in-flight edit call for up
-    /// to its own 45s internal timeout.
+    /// Set by `tickerLoop` right before it returns — `replyWithAnswer` polls this
+    /// (bounded) instead of blocking on `std.Thread.join()`.
     done: std.atomic.Value(bool) = .init(false),
     /// Flipped by a "🛑 Cancel" button press, routed through
     /// `features/cancel_request.zig`'s `InFlightRequests` from whichever
     /// `WorkerPool` worker is handling that press — a different one than
-    /// whatever's running this request. `replyWithAnswer` points
-    /// `toolcall.Progress.cancelled` straight at this field, so `toolcall.run`
-    /// sees it too (see that field's own doc comment on when it actually
-    /// takes effect); `tickerLoop` also watches it directly for the instant
-    /// "🛑 Cancelling..." feedback.
+    /// whatever's running this request.
     cancelled: std.atomic.Value(bool) = .init(false),
     /// This platform's hard cap on a single message's text (see
-    /// `effectiveMaxMessageLength`) — the rendered tree (see `renderTree`)
-    /// is truncated to this before being shown, since unlike the *final*
-    /// answer (routed to a file when too long via `sendTextOrFile`) the
-    /// growing interim preview has no such fallback and would otherwise
-    /// eventually 400 out of `editMessage` on a long-running request.
+    /// `effectiveMaxMessageLength`).
     max_len: usize,
     mutex: Io.Mutex = .init,
-    /// What's happened this request, oldest first — rendered as tree-branch
-    /// child lines under `thinking_text` by `renderTree`. Only ever touched
-    /// from `onProgressEvent`, which (like this whole struct's `allocator`)
-    /// runs exclusively on the main per-message task, never the ticker
-    /// thread — see this struct's own doc comment — so it needs no mutex of
-    /// its own.
+    /// What's happened this request, oldest first — rendered as tree-branch child
+    /// lines under `thinking_text` by `renderTree`.
     tool_history: std.ArrayList(TreeEntry) = .empty,
-    /// null = show the generic thinking animation; set = show this (already
-    /// including the tree so far — see `renderTree`) until the model moves
-    /// past whatever produced it.
+    /// Null = show the generic thinking animation; set = show this.
     status: ?[]const u8 = null,
 
     fn setStatus(self: *TickerState, text: ?[]const u8) void {
@@ -10240,16 +8583,8 @@ const TickerState = struct {
         return self.status;
     }
 
-    /// Builds `thinking_text` followed by one tree-branch child line per
-    /// entry in `tool_history` so far ("├── 🔧 Using x..."/"└── 🔧 Using
-    /// y..."), plus `trailing` (a streaming answer preview) as one final
-    /// child line when given. Called from `onProgressEvent` — main task
-    /// thread only, same as `tool_history` itself (see its doc comment).
-    /// Truncated to `max_len` as a whole, not just `trailing` on its own
-    /// (unlike before this tree existed): the accumulated history now
-    /// counts against the same platform message-size budget. Falls back to
-    /// the bare header on allocation failure — losing the tree for one tick
-    /// is better than failing the whole progress report over it.
+    /// Builds `thinking_text` followed by one tree-branch child line per entry in
+    /// `tool_history` so far ("├── 🔧 Using x..."/"└── 🔧 Using y...").
     fn renderTree(self: *TickerState, trailing: ?[]const u8) []const u8 {
         var buf: std.ArrayList(u8) = .empty;
         buf.appendSlice(self.allocator, thinking_text) catch return thinking_text;
@@ -10264,9 +8599,8 @@ const TickerState = struct {
                     buf.appendSlice(self.allocator, toolEmoji(t.name)) catch return thinking_text;
                     buf.appendSlice(self.allocator, " Using ") catch return thinking_text;
                     buf.appendSlice(self.allocator, t.name) catch return thinking_text;
-                    // Only once the model has actually called it more than
-                    // once with *different* arguments — a repeat of the
-                    // identical call never gets here (see `onProgressEvent`).
+                    // Only once the model has actually called it more than once with *different*
+                    // arguments — a repeat of the identical call never gets here.
                     if (t.count > 1) {
                         const suffix = std.fmt.allocPrint(self.allocator, " (x{d})", .{t.count}) catch return thinking_text;
                         buf.appendSlice(self.allocator, suffix) catch return thinking_text;
@@ -10298,8 +8632,7 @@ test "toolEmoji maps known tools and falls back to the wrench for anything else"
 }
 
 /// A `TickerState` wired to an arena, for exercising `onProgressEvent` +
-/// `renderTree` without a connector or a live request. `max_len` is
-/// deliberately large so nothing under test is truncated.
+/// `renderTree` without a connector or a live request.
 fn testTicker(arena: std.mem.Allocator) TickerState {
     return .{ .io = std.testing.io, .allocator = arena, .max_len = 4096 };
 }
@@ -10370,25 +8703,13 @@ fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
     const state: *TickerState = @ptrCast(@alignCast(ptr));
     switch (event) {
         .thinking => {
-            // Fires on every turn, including right after a tool call whose
-            // child line is already reflected in `status` (set below, by
-            // that same `.tool_use` event) — only reset to the bare header
-            // when there's no tree yet to preserve (the very first turn).
+            // Fires on every turn, including right after a tool call whose child line is
+            // already reflected in `status` (set below, by that same `.tool_use` event).
             if (state.tool_history.items.len == 0) state.setStatus(null);
         },
         .tool_use => |use| {
-            // Three cases, per the reported bug (identical web_search lines
-            // stacking under one message):
-            //   * same tool, same arguments as the last entry — the model
-            //     re-issuing a call already shown. Not new activity, so
-            //     nothing changes at all, not even a count.
-            //   * same tool, different arguments — a genuinely new call;
-            //     collapse into the existing line as "(xN)" rather than
-            //     repeating the tool's name down the tree.
-            //   * anything else — a new line.
-            // Only the most recent entry is considered, so alternating
-            // tools (search, scrape, search) still read in call order
-            // instead of silently merging across the gap.
+            // Three cases, per the reported bug (identical web_search lines stacking
+            // under one message): * same tool, same arguments as the last entry.
             if (state.tool_history.items.len > 0) {
                 const last = &state.tool_history.items[state.tool_history.items.len - 1];
                 if (last.* == .tool and std.mem.eql(u8, last.tool.name, use.name)) {
@@ -10420,19 +8741,12 @@ fn onProgressEvent(ptr: *anyopaque, event: toolcall.Progress.Event) void {
     }
 }
 
-/// UTF-8-boundary-safe truncation to at most `max_len` bytes — backs off
-/// from `max_len` to the start of whatever multi-byte codepoint it would
-/// otherwise cut through, so a truncated interim streaming preview is never
-/// invalid UTF-8 (which `editMessage` would otherwise send to Telegram
-/// broken, the same class of problem `toolcall.zig`'s `sanitizeUtf8` guards
-/// tool results against). Returns `text` unchanged (no allocation) when
-/// it's already within budget.
+/// UTF-8-boundary-safe truncation to at most `max_len` bytes.
 fn truncateUtf8(text: []const u8, max_len: usize) []const u8 {
     if (text.len <= max_len) return text;
     var end = max_len;
-    // `text[end]` is the first byte being cut off; back off while it's a
-    // UTF-8 continuation byte (`10xxxxxx`), i.e. while stopping here would
-    // split a multi-byte codepoint in half.
+    // `text[end]` is the first byte being cut off; back off while it's a UTF-8
+    // continuation byte (`10xxxxxx`).
     while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
     return text[0..end];
 }
@@ -10457,41 +8771,7 @@ test "truncateUtf8 handles max_len landing exactly on a boundary" {
     try std.testing.expectEqualStrings("caf", truncateUtf8(text, 3));
 }
 
-/// Runs on its own real, detached `std.Thread` (see `replyWithAnswer` —
-/// deliberately NOT `Io.concurrent`, see below), editing `message_id` no
-/// more than once per `ticker_interval_ms` — the generic thinking
-/// animation, or whatever `state.status` currently says, whichever's
-/// current. Dedupes against the last text it actually sent so a run of
-/// identical statuses (or a tick where nothing changed) doesn't trigger a
-/// wasted edit — besides being pointless, Telegram rejects a no-op edit
-/// ("message is not modified"), which `editMessage` can't distinguish from
-/// a real failure (see its doc comment).
-///
-/// Stops cooperatively via `state.stop`, checked once per tick, rather than
-/// via `Future.cancel()` — confirmed live in production (VPS wedge,
-/// 2026-07-31/08-01) that when this loop's own `editMessage` call is
-/// in-flight at the exact moment its call to `http_util`'s 45s
-/// timeout-and-detach escape hatch fires, a caller blocked in
-/// `Future.cancel()` waiting for this task to stop can hang forever —
-/// permanently stranding whichever `WorkerPool` worker was running that
-/// caller. Same class of bug `xmpp.zig`'s `pollFn` hit and was fixed for
-/// (see `worker_pool.zig`'s module doc): `Future.cancel()` can't be trusted
-/// to unwind through that raw-detached-thread boundary. A plain
-/// `std.Thread` + atomic stop flag sidesteps the question entirely — no
-/// cancellation to trust, just a flag this loop checks on its own schedule,
-/// with `replyWithAnswer` bounding how long it waits rather than blocking
-/// unboundedly on a join.
-///
-/// Deliberately does NOT take the per-message arena `replyWithAnswer` and
-/// `qa.answer` use — this runs as a genuinely concurrent task (a real OS
-/// thread), and `std.heap.ArenaAllocator` has no internal locking, so two
-/// threads allocating from the same arena at once corrupts its bookkeeping.
-/// That was the actual cause of an earlier reported hang: no timeout ever
-/// fired because the corruption happened inside allocator internals,
-/// nowhere near the network code the timeouts guard. Every allocation
-/// `editMessage`'s call chain makes is `defer`-freed by itself (no reliance
-/// on arena-wholesale-free), so a plain thread-safe allocator works fine
-/// here — no arena needed.
+/// Runs on its own real, detached `std.Thread`.
 fn tickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []const u8, state: *TickerState) void {
     defer state.done.store(true, .release);
     var last_sent: []const u8 = thinking_text;
@@ -10511,16 +8791,7 @@ fn tickerLoop(connector: iface.Connector, chat_id: []const u8, message_id: []con
 }
 
 /// Maps an LLM tool's own `.name` (the function-calling identifier) to the
-/// `feature_flags` module key that gates it — `null` for tools with no
-/// toggle (calculator, currency, fetch_url, draw_diagram, word_cloud,
-/// find_chat_member), which always stay available. Deliberately covers
-/// more than /home/armin/claude/warden-ui/ARCHITECTURE.md §5's literal
-/// "LLM-tool-shaped features" list: the standalone-module tools
-/// (set_reminder, set_alert, begin_file_conversion, convert_file) map back
-/// to their command's own module key too — disabling "Reminders" bot-wide
-/// should stop *every* way to create one, not just the `/remind` command,
-/// or the toggle would be a half-measure a careful admin would reasonably
-/// call a bug.
+/// `feature_flags` module key that gates it.
 fn toolModuleKey(name: []const u8) ?[]const u8 {
     const Pair = struct { name: []const u8, key: []const u8 };
     const pairs = [_]Pair{
@@ -10552,12 +8823,8 @@ fn toolModuleKey(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `false` for a tool whose `ToolContext` sink is null — the owner-only
-/// sinks `processMessageTask` leaves unwired for anyone but the owner.
-/// Such a tool would only ever answer `error.MissingToolContext`, so it
-/// isn't offered to the model in the first place. Tools that don't go
-/// through one of these sinks are always `true` here; they're gated by
-/// `toolModuleKey`/`feature_flags` alone.
+/// `false` for a tool whose `ToolContext` sink is null — the owner-only sinks
+/// `processMessageTask` leaves unwired for anyone but the owner.
 fn toolSinkPresent(ctx: tool_registry.ToolContext, name: []const u8) bool {
     const personal_account = [_][]const u8{ "summarize_unread_chat", "list_personal_chats", "send_personal_message", "reply_to_message" };
     for (personal_account) |n| {
@@ -10568,15 +8835,8 @@ fn toolSinkPresent(ctx: tool_registry.ToolContext, name: []const u8) bool {
     return true;
 }
 
-/// Filters `tools` against `feature_flags` right before handing them to
-/// the model — the "handing over" moment ARCHITECTURE.md §5 describes,
-/// checked fresh on every turn so a toggle takes effect immediately, no
-/// restart needed — and against `ctx`, dropping any tool whose sink isn't
-/// wired for this sender (see `toolSinkPresent`). `a` is expected to be
-/// the caller's per-message arena (same convention every other per-message
-/// allocation in this function follows) — falls back to returning `tools`
-/// unfiltered on allocation failure rather than failing the whole reply
-/// over a disabled-tools list.
+/// Filters `tools` against `feature_flags` right before handing them to the
+/// model.
 fn filterEnabledTools(pool: *store_pool.PgPool, a: std.mem.Allocator, ctx: tool_registry.ToolContext, tools: []const tool_registry.ToolDef) []const tool_registry.ToolDef {
     const out = a.alloc(tool_registry.ToolDef, tools.len) catch return tools;
     var n: usize = 0;
@@ -10634,10 +8894,7 @@ test "filterEnabledTools drops only tools whose module is explicitly disabled" {
         .{ .name = "air_quality", .description = "", .input_schema_json = "{}", .execute = dummy_execute },
     };
 
-    // `filterEnabledTools` is documented to expect an arena (its return
-    // value is a shorter sub-slice of its own internal allocation, which
-    // `std.testing.allocator`'s strict tracking can't free directly) --
-    // same convention every per-message call site already uses it under.
+    // `filterEnabledTools` is documented to expect an arena.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -10649,9 +8906,7 @@ test "filterEnabledTools drops only tools whose module is explicitly disabled" {
 }
 
 // AUDIT-2026-09-03 CORE-4: the personal-account, monitoring and bulletin
-// tools used to be offered to (and wired for) every asker. With their sinks
-// absent from the context -- what a non-owner gets -- none of them is
-// offered, module flags notwithstanding; a tool with no sink is untouched.
+// tools used to be offered to (and wired for) every asker.
 test "filterEnabledTools drops the owner-only tools when their sink isn't wired" {
     const test_support = @import("store/test_support.zig");
     var db = try test_support.openTestDb(std.testing.allocator) orelse return error.SkipZigTest;
@@ -10686,23 +8941,12 @@ test "filterEnabledTools drops the owner-only tools when their sink isn't wired"
     try std.testing.expectEqualStrings("calculator", filtered[0].name);
 }
 
-/// The "🛑 Cancel" button attached to the thinking/tool-use placeholder —
-/// a single fixed choice (nothing to pick between, just one action), same
-/// shape `audit_notify`'s "Undo" button uses for its own single-choice
-/// prompt. See `features/cancel_request.zig`'s module doc comment for the
-/// register/press/cancel flow a pick of this feeds into.
+/// The "🛑 Cancel" button attached to the thinking/tool-use placeholder — a
+/// single fixed choice (nothing to pick between, just one action).
 const cancel_choices = [_]iface.Choice{.{ .emoji = "🛑", .label = "Cancel", .value = cancel_request.cancel_choice_value }};
 
-/// Sends (or morphs `existing_placeholder_id` into) the thinking
-/// placeholder, attaching the Cancel button when — and only when — this
-/// connector actually implements the relevant vtable method itself.
-/// Deliberately checks `connector.vtable.*` directly rather than going
-/// through the `sendChoicePrompt`/`editChoicePrompt` wrapper methods'
-/// unconditional fallbacks (a plain-text listing send, `error.Unsupported`)
-/// — neither is the right degrade here. A platform with no button support
-/// should behave exactly like it did before this feature existed: a plain
-/// `sendMessageReturningId`/`editMessage`, or, if even that's unsupported,
-/// no placeholder at all (see `sendMessageReturningId`'s own doc comment).
+/// Sends (or morphs `existing_placeholder_id` into) the thinking placeholder,
+/// attaching the Cancel button when.
 fn sendOrMorphPlaceholder(connector: iface.Connector, a: std.mem.Allocator, native_chat_id: []const u8, reply_to: ?[]const u8, existing_placeholder_id: ?[]const u8) ?[]const u8 {
     if (existing_placeholder_id) |pid| {
         if (connector.vtable.editChoicePrompt != null) {
@@ -10730,11 +8974,7 @@ fn sendOrMorphPlaceholder(connector: iface.Connector, a: std.mem.Allocator, nati
     };
 }
 
-/// Replaces the placeholder's text and drops its Cancel button (a no-op
-/// button from here on — the request it controlled is already resolved),
-/// falling back the same way `sendOrMorphPlaceholder` does when this
-/// connector can't edit the keyboard, can't edit at all, or there's no
-/// placeholder to begin with.
+/// Replaces the placeholder's text and drops its Cancel button.
 fn finalizePlaceholder(connector: iface.Connector, a: std.mem.Allocator, native_chat_id: []const u8, placeholder_id: ?[]const u8, reply_to: ?[]const u8, text: []const u8) void {
     const pid = placeholder_id orelse {
         connector.sendMessage(a, native_chat_id, text, reply_to);
@@ -10744,9 +8984,8 @@ fn finalizePlaceholder(connector: iface.Connector, a: std.mem.Allocator, native_
         if (connector.editChoicePrompt(a, native_chat_id, pid, text, &.{})) |_| {
             return;
         } else |_| {
-            // Fall through to the plain edit below — same "log once,
-            // degrade" shape as everywhere else in this file that tries a
-            // richer send/edit first.
+            // Fall through to the plain edit below — same "log once, degrade" shape as
+            // everywhere else in this file that tries a richer send/edit first.
         }
     }
     connector.editMessage(a, native_chat_id, pid, text) catch |err| {
@@ -10783,31 +9022,17 @@ fn replyWithAnswer(
     max_tokens_override: ?u32,
     history_window: i64,
     /// Retries per model call on a transient failure — see
-    /// `toolcall.callProviderWithRetry`. Threaded from
-    /// `LlmDynamicSettings.max_retries` like every other LLM dial here.
+    /// `toolcall.callProviderWithRetry`.
     max_retries: u32,
     in_flight: *cancel_request.InFlightRequests,
 ) void {
-    // The placeholder + ticker only work when the platform supports
-    // editing (Telegram does); anything that doesn't falls back to
-    // exactly the old behavior — one blocking call, one send at the end.
-    // `existing_placeholder_id` (from `resolveQuestion`'s "🎙️
-    // Transcribing…" placeholder) is reused and morphed rather than
-    // sending a second message right after it. See
-    // `sendOrMorphPlaceholder`'s own doc comment for the Cancel-button
-    // half of this.
+    // The placeholder + ticker only work when the platform supports editing
+    // (Telegram does); anything that doesn't falls back to exactly the old
+    // behavior.
     const placeholder_id = sendOrMorphPlaceholder(connector, a, native_chat_id, reply_to, existing_placeholder_id);
     log.info("qa: placeholder for chat {s} = {?s}", .{ native_chat_id, placeholder_id });
 
-    // Heap-allocated on `page_allocator`, not stack-local: `tickerLoop` runs
-    // on a real detached thread that this function may have to walk away
-    // from (still running) if it doesn't stop promptly — see the bounded
-    // stop/join below and `TickerState`'s doc comment. Never freed on that
-    // walk-away path (same accepted "detach and abandon" tradeoff
-    // `http_util.zig`'s `fetchWithTimeout` already makes for its own
-    // stalled-connection case) — a handful of leaked `TickerState`s over a
-    // long-running process is a fine trade for never stranding a
-    // `WorkerPool` worker again.
+    // Heap-allocated on `page_allocator`, not stack-local.
     const state = std.heap.page_allocator.create(TickerState) catch |err| blk: {
         log.warn("qa: couldn't allocate ticker state for chat {s}: {t}", .{ native_chat_id, err });
         break :blk null;
@@ -10818,9 +9043,8 @@ fn replyWithAnswer(
     if (placeholder_id) |pid| {
         if (state) |s| {
             progress = .{ .ptr = s, .onEvent = onProgressEvent, .cancelled = &s.cancelled };
-            // Best-effort: a failure here just means the Cancel button (if
-            // shown at all) silently does nothing when pressed — not worth
-            // failing the whole answer over.
+            // Best-effort: a failure here just means the Cancel button (if shown at all)
+            // silently does nothing when pressed.
             in_flight.register(now, native_chat_id, pid, asker.native_id, &s.cancelled) catch |err| {
                 log.warn("qa: couldn't register the Cancel button for chat {s}: {t}", .{ native_chat_id, err });
             };
@@ -10831,24 +9055,14 @@ fn replyWithAnswer(
         }
     }
     // Runs on every exit path below (normal answer, error, cancelled, empty
-    // answer, overlength-to-file) — a Cancel press after this point finds
-    // nothing to act on, same as pressing it on any other already-resolved
-    // prompt. Unregistering a placeholder that was never registered (state
-    // allocation failed above) is a harmless no-op lookup miss.
+    // answer, overlength-to-file).
     defer if (placeholder_id) |pid| in_flight.unregister(native_chat_id, pid);
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
     const result_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window, max_retries);
 
-    // Stop the ticker before touching the placeholder ourselves. Signaled
-    // cooperatively (`state.stop`) and joined with a bound, rather than
-    // trusted to `Future.cancel()`/`std.Thread.join()` unbounded — see
-    // `tickerLoop`'s doc comment for the production wedge this replaced.
-    // 5s comfortably covers a normal stop (next tick is at most
-    // `ticker_interval_ms` away) while still being far short of the ticker's
-    // own 45s internal HTTP timeout, so this only ever eats the bound on the
-    // rare tick that's genuinely wedged in that timeout's tail.
+    // Stop the ticker before touching the placeholder ourselves.
     if (state) |s| {
         s.stop.store(true, .release);
         var waited_ms: i64 = 0;
@@ -10889,20 +9103,11 @@ fn replyWithAnswer(
         return;
     };
 
-    // What the model actually did this turn, kept with its reply in the
-    // history (see `messages.insertWithTrace`) so the next turn can see
-    // its own earlier tool calls instead of just the prose it ended on.
+    // What the model actually did this turn, kept with its reply in the history.
     const tool_trace = toolcall.formatTrace(a, result.tool_calls) catch null;
 
     // The loop already nudged the model once for a visible reply (see
-    // `toolcall.runDetailed`), so an empty answer here means it had
-    // nothing to say twice over. That used to delete the placeholder and
-    // leave nothing behind -- to the user, the bot just went quiet, and to
-    // the next turn there was no record anything had happened. Now the
-    // placeholder becomes a short visible fallback instead, and the turn
-    // is recorded with its tool trace like any other. Telegram rejects
-    // empty text with a 400, so the fallback is also what keeps this path
-    // sendable at all.
+    // `toolcall.runDetailed`).
     const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
     const answer = if (trimmed.len > 0) trimmed else blk: {
         log.warn("qa: empty answer for chat {s} after nudge (stop={t}, tools={d}: {s})", .{
@@ -10913,27 +9118,22 @@ fn replyWithAnswer(
     log.info("qa: answer for chat {s} is {d} bytes (raw {d}, tools {d})", .{ native_chat_id, answer.len, result.text.len, result.tool_calls.len });
 
     if (answer.len > max_message_len) {
-        // Too long for this platform's limit — editing the placeholder
-        // in-place with it would just fail the same way sending it fresh
-        // would, so drop the placeholder and attach it as a file instead.
+        // Too long for this platform's limit — editing the placeholder in-place with
+        // it would just fail the same way sending it fresh would.
         log.info("qa: answer for chat {s} exceeds max_message_len ({d} > {d}), sending as a file", .{ native_chat_id, answer.len, max_message_len });
         if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |err| {
             log.warn("qa: failed to delete placeholder before file fallback for chat {s}: {t}", .{ native_chat_id, err });
         };
         sendTextOrFile(connector, a, native_chat_id, answer, reply_to, max_message_len, "answer.txt");
     } else {
-        // `finalizePlaceholder` also drops the Cancel button — the request
-        // it controlled is done, so a press on it from here on should find
-        // nothing (it's already unregistered above) rather than lingering
-        // as a dead-looking button.
+        // `finalizePlaceholder` also drops the Cancel button — the request it
+        // controlled is done.
         finalizePlaceholder(connector, a, native_chat_id, placeholder_id, reply_to, answer);
         if (placeholder_id != null) log.info("qa: final answer edited into placeholder for chat {s}", .{native_chat_id});
     }
 
-    // Log the bot's own reply too, so follow-up questions see it in the
-    // history window (inbound polling never echoes our own sends back).
-    // Resolved to a real identity row (the bot's own), not the old
-    // hardcoded `user_id = "warden"` placeholder.
+    // Log the bot's own reply too, so follow-up questions see it in the history
+    // window (inbound polling never echoes our own sends back).
     const bot_username = connector.selfUsername() orelse "warden";
     const bot_identity_id = identities.getOrCreateMinimal(pool, connector.platform(), connector.selfId() orelse "warden", bot_username, connector.selfUsername(), true, now) catch |err| {
         log.err("qa: failed to resolve bot identity for chat {s}: {t}", .{ native_chat_id, err });
@@ -11004,16 +9204,7 @@ fn replyWithStats(connector: iface.Connector, a: std.mem.Allocator, pool: *store
 }
 
 // ---------------------------------------------------------------------------
-// /menu ActionRunner — the switch that actually performs every module's
-// buttons/prompts. Deliberately thin: almost every branch below calls
-// straight into a handler function (or store mutation) that already exists
-// for the slash-command equivalent. Authorization for the button path is
-// *not* inherited from those handlers (several of them assume their caller
-// gated them); it lives in `menuAuthorize` below, driven by each node's
-// `menu_tree.MinRole`, and the engine applies it both when rendering a
-// branch's buttons and again before every dispatch. See
-// `features/menu.zig`'s module doc comment for the engine this plugs into.
-// ---------------------------------------------------------------------------
+// /menu ActionRunner.
 
 fn menuCtx(
     connector: iface.Connector,
@@ -11052,9 +9243,7 @@ fn menuCtx(
 }
 
 /// `ActionRunner.authorize` — the menu path's permission check, one tier per
-/// `menu_tree.MinRole`. Every state-changing node names its tier in the tree
-/// (see that enum's doc comment for why `.chat_admin` here is owner-or-live-
-/// platform-admin, with no `/sudo` or token fallback).
+/// `menu_tree.MinRole`.
 fn menuAuthorize(id: menu_tree.NodeId, ctx: menu.ActionContext) bool {
     return switch (menu_tree.node(id).min_role) {
         .anyone => true,
@@ -11064,10 +9253,7 @@ fn menuAuthorize(id: menu_tree.NodeId, ctx: menu.ActionContext) bool {
     };
 }
 
-/// The live `getChatMember` half of `.chat_admin`, memoized per message in
-/// `ctx.live_admin_cache` (rendering Group Administration authorizes ten
-/// children in a row). Fails closed on a platform error, same as
-/// `auth.checkGroupAdminAccess`.
+/// The live `getChatMember` half of `.chat_admin`.
 fn menuIsLiveChatAdmin(ctx: menu.ActionContext) bool {
     if (ctx.live_admin_cache.*) |cached| return cached;
     const is_admin = ctx.connector.isGroupAdmin(ctx.a, ctx.msg.chat_id, ctx.msg.user_id) catch |err| blk: {
@@ -11093,23 +9279,14 @@ fn menuSendAndShow(ctx: menu.ActionContext, text: []const u8, show: menu_tree.No
     return .{ .show = show };
 }
 
-/// Distinct, ordered emoji for a `.dynamic_list`'s live entries — same
-/// index-based idiom as `convert_flow.zig`'s own `choice_emoji`
-/// (duplicated rather than shared: it's four lines, and exporting it would
-/// couple two otherwise-independent features over a trivial helper).
+/// Distinct, ordered emoji for a `.dynamic_list`'s live entries.
 const dynamic_list_emoji = [_][]const u8{ "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟" };
 fn dynamicEmojiFor(i: usize) []const u8 {
     return dynamic_list_emoji[i % dynamic_list_emoji.len];
 }
 
-/// Maps a menu action's `NodeId` to the `feature_flags` module key that
-/// gates it — `null` for navigation/settings nodes with no toggle.
-/// Checked once at the top of each menu dispatch function below rather
-/// than duplicated per switch arm, since several of these nodes (group
-/// admin actions, `.convert`, the reminder wizard) are real state-changing
-/// actions reachable *only* through `/menu`, entirely separate from the
-/// slash-command dispatch in `handleMessage` — ARCHITECTURE.md §5
-/// explicitly calls out needing both gated, not just the command form.
+/// Maps a menu action's `NodeId` to the `feature_flags` module key that gates
+/// it — `null` for navigation/settings nodes with no toggle.
 fn menuNodeModuleKey(id: menu_tree.NodeId) ?[]const u8 {
     return switch (id) {
         .convert => "convert",
@@ -11264,7 +9441,7 @@ fn menuDynamicChoices(id: menu_tree.NodeId, ctx: menu.ActionContext) []const ifa
             const pending = reminders.listPending(ctx.pool, ctx.a, ctx.chat_id, .reminder) catch return &.{};
             for (pending, 0..) |r, i| {
                 // Each reminder's setter's own timezone/format, not the
-                // viewer's -- see `formatPendingReminders`'s doc comment.
+                // Viewer's.
                 const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.a, r.identity_id);
                 const date_format = user_settings.getEffectiveDateFormat(ctx.pool, ctx.a, r.identity_id);
                 const time_format = user_settings.getEffectiveTimeFormat(ctx.pool, ctx.a, r.identity_id);
@@ -11397,10 +9574,7 @@ fn menuResumeAwaitingInput(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.O
     return .{ .show = parent };
 }
 
-/// A signed `H[:MM]` UTC offset, e.g. "+3:30", "-5", "+0" — an explicit
-/// sign is required (no bare "5", to avoid guessing whether it means +5 or
-/// local convention) since this is the one place a personal timezone is
-/// set directly rather than guessed from `language_code`.
+/// A signed `H[:MM]` UTC offset, e.g. "+3:30", "-5", "+0".
 fn parseUtcOffsetInput(text: []const u8) ?i32 {
     if (text.len < 2) return null;
     const sign: i32 = switch (text[0]) {
@@ -11418,19 +9592,10 @@ fn parseUtcOffsetInput(text: []const u8) ?i32 {
     return sign * (hour * 60 + minute);
 }
 
-/// `ActionRunner.beginWizard` — the reminder wizard's initial draft:
-/// today, local current-hour-plus-one on the dot (a sensible "later
-/// today" default the stepper buttons can nudge from).
+/// `ActionRunner.beginWizard` — the reminder wizard's initial draft.
 fn menuBeginWizard(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.ReminderDraft {
     _ = id;
-    // Deliberately doesn't check `feature_flags` here -- this only builds
-    // an initial draft (`menu.Session`'s own state machine calls this
-    // directly for a `NodeKind.wizard` node, bypassing `menuPerform`
-    // entirely), and this function's return type can't express "refuse, +
-    // show a message" the way `menu.Outcome` can. Letting someone start
-    // filling out a disabled module's wizard is a UX wart, not a real
-    // gap -- `menuFinishWizard` below is where the reminder actually gets
-    // written, and that's where the real gate lives.
+    // Deliberately doesn't check `feature_flags` here.
     const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.a, ctx.identity_id);
     const local = civil_time.localFromUnix(ctx.now, offset_minutes);
     return .{
@@ -11476,11 +9641,7 @@ fn menuFinishWizard(draft: menu.ReminderDraft, ctx: menu.ActionContext) menu.Out
 }
 
 /// Builds the synthetic `"<cmd> <captured input>"` string every awaiting-
-/// input resume below feeds to an existing slash-command handler, so the
-/// menu and the command end up running the literal same code (including
-/// its own `auth.*` gate) rather than a re-implementation of it. `ctx.msg`
-/// itself (not this string) is what carries a reply, if the user replied
-/// instead of typing `@username`/an id/free text.
+/// input resume below feeds to an existing slash-command handler.
 fn menuSyntheticText(ctx: menu.ActionContext, comptime cmd: []const u8) []const u8 {
     return std.fmt.allocPrint(ctx.a, cmd ++ " {s}", .{ctx.msg.text orelse ""}) catch cmd;
 }
@@ -11508,10 +9669,7 @@ fn handleKickBanCommandBan(connector: iface.Connector, a: std.mem.Allocator, poo
 }
 
 // Zig's test collector only walks `test` blocks reachable from the file
-// passed to `addTest` — it does NOT transitively pull in tests from files
-// that are merely `@import`ed for their declarations. Each module below
-// that has its own `test` blocks must be explicitly re-referenced here (or
-// `zig build test` silently runs zero of its tests, no error, no warning).
+// passed to `addTest`.
 test {
     _ = auth;
     _ = @import("store/pool.zig");
@@ -11644,10 +9802,8 @@ test {
     _ = @import("store/instagram_sessions.zig");
     _ = @import("worker_pool.zig");
     _ = @import("store/db.zig");
-    // AUDIT-2026-09-03 TEXT-6/STORE-4: these seventeen carried tests that
-    // no `zig build test` had ever reached -- the known "not in this block,
-    // silently never runs" gotcha, at scale. The member-ACL persistence
-    // tests in `store/member_permissions.zig` were among them.
+    // AUDIT-2026-09-03 TEXT-6/STORE-4: these seventeen carried tests that no `zig
+    // build test` had ever reached.
     _ = @import("auth.zig");
     _ = @import("log.zig");
     _ = @import("features/bulletin.zig");
@@ -11668,17 +9824,6 @@ test {
 }
 
 /// Codepoints that delimit a word for magic-word / keyword matching.
-///
-/// ASCII is easy: anything non-alphanumeric. Beyond ASCII there's no full
-/// Unicode table to consult, so this enumerates the punctuation, symbol and
-/// separator blocks that actually turn up in chat -- above all the Persian
-/// comma (U+060C) and question mark (U+061F), which is what "وردن،" and
-/// "وردن؟" end with. Everything else >= 0x80 stays a word character, so a
-/// name embedded in a longer word ("محسن" vs "حسن") still isn't a match.
-///
-/// ZWNJ/ZWJ (U+200C/U+200D) are deliberately word characters: Persian uses
-/// them *inside* words, so treating them as boundaries would match a name
-/// glued to a suffix.
 fn isWordBoundaryCodepoint(cp: u21) bool {
     if (cp < 0x80) return !std.ascii.isAlphanumeric(@intCast(cp));
     return switch (cp) {
@@ -11702,8 +9847,7 @@ fn isWordBoundaryCodepoint(cp: u21) bool {
 }
 
 /// Boundary test for the byte *before* `idx`: walks back to the start of the
-/// UTF-8 sequence and decodes it. Malformed or misaligned input counts as a
-/// boundary -- erring toward answering beats silently ignoring the owner.
+/// UTF-8 sequence and decodes it.
 fn isWordBoundaryBefore(haystack: []const u8, idx: usize) bool {
     if (idx == 0) return true;
     var i = idx;
@@ -11727,9 +9871,8 @@ fn isWordBoundaryAt(haystack: []const u8, idx: usize) bool {
     return isWordBoundaryCodepoint(cp);
 }
 
-/// Whole-word, ASCII-case-insensitive search — used for magic-word
-/// detection so "Hassan," matches a magic word of "hassan" but
-/// "hassanabad" doesn't.
+/// Whole-word, ASCII-case-insensitive search — used for magic-word detection
+/// so "Hassan," matches a magic word of "hassan" but "hassanabad" doesn't.
 fn containsWordIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return false;
 
@@ -11768,9 +9911,7 @@ test "containsWordIgnoreCase handles UTF-8 magic words" {
     try std.testing.expect(!containsWordIgnoreCase("محسن اومد", "حسن"));
 }
 
-// Regression: Persian punctuation is multi-byte UTF-8, so the old
-// ASCII-only boundary test saw "وردن،" as one long word and the bot stayed
-// silent when it was called by name with normal Persian punctuation.
+// Regression: Persian punctuation is multi-byte UTF-8.
 test "containsWordIgnoreCase treats Persian punctuation as a word boundary" {
     const magic = "وردن";
     try std.testing.expect(containsWordIgnoreCase("وردن، حالت چطوره؟", magic)); // Arabic comma U+060C

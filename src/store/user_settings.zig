@@ -3,15 +3,7 @@ const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 const civil_time = @import("../text/civil_time.zig");
 
-/// Rough, DST-ignorant "typical UTC offset for this locale" table — the
-/// default a personal `utc_offset_minutes` setting starts at before the
-/// user ever touches it, derived from Telegram's `language_code` (the only
-/// locale hint any connector's API actually exposes; there is no
-/// timezone/region field anywhere to key off instead). Matched exactly
-/// first (e.g. "en-GB"), then by the base language subtag before any `-`
-/// (e.g. "en"). Deliberately small and approximate — a real per-user
-/// override (`setUtcOffsetMinutes`) always wins over this, and this is
-/// only ever a first guess, not a source of truth.
+/// Rough, DST-ignorant "typical UTC offset for this locale" table.
 const language_code_offsets = [_]struct { code: []const u8, offset_minutes: i32 }{
     .{ .code = "en-gb", .offset_minutes = 0 },
     .{ .code = "en-us", .offset_minutes = -300 },
@@ -62,14 +54,8 @@ pub fn offsetForLanguageCode(a: std.mem.Allocator, language_code: []const u8) ?i
     return null;
 }
 
-/// How much autonomy a drafted "reply on my behalf" gets — see migration
-/// `0043_reply_autonomy.sql`'s doc comment for what each level means.
-/// `.off` is both the enum default and what `getEffectiveReplyAutonomy`
-/// falls back to when nothing's ever been set, so a fresh install (or a
-/// chat that's never touched the setting) never drafts anything until the
-/// owner explicitly opts in — same "off until asked" convention
-/// `silent_by_default`/every other opt-in `chat_settings` flag already
-/// follows.
+/// How much autonomy a drafted "reply on my behalf" gets (see
+/// docs/features.md, "Reply autonomy").
 pub const ReplyAutonomy = enum {
     off,
     draft,
@@ -77,14 +63,9 @@ pub const ReplyAutonomy = enum {
 };
 
 /// A chat's monitoring level for `get_bulletin` (`chat_settings.
-/// monitor_importance`) or the owner's global default applied to every
-/// chat without its own override (`monitor_all_default` below) — see
-/// `0046_monitor_all_default.sql`. `.off` is an explicit value here (not
-/// just "unset"), same reasoning as `ReplyAutonomy.off`: a chat needs to be
-/// able to opt OUT even while the global default is "monitor everything",
-/// which a merely-absent value can't express once absence means "inherit
-/// the global default" rather than "off" (see `chat_settings.
-/// resolveMonitorImportance`).
+/// monitor_importance`) or the owner's global default applied to every chat
+/// without its own override (`monitor_all_default` below) — see
+/// `0046_monitor_all_default.sql`.
 pub const MonitorImportance = enum {
     off,
     low,
@@ -131,11 +112,8 @@ pub fn setReplyAutonomyDefault(pool: *PgPool, identity_id: i64, value: ?ReplyAut
     try upsertColumn(pool, identity_id, "reply_autonomy_default", text);
 }
 
-/// The owner's default monitoring level for every personal-account chat
-/// that has no per-chat override (`chat_settings.monitor_importance`) —
-/// `.off` (the default until the owner sets this) means only explicitly
-/// opted-in chats are monitored, same as before this setting existed.
-/// `null` clears the override (falls back to `.off`).
+/// The owner's default monitoring level for every personal-account chat that
+/// has no per-chat override (`chat_settings.monitor_importance`) — `.off`.
 pub fn setMonitorAllDefault(pool: *PgPool, identity_id: i64, value: ?MonitorImportance) !void {
     const text: ?[]const u8 = if (value) |v| @tagName(v) else null;
     try upsertColumn(pool, identity_id, "monitor_all_default", text);
@@ -157,9 +135,7 @@ const Row = struct {
     monitor_all_default: ?[]const u8,
 };
 
-/// One query joining `user_settings` and `telegram_profiles` — every
-/// `getEffective*` function below reads from this instead of round-
-/// tripping separately, since they all need the same row.
+/// One query joining `user_settings` and `telegram_profiles`.
 fn loadRow(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ?Row {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -186,8 +162,7 @@ fn loadRow(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ?Row {
 }
 
 /// `loadRow` dupes its string fields (so they outlive the statement it read
-/// them from) — every `getEffective*` below must free them before
-/// returning, since they only ever need to read the row once.
+/// them from) — every `getEffective*` below must free them before returning.
 fn freeRow(allocator: std.mem.Allocator, row: Row) void {
     if (row.date_format) |v| allocator.free(v);
     if (row.time_format) |v| allocator.free(v);
@@ -197,8 +172,6 @@ fn freeRow(allocator: std.mem.Allocator, row: Row) void {
 }
 
 /// Explicit override, else a `language_code`-derived guess, else UTC (0).
-/// Fails closed to UTC on any lookup error — never blocks a reminder over
-/// a transient DB hiccup.
 pub fn getEffectiveOffsetMinutes(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) i32 {
     const row = loadRow(pool, allocator, identity_id) orelse return 0;
     defer freeRow(allocator, row);
@@ -207,9 +180,7 @@ pub fn getEffectiveOffsetMinutes(pool: *PgPool, allocator: std.mem.Allocator, id
     return offsetForLanguageCode(allocator, lang) orelse 0;
 }
 
-/// Explicit override, else `.mdy` (matches this codebase's existing
-/// American-English-oriented tone elsewhere, e.g. `reminder_format.zig`'s
-/// own docs/tests already use M/D-shaped examples).
+/// Explicit override, else `.mdy`.
 pub fn getEffectiveDateFormat(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) civil_time.DateFormat {
     const row = loadRow(pool, allocator, identity_id) orelse return .mdy;
     defer freeRow(allocator, row);
@@ -226,10 +197,7 @@ pub fn getEffectiveTimeFormat(pool: *PgPool, allocator: std.mem.Allocator, ident
     return .h24;
 }
 
-/// The owner's global "reply on my behalf" default. Explicit override,
-/// else `.off` — see `ReplyAutonomy`'s doc comment for why `.off` (not
-/// `.draft`) is the fail-closed default. `chat_settings.getReplyAutonomy`
-/// is the per-chat override that beats this when set.
+/// The owner's global "reply on my behalf" default.
 pub fn getEffectiveReplyAutonomyDefault(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ReplyAutonomy {
     const row = loadRow(pool, allocator, identity_id) orelse return .off;
     defer freeRow(allocator, row);
@@ -238,8 +206,6 @@ pub fn getEffectiveReplyAutonomyDefault(pool: *PgPool, allocator: std.mem.Alloca
 }
 
 /// The owner's global monitoring default — explicit override, else `.off`.
-/// `chat_settings.resolveMonitorImportance` is the per-chat combined result
-/// callers actually want (a chat's own override beats this).
 pub fn getEffectiveMonitorAllDefault(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) MonitorImportance {
     const row = loadRow(pool, allocator, identity_id) orelse return .off;
     defer freeRow(allocator, row);
@@ -248,12 +214,7 @@ pub fn getEffectiveMonitorAllDefault(pool: *PgPool, allocator: std.mem.Allocator
 }
 
 /// `get_bulletin`'s cursor: the last time a bulletin was generated for this
-/// owner, or 0 if never. Identity-scoped (not `upsertColumn`'s `i32`/text
-/// shape) since a bulletin covers every monitored chat under one owner at
-/// once — same "own get/set pair, timestamp stored via to_timestamp/
-/// EXTRACT(EPOCH...)" shape `chat_settings.getLastDigestTs`/
-/// `setLastDigestTs` already uses, just identity- rather than chat-scoped.
-/// See `0045_chat_monitoring.sql`.
+/// owner, or 0 if never.
 pub fn getLastBulletinTs(pool: *PgPool, identity_id: i64) i64 {
     const db = pool.acquire() catch return 0;
     defer pool.release(db);

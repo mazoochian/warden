@@ -4,10 +4,7 @@ const PgPool = @import("pool.zig").PgPool;
 const Platform = @import("../platform/interface.zig").Platform;
 
 /// Which grant a pending-by-username row promises — see this module's
-/// callers (`main.zig`'s `/blockuser`/`/addadmin` handlers, which queue one
-/// of these; `resolveSenderIdentity`, which completes it once the identity
-/// is known) for the full flow. A "grant" of `blocked_user` is a block
-/// applied the moment that username first shows up.
+/// callers.
 pub const Kind = enum {
     blocked_user,
     bot_admin,
@@ -21,8 +18,7 @@ pub const Kind = enum {
 };
 
 /// Queues a grant for a `@username` the bot has no identity row for yet —
-/// idempotent (re-queueing the same platform/username/kind is a no-op, not
-/// an error).
+/// idempotent.
 pub fn addPending(pool: *PgPool, platform: Platform, username: []const u8, kind: Kind, added_by: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -40,9 +36,8 @@ pub fn addPending(pool: *PgPool, platform: Platform, username: []const u8, kind:
     _ = try stmt.step();
 }
 
-/// Cancels a pending grant before it's ever completed — no-op if there
-/// wasn't one. Used by `/unblockuser`/`/removeadmin` when the target still
-/// has no resolvable identity (nothing else to "remove" in that case).
+/// Cancels a pending grant before it's ever completed — no-op if there wasn't
+/// one.
 pub fn removePending(pool: *PgPool, platform: Platform, username: []const u8, kind: Kind) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -59,10 +54,7 @@ pub fn removePending(pool: *PgPool, platform: Platform, username: []const u8, ki
 }
 
 /// Atomically removes and returns the granter's identity id for a pending
-/// (platform, username, kind) grant, or `null` if none is queued — the
-/// `DELETE ... RETURNING` makes "check and consume" a single round trip,
-/// so two concurrent messages from the same brand-new username can't both
-/// claim (and double-apply) the same pending grant.
+/// (platform, username, kind) grant, or `null` if none is queued.
 pub fn takePending(pool: *PgPool, platform: Platform, username: []const u8, kind: Kind) !?i64 {
     const db = try pool.acquire();
     defer pool.release(db);

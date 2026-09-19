@@ -2,27 +2,14 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
-/// Every mutating warden-ui API call writes one row here — built in from
-/// the project's very first mutating endpoint rather than retrofitted
-/// later, per /home/armin/claude/warden-ui/ARCHITECTURE.md §4's reasoning.
-/// Since Phase 20 (ROADMAP.md), chat-command admin actions
-/// (mute/kick/promote/...) write here too, via
-/// `features/audit_notify.zig`. `account_id` and `identity_id` are two
-/// independent nullable actor columns, not alternates of the same thing —
-/// `account_id` references warden-ui's `accounts` (a web login),
-/// `identity_id` references a chat platform identity; a given row
-/// populates whichever namespace it actually came from (occasionally
-/// neither, if the actor genuinely can't be resolved), never both. Both
-/// nullable so audit logging is never the reason an action fails.
+/// Every mutating warden-ui API call writes one row here.
 pub fn record(pool: *PgPool, account_id: ?i64, identity_id: ?i64, action: []const u8, target: ?[]const u8, detail_json: ?[]const u8) void {
     recordFallible(pool, account_id, identity_id, action, target, detail_json) catch |err| {
         std.log.scoped(.audit).err("failed to write audit log entry for action '{s}': {t}", .{ action, err });
     };
 }
 
-/// Split out from `record` purely so tests can assert on the error path
-/// too — every real call site should use `record` (audit logging must
-/// never be the reason a request fails), never this directly.
+/// Split out from `record` purely so tests can assert on the error path too.
 fn recordFallible(pool: *PgPool, account_id: ?i64, identity_id: ?i64, action: []const u8, target: ?[]const u8, detail_json: ?[]const u8) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -51,7 +38,6 @@ pub const Entry = struct {
 
 /// Paginated, newest first — `before_id` (from the previous page's last
 /// entry) narrows to strictly older rows; pass `null` for the first page.
-/// Optional `action_filter` narrows to exactly one action name.
 pub fn list(pool: *PgPool, allocator: std.mem.Allocator, before_id: ?i64, action_filter: ?[]const u8, limit: i64) ![]Entry {
     const db = try pool.acquire();
     defer pool.release(db);

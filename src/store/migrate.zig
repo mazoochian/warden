@@ -7,10 +7,7 @@ const Migration = struct {
     sql: [:0]const u8,
 };
 
-/// Ordered, one-way schema migrations — a real replacement for the old
-/// `schema.zig`'s idempotent `CREATE TABLE IF NOT EXISTS` (which doubled as
-/// "the migration system" back when every chat had its own SQLite file).
-/// Add new entries here, never edit an already-shipped one.
+/// Ordered, one-way schema migrations.
 const migrations = [_]Migration{
     .{ .version = 1, .name = "0001_init", .sql = @embedFile("migrations/0001_init.sql") },
     .{ .version = 2, .name = "0002_reminders", .sql = @embedFile("migrations/0002_reminders.sql") },
@@ -67,11 +64,7 @@ const migrations = [_]Migration{
     .{ .version = 53, .name = "0053_blocklist_drop_credits_tokens", .sql = @embedFile("migrations/0053_blocklist_drop_credits_tokens.sql") },
 };
 
-/// Applies every migration not yet recorded in `schema_migrations`, each
-/// wrapped (migration body + its own version-recording INSERT) in a single
-/// transaction so a mid-migration failure can never leave a schema change
-/// applied without being recorded (which would otherwise make it get
-/// re-applied, and fail, on the next start).
+/// Applies every migration not yet recorded in `schema_migrations`.
 pub fn migrate(db: *Db, allocator: std.mem.Allocator) !void {
     try db.exec(
         \\CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -80,13 +73,7 @@ pub fn migrate(db: *Db, allocator: std.mem.Allocator) !void {
         \\);
     );
 
-    // One round trip for the whole set, not one per migration. This used to
-    // call `isApplied` inside the loop below, which is a separate query each
-    // -- 51 of them on every `migrate()`, and `migrate()` runs on every
-    // `openTestDb`, so it dominated the test suite's runtime (see
-    // `db.zig`'s poll-interval doc comment for the other half of that).
-    // The table is one small row per applied migration; reading all of it
-    // is cheaper than a single one of those probes was.
+    // One round trip for the whole set, not one per migration.
     var applied = std.AutoHashMapUnmanaged(i64, void).empty;
     defer applied.deinit(allocator);
     {
@@ -117,9 +104,8 @@ test "migrate creates every table and is idempotent on a second run" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
 
-    // test_support.openTestDb already ran migrate() once; running it again
-    // here must be a no-op (already-applied versions are skipped), not an
-    // error from re-creating existing tables.
+    // Test_support.openTestDb already ran migrate() once; running it again here
+    // must be a no-op (already-applied versions are skipped).
     try migrate(&db, testing.allocator);
 
     var stmt = try db.prepare("SELECT count(*) FROM identities;");

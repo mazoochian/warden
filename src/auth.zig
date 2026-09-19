@@ -5,9 +5,7 @@ const Platform = iface.Platform;
 const PgPool = @import("store/pool.zig").PgPool;
 
 /// Single choke point for the owner check: every feature handler must be
-/// reached only through here (or through the other functions in this file,
-/// which all route through `isOwner` themselves). Checked by native
-/// platform user id only, never username/display name.
+/// reached only through here.
 pub fn isOwner(config: *const Config, platform: Platform, user_id: []const u8) bool {
     for (config.owners) |entry| {
         if (entry.platform == platform and std.mem.eql(u8, entry.owner_id, user_id)) return true;
@@ -15,31 +13,8 @@ pub fn isOwner(config: *const Config, platform: Platform, user_id: []const u8) b
     return false;
 }
 
-/// The permission ladder for group-moderation-tier commands (`/mute
-/// /unmute /pin /unpin /delete /kick /ban /confirm /cancel`). Checked in
-/// order, each tier a strict fallback from the one before:
-///
-///   1. Owner — always allowed.
-///   2. `sudo_active` (the caller has already verified the sender is a bot
-///      admin and that the message was prefixed with "/sudo " — see
-///      `main.zig`'s `handleMessage`) — allowed, and sends
-///      "<display name> has been granted superuser permissions for action:
-///      <action_name>" so the override is never silent. This is the ONLY
-///      way a bot admin's non-platform-scoped status elevates a platform-
-///      scoped action: without `/sudo`, a bot admin falls straight through
-///      to tier 3 like anyone else.
-///   3. A live platform admin of this specific chat — allowed.
-///   4. Otherwise: denied, silently (matches the pre-existing convention —
-///      an unauthorized attempt at a moderation command doesn't announce
-///      itself to the whole chat).
-///
-/// There used to be a further tier that let a plain member spend one of a
-/// per-chat stock of "tokens" an admin had granted them; that mechanism is
-/// gone (RBAC is the whole model now), so `pool`/`chat_id`/`identity_id`
-/// are unused here today and kept only so the many call sites don't churn.
-///
-/// `action_name` (e.g. "kick") names the action in both the sudo-grant
-/// message and error logs.
+/// The permission ladder for group-moderation-tier commands (`/mute /unmute
+/// /pin /unpin /delete /kick /ban /confirm /cancel`).
 pub fn checkGroupAdminAccess(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -72,30 +47,19 @@ pub fn checkGroupAdminAccess(
 
 /// Gate for a management-room action (`/manage bind`/`/manage unbind`/
 /// `/notice`, see `main.zig`'s dispatch chain) — unlike
-/// `checkGroupAdminAccess`, which checks admin-of-the-*current*-chat via
-/// `msg.chat_id`, these actions target a chat other than the one the
-/// command was typed in, so `native_chat_id` here is the *target's*
-/// native id, not `msg.chat_id`. No `sudo` tier — a bot admin who isn't
-/// also the owner or a live admin of the target chat has no business
-/// binding/unbinding/notifying it.
+/// `checkGroupAdminAccess`.
 pub fn isOwnerOrLiveAdminOfChat(connector: iface.Connector, a: std.mem.Allocator, config: *const Config, native_chat_id: []const u8, user_id: []const u8) bool {
     if (isOwner(config, connector.platform(), user_id)) return true;
     return connector.isGroupAdmin(a, native_chat_id, user_id) catch false;
 }
 
 /// Gate for the six bot-management commands (`/blockuser /unblockuser
-/// /blockchat /unblockchat /addadmin /removeadmin`) — owner or bot admin
-/// only, no platform-admin fallback: these act bot-wide, not on one chat,
-/// so a chat's own admins have no say in them.
+/// /blockchat /unblockchat /addadmin /removeadmin`).
 pub fn isOwnerOrBotAdmin(config: *const Config, platform: Platform, user_id: []const u8, is_bot_admin: bool) bool {
     return isOwner(config, platform, user_id) or is_bot_admin;
 }
 
-/// Gate for `/redact regex` mode specifically — deliberately excludes even
-/// a live platform admin (stricter than plain `/redact`'s
-/// `checkGroupAdminAccess` tier), since a malicious or merely careless
-/// regex is a distinct risk class from an ordinary bulk delete. `sudo_active`
-/// carries the same pre-verified meaning as in `checkGroupAdminAccess`.
+/// Gate for `/redact regex` mode specifically.
 pub fn isOwnerOrSudoBotAdmin(config: *const Config, platform: Platform, user_id: []const u8, sudo_active: bool) bool {
     return isOwner(config, platform, user_id) or sudo_active;
 }
@@ -105,14 +69,7 @@ const test_support = @import("store/test_support.zig");
 const identities = @import("store/identities.zig");
 const chats = @import("store/chats.zig");
 
-// `comptime owner_id` (not a runtime `[]const u8` param) is load-bearing:
-// `.owners = &.{...}` below is only safe to return from this function
-// because every field of that anonymous literal is comptime-known, which
-// places it in static read-only memory. A runtime `owner_id` would make the
-// literal a stack allocation local to this function's own frame — a
-// dangling pointer the instant `testConfig` returns (confirmed the hard
-// way: silent, nondeterministic `isOwner` false negatives, not a compile
-// error, since reading through a dangling stack pointer doesn't fault).
+// `comptime owner_id` (not a runtime `[]const u8` param) is load-bearing.
 fn testConfig(comptime owner_id: []const u8) Config {
     return Config{
         .telegram_bot_token = "x",
@@ -151,10 +108,8 @@ test "isOwner matches only the configured platform+id pair" {
     try testing.expect(!isOwner(&config, .matrix, "101573604"));
 }
 
-/// A minimal `Connector` stub for exercising `checkGroupAdminAccess`/
-/// friends without a real platform — `is_group_admin`/`sent_messages` are
-/// set/read directly by tests, matching how `iface.Connector`'s ptr+vtable
-/// shape is meant to be exercised (see `platform/interface.zig`).
+/// A minimal `Connector` stub for exercising `checkGroupAdminAccess`/ friends
+/// without a real platform.
 const StubConnector = struct {
     is_group_admin: bool = false,
     is_group_admin_err: bool = false,

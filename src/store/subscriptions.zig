@@ -1,13 +1,7 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// One recurring cost (ROADMAP.md's Phase 17) -- a read-only ledger of
-/// "what am I paying for and how much per month total," not a second
-/// reminder-firing scheduler; see the `0031_subscriptions.sql` migration
-/// comment for why "remind me when it's due" is deliberately left to the
-/// existing `/remind every <interval> <message>` instead of duplicated
-/// here. Chat-scoped and shared, same "creator or the bot owner may
-/// remove" model `notes.zig`/`expenses.zig` already use.
+/// One recurring cost.
 pub const Subscription = struct {
     id: i64,
     chat_id: i64,
@@ -70,12 +64,7 @@ pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![
     return out.toOwnedSlice(allocator);
 }
 
-/// One row for the web API's `GET /api/v1/subscriptions` -- identity-
-/// scoped (not chat-scoped like `Subscription`/`listForChat` above, which
-/// back the bot's own in-chat `/subscription list`), so each row carries
-/// its own chat context for a "everything I'm paying for, across every
-/// chat" view, same shape as `expenses.ExpenseForIdentity`/
-/// `notes.NoteForIdentity`.
+/// One row for the web API's `GET /api/v1/subscriptions` -- identity- scoped.
 pub const SubscriptionForIdentity = struct {
     id: i64,
     chat_id: i64,
@@ -87,10 +76,7 @@ pub const SubscriptionForIdentity = struct {
     created_at: i64,
 };
 
-/// Subscriptions added by one identity, optionally narrowed to one chat
-/// -- see `SubscriptionForIdentity`'s doc comment for why this is a
-/// separate query from `listForChat`. Oldest first, same ordering
-/// `listForChat` already uses.
+/// Subscriptions added by one identity, optionally narrowed to one chat.
 pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]SubscriptionForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -122,9 +108,8 @@ pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_i
     return out.toOwnedSlice(allocator);
 }
 
-/// `null` if no such subscription exists -- used by `/subscription
-/// remove` to check chat/creator before deleting, same pattern as
-/// `notes.get`.
+/// `null` if no such subscription exists -- used by `/subscription remove` to
+/// check chat/creator before deleting, same pattern as `notes.get`.
 pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Subscription {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -156,10 +141,7 @@ pub fn remove(pool: *PgPool, id: i64) !void {
 }
 
 /// `amount_cents` expressed as a 30-day-month equivalent -- e.g. a $84/yr
-/// subscription is ~$7/mo. Approximate by construction (see this file's
-/// own doc comment on `interval_days` not being calendar-aware) but good
-/// enough to answer "what's my total monthly recurring spend," the
-/// actual point of tracking these at all.
+/// subscription is ~$7/mo.
 pub fn monthlyEquivalentCents(amount_cents: i64, interval_days: i64) i64 {
     return @divTrunc(amount_cents * 30, interval_days);
 }

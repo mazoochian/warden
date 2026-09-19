@@ -2,10 +2,7 @@ const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 const embeddings = @import("../llm/embeddings.zig");
 
-/// One chat's summary for one local day — the design brief's episodic
-/// layer. `local_date_unix` is that date's UTC midnight, only ever used to
-/// compute a relative age ("4 months ago") for rendering; it is not the
-/// actual timestamp of any message in the digest.
+/// One chat's summary for one local day — the design brief's episodic layer.
 pub const Digest = struct {
     id: i64,
     weekday: []const u8,
@@ -13,10 +10,7 @@ pub const Digest = struct {
     local_date_unix: i64,
 };
 
-/// Cheap existence check, same purpose as `facts.hasAny` — lets
-/// `context_assembly.zig` skip the embed-and-rank round trip for a chat
-/// with no digests yet (true for every chat until the nightly digest job,
-/// ROADMAP.md's memory-layer phase, lands).
+/// Cheap existence check, same purpose as `facts.hasAny`.
 pub fn hasAny(pool: *PgPool, chat_id: i64) !bool {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -27,11 +21,7 @@ pub fn hasAny(pool: *PgPool, chat_id: i64) !bool {
     return try stmt.step();
 }
 
-/// Creates or replaces the digest for `chat_id`/`(year, month, day)` — the
-/// nightly digest job's write path (not built yet; this is the store-layer
-/// primitive it will call). `topics`/`entities`/`source` extraction isn't
-/// implemented in this slice, so those columns are left at their schema
-/// defaults (`'{}'`) rather than threaded through here as unused params.
+/// Creates or replaces the digest for `chat_id`/`(year, month, day)`.
 pub fn upsert(
     pool: *PgPool,
     allocator: std.mem.Allocator,
@@ -50,11 +40,8 @@ pub fn upsert(
 
     const vec_literal = try embeddings.formatVectorLiteral(allocator, embedding);
     defer allocator.free(vec_literal);
-    // `{d:0>N}` zero-pads a *signed* integer with an explicit sign character
-    // (Zig reserves the leading column for it even when positive) --
-    // `year` cast to unsigned avoids emitting "+2026-04-14", which Postgres
-    // fails to parse as a date (it reads the leading '+' as a timezone
-    // sign and errors out entirely, not just on the stray character).
+    // `{d:0>N}` zero-pads a *signed* integer with an explicit sign character (Zig
+    // reserves the leading column for it even when positive).
     const date_literal = try std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(year)), month, day });
     defer allocator.free(date_literal);
 
@@ -93,9 +80,7 @@ fn collect(stmt: *@import("db.zig").Stmt, allocator: std.mem.Allocator) ![]Diges
 }
 
 /// The most recent `n` digests for `chat_id`, newest first — the design
-/// brief's mandatory "recency floor": these are always shown regardless of
-/// how they'd score against the current question, since continuity beats
-/// relevance for recent context.
+/// brief's mandatory "recency floor".
 pub fn mostRecent(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, n: u32) ![]Digest {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -112,12 +97,7 @@ pub fn mostRecent(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, n: 
 }
 
 /// Top-`limit` digests by hybrid score against `query_embedding`/`query_text`
-/// — the design brief's "Retrieved episodes" budget block. The brief only
-/// gives a scoring formula for facts (scope-dependent half-life); episodes
-/// have no such per-row scope, so this uses a flat 30-day half-life
-/// (roughly "last month feels current, longer ago needs to rank on
-/// relevance instead") rather than inventing an unspecified per-digest
-/// scope. `ts_rank_cd` again stands in for the brief's `bm25()`.
+/// — the design brief's "Retrieved episodes" budget block.
 pub fn ranked(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, query_embedding: []const f32, query_text: []const u8, limit: u32, now: i64) ![]Digest {
     const db = try pool.acquire();
     defer pool.release(db);

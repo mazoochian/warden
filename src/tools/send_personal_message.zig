@@ -9,17 +9,7 @@ const Args = struct {
 };
 
 /// Companion to `/tdsend`/`/sendas` for the personal-account (TDLib)
-/// connector: lets the owner ask Warden to send a message on their behalf
-/// in natural language ("tell Alice I'll be 10 min late") instead of
-/// typing a raw chat id. `chat` accepts a TDLib chat id or any title
-/// substring (`chat_summary.resolveChat`) -- unlike the slash commands,
-/// there's no "where does the target end and the message begin" ambiguity
-/// here, since `chat`/`message` already arrive as separate structured
-/// tool-call fields rather than one space-delimited string, so name-based
-/// targeting is safe to allow directly. Same "the sink actually sends and
-/// reports what happened" shape `send_personal_message`'s doc comment on
-/// `PersonalAccountSink.sendMessage` describes -- an ambiguous or
-/// unresolvable `chat` never sends anything, it just says so.
+/// connector.
 pub const tool: registry.ToolDef = .{
     .name = "send_personal_message",
     .description = "Sends a message through the owner's personal Telegram account to one chat, on the owner's behalf. `chat` can be a TDLib chat id or any substring of the chat's title/name (case-insensitive) -- use list_personal_chats first if you're not sure of the exact match. Only call this when the owner has actually asked you to send something -- never proactively.",

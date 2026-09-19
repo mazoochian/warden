@@ -4,21 +4,7 @@ const chats = @import("chats.zig");
 const Platform = @import("../platform/interface.zig").Platform;
 
 /// A "management room" binding: `control_chat_id` is authorized to act on
-/// `target_chat_id` — see ROADMAP.md's Phase 9 for why this exists
-/// (channels have no back-and-forth a member could type commands into, so
-/// admin actions/notices for one are issued from a separate control chat
-/// instead). **1:1 as of Phase 20**: a control room binds exactly one
-/// target, and a target is watched by exactly one room — this is what lets
-/// a command typed directly in a bound room (no `/as <id>` prefix, see
-/// Phase 21) know its implicit target, and what makes "the" room a target's
-/// audit log posts into well-defined. `/as` itself doesn't need a binding
-/// at all any more (see `resolveAsCommand` in `main.zig`) — this table now
-/// exists purely for the direct-dispatch and audit-routing use cases.
-///
-/// Rebinding either side clears whatever it was previously bound to first
-/// — `/manage bind` re-run against a new target moves the room, it doesn't
-/// add a second binding. Idempotent for the exact same pair: binding an
-/// already-bound pair is a no-op beyond the clear, not an error.
+/// `target_chat_id`.
 pub fn bind(pool: *PgPool, control_chat_id: i64, target_chat_id: i64, bound_by_identity_id: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -43,9 +29,7 @@ pub fn bind(pool: *PgPool, control_chat_id: i64, target_chat_id: i64, bound_by_i
     _ = try stmt.step();
 }
 
-/// Removes a binding, if one exists. Returns whether a row was actually
-/// removed, so `/manage unbind` can tell the caller "wasn't bound" apart
-/// from "unbound".
+/// Removes a binding, if one exists.
 pub fn unbind(pool: *PgPool, control_chat_id: i64, target_chat_id: i64) !bool {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -62,11 +46,7 @@ pub fn unbind(pool: *PgPool, control_chat_id: i64, target_chat_id: i64) !bool {
 }
 
 /// The actual authorization gate `/notice` checks before acting on a target
-/// chat: is *this specific* control room currently bound to it. Doesn't by
-/// itself confirm the caller has any standing to act — see
-/// `auth.isOwnerOrLiveAdminOfChat`, checked separately and always alongside
-/// this. `/as` (Phase 20 onward) no longer uses this at all — it works from
-/// any chat regardless of binding.
+/// chat: is *this specific* control room currently bound to it.
 pub fn isBound(pool: *PgPool, control_chat_id: i64, target_chat_id: i64) !bool {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -81,9 +61,7 @@ pub fn isBound(pool: *PgPool, control_chat_id: i64, target_chat_id: i64) !bool {
     return try stmt.step();
 }
 
-/// The single target `control_chat_id` is currently bound to, if any —
-/// what Phase 21's direct-in-room dispatch (a command typed in a bound room
-/// with no `/as <id>` prefix) resolves its implicit target from.
+/// The single target `control_chat_id` is currently bound to, if any.
 pub fn getBoundTarget(pool: *PgPool, allocator: std.mem.Allocator, control_chat_id: i64) !?chats.ChatRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -126,8 +104,8 @@ pub fn getBoundRoom(pool: *PgPool, allocator: std.mem.Allocator, target_chat_id:
     };
 }
 
-/// Every chat currently bound to `control_chat_id` (at most one as of
-/// Phase 20), for `/manage list`.
+/// Every chat currently bound to `control_chat_id` (at most one today), for
+/// `/manage list`.
 pub fn listTargets(pool: *PgPool, allocator: std.mem.Allocator, control_chat_id: i64) ![]chats.ChatRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -167,9 +145,7 @@ pub const Binding = struct {
 };
 
 /// Every management-room binding bot-wide, most recently created first --
-/// backs warden-ui's admin overview page. None of the per-room queries
-/// above fit that shape: an admin browsing a bindings list doesn't already
-/// know a specific `control_chat_id` to ask `listTargets` about.
+/// backs warden-ui's admin overview page.
 pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]Binding {
     const db = try pool.acquire();
     defer pool.release(db);

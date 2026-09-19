@@ -1,13 +1,7 @@
 const std = @import("std");
 const civil_time = @import("../text/civil_time.zig");
 
-/// Parses a duration like "30m"/"2h"/"1d" into seconds. Deliberately
-/// relative-only (no timezone conversion) — see `parseAbsoluteTime`'s doc
-/// comment on why absolute times stay a simple clock-time match rather than
-/// a real calendar/timezone computation. Shared by the `/remind` command
-/// (`main.zig`) and the `set_reminder` LLM tool (`tools/remind.zig`), which
-/// asks the model to translate whatever natural-language time the user gave
-/// into this shorthand.
+/// Parses a duration like "30m"/"2h"/"1d" into seconds.
 pub fn parseDuration(text: []const u8) ?i64 {
     if (text.len < 2) return null;
     const unit = text[text.len - 1];
@@ -19,31 +13,18 @@ pub fn parseDuration(text: []const u8) ?i64 {
         'd' => 86400,
         else => return null,
     };
-    // `n * multiplier` unchecked was a crash any chat member could trigger
-    // (`/remind 106751991167301d x` overflows i64, which is an abort in
-    // `-Doptimize=ReleaseSafe`, not an error). The cap does the same job for
-    // the values just under that too: a reminder a thousand years out is a
-    // typo, and treating it as one gives the caller the usage message.
+    // `n * multiplier` unchecked was a crash any chat member could trigger.
     const seconds = std.math.mul(i64, n, multiplier) catch return null;
     if (seconds > max_schedule_seconds) return null;
     return seconds;
 }
 
 /// Upper bound on any user-supplied delay or repeat interval — a year (plus a
-/// day for leap years). Enforced by `parseDuration` for the command/tool
-/// shorthand, and by `api/router.zig` for the raw `seconds`/
-/// `recur_interval_seconds` numbers the web API accepts, since those never
-/// pass through the shorthand parser at all.
+/// day for leap years).
 pub const max_schedule_seconds: i64 = 366 * 86400;
 
-/// Parses a 24h clock time like "9:00" or "14:30" and resolves it to the
-/// next absolute unix timestamp at or after `now` that matches that
-/// time-of-day — today if it hasn't passed yet, tomorrow otherwise.
-/// Deliberately naive about timezones: `now` is treated as already being in
-/// whatever clock the operator cares about (server-local or UTC, same
-/// tradeoff `scheduler.zig`'s doc comment makes for digests) rather than
-/// doing a real tz-database conversion — good enough for a personal bot
-/// with one owner, not a multi-timezone scheduling system.
+/// Parses a 24h clock time like "9:00" or "14:30" and resolves it to the next
+/// absolute unix timestamp at or after `now` that matches that time-of-day.
 pub fn parseAbsoluteTime(text: []const u8, now: i64) ?i64 {
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
     const hour = std.fmt.parseInt(i64, text[0..colon], 10) catch return null;
@@ -65,24 +46,12 @@ fn parseWeekdayName(text: []const u8) ?civil_time.Weekday {
     return null;
 }
 
-/// Time of day a bare weekday name resolves to when the user didn't also
-/// give a clock time ("remind me Friday") — a reminder needs *some* time,
-/// and a quiet early-morning default reads as "sometime that day" rather
-/// than implying anything more specific was meant.
+/// Time of day a bare weekday name resolves to when the user didn't also give
+/// a clock time ("remind me Friday").
 const default_weekday_hour: u8 = 6;
 
-/// Parses a weekday name ("friday"), optionally followed by a space and a
-/// 24h clock time ("friday 18:00"), and resolves it to the next absolute
-/// unix timestamp at or after `now` that lands on that weekday — today if
-/// today *is* that weekday and the time (default `default_weekday_hour`:00
-/// if none given) hasn't passed yet, otherwise the coming occurrence a week
-/// out at most. This is what makes "remind me this Friday" correct without
-/// the caller (the LLM, for `tools/remind.zig`) ever having to know what
-/// day of the week today is — the model has no reliable notion of the
-/// current date, so asking it to compute "Friday is N days from now"
-/// itself was silently landing on the wrong day (including today, if its
-/// guess for today's weekday happened to already be Friday). Same
-/// "deliberately naive about timezones" tradeoff as `parseAbsoluteTime`.
+/// Parses a weekday name ("friday"), optionally followed by a space and a 24h
+/// clock time ("friday 18:00").
 pub fn parseWeekdayWhen(text: []const u8, now: i64) ?i64 {
     const trimmed = std.mem.trim(u8, text, " \t");
     var day_text: []const u8 = trimmed;
@@ -107,12 +76,8 @@ pub fn parseWeekdayWhen(text: []const u8, now: i64) ?i64 {
     return if (candidate > now) candidate else candidate + 7 * seconds_per_day;
 }
 
-/// Unified entry point for anything that names a single point in time to
-/// fire at: tries the relative-duration shorthand first (`parseDuration`,
-/// returning `now + that many seconds`), then a "HH:MM" absolute clock time
-/// (`parseAbsoluteTime`), then a weekday name (`parseWeekdayWhen`). Returns
-/// an absolute unix timestamp either way, or null if `text` matches none of
-/// those shapes.
+/// Unified entry point for anything that names a single point in time to fire
+/// at.
 pub fn parseWhen(text: []const u8, now: i64) ?i64 {
     if (parseDuration(text)) |secs| return now + secs;
     if (parseAbsoluteTime(text, now)) |ts| return ts;
@@ -121,16 +86,7 @@ pub fn parseWhen(text: []const u8, now: i64) ?i64 {
 
 pub const DateParts = struct { year: ?i32, month: u8, day: u8 };
 
-/// Parses a date with no time component: ISO `Y-M-D` (always available,
-/// `-`-separated), or `/`-separated `M/D[/Y]`/`D/M[/Y]` per `format` (`.ymd`
-/// falls back to `Y/M/D` for the `/` form, mirroring the `-` one). Year is
-/// optional only in the `/` form; a 2-digit year is treated as 2000+yy.
-/// `null` on anything malformed — deliberately not validating day-of-month
-/// against the actual days in `month` (`civil_time.daysFromCivil` already
-/// normalizes an out-of-range day rather than rejecting it, same tradeoff).
-/// Exported (not just used internally by `parseWhenLocal`) since `menu.zig`'s
-/// reminder wizard reuses it for its "reply with a date to jump there" text
-/// shortcut.
+/// Parses a date with no time component.
 pub fn parseDatePart(text: []const u8, format: civil_time.DateFormat) ?DateParts {
     if (std.mem.indexOfScalar(u8, text, '-') != null) {
         var it = std.mem.splitScalar(u8, text, '-');
@@ -178,10 +134,7 @@ pub fn parseDatePart(text: []const u8, format: civil_time.DateFormat) ?DateParts
 }
 
 /// Parses a bare 24h clock time like "9:00" or "14:30" into its components
-/// (no date, no rollover — just validates ranges). Exported for
-/// `menu.zig`'s reminder wizard's "reply with a time to jump there" text
-/// shortcut; `parseWhenLocal` below uses it too instead of duplicating the
-/// same two lines.
+/// (no date, no rollover — just validates ranges).
 pub fn parseClockTime(text: []const u8) ?struct { hour: u8, minute: u8 } {
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
     const hour = std.fmt.parseInt(u8, text[0..colon], 10) catch return null;
@@ -190,27 +143,7 @@ pub fn parseClockTime(text: []const u8) ?struct { hour: u8, minute: u8 } {
     return .{ .hour = hour, .minute = minute };
 }
 
-/// Timezone-aware, date-capable sibling of `parseWhen` — the wizard/`/menu`
-/// era's entry point, tried by `/remind`/`/reminders` instead of the naive
-/// version above (which stays for `tools/remind.zig`'s LLM tool, which
-/// already gets an absolute-feeling instruction and has no per-user offset
-/// wired to it). `offset_minutes`/`date_format` come from
-/// `store/user_settings.zig`'s `getEffectiveOffsetMinutes`/
-/// `getEffectiveDateFormat` for whoever is setting the reminder.
-///
-/// Accepted shapes, tried in order:
-///  - relative duration (`30m`/`2h`/`1d`) — unchanged, timezone-irrelevant.
-///  - bare `HH:MM` — resolves against *local* now (today if not yet passed,
-///    else tomorrow), same rollover rule `parseAbsoluteTime` uses.
-///  - `<date> HH:MM` — an explicit calendar date (see `parseDatePart`)
-///    followed by a time, both interpreted in the local offset. A year
-///    omitted from `<date>` defaults to the local current year, rolling to
-///    next year if that local moment has already passed (mirroring the
-///    bare-time rollover one level up); an explicit year is trusted as-is
-///    even if it's already past.
-///  - a bare date with no time defaults to 09:00 local — good enough for
-///    anyone who doesn't care about the exact time; the wizard is the real
-///    path for that.
+/// Timezone-aware, date-capable sibling of `parseWhen`.
 pub fn parseWhenLocal(text: []const u8, now: i64, offset_minutes: i32, date_format: civil_time.DateFormat) ?i64 {
     if (parseDuration(text)) |secs| return now + secs;
 
@@ -251,20 +184,7 @@ pub fn parseWhenLocal(text: []const u8, now: i64, offset_minutes: i32, date_form
 }
 
 /// Advances a recurring reminder's `due_at` to the next occurrence strictly
-/// after `now`, jumping past however many intervals have already elapsed in
-/// one step — so a reminder that missed several firings (bot was down,
-/// clock skew) doesn't fire once per missed interval in a burst, just once
-/// for "now" and resumes its normal cadence from there.
-/// Saturates instead of overflowing: a row whose `recur_interval_seconds`
-/// predates the cap in `parseDuration`/the API (or was written straight into
-/// Postgres) would otherwise abort the scheduler here — and because the
-/// scheduler sends the message *before* rescheduling, that abort left the row
-/// still due and re-fired it on every restart until someone deleted it by
-/// hand. Parking it at `maxInt` retires the reminder instead, which is
-/// visible in `/reminders` and fixable from chat — that last part only
-/// because `civil_time.localFromUnix` clamps rather than converting: a
-/// `maxInt` timestamp is far outside a four-digit year, and rendering one
-/// used to be its own abort on every listing that included the row.
+/// after `now`.
 pub fn nextOccurrence(due_at: i64, interval_seconds: i64, now: i64) i64 {
     if (interval_seconds <= 0 or due_at > now) return due_at;
     const overdue_by = now -| due_at;
@@ -274,9 +194,7 @@ pub fn nextOccurrence(due_at: i64, interval_seconds: i64, now: i64) i64 {
 }
 
 /// Renders a recur interval back into compact shorthand ("1d", "2h", "30m")
-/// for `/reminders`' "(repeats every ...)" display — picks the largest unit
-/// that divides evenly, falling back to seconds for anything that doesn't
-/// (which shouldn't happen for anything `parseDuration` itself produced).
+/// for `/reminders`' "(repeats every ...)" display.
 pub fn formatInterval(a: std.mem.Allocator, interval_seconds: i64) []const u8 {
     if (@mod(interval_seconds, 86400) == 0) return std.fmt.allocPrint(a, "{d}d", .{@divExact(interval_seconds, 86400)}) catch "some time";
     if (@mod(interval_seconds, 3600) == 0) return std.fmt.allocPrint(a, "{d}h", .{@divExact(interval_seconds, 3600)}) catch "some time";
@@ -284,9 +202,8 @@ pub fn formatInterval(a: std.mem.Allocator, interval_seconds: i64) []const u8 {
     return std.fmt.allocPrint(a, "{d}s", .{interval_seconds}) catch "some time";
 }
 
-/// Renders seconds-until-due as a compact human string ("45s", "12m",
-/// "3h 5m", "2d 1h"). Negative/zero clamps to 0 rather than showing a
-/// confusing negative duration for a reminder that's about to fire.
+/// Renders seconds-until-due as a compact human string ("45s", "12m", "3h
+/// 5m", "2d 1h").
 pub fn formatRemaining(a: std.mem.Allocator, remaining_seconds: i64) []const u8 {
     const secs = @max(remaining_seconds, 0);
     if (secs < 60) return std.fmt.allocPrint(a, "{d}s", .{secs}) catch "soon";
@@ -453,9 +370,7 @@ test "formatRemaining scales units and clamps negatives to 0" {
     try testing.expectEqualStrings("2d 1h", formatRemaining(a, 2 * 86400 + 3600));
 }
 
-// AUDIT-2026-09-03 TEXT-1 / API-3: both of these were aborts in
-// `-Doptimize=ReleaseSafe` rather than errors, and the recurring one was a
-// crash loop that survived restarts (the row stayed due).
+// AUDIT-2026-09-03 TEXT-1 / API-3.
 test "parseDuration refuses a duration that would overflow, or that is simply absurd" {
     try std.testing.expectEqual(@as(?i64, 1800), parseDuration("30m"));
     try std.testing.expectEqual(@as(?i64, 366 * 86400), parseDuration("366d"));

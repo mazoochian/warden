@@ -10,8 +10,7 @@ const log = @import("../log.zig").scoped("llm");
 const ToolCallFunction = struct {
     name: []const u8 = "",
     /// A JSON-encoded *string* per OpenAI's function-calling shape (unlike
-    /// Anthropic, which embeds `input` as a real JSON object) — parsed into
-    /// a `json.Value` ourselves after the outer response parse.
+    /// Anthropic, which embeds `input` as a real JSON object).
     arguments: []const u8 = "",
 };
 
@@ -23,10 +22,7 @@ const RawToolCall = struct {
 const RawMessage = struct {
     content: ?[]const u8 = null,
     /// Reasoning-model backends surface chain-of-thought either as inline
-    /// `<think>`/`<thinking>` tags inside `content`, or as a separate field
-    /// — `reasoning_content` (DeepSeek, vLLM's reasoning parser) or
-    /// `reasoning` (OpenRouter). We check both field names; whichever one a
-    /// given backend actually sends, the other stays null and is ignored.
+    /// `<think>`/`<thinking>` tags inside `content`, or as a separate field.
     reasoning_content: ?[]const u8 = null,
     reasoning: ?[]const u8 = null,
     tool_calls: []RawToolCall = &.{},
@@ -47,9 +43,7 @@ const ChatCompletionResponse = struct {
     @"error": ?ApiError = null,
 };
 
-/// Generic OpenAI-compatible `/v1/chat/completions` adapter. Covers Ollama,
-/// llama.cpp server, LM Studio, vLLM, etc. transparently since they all
-/// speak this same wire shape — no per-runtime adapter needed.
+/// Generic OpenAI-compatible `/v1/chat/completions` adapter.
 pub const OpenAiCompatProvider = struct {
     http_client: http.Client,
     /// e.g. "http://localhost:11434/v1" — no trailing slash.
@@ -78,12 +72,8 @@ pub const OpenAiCompatProvider = struct {
 
     const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn };
 
-    /// Shared request-body builder for both `chatFn` and `chatStreamFn` —
-    /// the only difference between the two is `"stream":true`. Duped into a
-    /// fresh allocation before returning rather than handing back
-    /// `payload_writer.buffered()` directly, since `payload_writer` goes
-    /// out of scope here (see `anthropic.zig`'s `buildPayload`, same
-    /// reasoning).
+    /// Shared request-body builder for both `chatFn` and `chatStreamFn` — the
+    /// only difference between the two is `"stream":true`.
     fn buildPayload(allocator: std.mem.Allocator, self: *const OpenAiCompatProvider, request: llm.ChatRequest, stream: bool) ![]const u8 {
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
@@ -103,14 +93,7 @@ pub const OpenAiCompatProvider = struct {
         return allocator.dupe(u8, w.buffered());
     }
 
-    /// Writes the "Bearer ..." value into `auth_header_buf` and the header
-    /// itself into `headers_buf[0]`, returning a slice into `headers_buf` —
-    /// both caller-owned buffers, so the returned slice's storage is the
-    /// *caller's* stack frame, not this function's (which would leave a
-    /// dangling slice into memory that's gone the instant this returns —
-    /// confirmed the hard way: an earlier version of this returned `&.{...}`
-    /// directly and segfaulted on the very first request, `extra_headers`
-    /// already garbage by the time `std.http.Client.request` read it).
+    /// Writes the "Bearer ...
     fn buildHeaders(self: *const OpenAiCompatProvider, auth_header_buf: []u8, headers_buf: *[1]http.Header) ![]const http.Header {
         if (self.api_key.len == 0) return &.{};
         const value = try std.fmt.bufPrint(auth_header_buf, "Bearer {s}", .{self.api_key});
@@ -135,11 +118,7 @@ pub const OpenAiCompatProvider = struct {
         defer allocator.free(body);
         log.debug("chat: {s} returned in {d}ms", .{ self.model, elapsedMs(self.http_client.io, started) });
 
-        // Deliberately never `.deinit()`'d — see the note on
-        // `llm.ChatResponse`; content (and each tool call's parsed
-        // `arguments`) borrows from this arena and from a nested one built
-        // below, both reclaimed together whenever the caller's own arena
-        // resets.
+        // Deliberately never `.deinit()`'d.
         const parsed = json.parseFromSlice(
             ChatCompletionResponse,
             allocator,
@@ -159,31 +138,22 @@ pub const OpenAiCompatProvider = struct {
 
         var blocks: std.ArrayList(llm.ContentBlock) = .empty;
         // Field-carried reasoning is kept as its own block regardless of
-        // `show_thinking` -- it has to travel back to the model on the next
-        // turn either way (see `llm.ThinkingBlock`); whether the *user*
-        // sees it is decided downstream by `toolcall.zig`.
+        // `show_thinking` -- it has to travel back to the model on the next turn
+        // either way.
         if (choice.message.reasoning_content) |r| {
             if (r.len > 0) try blocks.append(allocator, .{ .thinking = .{ .text = r, .field = .reasoning_content } });
         } else if (choice.message.reasoning) |r| {
             if (r.len > 0) try blocks.append(allocator, .{ .thinking = .{ .text = r, .field = .reasoning } });
         }
         if (request.show_thinking) {
-            // Some models (MiniMax-M3 among them) send chain-of-thought
-            // inline in `content` as literal <think>/<thinking> tags
-            // instead of (or as well as) the separate reasoning field above
-            // — rewrap those into the same thinking_start/thinking_end
-            // markers so they render as the same expandable blockquote
-            // instead of showing up as raw, unrendered tag text (see
-            // `wrapThinkingTags`).
             if (choice.message.content) |c0| {
                 var c = try wrapThinkingTags(allocator, c0, "think");
                 c = try wrapThinkingTags(allocator, c, "thinking");
                 if (c.len > 0) try blocks.append(allocator, .{ .text = c });
             }
         } else {
-            // reasoning/reasoning_content is dropped outright; inline
-            // <think>/<thinking> tags inside `content` are stripped instead
-            // of dropped, since the surrounding text is the real answer.
+            // Reasoning/reasoning_content is dropped outright; inline <think>/<thinking>
+            // tags inside `content` are stripped instead of dropped.
             if (choice.message.content) |c0| {
                 var c = try stripThinkingBlock(allocator, c0, "think");
                 c = try stripThinkingBlock(allocator, c, "thinking");
@@ -192,9 +162,6 @@ pub const OpenAiCompatProvider = struct {
             }
         }
         for (choice.message.tool_calls) |tc| {
-            // Some models emit an empty string (not "{}") for no-argument
-            // tool calls; treat it as an empty object instead of failing
-            // the entire answer on a JSON parse of "".
             const args_src = if (tc.function.arguments.len == 0) "{}" else tc.function.arguments;
             const args = json.parseFromSlice(json.Value, allocator, args_src, .{}) catch |err| {
                 log.err("tool call '{s}' has unparseable arguments ({t}): {s}", .{
@@ -251,10 +218,7 @@ fn elapsedMs(io: Io, started: Io.Timestamp) i64 {
 
 /// Removes every `<tag>...</tag>` span from `content` (used to strip
 /// `<think>`/`<thinking>` chain-of-thought some reasoning models inline
-/// directly into their answer text). An unterminated opening tag drops
-/// everything from that point on rather than leaking a half-written
-/// thinking block. Returns `content` unchanged (no allocation) when the
-/// open tag never appears.
+/// directly into their answer text).
 fn stripThinkingBlock(allocator: std.mem.Allocator, content: []const u8, comptime tag: []const u8) ![]const u8 {
     const open_tag = "<" ++ tag ++ ">";
     const close_tag = "</" ++ tag ++ ">";
@@ -277,20 +241,7 @@ fn stripThinkingBlock(allocator: std.mem.Allocator, content: []const u8, comptim
     return out.toOwnedSlice(allocator);
 }
 
-/// Converts inline `<tag>...</tag>` spans — a reasoning model's chain-of-
-/// thought embedded directly in `content` (MiniMax-M3 and similar do this,
-/// rather than/as well as the separate `reasoning`/`reasoning_content`
-/// field) — into `llm.thinking_start`/`thinking_end`-wrapped spans, so
-/// `platform/telegram/markdown_html.zig` renders them as the same expandable
-/// blockquote as field-based reasoning gets, instead of the raw tag text
-/// showing up escaped and unrendered. The mirror image of
-/// `stripThinkingBlock`: content is *kept* (wrapped, not deleted) — this
-/// only runs when `show_thinking` is true, so the whole point is showing
-/// it, just legibly. An unterminated opening tag (mid-stream, before the
-/// closing tag has arrived yet) is left as literal text for this call —
-/// callers that re-run this on the whole growing buffer on every delta
-/// (see `StreamState.shownText`) resolve it naturally once the closing tag
-/// actually streams in.
+/// Converts inline `<tag>...</tag>` spans.
 fn wrapThinkingTags(allocator: std.mem.Allocator, content: []const u8, comptime tag: []const u8) ![]const u8 {
     const open_tag = "<" ++ tag ++ ">";
     const close_tag = "</" ++ tag ++ ">";
@@ -323,29 +274,22 @@ fn jsonStr(obj: json.ObjectMap, key: []const u8) []const u8 {
 }
 
 /// Incrementally assembles a `llm.ChatResponse` from an OpenAI-compatible
-/// `chat.completion.chunk` SSE stream. Unlike Anthropic's stream (see
-/// `anthropic.zig`'s `StreamState` doc comment), tool-call deltas carry
-/// their own `index` and aren't guaranteed to arrive one-at-a-time, so
-/// in-progress tool calls are tracked in a small list keyed by that index
-/// rather than assuming only one is ever open.
+/// `chat.completion.chunk` SSE stream.
 const StreamState = struct {
     const ToolCallAccum = struct {
         index: i64,
         id: std.ArrayList(u8) = .empty,
         name: std.ArrayList(u8) = .empty,
-        /// Fragments concatenate into a JSON string, parsed once complete
-        /// (see `finalize`) — same reasoning as the non-streaming path's
-        /// `tc.function.arguments`.
+        /// Fragments concatenate into a JSON string, parsed once complete (see
+        /// `finalize`).
         arguments: std.ArrayList(u8) = .empty,
     };
 
     allocator: std.mem.Allocator,
     stream_sink: llm.StreamSink,
     show_thinking: bool,
-    /// Raw `content` deltas concatenated as they arrive, tags and all —
-    /// the source of truth `finalize` builds the real response from.
-    /// *Not* what's reported to `stream_sink` when `show_thinking` is
-    /// false — see `shownText`, called on every delta instead.
+    /// Raw `content` deltas concatenated as they arrive, tags and all — the
+    /// source of truth `finalize` builds the real response from.
     visible_text: std.ArrayList(u8) = .empty,
     reasoning_text: std.ArrayList(u8) = .empty,
     /// Which field the reasoning deltas arrived in -- echoed back verbatim
@@ -375,9 +319,8 @@ const StreamState = struct {
         if (data.len == 0) return;
         if (std.mem.eql(u8, data, "[DONE]")) return;
 
-        // `.alloc_always` so nothing in `parsed.value` aliases `data`,
-        // which aliases the SSE reader's transfer buffer — see
-        // `anthropic.zig`'s `StreamState.onLine` for the same note.
+        // `.alloc_always` so nothing in `parsed.value` aliases `data`, which aliases
+        // the SSE reader's transfer buffer.
         var parsed = json.parseFromSlice(json.Value, self.allocator, data, .{ .allocate = .alloc_always }) catch |err| {
             log.warn("stream: unparseable SSE data line ({t}): {s}", .{ err, data[0..@min(data.len, 200)] });
             return;
@@ -413,12 +356,9 @@ const StreamState = struct {
         if (delta.object.get("content")) |c| {
             if (c == .string and c.string.len > 0) {
                 try self.visible_text.appendSlice(self.allocator, c.string);
-                // Duped: `shownText()` can return `visible_text.items`
-                // itself (the `show_thinking = true` case), which keeps
-                // growing/reallocating on later deltas — the sink (and the
-                // ticker status it ends up in) needs its own immutable
-                // snapshot, not a live alias that could be freed out from
-                // under it.
+                // Duped: `shownText()` can return `visible_text.items` itself (the
+                // `show_thinking = true` case), which keeps growing/reallocating on later
+                // deltas.
                 const shown = try self.allocator.dupe(u8, try self.shownText());
                 if (shown.len > 0) self.stream_sink.report(shown);
             }
@@ -460,28 +400,7 @@ const StreamState = struct {
         }
     }
 
-    /// The answer text as it should be *shown right now* — i.e. what
-    /// `finalize` computes from the complete response, just recomputed from
-    /// `visible_text` on every delta instead of once at the end.
-    ///
-    /// `show_thinking = false`: while inside an unterminated `<think>`/
-    /// `<thinking>` block, `stripThinkingBlock` already drops everything
-    /// from the open tag onward (see its own doc comment), so this
-    /// naturally reports nothing new for the whole thinking phase — the
-    /// live stream just pauses until `</think>` closes, then the real
-    /// answer appears and continues streaming normally.
-    ///
-    /// `show_thinking = true`: `wrapThinkingTags` rewrites any inline
-    /// `<think>`/`<thinking>` tags (some models, MiniMax-M3 included, embed
-    /// chain-of-thought directly in `content` rather than a separate
-    /// field) into `llm.thinking_start`/`thinking_end` markers, so
-    /// `platform/telegram/markdown_html.zig` renders them as an expandable
-    /// blockquote instead of raw, unrendered tag text.
-    ///
-    /// Re-scanning the whole buffer each call is O(n) in the response
-    /// length; for a chat-sized answer over maybe a hundred deltas that's
-    /// negligible, and both helpers are no-op allocations whenever no tag
-    /// has appeared yet (the common non-reasoning-model case).
+    /// The answer text as it should be *shown right now*.
     fn shownText(self: *StreamState) ![]const u8 {
         if (self.show_thinking) {
             var c = try wrapThinkingTags(self.allocator, self.visible_text.items, "think");
@@ -493,11 +412,8 @@ const StreamState = struct {
         return std.mem.trim(u8, c, " \t\r\n");
     }
 
-    /// Assembles the final `llm.ChatResponse` once the stream has ended —
-    /// mirrors `chatFn`'s own block-building tail exactly (same
-    /// `show_thinking` branches, same empty-arguments-becomes-`{}`
-    /// handling), just reading from accumulated stream state instead of one
-    /// parsed `ChatCompletionResponse`.
+    /// Assembles the final `llm.ChatResponse` once the stream has ended — mirrors
+    /// `chatFn`'s own block-building tail exactly.
     fn finalize(self: *StreamState, allocator: std.mem.Allocator) !llm.ChatResponse {
         var blocks: std.ArrayList(llm.ContentBlock) = .empty;
 
@@ -530,9 +446,7 @@ const StreamState = struct {
 };
 
 /// Unlike Anthropic (one bundled `tool_result` array per turn), OpenAI
-/// expects one standalone `{"role":"tool",...}` message per result — so a
-/// single logical `ChatMessage` full of `tool_result` blocks expands into
-/// several JSON messages here.
+/// expects one standalone `{"role":"tool",...}` message per result.
 fn writeMessages(
     allocator: std.mem.Allocator,
     w: *Io.Writer,
@@ -567,21 +481,15 @@ fn writeMessages(
         for (m.content) |block| {
             switch (block) {
                 .text => |t| try text_parts.appendSlice(allocator, t),
-                // Handed back under whichever key the backend itself used
-                // (see `llm.ThinkingBlock`) -- an interleaved-thinking model
-                // needs its earlier thoughts next to its tool calls.
+                // Handed back under whichever key the backend itself used (see
+                // `llm.ThinkingBlock`).
                 .thinking => |th| {
                     try reasoning_parts.appendSlice(allocator, th.text);
                     reasoning_field = th.field;
                 },
                 .image => |img| try images.append(allocator, img),
-                // No equivalent on this surface: a native document block is
-                // an Anthropic-specific shape (see `anthropic.zig`), and
-                // OpenAI's `image_url` part won't accept a PDF. Rather than
-                // drop the attachment silently -- which would leave the
-                // model confidently answering "about" a file it never
-                // received -- say so in the text, so it can tell the user
-                // it can't read the document instead of inventing content.
+                // No equivalent on this surface: a native document block is an Anthropic-
+                // specific shape.
                 .document => documents += 1,
                 .tool_use => |tu| try tool_calls.append(allocator, tu),
                 .tool_result => |tr| try tool_results.append(allocator, tr),
@@ -611,12 +519,7 @@ fn writeMessages(
         try json.Stringify.value(@tagName(m.role), .{}, w);
         try w.writeAll(",\"content\":");
         if (images.items.len > 0) {
-            // A message with an image can't use the plain-string `content`
-            // shape below -- OpenAI's vision API (and most OpenAI-compatible
-            // backends that mirror it) needs an array of typed parts here.
-            // Text-only messages never take this branch, so every existing
-            // non-vision call through this file stays byte-for-byte
-            // unchanged.
+            // A message with an image can't use the plain-string `content` shape below.
             try w.writeByte('[');
             var part_first = true;
             if (text_parts.items.len > 0) {
@@ -837,9 +740,7 @@ test "wrapThinkingTags returns the input unchanged when the tag never appears" {
     try testing.expectEqualStrings(input, out);
 }
 
-// `StreamState.onLine` is fed canned SSE lines directly, same "deterministic
-// and offline" philosophy as the response-body tests above, at the
-// SSE-chunk granularity instead of one whole JSON body.
+// `StreamState.onLine` is fed canned SSE lines directly.
 
 const Recorder = struct {
     reports: std.ArrayList([]const u8) = .empty,
@@ -929,11 +830,6 @@ test "StreamState suppresses live reporting entirely during an unterminated <thi
         "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
     });
 
-    // The two deltas that landed entirely inside the still-open <think>
-    // block report nothing at all (stripThinkingBlock drops everything
-    // from an unterminated open tag onward, so there's nothing new to
-    // show) -- no raw tag ever reaches the sink. The moment </think>
-    // closes, the real answer appears and keeps streaming normally.
     try testing.expectEqual(@as(usize, 2), recorder.reports.items.len);
     try testing.expectEqualStrings("the", recorder.reports.items[0]);
     try testing.expectEqualStrings("the answer is 4", recorder.reports.items[1]);
@@ -958,10 +854,8 @@ test "StreamState rewraps inline <think> tags into thinking_start/thinking_end m
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"</think>4\"}}]}",
     });
 
-    // While the tag is still open, it's left as literal text for now (no
-    // matching close yet) — same "resolves once the closing tag streams
-    // in" story as the show_thinking=false suppression case, just visible
-    // instead of hidden meanwhile.
+    // While the tag is still open, it's left as literal text for now (no matching
+    // close yet).
     try testing.expectEqual(@as(usize, 2), recorder.reports.items.len);
     try testing.expectEqualStrings("<think>pondering", recorder.reports.items[0]);
     try testing.expectEqualStrings(llm.thinking_start ++ "pondering" ++ llm.thinking_end ++ "4", recorder.reports.items[1]);

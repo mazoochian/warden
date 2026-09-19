@@ -1,11 +1,9 @@
 const std = @import("std");
 const Io = std.Io;
 
-/// Shells out to the bundled Mermaid CLI (`tools/diagram/node_modules/.bin/mmdc`)
-/// to render `mermaid_source` and returns the resulting PNG bytes. Requires
-/// `node` on PATH and the mermaid-cli install in `tools/diagram/` (it
-/// bundles its own headless Chromium via Puppeteer — a much heavier
-/// dependency than the word cloud's pure-canvas renderer).
+/// Shells out to the bundled Mermaid CLI
+/// (`tools/diagram/node_modules/.bin/mmdc`) to render `mermaid_source` and
+/// returns the resulting PNG bytes.
 pub fn render(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, mermaid_source: []const u8) ![]const u8 {
     try Io.Dir.cwd().createDirPath(io, tmp_dir);
 

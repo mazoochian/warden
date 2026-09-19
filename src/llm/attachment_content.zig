@@ -5,18 +5,9 @@ const registry = @import("../tools/registry.zig");
 const iface = @import("../platform/interface.zig");
 
 /// Anthropic's real per-image cap; OpenAI's vision limit is comparable.
-/// Oversized attachments fall back to text-only rather than failing the
-/// whole Q&A call — see `imageBlockForAttachment`'s doc comment.
 const max_image_bytes = 5 * 1024 * 1024;
 
-/// Deliberately *not* Anthropic's own 32MB number: that limit is on the
-/// whole request, while this caps one attachment's raw bytes before base64
-/// expands them by 4/3 (a 24MB PDF is already ~32MB encoded, before the
-/// system prompt, tool schemas, and conversation history that share the
-/// same request). 16MB raw is ~21.3MB encoded, leaving real headroom for
-/// the rest of the request. It also sits comfortably above Telegram's own
-/// Bot-API download ceiling (20MB via `getFile`), so in practice this cap
-/// rejects almost nothing that could actually have been fetched.
+/// Deliberately *not* Anthropic's own 32MB number.
 const max_document_bytes = 16 * 1024 * 1024;
 
 const image_extensions = [_]struct { ext: []const u8, media_type: []const u8 }{
@@ -28,12 +19,7 @@ const image_extensions = [_]struct { ext: []const u8, media_type: []const u8 }{
 };
 
 /// `.document`-kind attachments (a file, not a Telegram "photo") need their
-/// own image/not-image call: a real `image/*` mime type is authoritative
-/// (returned as-is, so a provider gets the exact reported type rather than
-/// a guess); with no mime at all, falls back to sniffing the filename's own
-/// extension, same shape `main.zig`'s `extensionFor` already uses for
-/// picking a download extension. A non-image mime (e.g. `application/pdf`)
-/// is authoritative too — never overridden by a filename guess.
+/// own image/not-image call.
 fn imageMediaTypeForDocument(ctx: registry.ToolContext) ?[]const u8 {
     if (ctx.attachment_mime) |mime| {
         return if (std.mem.startsWith(u8, mime, "image/")) mime else null;
@@ -47,27 +33,14 @@ fn imageMediaTypeForDocument(ctx: registry.ToolContext) ?[]const u8 {
     return null;
 }
 
-/// Builds a base64 `llm.ContentBlock.image` for this message's attachment,
-/// if it has one and it's an image — see `ROADMAP.md`'s Phase 10 for why
-/// this exists (making the model actually see a photo instead of only ever
-/// mechanically converting/transcribing it) and its "scope decision" note
-/// on why PDFs/other documents aren't handled here.
-///
-/// Every failure path returns `null` rather than an error — a missing
-/// attachment, an unreadable file, or one over `max_image_bytes` should
-/// silently fall back to text-only, never fail the whole Q&A call over a
-/// picture the model just won't get to see this time. Callers are expected
-/// to gate this behind their own `vision_enabled` check (see
-/// `llm/toolcall.zig`'s `run`) rather than this function knowing about that
-/// config itself.
+/// Builds a base64 `llm.ContentBlock.image` for this message's attachment, if
+/// it has one and it's an image.
 pub fn imageBlockForAttachment(ctx: registry.ToolContext) ?llm.ContentBlock {
     const path = ctx.attachment_path orelse return null;
     const kind = ctx.attachment_kind orelse return null;
 
     // Telegram never reports a `mime_type` for a `.photo` at all (see
-    // `platform/telegram/connector.zig`'s `attachmentFromMessage`) -- always
-    // JPEG for the size warden picks, so this is a safe hardcode, not a
-    // guess.
+    // `platform/telegram/connector.zig`'s `attachmentFromMessage`).
     const media_type = switch (kind) {
         .photo => "image/jpeg",
         .document => imageMediaTypeForDocument(ctx) orelse return null,
@@ -79,14 +52,7 @@ pub fn imageBlockForAttachment(ctx: registry.ToolContext) ?llm.ContentBlock {
 }
 
 /// Reads `path` (capped at `max_bytes`) and base64-encodes it, or returns
-/// `null` on any failure — shared by `imageBlockForAttachment` and
-/// `documentBlockForAttachment`, which differ only in their cap and the
-/// block they wrap the result in. `what` only labels the warning log.
-///
-/// Returning `null` rather than an error is the whole point: see
-/// `imageBlockForAttachment`'s doc comment on why an unreadable or
-/// oversized attachment must degrade to text-only instead of failing the
-/// Q&A call around it.
+/// `null` on any failure.
 fn readBase64(ctx: registry.ToolContext, path: []const u8, max_bytes: usize, what: []const u8) ?[]const u8 {
     const bytes = Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.allocator, .limited(max_bytes)) catch |err| {
         std.log.warn("attachment_content: couldn't read {s} for {s}: {t}", .{ path, what, err });
@@ -102,16 +68,7 @@ fn readBase64(ctx: registry.ToolContext, path: []const u8, max_bytes: usize, wha
 }
 
 /// PDF is the only document type here, for the same reason ROADMAP.md's
-/// Phase 10 deferred this in the first place: a native `document` block is
-/// an Anthropic-specific wire shape, and PDF is the only media type it
-/// accepts. Anything else a user sends as a `.document` (a .docx, a .zip)
-/// stays on the existing `/convert`-and-transcribe path rather than being
-/// handed to the model as opaque bytes it can't decode.
-///
-/// Mime-type-first, filename-fallback — deliberately the same precedence
-/// `imageMediaTypeForDocument` above uses, since the inputs have the same
-/// reliability: a real `application/pdf` is authoritative, and a missing
-/// mime (which Telegram does sometimes send) falls back to the extension.
+/// deferred this in the first place.
 fn documentMediaTypeFor(ctx: registry.ToolContext) ?[]const u8 {
     if (ctx.attachment_mime) |mime| {
         return if (std.mem.eql(u8, mime, "application/pdf")) "application/pdf" else null;
@@ -121,19 +78,8 @@ fn documentMediaTypeFor(ctx: registry.ToolContext) ?[]const u8 {
     return if (std.ascii.eqlIgnoreCase(".pdf", name[dot..])) "application/pdf" else null;
 }
 
-/// Builds a base64 `llm.ContentBlock.document` for this message's
-/// attachment, if it has one and it's a PDF — the Phase 10 slice 2
-/// counterpart to `imageBlockForAttachment`, letting the model read a PDF
-/// natively (real layout/page understanding) instead of only ever
-/// mechanically converting it.
-///
-/// Only `.document`-kind attachments qualify: a Telegram `.photo` is never
-/// a PDF, and voice/audio/video have their own transcription path. Every
-/// failure returns `null` for exactly the same reason the image path does
-/// — a PDF the model won't see this turn must not fail the whole call.
-///
-/// Callers gate this on config themselves (see `llm/toolcall.zig`'s `run`),
-/// same division of responsibility as `imageBlockForAttachment`.
+/// Builds a base64 `llm.ContentBlock.document` for this message's attachment,
+/// if it has one and it's a PDF.
 pub fn documentBlockForAttachment(ctx: registry.ToolContext) ?llm.ContentBlock {
     const path = ctx.attachment_path orelse return null;
     const kind = ctx.attachment_kind orelse return null;

@@ -2,25 +2,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
-/// Warden's own per-chat "slow mode" (ROADMAP.md's Phase 24) — Telegram's
-/// Bot API has no method exposing a chat's native slow-mode delay (that
-/// setting is client-UI-only, confirmed while planning this phase), so this
-/// is implemented as warden's own logic, uniformly across Telegram/Matrix
-/// (one code path — see `main.zig`'s `checkSlowMode`, wired into
-/// `processMessageTask` right where `recordMessage` already runs), and left
-/// unimplemented on XMPP, whose `Connector` vtable has no moderation slots
-/// at all (`platform/xmpp/connector.zig` never sets `deleteMessage`, so
-/// `checkSlowMode` degrades to a no-op there via the same `error.Unsupported`
-/// path every other XMPP moderation gap already uses).
-///
-/// Kept as its own table rather than additive columns on `chat_settings`/
-/// `chat_members` (both already large, frequently-touched files this phase
-/// otherwise never needs to open) — two small tables here, following the
-/// same `ON CONFLICT (chat_id) DO UPDATE` idiom `chat_settings.zig` uses.
-///
-/// `min_seconds_between_messages` of 0 (or no row at all) means "no limit" —
-/// same "0/absent both mean off" convention `chat_settings.getLastDigestTs`
-/// uses for an unset timestamp.
+/// Warden's own per-chat "slow mode".
 pub fn getSlowModeSeconds(pool: *PgPool, chat_id: i64) i64 {
     const db = pool.acquire() catch return 0;
     defer pool.release(db);
@@ -49,15 +31,8 @@ pub fn setSlowModeSeconds(pool: *PgPool, chat_id: i64, seconds: i64) !void {
     _ = try stmt.step();
 }
 
-/// The last *accepted* (not rate-limited) message timestamp for
-/// (chat_id, identity_id), or `null` if this member has never had one
-/// recorded — deliberately its own table rather than reading
-/// `chat_members.last_seen`: that column is bumped by `recordMessage` for
-/// *every* inbound message, including the one currently being checked, so
-/// by the time `checkSlowMode` could read it the cooldown window would
-/// already look like it just reset to zero. This table is only ever
-/// touched by `touchLastMessage` below, called exactly when a message is
-/// accepted.
+/// The last *accepted* (not rate-limited) message timestamp for (chat_id,
+/// identity_id), or `null` if this member has never had one recorded.
 pub fn getLastMessageAt(pool: *PgPool, chat_id: i64, identity_id: i64) ?i64 {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -87,14 +62,7 @@ pub fn touchLastMessage(pool: *PgPool, chat_id: i64, identity_id: i64, ts: i64) 
     _ = try stmt.step();
 }
 
-/// Pure cooldown check, no DB access — the actual logic `main.zig`'s
-/// `checkSlowMode` runs after fetching `min_seconds_between_messages` and
-/// `getLastMessageAt` above, split out so it's unit-testable without a
-/// Postgres instance (see `openTestDb`'s "skip when `WARDEN_TEST_POSTGRES_
-/// DSN` is unset" convention below — this function needs none of that).
-/// `min_seconds_between_messages <= 0` always means "not limited" (slow
-/// mode off); `last_message_at == null` means this member has no prior
-/// accepted message on record, so nothing to be a cooldown violation of.
+/// Pure cooldown check, no DB access.
 pub fn isRateLimited(last_message_at: ?i64, min_seconds_between_messages: i64, now: i64) bool {
     if (min_seconds_between_messages <= 0) return false;
     const last = last_message_at orelse return false;
@@ -117,9 +85,8 @@ test "isRateLimited: off, no prior message, and the cooldown boundary itself" {
     // Well within the cooldown.
     try testing.expect(isRateLimited(1000, 30, 1010));
 
-    // Exactly at the boundary is allowed (strictly-less-than, not
-    // less-than-or-equal) -- matches `parseAbsoluteTime`'s "must be
-    // strictly after" convention elsewhere in this codebase.
+    // Exactly at the boundary is allowed (strictly-less-than, not less-than-or-
+    // equal).
     try testing.expect(!isRateLimited(1000, 30, 1030));
 
     // Just past the boundary.

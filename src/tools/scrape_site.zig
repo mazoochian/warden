@@ -1,16 +1,7 @@
-//! Extracts clean, readable text from a web page — unlike `fetch_url`,
-//! which hands back raw markup, this strips tags/scripts/nav and can
-//! follow same-site links a couple of pages deep. Two backends, selected
-//! by the owner via `/scraper` (see `store/bot_config.zig`):
-//!
-//!  - `local` (default): fetches and parses HTML on-device with
-//!    `html_extract.zig`. No third-party dependency, works out of the box.
-//!  - `remote`: POSTs `{"url", "max_pages"}` as JSON to an owner-configured
-//!    endpoint and returns its response body verbatim. Lets the owner
-//!    delegate to a headless-browser/JS-rendering scraping service
-//!    (Firecrawl, ScrapingBee, a self-hosted browserless+readability
-//!    setup, a katana-based crawler, etc.) for sites the local extractor
-//!    can't handle (client-side-rendered pages, bot-walled sites).
+//! Extracts clean, readable text from a web page — unlike `fetch_url`, which
+//! hands back raw markup, this strips tags/scripts/nav and can follow same-
+//! site links a couple of pages deep. Two backends, selected by the owner via
+//! `/scraper` (see `store/bot_config.zig`).
 
 const std = @import("std");
 const http = std.http;
@@ -34,9 +25,8 @@ const max_page_text_len = 4000;
 const max_total_len = 12000;
 /// Cap on a remote scraper's response body.
 const max_remote_body_len = 12000;
-/// How many extra same-page links to surface for follow-up when only one
-/// page was scraped (skipped for multi-page crawls — the frontier already
-/// consumed the interesting ones).
+/// How many extra same-page links to surface for follow-up when only one page
+/// was scraped.
 const max_shown_links = 8;
 
 pub const tool: registry.ToolDef = .{
@@ -76,17 +66,8 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
 
 const Fetched = struct { url: []const u8, page: html_extract.Page };
 
-/// The seed page has to be fetched (and its links extracted) before we
-/// know what else is even worth fetching, so it alone is sequential; every
-/// page after that is an independent sibling in the crawl frontier (all
-/// discovered from the seed page's own links, not each other's), so they
-/// fan out concurrently instead of one after another. This matters a lot
-/// for total latency: sequential, `max_pages` slow/unreachable pages sum
-/// their timeouts (5 x `tool_timeout_ns` is nearly 2 minutes for one tool
-/// call); concurrent, the whole fan-out takes as long as the single
-/// slowest page, not the sum — confirmed in production as the actual cause
-/// of a "stuck thinking" report that was really just a multi-page scrape
-/// taking minutes the sequential way.
+/// The seed page has to be fetched (and its links extracted) before we know
+/// what else is even worth fetching.
 fn scrapeLocal(ctx: registry.ToolContext, start_url: []const u8, max_pages: usize) ![]const u8 {
     var client: http.Client = .{ .allocator = ctx.allocator, .io = ctx.io };
     defer client.deinit();
@@ -103,11 +84,8 @@ fn scrapeLocal(ctx: registry.ToolContext, start_url: []const u8, max_pages: usiz
         for (seed_page.links) |link| {
             if (targets.items.len >= max_pages - 1) break;
             if (!sameHost(start_url, link)) continue;
-            // A link back to the seed page itself (e.g. a "Home" nav link
-            // to "/"), or the same link appearing twice on the page,
-            // would otherwise be fetched again as if it were a distinct
-            // page — dropped this dedup when the crawl stopped being
-            // sequential-with-a-`visited`-list; still needed here.
+            // A link back to the seed page itself (e.g. a "Home" nav link to "/"), or the
+            // same link appearing twice on the page.
             if (std.mem.eql(u8, link, start_url) or containsString(targets.items, link)) continue;
             try targets.append(ctx.allocator, link);
         }
@@ -120,17 +98,11 @@ fn scrapeLocal(ctx: registry.ToolContext, start_url: []const u8, max_pages: usiz
 }
 
 /// Result of one concurrently-fetched page. Deliberately allocator-free of
-/// `ctx.allocator` (the caller's arena) — see `fetchOnePage`'s doc comment.
+/// `ctx.allocator` (the caller's arena).
 const ConcurrentFetchResult = struct { url: []const u8, page: ?html_extract.Page };
 
 /// Runs on a real OS thread (spawned via `Io.concurrent`) alongside every
-/// other in-flight fetch, so — same reasoning as `main.zig`'s ticker fix —
-/// it must NOT touch `ctx.allocator` (the per-message arena): concurrent
-/// allocation into an arena from multiple threads corrupts its bookkeeping
-/// with no error or crash to point at, just a mysteriously broken result.
-/// `std.heap.page_allocator` is thread-safe and every allocation here is
-/// explicitly freed by the caller once collected back on the single
-/// calling thread (see `fetchConcurrently`), so nothing leaks.
+/// other in-flight fetch, so.
 fn fetchOnePage(client: *http.Client, url: []const u8) ConcurrentFetchResult {
     const pa = std.heap.page_allocator;
     const body = http_util.getWithTimeout(client, pa, url, http_util.tool_timeout_ns) catch {
@@ -144,12 +116,7 @@ fn fetchOnePage(client: *http.Client, url: []const u8) ConcurrentFetchResult {
 }
 
 /// Fetches every URL in `targets` concurrently and appends successes to
-/// `out` (dupe'd into `allocator` — the caller's arena, safe here since by
-/// the time each `Future.await` returns, that specific task has already
-/// fully finished and nothing is touching `page_allocator`-owned memory
-/// concurrently with this thread anymore). A page that fails just doesn't
-/// appear in `out` — best-effort, matching the old sequential crawl's
-/// "one fewer page in the result" behavior for a mid-crawl failure.
+/// `out`.
 fn fetchConcurrently(
     allocator: std.mem.Allocator,
     io: std.Io,

@@ -1,10 +1,8 @@
-//! `platform.Connector` adapter for the Instagram personal-account
-//! connector -- wires `auth.zig` (login/challenge/2FA), `session.zig`
-//! (Postgres-persisted session, so a restart resumes without re-login),
-//! `direct.zig` (DM poll/send), and `policy.zig` (pacing +
-//! pause-on-challenge) into the same shape as `../xmpp/connector.zig`/
-//! `../telegram/user_connector.zig`. No group-admin vtable slots --
-//! Instagram DMs have no equivalent concept.
+//! `platform.Connector` adapter for the Instagram personal-account connector
+//! -- wires `auth.zig` (login/challenge/2FA), `session.zig` (Postgres-
+//! persisted session, so a restart resumes without re-login), `direct.zig`
+//! (DM poll/send), and `policy.zig` (pacing + pause-on-challenge) into the
+//! same shape as `../xmpp/connector.zig`/ `../telegram/user_connector.zig`.
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../interface.zig");
@@ -27,18 +25,12 @@ pub const InstagramConnector = struct {
     poll_interval_ms: u32,
     auth_client: auth.AuthClient,
     breaker: policy.Breaker,
-    /// Guards `auth_client` -- `poll()` runs on its own connector thread
-    /// while `/iglogin`'s handler (a `MessageWorkerPool` command-handler
-    /// thread) can concurrently call `login`/`submitChallengeCode`/
-    /// `submit2faCode`/`logOut`, same two-different-threads shape
-    /// `telegram_user.zig`'s `known_chats_mu` documents.
+    /// Guards `auth_client` -- `poll()` runs on its own connector thread while
+    /// `/iglogin`'s handler (a `MessageWorkerPool` command-handler thread) can
+    /// concurrently call `login`/`submitChallengeCode`/ `submit2faCode`/`logOut`.
     auth_mu: Io.Mutex = .init,
 
-    /// `pool` must outlive this connector. Loads (or generates, on first
-    /// ever run) a `DeviceProfile` and restores a persisted session if one
-    /// exists -- see `session.zig`'s doc comment for why device
-    /// identity and session cookies are Postgres-resident rather than a
-    /// flat session file.
+    /// `pool` must outlive this connector.
     pub fn init(allocator: std.mem.Allocator, io: Io, pool: *store_pool.PgPool, poll_interval_ms: u32, rotating: transport.RotatingConstants) !InstagramConnector {
         const profile = (try session.loadDeviceProfile(pool, allocator)) orelse try transport.DeviceProfile.generate(io, allocator);
 
@@ -76,10 +68,7 @@ pub const InstagramConnector = struct {
         .downloadFile = downloadFileFn,
         .selfId = selfIdFn,
         .selfUsername = selfUsernameFn,
-        // No sendPhoto/sendVideo/sendDocument yet (Instagram DM media send
-        // needs its own upload flow, not built in this pass -- see the
-        // connector plan's sequencing) and no group-admin slots (no
-        // equivalent concept on a DM-only platform).
+        // No sendPhoto/sendVideo/sendDocument yet.
     };
 
     fn platformFn(ptr: *anyopaque) iface.Platform {
@@ -116,8 +105,8 @@ pub const InstagramConnector = struct {
         self.breaker.resume_();
     }
 
-    /// `/iglogin start <username> <password>` -- see `auth.AuthClient.login`'s
-    /// doc comment on why the raw password never outlives this call.
+    /// `/iglogin start <username> <password>`. The raw password never outlives
+    /// this call.
     pub fn login(self: *InstagramConnector, username: []const u8, password: []const u8) !auth.AuthStepOutcome {
         self.auth_mu.lockUncancelable(self.io);
         defer self.auth_mu.unlock(self.io);
@@ -164,9 +153,8 @@ pub const InstagramConnector = struct {
     fn pollFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]iface.Message {
         const self: *InstagramConnector = @ptrCast(@alignCast(ptr));
 
-        // Always pace, even when there's nothing to do yet -- avoids a
-        // tight busy-loop while not-yet-logged-in or paused, matching every
-        // other connector's "poll blocks for roughly one cycle" contract.
+        // Always pace, even when there's nothing to do yet -- avoids a tight busy-
+        // loop while not-yet-logged-in or paused.
         defer Io.sleep(self.io, .fromMilliseconds(policy.nextPollDelayMs(self.io, self.poll_interval_ms)), .awake) catch {};
 
         if (self.breaker.isPaused()) return &.{};
@@ -203,9 +191,7 @@ pub const InstagramConnector = struct {
         var out = try std.ArrayList(iface.Message).initCapacity(allocator, direct_messages.len);
         errdefer out.deinit(allocator);
 
-        // Highest timestamp seen per thread this cycle, to advance the
-        // watermark once past the point of no return (every message in
-        // this batch has already been handed to `main.zig`).
+        // Highest timestamp seen per thread this cycle.
         var max_ts: std.StringHashMapUnmanaged(i64) = .empty;
         defer max_ts.deinit(allocator);
 
@@ -254,11 +240,8 @@ pub const InstagramConnector = struct {
         };
     }
 
-    /// Resolves a `file_id` shaped like a shortcode/media URL (or a bare
-    /// numeric `media_pk`) to bytes via the authenticated media-info
-    /// resolver. This is the same path `video_download.zig`'s fallback
-    /// integration (not built in this pass) will call into for private/
-    /// gated content `yt-dlp` alone can't reach.
+    /// Resolves a `file_id` shaped like a shortcode/media URL (or a bare numeric
+    /// `media_pk`) to bytes via the authenticated media-info resolver.
     fn downloadFileFn(ptr: *anyopaque, allocator: std.mem.Allocator, file_id: []const u8) anyerror![]u8 {
         const self: *InstagramConnector = @ptrCast(@alignCast(ptr));
 
@@ -287,10 +270,8 @@ const testing = std.testing;
 test "platformFn reports .instagram" {
     var pool_stub: store_pool.PgPool = undefined;
     _ = &pool_stub;
-    // `init` needs a real pool (device-profile/session lookups); this test
-    // only exercises the vtable's static platform() mapping, which doesn't
-    // touch `self` at all, so a connector built directly (bypassing
-    // `init`'s store round trips) is enough.
+    // `init` needs a real pool (device-profile/session lookups); this test only
+    // exercises the vtable's static platform() mapping.
     var conn = InstagramConnector{
         .allocator = testing.allocator,
         .io = testing.io,

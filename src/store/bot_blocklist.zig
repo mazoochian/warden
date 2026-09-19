@@ -3,21 +3,7 @@ const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
 /// Coarse gate on whether the bot responds to a message at all — the bot
-/// answers everyone by default, and this is the list of who it doesn't:
-/// a blocked identity, or any chat that's blocked as a whole. Bundled in
-/// one module since every call site checks the two together (see
-/// `main.zig`'s `handleMessage` top-of-function gate:
-/// `!(isUserBlocked(...) or isChatBlocked(...))`). Owners and bot admins
-/// are never blocked and never call into here; message recording/stats
-/// (`recordMessage`/`recordObservedUsers`) run earlier in
-/// `processMessageTask` and are unaffected by any of this — this only
-/// gates whether `handleMessage` takes further action.
-///
-/// Both `isX` checks fail *open* (return `false`, i.e. not blocked) on a
-/// pool/query error — the inverse of the old allowlist's fail-closed: a
-/// DB hiccup shouldn't silence the bot for everyone, and a block is a
-/// moderation nicety, not a security boundary (the owner-only LLM gate and
-/// every admin-tier check are enforced separately, and don't consult this).
+/// answers everyone by default, and this is the list of who it doesn't.
 pub fn isUserBlocked(pool: *PgPool, identity_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);

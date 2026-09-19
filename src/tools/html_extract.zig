@@ -1,9 +1,7 @@
 //! Minimal, dependency-free HTML → text extraction: strips tags/scripts/
 //! styles, decodes common entities, collapses whitespace into readable
-//! paragraphs, and pulls out the page title plus a deduplicated list of
-//! same-page links (resolved to absolute URLs). Not a spec-compliant HTML
-//! parser — a single forward byte scan good enough for "read this page"
-//! purposes, in the same spirit as the rest of this codebase's tools.
+//! paragraphs, and pulls out the page title plus a deduplicated list of same-
+//! page links (resolved to absolute URLs).
 
 const std = @import("std");
 const Uri = std.Uri;
@@ -27,9 +25,7 @@ pub const ExtractOptions = struct {
     max_links: usize = 30,
 };
 
-/// Extracts readable text/title/links from `html`. `base_url` is the page's
-/// own URL, used to resolve relative `href`s to absolute ones; link
-/// extraction is silently skipped (empty list) if it doesn't parse.
+/// Extracts readable text/title/links from `html`.
 pub fn extract(allocator: std.mem.Allocator, html: []const u8, base_url: []const u8, opts: ExtractOptions) !Page {
     const base: ?Uri = Uri.parse(base_url) catch null;
 
@@ -92,9 +88,7 @@ pub fn extract(allocator: std.mem.Allocator, html: []const u8, base_url: []const
             }
         }
 
-        // A newline on both the open and close of a block tag, not just the
-        // close, so two adjacent block elements with no whitespace between
-        // them in the source (e.g. "</a><p>") don't run their text together.
+        // A newline on both the open and close of a block tag, not just the close.
         if ((isBlockTag(name) and !std.mem.eql(u8, name, "br")) or (!closing and std.mem.eql(u8, name, "br"))) {
             try body_out.writeNewline();
         }
@@ -121,8 +115,7 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
 }
 
 /// Accumulates text with runs of whitespace collapsed to a single space and
-/// block-tag boundaries collapsed to a single newline, so paragraph
-/// structure survives without leaving a wall of blank lines.
+/// block-tag boundaries collapsed to a single newline.
 const TextBuilder = struct {
     w: std.Io.Writer.Allocating,
     last: enum { start, space, newline, other } = .start,
@@ -155,9 +148,8 @@ const TextBuilder = struct {
         self.last = .other;
     }
 
-    /// For a single ASCII byte from the source (or an entity that decoded
-    /// to one) — collapses runs of whitespace, everything else passes
-    /// through as-is.
+    /// For a single ASCII byte from the source (or an entity that decoded to one)
+    /// — collapses runs of whitespace, everything else passes through as-is.
     fn writeAsciiByte(self: *TextBuilder, c: u8) !void {
         switch (c) {
             ' ', '\t', '\r' => {
@@ -173,11 +165,7 @@ const TextBuilder = struct {
         }
     }
 
-    /// Writes a raw HTML text run, decoding entities as it goes. Bytes
-    /// >= 0x80 are passed straight through: they're already valid UTF-8 in
-    /// the source (this isn't ASCII-only content), not one-byte-per-
-    /// codepoint data — re-encoding them individually as codepoints would
-    /// mangle every multi-byte character.
+    /// Writes a raw HTML text run, decoding entities as it goes.
     fn writeText(self: *TextBuilder, text: []const u8) !void {
         var i: usize = 0;
         while (i < text.len) {
@@ -201,8 +189,7 @@ const TextBuilder = struct {
 };
 
 /// Finds the index of the `>` that closes the tag starting at `html[start]`
-/// (which must be `<`), treating `>` inside a quoted attribute value as
-/// content rather than the terminator.
+/// (which must be `<`).
 fn tagEnd(html: []const u8, start: usize) usize {
     var i = start + 1;
     var quote: u8 = 0;
@@ -291,10 +278,8 @@ fn extractHref(tag_inner: []const u8) ?[]const u8 {
 
 const ignored_href_schemes = [_][]const u8{ "javascript:", "mailto:", "tel:", "data:", "ftp:" };
 
-/// Resolves `href` (found on the page at `base`) to an absolute http(s)
-/// URL, or null for anchors/unsupported schemes/anything that fails to
-/// resolve. Deliberately not a full RFC 3986 resolver (no `.`/`..`
-/// normalization) — good enough for the anchors real pages actually emit.
+/// Resolves `href` (found on the page at `base`) to an absolute http(s) URL,
+/// or null for anchors/unsupported schemes/anything that fails to resolve.
 fn resolveHref(allocator: std.mem.Allocator, base: Uri, href: []const u8) !?[]const u8 {
     const trimmed = std.mem.trim(u8, href, " \t\r\n");
     if (trimmed.len == 0 or trimmed[0] == '#') return null;

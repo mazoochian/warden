@@ -3,11 +3,7 @@ const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 const registry = @import("../tools/registry.zig");
 
-/// Bot-wide (not per-chat) config — replaces the old `scraper_settings.zig`,
-/// which stored these same values in the per-chat KV mechanism under a
-/// reserved fake chat id (`"_global"`) purely because there was no other
-/// storage mechanism available. A real `bot_config` table needs no such
-/// workaround.
+/// Bot-wide (not per-chat) config — replaces the old `scraper_settings.zig`.
 pub const Mode = registry.ScraperMode;
 pub const Snapshot = registry.ScraperConfig;
 

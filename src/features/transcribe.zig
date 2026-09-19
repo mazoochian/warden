@@ -9,8 +9,6 @@ pub const TranscribeError = error{TranscriptionFailed};
 /// Normalizes `input_path` to 16kHz mono WAV via ffmpeg (whisper.cpp's own
 /// documented preferred input shape) and posts it to a `whisper-server`
 /// instance's `/inference` endpoint, returning the plain-text transcript.
-/// `whisper_url` has no trailing slash (see `config.zig`'s `whisper_url`
-/// doc comment).
 pub fn transcribe(allocator: std.mem.Allocator, io: Io, whisper_url: []const u8, tmp_dir: []const u8, input_path: []const u8) ![]const u8 {
     try Io.Dir.cwd().createDirPath(io, tmp_dir);
     const ts = Io.Timestamp.now(io, .real).toNanoseconds();
@@ -42,9 +40,7 @@ fn runFfmpeg(allocator: std.mem.Allocator, io: Io, input_path: []const u8, wav_p
     }
 }
 
-/// `response_format=text` gets back the raw transcript with no JSON
-/// wrapper (whisper.cpp's server also supports `json`/`verbose_json`, but
-/// the plain-text form is all this needs and skips a parse step entirely).
+/// `response_format=text` gets back the raw transcript with no JSON wrapper.
 fn postForTranscription(allocator: std.mem.Allocator, io: Io, whisper_url: []const u8, wav_bytes: []const u8) ![]const u8 {
     const boundary = "----WardenBoundary7f3a9c2e";
 

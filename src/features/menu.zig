@@ -13,12 +13,8 @@ const log = @import("../log.zig").scoped("menu");
 
 pub const NodeId = tree.NodeId;
 
-/// `.help` mode renders the exact same tree read-only (picking anything
-/// just shows its description, never performs an action or prompts for
-/// input) — see `menu_tree.zig`'s doc comment for why this is one tree,
-/// not two. Reverts to `.normal` the moment navigation returns to `.root`
-/// (there's no meaningful "help view of the root menu" distinct from the
-/// real one).
+/// `.help` mode renders the exact same tree read-only (picking anything just
+/// shows its description, never performs an action or prompts for input).
 pub const Mode = enum { normal, help };
 
 const Stage = union(enum) {
@@ -26,21 +22,16 @@ const Stage = union(enum) {
     /// The live message is showing `NodeId`'s `.prompt` text, waiting for
     /// the next plain-text/reply message from this same (chat, user).
     awaiting_input: NodeId,
-    /// Mid-`.wizard`-kind-node flow — see `ReminderDraft`'s doc comment.
+    /// Mid-`.wizard`-kind-node flow.
     wizard: ReminderDraft,
 };
 
 /// One step in the reminder-creation wizard (the only `.wizard`-kind node
-/// today — see `menu_tree.zig`'s `.reminders_new`). Built specifically for
-/// this flow rather than a generalized "any wizard" framework: YAGNI until
-/// a second wizard actually needs one.
+/// today — see `menu_tree.zig`'s `.reminders_new`).
 pub const WizardStep = enum { date, hour, minute, second, message, confirm };
 
 /// `year`/`month`/`day`/`hour`/`minute`/`second` are the in-progress local
-/// civil time being assembled (see `civil_time.Civil`); `message` is only
-/// set once `step` reaches `.message`. Owned by `Sessions.allocator` (not
-/// the caller's per-message arena) since it outlives any single message —
-/// see `Sessions.freeStage`.
+/// civil time being assembled.
 pub const ReminderDraft = struct {
     step: WizardStep = .date,
     year: i32,
@@ -57,16 +48,14 @@ const Session = struct {
     mode: Mode,
     /// Breadcrumb trail for "Back" — does not include `node` itself.
     stack: std.ArrayList(NodeId),
-    /// The one living message this session edits in place on platforms
-    /// that support it (Telegram); a fresh message each navigation step
-    /// otherwise (Matrix) — see `showNode`.
+    /// The one living message this session edits in place on platforms that
+    /// support it (Telegram); a fresh message each navigation step otherwise
+    /// (Matrix).
     prompt_message_id: []const u8,
     stage: Stage,
     expires_at: i64,
-    /// Which connector opened this session — set once at creation from
-    /// the `connector` `open` was called with. `sweepExpired` uses this to
-    /// find the right connector (out of possibly several, one per
-    /// platform) to edit the stale message on before evicting.
+    /// Which connector opened this session — set once at creation from the
+    /// `connector` `open` was called with.
     platform: iface.Platform,
 };
 
@@ -78,16 +67,11 @@ pub const Outcome = union(enum) {
     /// The flow is done (e.g. `/convert` handed off to its own separate UI);
     /// dismiss the menu.
     close,
-    /// Stay on the current `awaiting_input` node — the runner has already
-    /// sent whatever feedback was needed (e.g. a usage error), and the user
-    /// can just try again.
+    /// Stay on the current `awaiting_input` node.
     retry,
 };
 
-/// Everything a runner call needs beyond its own `NodeId` — deliberately a
-/// plain passthrough bundle (`menu.zig` never reaches into `pool`/`config`
-/// itself, just carries them from the caller in `main.zig` to the runner
-/// functions also defined in `main.zig`).
+/// Everything a runner call needs beyond its own `NodeId`.
 pub const ActionContext = struct {
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -96,26 +80,16 @@ pub const ActionContext = struct {
     chat_id: i64,
     identity_id: i64,
     now: i64,
-    /// The message that triggered this call — a button press's synthetic
-    /// wrapper message for `.perform`/`.performDynamicPick`, or the actual
-    /// follow-up message for `.resumeAwaitingInput`.
+    /// The message that triggered this call.
     msg: iface.Message,
-    /// The presser's bot-wide tiers, resolved once by the caller in
-    /// `main.zig` (it has already paid for both lookups to dispatch the
-    /// message at all) — read by `ActionRunner.authorize` to evaluate a
-    /// node's `menu_tree.MinRole`, never by `menu.zig` itself.
+    /// The presser's bot-wide tiers, resolved once by the caller in `main.zig`
+    /// (it has already paid for both lookups to dispatch the message at all).
     is_owner: bool,
     is_bot_admin: bool,
     /// Memo for the one live `isGroupAdmin` round trip a `.chat_admin` node
-    /// needs: rendering a branch authorizes every child, so without this a
-    /// single Group Administration screen would cost ten identical platform
-    /// calls. Points at a local in the caller's frame (see `menuCtx`), so its
-    /// lifetime is this one message's dispatch and no lock is needed.
+    /// needs: rendering a branch authorizes every child.
     live_admin_cache: *?bool,
-    /// The rest of this bundle is only needed by a handful of specific
-    /// actions (word cloud/pie chart rendering, the digest on/off toggle,
-    /// launching `/convert`'s own flow) — carried through unconditionally
-    /// anyway, same passthrough reasoning as `pool`/`config` above.
+    /// The rest of this bundle is only needed by a handful of specific actions.
     io: Io,
     digest_scheduler: *scheduler.DigestScheduler,
     pending_conversions: *convert_flow.PendingConversions,
@@ -123,16 +97,9 @@ pub const ActionContext = struct {
 };
 
 /// Every implementation lives in `main.zig` (the only place with every
-/// handler function/store module already in scope) as plain functions, not
-/// a ptr+vtable pair like `iface.Connector` — there's exactly one
-/// implementation, so the extra indirection buys nothing.
+/// handler function/store module already in scope) as plain functions.
 pub const ActionRunner = struct {
-    /// May this presser see and run `id`? Called for every child before it's
-    /// rendered as a button, and again for the node itself immediately before
-    /// any of the five dispatch entry points below — the menu is a UI over
-    /// handlers that mostly assume their caller gated them, so this is where
-    /// that gate actually lives for the button path. See
-    /// `menu_tree.MinRole`.
+    /// May this presser see and run `id`?
     authorize: *const fn (id: NodeId, ctx: ActionContext) bool,
     /// Runs a `.action` node's effect.
     perform: *const fn (id: NodeId, ctx: ActionContext) Outcome,
@@ -174,18 +141,7 @@ const Rendered = struct {
     choices: []const iface.Choice,
 };
 
-/// Builds the choice list for `id` under `mode`/`stack_len` — real content
-/// from `menu_tree`'s static `children` (or, in `.normal` mode only, a
-/// `.dynamic_list` node's live `runner.dynamicChoices`), plus a trailing
-/// Back (only when there's somewhere to go back to) and Close. This same
-/// list is rebuilt both to render a screen and to resolve a Matrix pick
-/// (matched by emoji) — see `resolvePick`.
-///
-/// In `.normal` mode a child the presser isn't authorized for is left out
-/// entirely, so it's neither shown nor resolvable. `.help` mode is
-/// deliberately unfiltered: it performs nothing, and the point of the Help
-/// browser is documenting what the bot can do, including the parts this
-/// reader can't invoke.
+/// Builds the choice list for `id` under `mode`/`stack_len`.
 fn choicesFor(n: *const tree.MenuNode, mode: Mode, runner: ActionRunner, ctx: ActionContext, stack_len: usize) []const iface.Choice {
     var out: std.ArrayList(iface.Choice) = .empty;
     if (mode == .normal and n.kind == .dynamic_list) {
@@ -220,11 +176,7 @@ fn renderNode(id: NodeId, mode: Mode, runner: ActionRunner, ctx: ActionContext, 
 }
 
 /// Resolves `picked_value` against `choices` the same way
-/// `convert_flow.resolveTargetFormat` does: Telegram's value already IS the
-/// canonical `Choice.value`; Matrix's is the raw reaction emoji, resolved
-/// by scanning for a matching `.emoji`. Returns the canonical `.value`
-/// either way (a `NodeId` tag name, a dynamic-list id/url, or a
-/// back/close sentinel).
+/// `convert_flow.resolveTargetFormat` does.
 fn resolvePick(platform: iface.Platform, choices: []const iface.Choice, picked_value: []const u8) ?[]const u8 {
     return switch (platform) {
         .telegram => blk: {
@@ -290,12 +242,7 @@ fn stepValueLabel(a: std.mem.Allocator, draft: ReminderDraft) []const u8 {
     };
 }
 
-/// Renders one wizard screen — bypasses `renderNode`/`choicesFor` entirely
-/// (those build a node's *static* children or a `.dynamic_list`'s live
-/// items; a wizard's buttons are its own stepper/nav, not tree content).
-/// No generic Back among these: the wizard's own Previous/Next covers
-/// linear step navigation, and Back's stack-pop semantics don't fit a
-/// linear flow — Discard (from `.confirm`) is the one way out early.
+/// Renders one wizard screen.
 fn renderWizardStep(draft: ReminderDraft, ctx: ActionContext) Rendered {
     var choices: std.ArrayList(iface.Choice) = .empty;
     var text: []const u8 = "";
@@ -341,18 +288,14 @@ fn renderWizardStep(draft: ReminderDraft, ctx: ActionContext) Rendered {
     return .{ .text = text, .choices = choices.items };
 }
 
-/// Tries the date shape first (both orderings, since the shortcut has no
-/// per-user format preference to consult — the stepper buttons remain the
-/// always-correct path; this is convenience-only), then a bare clock time.
+/// Tries the date shape first.
 fn parseShortcutDate(text: []const u8) ?reminder_format.DateParts {
     if (reminder_format.parseDatePart(text, .mdy)) |d| return d;
     return reminder_format.parseDatePart(text, .dmy);
 }
 
 /// Finds the connector whose platform matches `platform` — duplicated from
-/// `main.zig`'s own `findConnector` rather than exported, same reasoning
-/// as `features/alerts.zig`'s copy of the same helper: keeps this feature
-/// file's only dependency on `main.zig` at zero.
+/// `main.zig`'s own `findConnector` rather than exported.
 fn findConnectorByPlatform(connectors: []const iface.Connector, platform: iface.Platform) ?iface.Connector {
     for (connectors) |c| {
         if (c.platform() == platform) return c;
@@ -386,9 +329,7 @@ pub const Sessions = struct {
         return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ chat_id, user_id });
     }
 
-    /// Splits a stored key back into its `chat_id` half — used only by
-    /// `handleChoicePicked`'s "does this prompt belong to someone else in
-    /// this same chat" scan.
+    /// Splits a stored key back into its `chat_id` half.
     fn chatIdOfKey(key: []const u8) []const u8 {
         const at = std.mem.indexOfScalar(u8, key, 0) orelse return key;
         return key[0..at];
@@ -402,10 +343,7 @@ pub const Sessions = struct {
         self.allocator.free(entry.prompt_message_id);
     }
 
-    /// A `.wizard` stage owns its `draft.message` (once set) on
-    /// `self.allocator` — every place that overwrites or drops a session's
-    /// `stage` must free the outgoing value first, or a wizard's message
-    /// leaks once per finished/discarded/abandoned flow.
+    /// A `.wizard` stage owns its `draft.message` (once set) on `self.allocator`.
     fn freeStage(self: *Sessions, stage: Stage) void {
         switch (stage) {
             .wizard => |d| if (d.message.len > 0) self.allocator.free(d.message),
@@ -434,17 +372,8 @@ pub const Sessions = struct {
         });
     }
 
-    /// Opens a brand new `/menu` (always at `.root`, `.normal` mode) —
-    /// replaces any session already open for this (chat, user), same as
-    /// `convert_flow.beginAwaitingFile` replacing a stale entry.
-    /// `ctx.a` is a throwaway allocator for this one call's rendering/sending
-    /// (an arena in production, freed with the rest of the per-message
-    /// task) — distinct from `self.allocator`, the session store's own
-    /// long-lived allocator used only for what `putSession` actually keeps.
-    /// Takes the caller's full `ActionContext` (rather than the four fields it
-    /// needs directly) because rendering the root already runs
-    /// `runner.authorize` for every child, which reads the presser's tiers
-    /// out of it.
+    /// Opens a brand new `/menu` (always at `.root`, `.normal` mode) — replaces
+    /// any session already open for this (chat, user).
     pub fn open(self: *Sessions, runner: ActionRunner, ctx: ActionContext) void {
         const connector = ctx.connector;
         const a = ctx.a;
@@ -462,18 +391,12 @@ pub const Sessions = struct {
         };
     }
 
-    /// Edits the session's living message to show `id` (Telegram), or —
-    /// when the connector has no `editChoicePrompt` — sends a fresh message
-    /// and updates `prompt_message_id` to it (Matrix, this pass; see
-    /// `menu`'s module doc comment on why real in-place editing there is
-    /// deferred).
+    /// Edits the session's living message to show `id` (Telegram), or.
     fn showNode(self: *Sessions, connector: iface.Connector, runner: ActionRunner, ctx: ActionContext, chat_id: []const u8, user_id: []const u8, id: NodeId, mode: Mode, stack_len: usize) void {
         self.showRendered(connector, ctx, chat_id, user_id, renderNode(id, mode, runner, ctx, stack_len));
     }
 
-    /// Renders one wizard screen for the session's living message — the
-    /// `.wizard`-stage sibling of `showNode` (which renders a tree `NodeId`
-    /// instead of a `ReminderDraft`).
+    /// Renders one wizard screen for the session's living message.
     fn showWizardStep(self: *Sessions, connector: iface.Connector, ctx: ActionContext, chat_id: []const u8, user_id: []const u8, draft: ReminderDraft) void {
         self.showRendered(connector, ctx, chat_id, user_id, renderWizardStep(draft, ctx));
     }
@@ -515,9 +438,7 @@ pub const Sessions = struct {
         return s;
     }
 
-    /// A `choice_picked` event arrived. `connector`'s allocator use is the
-    /// caller's per-message arena (`ctx.a`); the session store's own
-    /// allocator is separate and long-lived.
+    /// A `choice_picked` event arrived.
     pub fn handleChoicePicked(self: *Sessions, runner: ActionRunner, now: i64, ctx: ActionContext, picked: iface.ChoicePicked) void {
         const chat_id = ctx.msg.chat_id;
         const user_id = ctx.msg.user_id;
@@ -532,12 +453,7 @@ pub const Sessions = struct {
         self.mutex.unlock(self.io);
 
         if (session == null or now > session.?.expires_at or !std.mem.eql(u8, session.?.prompt_message_id, picked.prompt_message_id)) {
-            // Not (or no longer) this presser's own open menu. If the
-            // prompt actually belongs to *someone else's* still-live menu
-            // in this chat, say so on Telegram (Matrix has no per-press
-            // alert channel, so it just stays silent) -- otherwise this is
-            // simply not a menu pick at all (e.g. it's `convert_flow`'s),
-            // and must be left alone.
+            // Not (or no longer) this presser's own open menu.
             if (ctx.connector.platform() == .telegram and self.anyOtherSessionOwnsPrompt(chat_id, picked.prompt_message_id)) {
                 ctx.connector.sendMessage(ctx.a, chat_id, "This menu isn't yours — run /menu yourself.", null);
             }
@@ -578,20 +494,15 @@ pub const Sessions = struct {
         switch (n.kind) {
             .branch => {
                 const picked_id = std.meta.stringToEnum(NodeId, resolved) orelse return;
-                // Second layer over `choicesFor`'s filter: `resolvePick` only
-                // matches what that filter produced, but a value resolved
-                // from an emoji (Matrix) or a `callback_data` string a client
-                // made up is not proof of anything on its own, and a session
-                // can outlive the role it was opened with.
+                // Second layer over `choicesFor`'s filter.
                 if (!runner.authorize(picked_id, ctx)) {
                     log.warn("unauthorized menu pick {t} by user {s} in chat {s}", .{ picked_id, user_id, chat_id });
                     return;
                 }
                 const picked_node = tree.node(picked_id);
                 switch (picked_node.kind) {
-                    // Entering `.help` specifically is what switches the
-                    // session into help mode -- every other branch/
-                    // dynamic_list child is navigated in `.normal`.
+                    // Entering `.help` specifically is what switches the session into help mode
+                    // -- every other branch/ dynamic_list child is navigated in `.normal`.
                     .branch, .dynamic_list => self.navigateInto(ctx.connector, runner, ctx, chat_id, user_id, picked_id, if (picked_id == .help) .help else .normal),
                     .action => self.runAndApply(ctx.connector, runner, ctx, chat_id, user_id, runner.perform(picked_id, ctx)),
                     .awaiting_input => self.beginAwaitingInput(ctx.connector, runner, ctx, chat_id, user_id, picked_id),
@@ -604,8 +515,7 @@ pub const Sessions = struct {
     }
 
     /// True if some *other* session in `chat_id` currently has
-    /// `prompt_message_id` as its live message — used only to decide
-    /// whether a stray pick deserves the "not yours" notice.
+    /// `prompt_message_id` as its live message.
     fn anyOtherSessionOwnsPrompt(self: *Sessions, chat_id: []const u8, prompt_message_id: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -696,10 +606,8 @@ pub const Sessions = struct {
         self.showWizardStep(connector, ctx, chat_id, user_id, draft);
     }
 
-    /// Overwrites the session's stored wizard draft in place (used after
-    /// every stepper press/text-shortcut) — takes over `draft.message`'s
-    /// ownership from the caller (the old draft's message, if any, must
-    /// already have been freed by the caller before calling this).
+    /// Overwrites the session's stored wizard draft in place (used after every
+    /// stepper press/text-shortcut).
     fn updateWizardDraft(self: *Sessions, chat_id: []const u8, user_id: []const u8, draft: ReminderDraft) void {
         const key = compositeKey(self.allocator, chat_id, user_id) catch return;
         defer self.allocator.free(key);
@@ -708,10 +616,7 @@ pub const Sessions = struct {
         if (self.map.getPtr(key)) |s| s.stage = .{ .wizard = draft };
     }
 
-    /// A `choice_picked` event arrived while (chat_id, user_id) is mid-
-    /// wizard — resolved against that step's own synthetic choices (built
-    /// fresh from `draft`, not from `choicesFor`/the tree, since a wizard's
-    /// buttons are never tree content).
+    /// A `choice_picked` event arrived while (chat_id, user_id) is mid- wizard.
     fn handleWizardPick(self: *Sessions, runner: ActionRunner, ctx: ActionContext, chat_id: []const u8, user_id: []const u8, draft_in: ReminderDraft, picked: iface.ChoicePicked) void {
         const rendered = renderWizardStep(draft_in, ctx);
         const resolved = resolvePick(ctx.connector.platform(), rendered.choices, picked.value) orelse return;
@@ -747,13 +652,6 @@ pub const Sessions = struct {
     }
 
     /// A plain message arrived while (chat_id, user_id) is mid-wizard.
-    /// `.message` step: captures it as the reminder text. Any stepper step:
-    /// the "reply with a time/date to jump straight there" shortcut — a
-    /// parseable date sets year/month/day and advances to the hour step; a
-    /// parseable clock time sets hour/minute and jumps straight to the
-    /// message step. Anything else is left alone (`false`) so normal
-    /// command/LLM dispatch proceeds untouched, same convention as
-    /// `handleAwaitingInputMessage`.
     fn handleWizardMessage(self: *Sessions, ctx: ActionContext, chat_id: []const u8, user_id: []const u8, draft_in: ReminderDraft) bool {
         const text = std.mem.trim(u8, ctx.msg.text orelse "", " \t\r\n");
         if (text.len == 0) return false;
@@ -785,9 +683,8 @@ pub const Sessions = struct {
         return true;
     }
 
-    /// Shared by `handleWizardPick`'s Close and `runAndApply`'s `.close`
-    /// outcome — looks up the session's own living message id (the caller
-    /// doesn't necessarily have it to hand) and tears the session down.
+    /// Shared by `handleWizardPick`'s Close and `runAndApply`'s `.close` outcome
+    /// — looks up the session's own living message id.
     fn closeCurrent(self: *Sessions, connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) void {
         const prompt_id = blk: {
             self.mutex.lockUncancelable(self.io);
@@ -819,10 +716,8 @@ pub const Sessions = struct {
         }
     }
 
-    /// Like `navigateInto`, but replaces the current node in place rather
-    /// than pushing it onto the stack — used after an `.action`/
-    /// `.awaiting_input` completes, since e.g. Kick's own node was never
-    /// really "a screen" to preserve a Back-breadcrumb to.
+    /// Like `navigateInto`, but replaces the current node in place rather than
+    /// pushing it onto the stack.
     fn navigateIntoReplacingTop(self: *Sessions, connector: iface.Connector, runner: ActionRunner, ctx: ActionContext, chat_id: []const u8, user_id: []const u8, id: NodeId) void {
         const key = compositeKey(self.allocator, chat_id, user_id) catch return;
         defer self.allocator.free(key);
@@ -842,11 +737,7 @@ pub const Sessions = struct {
         self.showNode(connector, runner, ctx, chat_id, user_id, id, mode, stack_len);
     }
 
-    /// A plain message (or reply) arrived from `ctx.msg`'s sender. If they
-    /// have an open `awaiting_input` session, hands it to the runner; if
-    /// they're mid-wizard, hands it to `handleWizardMessage` (the message
-    /// capture step, or the stepper-step text shortcut). Returns `true` if
-    /// consumed, `false` so normal command/LLM dispatch proceeds untouched.
+    /// A plain message (or reply) arrived from `ctx.msg`'s sender.
     pub fn handleAwaitingInputMessage(self: *Sessions, runner: ActionRunner, ctx: ActionContext) bool {
         const chat_id = ctx.msg.chat_id;
         const user_id = ctx.msg.user_id;
@@ -861,9 +752,8 @@ pub const Sessions = struct {
         switch (s.stage) {
             .browsing => return false,
             .awaiting_input => |id| {
-                // Re-checked here, not just when the prompt was opened: the
-                // effect happens now, and a role can be revoked in between
-                // (the prompt lives for `timeout_seconds`).
+                // Re-checked here, not just when the prompt was opened: the effect happens
+                // now, and a role can be revoked in between.
                 if (!runner.authorize(id, ctx)) {
                     log.warn("unauthorized menu input for {t} by user {s} in chat {s}", .{ id, user_id, chat_id });
                     return false;
@@ -876,9 +766,6 @@ pub const Sessions = struct {
     }
 
     /// Clears whatever's open for (chat_id, user_id) — used by `/cancel`.
-    /// Returns whether anything was actually open. Doesn't touch the
-    /// message itself (the caller sends its own "Cancelled." reply, same
-    /// convention as `group_admin.cancel`).
     pub fn cancel(self: *Sessions, chat_id: []const u8, user_id: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -889,10 +776,8 @@ pub const Sessions = struct {
         return true;
     }
 
-    /// True if (chat_id, user_id) currently has an open, unexpired session
-    /// in `awaiting_input` stage — lets `/cancel`'s existing "try each
-    /// pending-state owner in turn" chain check this one without consuming
-    /// it, matching `PendingConversions.isAwaitingFile`'s shape.
+    /// True if (chat_id, user_id) currently has an open, unexpired session in
+    /// `awaiting_input` stage.
     pub fn isAwaitingInput(self: *Sessions, now: i64, chat_id: []const u8, user_id: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -904,24 +789,11 @@ pub const Sessions = struct {
         };
     }
 
-    /// Evicts every expired session — called once per main-loop tick
-    /// alongside `PendingConversions.sweepExpired`. Before evicting each
-    /// one, best-effort edits its living message to "Menu timeout" with no
-    /// buttons (rather than leaving dead buttons sitting there forever) —
-    /// `connectors` is searched for the one matching the session's stored
-    /// `platform` (see `Session.platform`'s doc comment); a lookup/edit
-    /// failure (message already deleted, connector gone) is logged and
-    /// doesn't block the eviction itself, same "best-effort, never let a
-    /// connector call block cleanup" convention `closeSession` follows.
+    /// Evicts every expired session — called once per main-loop tick alongside
+    /// `PendingConversions.sweepExpired`.
     pub fn sweepExpired(self: *Sessions, connectors: []const iface.Connector, now: i64) void {
-        // Two-phase, same reasoning as `closeSession`: the connector call
-        // below can block on a real network round trip, so it must never
-        // run while `self.mutex` is held (every other menu operation --
-        // navigate/open/etc -- takes the same lock and would stall behind
-        // it). Phase 1 removes every expired entry from the map under the
-        // lock but doesn't free it yet; phase 2 (unlocked) does the
-        // best-effort edit using the not-yet-freed `prompt_message_id`/key,
-        // then frees.
+        // Two-phase, same reasoning as `closeSession`: the connector call below can
+        // block on a real network round trip.
         const Removed = struct { key: []const u8, value: Session };
         var removed_list: std.ArrayList(Removed) = .empty;
         defer removed_list.deinit(self.allocator);
@@ -957,9 +829,7 @@ pub const Sessions = struct {
 const testing = std.testing;
 
 /// Permissive `authorize` — the tests below exercise navigation/wizard
-/// mechanics, not the permission tiers (`restrictedRunner` covers those), and
-/// several of them navigate into `group_admin`, whose real tier is
-/// `.chat_admin`.
+/// mechanics.
 fn testRunner() ActionRunner {
     const impl = struct {
         fn authorize(id: NodeId, ctx: ActionContext) bool {
@@ -1073,11 +943,8 @@ const StubConnector = struct {
         const self: *StubConnector = @ptrCast(@alignCast(ptr));
         self.sent_messages.append(allocator, text) catch {};
     }
-    /// Real Telegram/Matrix buttons carry the choice labels, not the
-    /// message text — so a test asserting on "what the user would see"
-    /// (e.g. a `.dynamic_list` node's live items) needs those labels
-    /// recorded somewhere too. Folds them into the stored string instead of
-    /// tracking a second parallel list.
+    /// Real Telegram/Matrix buttons carry the choice labels, not the message
+    /// text.
     fn renderWithChoices(allocator: std.mem.Allocator, text: []const u8, choices: []const iface.Choice) []const u8 {
         var buf: std.Io.Writer.Allocating = .init(allocator);
         buf.writer.print("{s}", .{text}) catch return text;
@@ -1108,8 +975,7 @@ const StubConnector = struct {
 };
 
 /// Every test here supplies its own `authorize`, so the tier fields are only
-/// along for the ride — a single file-scope cache is enough (these tests are
-/// single-threaded).
+/// along for the ride.
 var test_live_admin_cache: ?bool = null;
 
 fn baseCtx(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, now: i64) ActionContext {
@@ -1373,17 +1239,13 @@ test "help mode browses read-only: picking a module shows its help text, never r
     const ctx2 = baseCtx(stub.connector(), a, "chat1", "alice", 1002);
     sessions.handleChoicePicked(runner, 1002, ctx2, .{ .prompt_message_id = pid, .value = "alerts" });
 
-    // Shows alerts' help_body, not its normal browsing body -- and never
-    // called `perform`/pushed into `awaiting_input` the way normal mode
-    // would for a non-branch child.
+    // Shows alerts' help_body, not its normal browsing body.
     try testing.expect(std.mem.indexOf(u8, stub.edited.items[stub.edited.items.len - 1], "standing watch") != null);
     try testing.expect(!sessions.isAwaitingInput(1002, "chat1", "alice"));
 }
 
 /// Navigates a fresh session all the way to `reminders_new` (root ->
 /// Reminders -> New reminder) — every wizard test below starts from here.
-/// `now`s used for the two picks are fixed (1001/1002); callers continue
-/// from 1003.
 fn enterReminderWizard(sessions: *Sessions, stub: *StubConnector, a: std.mem.Allocator, runner: ActionRunner, pid: []const u8) void {
     const ctx1 = baseCtx(stub.connector(), a, "chat1", "alice", 1001);
     sessions.handleChoicePicked(runner, 1001, ctx1, .{ .prompt_message_id = pid, .value = "reminders" });
@@ -1614,8 +1476,8 @@ test "wizard: Close mid-wizard tears the session down cleanly (no leaked draft m
     sessions.handleChoicePicked(runner, 1005, ctx_close, .{ .prompt_message_id = pid, .value = close_value });
     try testing.expectEqual(@as(usize, 1), stub.deleted_ids.items.len);
     // The leak checker on `sessions.deinit()`/the arena above is the real
-    // assertion here: a bug in `freeStage` would surface as a testing
-    // allocator failure, not a normal `expect`.
+    // assertion here: a bug in `freeStage` would surface as a testing allocator
+    // failure.
 }
 
 test "a non-owner, non-admin sees no privileged buttons and can't reach one by forging a pick" {

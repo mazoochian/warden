@@ -2,10 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 /// Broad category a file extension falls into — determines which external
-/// tool `convert` shells out to. `.document` also covers pdf, even though
-/// pandoc itself can only ever *write* pdf (via an html+chromium detour,
-/// see `convertDocument`) and can't read it at all (pdftotext is the only
-/// supported pdf-as-source path).
+/// tool `convert` shells out to.
 pub const Family = enum { document, image, audio_video, unknown };
 
 const document_exts = [_][]const u8{ ".txt", ".md", ".html", ".htm", ".docx", ".odt", ".rtf", ".pdf" };
@@ -19,15 +16,7 @@ pub fn familyOfExt(ext: []const u8) Family {
     return .unknown;
 }
 
-/// Every valid target extension (bare, no leading dot — "png" not ".png")
-/// for a file whose source extension is `source_ext`, excluding
-/// `source_ext` itself — the choice list `features/convert_flow.zig` offers
-/// as buttons/reactions. Must stay in lockstep with `convert()`'s actual
-/// dispatch rules (family-equality plus the pdf-source-only-to-txt special
-/// case) or a button could offer a conversion that would just fail.
-/// Returned strings are static literals borrowed from the extension
-/// tables, not allocated — only the returned slice itself is owned by
-/// `allocator` and needs freeing.
+/// Every valid target extension.
 pub fn candidateTargets(allocator: std.mem.Allocator, source_ext: []const u8) ![]const []const u8 {
     const family = familyOfExt(source_ext);
     if (family == .unknown) return &.{};
@@ -53,9 +42,7 @@ pub fn candidateTargets(allocator: std.mem.Allocator, source_ext: []const u8) ![
     return out.toOwnedSlice(allocator);
 }
 
-/// Extension including the leading dot, or "" if `path` has none. Doesn't
-/// use `std.fs.path` to stay consistent with `main.zig`'s own hand-rolled
-/// extension lookup for downloaded attachments (`extensionFor`).
+/// Extension including the leading dot, or "" if `path` has none.
 pub fn extensionOf(path: []const u8) []const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "";
     if (dot == 0 or path[dot - 1] == '/') return "";
@@ -73,21 +60,8 @@ pub const ConvertError = error{
     ConversionFailed,
 };
 
-/// Converts the file at `input_path` to `target_format_raw` (a bare
-/// extension like "pdf" or "png", leading dot optional), dispatching by
-/// format family:
-///   - image  -> image:        ImageMagick `convert`
-///   - audio/video -> audio/video: `ffmpeg`
-///   - document -> document:   `pandoc` (txt/md/html/docx/odt/rtf), with
-///     pdf handled specially — pdf *output* goes through an html
-///     intermediate + headless Chromium print-to-pdf (pandoc alone can't
-///     produce pdf without pulling in a LaTeX engine); pdf *input* only
-///     supports a txt target, via `pdftotext` (pandoc can't read pdf at
-///     all).
-/// Returns the converted file's bytes plus a suggested filename. All three
-/// backends are external processes — `error.ConversionFailed` on a nonzero
-/// exit, `error.UnsupportedConversion`/`UnsupportedTargetFormat` for
-/// combinations this function doesn't attempt at all.
+/// Converts the file at `input_path` to `target_format_raw` (a bare extension
+/// like "pdf" or "png", leading dot optional), dispatching by format family.
 pub fn convert(
     allocator: std.mem.Allocator,
     io: Io,
@@ -231,9 +205,8 @@ test "candidateTargets excludes the source extension and matches convert()'s acc
     try testing.expectEqual(@as(usize, 1), pdf_targets.len);
     try testing.expectEqualStrings("txt", pdf_targets[0]);
 
-    // A non-pdf document source can target pdf (convertDocument's own
-    // special case), unlike image/audio_video which stay strictly
-    // same-family.
+    // A non-pdf document source can target pdf (convertDocument's own special
+    // case), unlike image/audio_video which stay strictly same-family.
     const txt_targets = try candidateTargets(a, ".txt");
     defer a.free(txt_targets);
     var found_pdf = false;

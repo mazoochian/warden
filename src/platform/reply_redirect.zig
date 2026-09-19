@@ -1,83 +1,13 @@
-//! A `Connector` decorator that separates "the chat a command *acts* on"
-//! from "the chat its output *goes* to" — the design problem ROADMAP.md's
-//! Phase 9 named as the blocker for `/as <chat ref> <command>`.
-//!
-//! Every admin handler in `main.zig` replies with
-//! `connector.sendMessage(a, msg.chat_id, ...)`, so re-dispatching one with
-//! `msg.chat_id` swapped to a target chat would correctly *act* on the
-//! target but would also post its confirmation there, instead of back into
-//! the management room where the operator is sitting. Rather than give
-//! every handler a second "where do replies go" parameter (~40 call sites,
-//! and every future handler has to remember it), the redirection is done
-//! once, underneath them, at the only layer they all already share: the
-//! `Connector` vtable.
-//!
-//! The rule, deliberately narrow:
-//!
-//!   * **Outbound message sends** (`sendMessage`, `sendPhoto`,
-//!     `sendDocument`, `sendPoll`, `sendMessageReturningId`, `editMessage`,
-//!     `sendChoicePrompt`, `editChoicePrompt`) addressed to
-//!     `action_chat_id` are rewritten to `reply_chat_id`, threaded under
-//!     the operator's own `/as` message.
-//!   * **Everything else passes through untouched** — `muteUser`,
-//!     `kickUser`, `banUser`, `promoteUser`, `demoteUser`, `pinMessage`,
-//!     `unpinMessage`, `deleteMessage`, `isGroupAdmin`, `listChatAdmins`.
-//!     Those are the *action*, and the action belongs in the target chat.
-//!     `isGroupAdmin` passing through unchanged is load-bearing for
-//!     security, not just correctness: it means a relayed command's own
-//!     `auth.checkGroupAdminAccess` still asks "is this user an admin of
-//!     the chat being acted on", never of the control room.
-//!   * A send addressed to some *other* chat (not `action_chat_id`) is
-//!     also left alone — a handler that deliberately messages a third
-//!     party (an owner DM, a reminder delivery) keeps working.
-//!
-//! Two consequences worth stating, since they fall out of the rule rather
-//! than being separately implemented:
-//!
-//!   * Redirected sends are self-consistent with redirected edits: a
-//!     `sendMessageReturningId` to the target returns an id that really
-//!     belongs to the *control room*, and the matching `editMessage`
-//!     addressed to the target is redirected to the control room too, so
-//!     the pair still refers to the same real message. A send-then-*pin*
-//!     pair is NOT self-consistent (the pin is an action and isn't
-//!     redirected), which is one reason `main.zig` doesn't relay `/notice`
-//!     — it has its own command.
-//!   * When the underlying connector doesn't implement an optional method,
-//!     this decorator doesn't either (the vtable entry stays `null`), so
-//!     `Connector`'s own degrade-to-text fallbacks still fire — and,
-//!     because those fallbacks call back through *this* connector's
-//!     `sendMessage`, the fallback text is redirected as well.
-//!
-//! ### Alternatives considered
-//!
-//! * **Add a `reply_chat_id` parameter to every handler.** Most explicit,
-//!   but it's a ~40-signature change, every one of which would then carry
-//!   a parameter that is the same as `msg.chat_id` in every case but one.
-//!   New handlers would silently regress it by forgetting.
-//! * **Add a `reply_chat_id` field to `iface.Message`.** Smaller diff, but
-//!   it only helps handlers that reply via `msg`; anything replying via a
-//!   plain `chat_id: []const u8` argument (`replyWithStats`,
-//!   `handleDigestCommand`, `handleRemindersList`, ... all of which take
-//!   the native chat id separately) would still need touching, and the
-//!   field would be dead weight on every message the connectors build.
-//! * **Buffer the relayed command's output and re-emit it.** Would give
-//!   the nicest transcript ("here's what happened"), but requires knowing
-//!   when a command is "done" — several are asynchronous (ticker edits,
-//!   streaming answers) — and would delay or reorder output. Rejected as
-//!   more machinery than the problem needs.
-//!
-//! The decorator won because it is the only option whose blast radius is
-//! one file, and because it makes the routing rule a single stated
-//! invariant that can be unit-tested against a fake connector rather than
-//! a convention spread across every handler.
+//! A `Connector` decorator that separates "the chat a command *acts* on" from
+//! "the chat its output *goes* to" — the design problem ROADMAP.md's named as
+//! the blocker for `/as <chat ref> <command>`.
 
 const std = @import("std");
 const iface = @import("interface.zig");
 const Identity = @import("../domain/identity.zig").Identity;
 
 /// Wraps `inner`, redirecting sends aimed at `action_chat_id` to
-/// `reply_chat_id`. Must not be copied after `connector()` is called — the
-/// returned `iface.Connector` borrows `&self.vt` and `self`.
+/// `reply_chat_id`.
 pub const ReplyRedirect = struct {
     inner: iface.Connector,
     /// Native id of the chat the relayed command acts on (the `/as`
@@ -86,15 +16,10 @@ pub const ReplyRedirect = struct {
     /// Native id of the chat replies should surface in (the management
     /// room the operator typed `/as` in).
     reply_chat_id: []const u8,
-    /// The operator's own `/as` message, so redirected replies thread
-    /// under it. Any `reply_to_message_id` a handler passes alongside a
-    /// redirected send is discarded in favour of this: the handler's id
-    /// refers to a message in the *target* chat, which would be a dangling
-    /// reference in the control room.
+    /// The operator's own `/as` message, so redirected replies thread under it.
     reply_to_message_id: ?[]const u8,
-    /// Per-instance so an optional method the inner connector lacks stays
-    /// `null` here too (see the module doc) — the entries can't be a
-    /// single shared `const`.
+    /// Per-instance so an optional method the inner connector lacks stays `null`
+    /// here too.
     vt: iface.Connector.VTable,
 
     pub fn init(
@@ -150,9 +75,7 @@ pub const ReplyRedirect = struct {
 
     const Route = struct { chat_id: []const u8, reply_to: ?[]const u8 };
 
-    /// The whole policy, in one place: a send aimed at the chat we're
-    /// acting on comes back to the operator instead; anything else is left
-    /// exactly as the handler asked for it.
+    /// The whole policy, in one place.
     fn route(self: *const ReplyRedirect, chat_id: []const u8, reply_to: ?[]const u8) Route {
         if (std.mem.eql(u8, chat_id, self.action_chat_id))
             return .{ .chat_id = self.reply_chat_id, .reply_to = self.reply_to_message_id };
@@ -171,7 +94,7 @@ pub const ReplyRedirect = struct {
         return self_(ptr).inner.poll(allocator);
     }
 
-    // --- redirected: message output ---
+    // --- redirected: message output.
 
     fn sendMessageFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to_message_id: ?[]const u8) void {
         const self = self_(ptr);
@@ -217,7 +140,7 @@ pub const ReplyRedirect = struct {
         return self.inner.editChoicePrompt(allocator, self.route(chat_id, null).chat_id, message_id, text, choices);
     }
 
-    // --- passed through: actions and queries against the target chat ---
+    // --- passed through: actions and queries against the target chat.
 
     fn maxMessageLengthFn(ptr: *anyopaque) usize {
         return self_(ptr).inner.maxMessageLength() orelse 0;
@@ -299,10 +222,6 @@ pub const ReplyRedirect = struct {
         return self_(ptr).inner.setCommands(allocator, commands);
     }
 };
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -502,8 +421,7 @@ test "an optional method the inner connector lacks stays unimplemented, and its 
     try testing.expect(c.vtable.sendPhoto == null);
 
     // `Connector.sendPhoto`'s degrade-to-text path calls back through this
-    // connector's own sendMessage, so the apology lands in the control
-    // room, not the target chat.
+    // connector's own sendMessage, so the apology lands in the control room.
     c.sendPhoto(testing.allocator, "target-chat", "PNGBYTES", null);
     try testing.expectEqualStrings("sendMessage", rec.calls.items[0].kind);
     try testing.expectEqualStrings("control-room", rec.calls.items[0].chat_id);

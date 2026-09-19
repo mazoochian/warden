@@ -3,9 +3,7 @@ const Io = std.Io;
 const iface = @import("../platform/interface.zig");
 const convert = @import("convert.zig");
 
-/// A file has been claimed for conversion — the prompt's choices are kept
-/// (owned copies) since Matrix's pick needs the original list to resolve a
-/// reacted emoji back to a target format (see `resolveTargetFormat`).
+/// A file has been claimed for conversion.
 pub const AwaitingFormat = struct {
     attachment_path: []const u8,
     attachment_file_name: ?[]const u8,
@@ -26,12 +24,7 @@ const PendingEntry = struct {
 };
 
 /// One pending conversion per (chat, user) — composite-key technique
-/// (`DigestScheduler`'s, not `PendingConfirmations`' chat-only key), since
-/// two different users converting files in the same group must not clobber
-/// each other. Unlike `PendingConfirmations` (which owns no disk resource,
-/// so lazy expiry-on-read was fine), an `awaiting_format` entry owns a real
-/// downloaded temp file — that needs *proactive* expiry (`sweepExpired`) or
-/// an abandoned entry leaks its file forever.
+/// (`DigestScheduler`'s, not `PendingConfirmations`' chat-only key).
 pub const PendingConversions = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -58,9 +51,8 @@ pub const PendingConversions = struct {
         return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ chat_id, user_id });
     }
 
-    /// Frees a removed map entry's key and (for `awaiting_format`) its
-    /// claimed file on disk plus every owned field — the one place file
-    /// deletion+deallocation happens, shared by `deinit`/`cancel`/`sweepExpired`.
+    /// Frees a removed map entry's key and (for `awaiting_format`) its claimed
+    /// file on disk plus every owned field.
     fn freeEntryDeletingFile(self: *PendingConversions, key: []const u8, entry: PendingEntry) void {
         self.allocator.free(key);
         switch (entry.stage) {
@@ -80,10 +72,7 @@ pub const PendingConversions = struct {
         }
     }
 
-    /// Starts (or restarts) the flow for (chat_id, user_id) — "send me a
-    /// file." Replaces any existing pending entry for this (chat, user),
-    /// deleting/freeing whatever it owned (e.g. an abandoned earlier
-    /// attempt's claimed file).
+    /// Starts (or restarts) the flow for (chat_id, user_id) — "send me a file.
     pub fn beginAwaitingFile(self: *PendingConversions, now: i64, chat_id: []const u8, user_id: []const u8) !void {
         const key = try compositeKey(self.allocator, chat_id, user_id);
         errdefer self.allocator.free(key);
@@ -95,9 +84,8 @@ pub const PendingConversions = struct {
         try self.map.put(key, .{ .stage = .awaiting_file, .expires_at = now + self.timeout_seconds });
     }
 
-    /// True if (chat_id, user_id) currently has an unexpired
-    /// `awaiting_file` entry — read-only, doesn't consume it. Used by the
-    /// dispatch-time "does this attachment belong to a pending flow" guard.
+    /// True if (chat_id, user_id) currently has an unexpired `awaiting_file`
+    /// entry — read-only, doesn't consume it.
     pub fn isAwaitingFile(self: *PendingConversions, allocator: std.mem.Allocator, now: i64, chat_id: []const u8, user_id: []const u8) bool {
         const key = compositeKey(allocator, chat_id, user_id) catch return false;
         defer allocator.free(key);
@@ -113,14 +101,8 @@ pub const PendingConversions = struct {
         };
     }
 
-    /// Transitions `awaiting_file` -> `awaiting_format`, taking ownership
-    /// of duped copies of everything passed in (the caller's originals
-    /// typically live in a per-message arena that goes away when this
-    /// task ends). Returns `false` (no-op, frees nothing new) if there
-    /// wasn't actually an unexpired `awaiting_file` entry — a race is
-    /// possible across concurrent per-message tasks for the same user, so
-    /// callers must treat `false` as "someone else already claimed or
-    /// canceled it," not an error.
+    /// Transitions `awaiting_file` -> `awaiting_format`, taking ownership of
+    /// duped copies of everything passed in.
     pub fn claimFile(
         self: *PendingConversions,
         allocator: std.mem.Allocator,
@@ -187,11 +169,8 @@ pub const PendingConversions = struct {
         return true;
     }
 
-    /// True if (chat_id, user_id) currently has an unexpired
-    /// `awaiting_format` entry — the mirror image of `isAwaitingFile`,
-    /// read-only. Used to route an inbound `choice_picked` event to this
-    /// flow rather than `features/menu.zig`'s own (both are keyed the same
-    /// way, and only one of them should ever actually claim a given pick).
+    /// True if (chat_id, user_id) currently has an unexpired `awaiting_format`
+    /// entry — the mirror image of `isAwaitingFile`, read-only.
     pub fn isAwaitingFormat(self: *PendingConversions, now: i64, chat_id: []const u8, user_id: []const u8) bool {
         const key = compositeKey(self.allocator, chat_id, user_id) catch return false;
         defer self.allocator.free(key);
@@ -207,13 +186,8 @@ pub const PendingConversions = struct {
         };
     }
 
-    /// Consumes an `awaiting_format` entry for (chat_id, user_id) if it
-    /// exists, matches `prompt_message_id`, and hasn't expired — a stale
-    /// pick (a superseded prompt, or one arriving after expiry) is a no-op
-    /// (null), not an error. The caller takes ownership of the returned
-    /// value's fields (and the file they name) and must free/delete them —
-    /// via `self.allocator` for the strings, since that's what allocated
-    /// them, not necessarily the caller's own allocator.
+    /// Consumes an `awaiting_format` entry for (chat_id, user_id) if it exists,
+    /// matches `prompt_message_id`, and hasn't expired.
     pub fn takeAwaitingFormat(
         self: *PendingConversions,
         allocator: std.mem.Allocator,
@@ -241,10 +215,8 @@ pub const PendingConversions = struct {
         return af;
     }
 
-    /// Clears whatever's pending for (chat_id, user_id), regardless of
-    /// stage, deleting any claimed file — used by `/cancel` and by
-    /// `beginAwaitingFile` replacing a stale entry. Returns whether
-    /// anything was actually pending.
+    /// Clears whatever's pending for (chat_id, user_id), regardless of stage,
+    /// deleting any claimed file.
     pub fn cancel(self: *PendingConversions, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) bool {
         const key = compositeKey(allocator, chat_id, user_id) catch return false;
         defer allocator.free(key);
@@ -276,12 +248,8 @@ pub const PendingConversions = struct {
     }
 };
 
-/// Resolves a `ChoicePicked.value` back to a target format string, using
-/// the choice list this specific prompt was built with. Telegram's value
-/// already IS the target format (matched against `choice.value`, the
-/// already-resolved `callback_data`); Matrix's value is the raw reaction
-/// emoji (matched against `choice.emoji`) — see `iface.ChoicePicked`'s doc
-/// comment for why this asymmetry is unavoidable.
+/// Resolves a `ChoicePicked.value` back to a target format string, using the
+/// choice list this specific prompt was built with.
 pub fn resolveTargetFormat(platform: iface.Platform, choices: []const iface.Choice, picked_value: []const u8) ?[]const u8 {
     return switch (platform) {
         .telegram => blk: {
@@ -297,8 +265,7 @@ pub fn resolveTargetFormat(platform: iface.Platform, choices: []const iface.Choi
 }
 
 /// Distinct, ordered emoji used to label each format choice — index-based
-/// rather than per-format, so "every supported format" (up to ~11 for
-/// audio/video) doesn't need a hand-curated emoji per exact extension.
+/// rather than per-format.
 const choice_emoji = [_][]const u8{ "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟", "🔢", "➕" };
 
 fn emojiForIndex(i: usize) []const u8 {
@@ -306,10 +273,7 @@ fn emojiForIndex(i: usize) []const u8 {
 }
 
 /// Edits `placeholder_id` to `text` if present, falling back to a plain
-/// `sendMessage` on any edit failure or if no placeholder was ever sent —
-/// same degrade convention as `replyWithAnswer`'s final-answer edit.
-/// Shared by `main.zig`'s direct `/convert` command and this file's own
-/// `handleChoicePicked`.
+/// `sendMessage` on any edit failure or if no placeholder was ever sent.
 pub fn finalizePlaceholder(connector: iface.Connector, a: std.mem.Allocator, chat_id: []const u8, placeholder_id: ?[]const u8, reply_to: ?[]const u8, text: []const u8) void {
     if (placeholder_id) |pid| {
         if (connector.editMessage(a, chat_id, pid, text)) |_| return else |_| {}
@@ -317,10 +281,7 @@ pub fn finalizePlaceholder(connector: iface.Connector, a: std.mem.Allocator, cha
     connector.sendMessage(a, chat_id, text, reply_to);
 }
 
-/// Stage 1: bare `/convert` (or the `begin_file_conversion` LLM tool, which
-/// calls `PendingConversions.beginAwaitingFile` directly instead of this —
-/// see `tools/begin_conversion.zig`) with no attachment yet. Registers
-/// `awaiting_file` and replies asking for a file.
+/// Stage 1: bare `/convert`.
 pub fn beginConvertFlow(connector: iface.Connector, a: std.mem.Allocator, pending: *PendingConversions, now: i64, msg: iface.Message) void {
     pending.beginAwaitingFile(now, msg.chat_id, msg.user_id) catch |err| {
         std.log.err("convert_flow: failed to begin flow for chat {s}: {t}", .{ msg.chat_id, err });
@@ -331,11 +292,7 @@ pub fn beginConvertFlow(connector: iface.Connector, a: std.mem.Allocator, pendin
 }
 
 /// Stage 2: an attachment arrived while (chat, user) has a pending
-/// `awaiting_file` entry. Builds the choice list via
-/// `convert.candidateTargets`, sends the choice prompt, transitions to
-/// `awaiting_format`. Returns whether the attachment was claimed — the
-/// caller must not delete the file itself when this returns `true` (see
-/// `main.zig`'s `processMessageTask` defer-skip).
+/// `awaiting_file` entry.
 pub fn claimAttachmentForConvert(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -366,10 +323,8 @@ pub fn claimAttachmentForConvert(
         connector.sendMessage(a, msg.chat_id, "Couldn't ask you that, try again.", msg.message_id);
         return false;
     }) orelse {
-        // No prompt id means the platform has no button/reaction concept
-        // (the wrapper already sent a plain-text fallback listing the
-        // choices) — nothing to attach a later pick to, so don't claim the
-        // file; point back at the one-shot caption command instead.
+        // No prompt id means the platform has no button/reaction concept (the wrapper
+        // already sent a plain-text fallback listing the choices).
         connector.sendMessage(a, msg.chat_id, "This platform can't show pick-a-format prompts — send the file again with /convert <format> as its caption instead.", msg.message_id);
         return false;
     };
@@ -379,18 +334,13 @@ pub fn claimAttachmentForConvert(
         return false;
     };
     if (!claimed) {
-        // Lost a race with another concurrent message for the same
-        // (chat, user) — e.g. the flow was canceled or superseded between
-        // the earlier `isAwaitingFile` check and now.
+        // Lost a race with another concurrent message for the same (chat, user).
         connector.sendMessage(a, msg.chat_id, "That conversion request isn't active anymore.", msg.message_id);
     }
     return claimed;
 }
 
-/// Stage 3: a choice_picked message arrived. Resolves the format, runs the
-/// conversion with a send-once/edit-once progress placeholder, sends the
-/// result, and cleans up the pending entry (including deleting the claimed
-/// temp file) regardless of outcome.
+/// Stage 3: a choice_picked message arrived.
 pub fn handleChoicePicked(
     connector: iface.Connector,
     a: std.mem.Allocator,

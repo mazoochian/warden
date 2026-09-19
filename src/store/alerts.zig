@@ -9,11 +9,7 @@ pub const Condition = enum { above, below };
 pub const default_check_interval_seconds: i64 = 300;
 pub const default_cooldown_seconds: i64 = 3600;
 
-/// An alert due to actually be re-checked against its external source (see
-/// the `0004_alerts.sql` migration comment on why this is gated separately
-/// from `cooldown_seconds`). Joined with `chats` for the native chat id and
-/// platform `checkAndDeliverAlerts` needs to pick the right connector (same
-/// reasoning as `reminders.DueReminder`).
+/// An alert due to actually be re-checked against its external source.
 pub const AlertToCheck = struct {
     id: i64,
     native_chat_id: []const u8,
@@ -76,11 +72,8 @@ pub fn create(
     return stmt.columnInt64(0);
 }
 
-/// Every alert whose check interval has elapsed (or has never been
-/// checked), across all chats — the poll loop calls this once per cycle
-/// (see `checkAndDeliverAlerts` in `features/alerts.zig`). A row whose
-/// `kind`/`condition` doesn't parse (shouldn't happen — both are only ever
-/// written via `@tagName` above) is skipped rather than guessed at.
+/// Every alert whose check interval has elapsed (or has never been checked),
+/// across all chats — the poll loop calls this once per cycle.
 pub fn dueForCheck(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]AlertToCheck {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -115,9 +108,8 @@ pub fn dueForCheck(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]Ale
     return out.toOwnedSlice(allocator);
 }
 
-/// Records that this alert's external source was just checked, regardless
-/// of whether the condition was true — keeps a persistently-false (or
-/// persistently-erroring) alert from being re-fetched every poll cycle.
+/// Records that this alert's external source was just checked, regardless of
+/// whether the condition was true.
 pub fn markChecked(pool: *PgPool, id: i64, now: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -142,9 +134,8 @@ pub fn markTriggered(pool: *PgPool, id: i64, now: i64) !void {
     _ = try stmt.step();
 }
 
-/// One row for the web API's `GET /api/v1/alerts` — identity-scoped, with
-/// its own chat context, same reasoning as
-/// `reminders.PendingReminderForIdentity`.
+/// One row for the web API's `GET /api/v1/alerts` — identity-scoped, with its
+/// own chat context.
 pub const PendingAlertForIdentity = struct {
     id: i64,
     chat_id: i64,
@@ -156,9 +147,7 @@ pub const PendingAlertForIdentity = struct {
     threshold: f64,
 };
 
-/// Alerts for one identity, optionally narrowed to one chat — see
-/// `reminders.listForIdentities`'s doc comment for why this is separate
-/// from `listPending`.
+/// Alerts for one identity, optionally narrowed to one chat.
 pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]PendingAlertForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);

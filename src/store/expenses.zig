@@ -1,12 +1,8 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// One manual expense entry (ROADMAP.md's Phase 17) -- chat-scoped and
-/// visible to the whole chat, same "shared, but only the creator or the
-/// bot owner may delete" model `notes.zig`/`reminders.zig` already use.
-/// `amount_cents` is always a positive integer (enforced by the
-/// `0029_expenses.sql` CHECK constraint) -- see that migration's comment
-/// for why cents, never a float, back real money here.
+/// One manual expense entry -- chat-scoped and
+/// visible to the whole chat.
 pub const Expense = struct {
     id: i64,
     chat_id: i64,
@@ -40,9 +36,8 @@ pub fn create(pool: *PgPool, chat_id: i64, identity_id: i64, amount_cents: i64, 
 }
 
 /// Most recent `limit` expenses in `chat_id`, newest first, optionally
-/// narrowed to one `category` and/or a `since_ts` floor -- backs
-/// `/expense list`. Same NULL-coalescing optional-filter idiom
-/// `notes.listForIdentities` already uses for its own optional `chat_id`.
+/// narrowed to one `category` and/or a `since_ts` floor -- backs `/expense
+/// list`.
 pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, category: ?[]const u8, since_ts: ?i64, limit: i64) ![]Expense {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -77,11 +72,7 @@ pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, ca
     return out.toOwnedSlice(allocator);
 }
 
-/// One row for the web API's `GET /api/v1/expenses` -- identity-scoped
-/// (not chat-scoped like `Expense`/`listForChat` above, which back the
-/// bot's own in-chat `/expense list`), so each row carries its own chat
-/// context for a "my spending across every chat" view, same shape as
-/// `notes.NoteForIdentity`/`reminders.PendingReminderForIdentity`.
+/// One row for the web API's `GET /api/v1/expenses` -- identity-scoped.
 pub const ExpenseForIdentity = struct {
     id: i64,
     chat_id: i64,
@@ -93,12 +84,8 @@ pub const ExpenseForIdentity = struct {
     created_at: i64,
 };
 
-/// Expenses recorded by one identity, optionally narrowed to one chat
-/// and/or `category` and/or a `since_ts` floor -- see
-/// `ExpenseForIdentity`'s doc comment for why this is a separate query
-/// from `listForChat` rather than a filter on top of it. Newest first,
-/// same ordering `listForChat` already uses (most recent spending is what
-/// you actually want to see first).
+/// Expenses recorded by one identity, optionally narrowed to one chat and/or
+/// `category` and/or a `since_ts` floor.
 pub fn listForIdentities(
     pool: *PgPool,
     allocator: std.mem.Allocator,
@@ -181,11 +168,7 @@ pub const CategoryTotal = struct {
     total_cents: i64,
 };
 
-/// Per-category totals since `since_ts` (null = all time), highest first
-/// -- backs `/expense summary` and `/budget list`'s "spent so far this
-/// month" column. Sums naively across whatever currencies happen to be
-/// recorded in a category -- see `Expense`'s doc comment on the v1
-/// single-effective-currency assumption.
+/// Per-category totals since `since_ts` (null = all time), highest first.
 pub fn totalsByCategory(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, since_ts: ?i64) ![]CategoryTotal {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -210,9 +193,7 @@ pub fn totalsByCategory(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i6
     return out.toOwnedSlice(allocator);
 }
 
-/// Grand total since `since_ts` (null = all time) across every category --
-/// 0 if there are no matching expenses at all (a bare `SUM()` over zero
-/// rows is SQL NULL, not 0, so this coalesces before returning).
+/// Grand total since `since_ts` (null = all time) across every category.
 pub fn totalForChat(pool: *PgPool, chat_id: i64, since_ts: ?i64) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);

@@ -8,8 +8,8 @@ const max_description_len = 500;
 const Args = struct {
     action: []const u8,
     /// Dollars (or whatever the chat's currency actually is), not cents --
-    /// converted to integer cents by `execute` below before ever reaching
-    /// the sink. Only for action=create.
+    /// converted to integer cents by `execute` below before ever reaching the
+    /// sink.
     amount: ?f64 = null,
     category: ?[]const u8 = null,
     description: ?[]const u8 = null,
@@ -17,12 +17,8 @@ const Args = struct {
     id: ?i64 = null,
 };
 
-/// ROADMAP.md's Phase 17 (finance trackers): lets the model log an
-/// expense from a plain statement ("I spent $12 on lunch") or a receipt
-/// photo it can already read via Phase 10's vision support -- no separate
-/// receipt-OCR plumbing needed, the model just extracts the amount/
-/// category itself and calls this tool the same way it would from typed
-/// text.
+/// Lets the model log an expense from a plain statement ("I spent $12 on
+/// lunch") or a receipt photo it can already read via the vision support.
 pub const tool: registry.ToolDef = .{
     .name = "set_expense",
     .description = "Logs, lists, or deletes manual expense entries for this chat's finance tracker. Use action=create when the user mentions spending money (including describing a receipt/photo you can see) -- amount is a plain number in the chat's currency (e.g. 12.50), not cents. Use action=list to show recent expenses, action=delete with an id from a previous list to remove one.",
@@ -32,15 +28,10 @@ pub const tool: registry.ToolDef = .{
     .execute = execute,
 };
 
-/// Rounds a dollar amount to the nearest cent -- see
-/// `registry.ExpenseSink`'s doc comment on why every store-layer boundary
-/// past this point only ever deals in integer cents, never a float.
+/// Rounds a dollar amount to the nearest cent.
 fn centsFromAmount(amount: f64) ?i64 {
     if (!std.math.isFinite(amount)) return null;
-    // Range-checked *before* `@intFromFloat`: converting an out-of-range
-    // float is an abort in `-Doptimize=ReleaseSafe`, and `amount` comes
-    // straight from the model, so a hallucinated `1e30` took the bot down.
-    // The ceiling is the same one `/expense add` uses.
+    // Range-checked *before* `@intFromFloat`.
     const scaled = @round(amount * 100.0);
     const max_cents: f64 = @floatFromInt(registry.max_expense_cents);
     if (scaled <= 0 or scaled > max_cents) return null;

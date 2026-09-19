@@ -2,31 +2,7 @@
 //! (err/warn/info/debug) can't express the "something is unrecoverable, exit
 //! now" (FATAL) vs. "worth a human's attention but not an error" (NOTICE)
 //! distinction the operator asked for, and because `std.log`'s own filtering
-//! (`std.options.log_level`) is a `comptime` value baked in at build time —
-//! there's no way to flip verbosity at runtime from an env var through that
-//! path alone.
-//!
-//! Every line renders as fixed-width columns (timestamp, level, scope,
-//! message) so `journalctl`/`docker logs` output stays readable and
-//! greppable instead of one giant unstructured sentence per line. Output
-//! goes through `std.debug.lockStderr`/`unlockStderr` — the same primitive
-//! `std.log`'s own `defaultLog` uses — which is already safe to call
-//! concurrently from any thread (recursive lock), so every poll-loop thread,
-//! worker-pool thread, and the scheduler loop can log without stepping on
-//! each other's output mid-line.
-//!
-//! Two ways in:
-//!   1. `scoped("name")` gives a per-module logger with `.debug`/`.info`/
-//!      `.notice`/`.warn`/`.err`/`.fatal` methods — use this for anything
-//!      new.
-//!   2. `stdLogFn` is wired in as `std_options.logFn` (see `main.zig`), so
-//!      pre-existing `std.log.err`/`.warn`/`.info`/`.debug` call sites
-//!      elsewhere in the codebase render through the exact same tabular
-//!      formatter and runtime level filter without needing to be rewritten.
-//!
-//! Verbosity is controlled by `WARDEN_LOG_LEVEL` (debug/info/notice/warn/
-//! error/fatal, case-insensitive; defaults to "info") — see `init`, called
-//! once at the very top of `main`.
+//! (`std.options.log_level`) is a `comptime` value baked in at build time.
 const std = @import("std");
 const Io = std.Io;
 
@@ -63,16 +39,12 @@ pub const Level = enum(u8) {
     }
 };
 
-/// Width the SCOPE column is padded/aligned to. Longest scope name in use
-/// today is "worker_pool" (11) — 12 leaves one space of natural separation
-/// even for that one before the two literal padding spaces below.
+/// Width the SCOPE column is padded/aligned to.
 const scope_width = 12;
 
 /// `main` sets this via `init` before anything else runs (even before
 /// `Config.load`, so config-load failures themselves get a real timestamp
-/// too). Reading a timestamp needs an `Io` instance in this Zig version
-/// (see `Io.Timestamp`) — there is no longer a plain `std.time.timestamp()`
-/// that works without one.
+/// too).
 var g_io: Io = undefined;
 var g_io_ready: std.atomic.Value(bool) = .init(false);
 
@@ -80,18 +52,12 @@ var g_io_ready: std.atomic.Value(bool) = .init(false);
 /// shouldn't be one) still filters out debug spam rather than failing open.
 var g_min_level: std.atomic.Value(u8) = .init(@intFromEnum(Level.info));
 
-/// Call once, as the very first thing in `main`, before `Config.load` —
-/// logging (including `Config.load`'s own error paths) should work even if
-/// the rest of config loading fails. `env` is the same
-/// `init.environ_map` every other config read in this codebase uses.
+/// Call once, as the very first thing in `main`, before `Config.load`.
 pub fn init(io: Io, env: *const std.process.Environ.Map) void {
     g_io = io;
     g_io_ready.store(true, .release);
     const raw = env.get("WARDEN_LOG_LEVEL") orelse "info";
     const level = parseLevel(raw) orelse blk: {
-        // Logged directly (not via `emit`, which would depend on
-        // `g_min_level` already being set) so a typo'd env var is visible
-        // instead of silently falling back.
         writeLine(.warn, "log", "unrecognized WARDEN_LOG_LEVEL '{s}', defaulting to info (want: debug|info|notice|warn|error|fatal)", .{raw});
         break :blk .info;
     };
@@ -99,8 +65,7 @@ pub fn init(io: Io, env: *const std.process.Environ.Map) void {
 }
 
 /// The currently-configured minimum level — used e.g. by `main.zig` to log
-/// its own effective verbosity once at startup, so "why am I not seeing
-/// DEBUG lines" is answerable by reading the log itself.
+/// its own effective verbosity once at startup.
 pub fn currentLevel() Level {
     return @enumFromInt(g_min_level.load(.acquire));
 }
@@ -125,9 +90,7 @@ pub fn scoped(comptime name: []const u8) type {
         pub fn info(comptime fmt: []const u8, args: anytype) void {
             emit(.info, name, fmt, args);
         }
-        /// Worth a human's attention on a quick log skim, but not a
-        /// malfunction — e.g. a feature being disabled by configuration, a
-        /// connector coming back up after a transient drop.
+        /// Worth a human's attention on a quick log skim, but not a malfunction.
         pub fn notice(comptime fmt: []const u8, args: anytype) void {
             emit(.notice, name, fmt, args);
         }
@@ -137,11 +100,8 @@ pub fn scoped(comptime name: []const u8) type {
         pub fn err(comptime fmt: []const u8, args: anytype) void {
             emit(.err, name, fmt, args);
         }
-        /// Logs unconditionally (bypasses `WARDEN_LOG_LEVEL`) and then
-        /// terminates the process — for startup/invariant failures the bot
-        /// has no reasonable way to keep running past (e.g. config load
-        /// failure, DB pool init failure). Prefer this over a bare
-        /// `std.process.exit` so the reason is never silent.
+        /// Logs unconditionally (bypasses `WARDEN_LOG_LEVEL`) and then terminates the
+        /// process.
         pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
             writeLine(.fatal, name, fmt, args);
             std.process.exit(1);
@@ -156,8 +116,7 @@ fn emit(level: Level, scope: []const u8, comptime fmt: []const u8, args: anytype
 
 fn writeLine(level: Level, scope: []const u8, comptime fmt: []const u8, args: anytype) void {
     // Matches `std.log.defaultLog`'s own buffer size — this is just the
-    // underlying writer's flush chunk size, not a line-length cap; `print`
-    // below flushes and continues as needed for longer lines.
+    // underlying writer's flush chunk size.
     var buffer: [128]u8 = undefined;
     const t = std.debug.lockStderr(&buffer).terminal();
     defer std.debug.unlockStderr();
@@ -202,13 +161,7 @@ fn writeTimestamp(w: *Io.Writer) std.Io.Writer.Error!void {
     });
 }
 
-/// Wired in as `std_options.logFn` (see `main.zig`) so every pre-existing
-/// `std.log.err`/`.warn`/`.info`/`.debug` call site elsewhere in the
-/// codebase renders through the same tabular formatter and the same runtime
-/// `WARDEN_LOG_LEVEL` filter, without needing to be individually rewritten.
-/// `std_options.log_level` is left at `.debug` (see `main.zig`) so
-/// `std.log`'s own comptime filter never intercepts a message before it
-/// reaches here — filtering happens once, at runtime, in `emit`.
+/// Wired in as `std_options.logFn`.
 pub fn stdLogFn(
     comptime message_level: std.log.Level,
     comptime scope: @EnumLiteral(),
@@ -263,9 +216,8 @@ test "WARDEN_LOG_LEVEL gates emit() without affecting fatal's always-on behavior
     try testing.expectEqual(@intFromEnum(Level.err), g_min_level.load(.acquire));
 
     const log = scoped("test");
-    // Below-threshold levels must not be filtered out by crashing or
-    // otherwise misbehaving — there's no observable return value here, this
-    // just exercises the early-return path in `emit`.
+    // Below-threshold levels must not be filtered out by crashing or otherwise
+    // misbehaving.
     log.debug("should be filtered out", .{});
     log.info("should be filtered out", .{});
     log.err("should still print", .{});

@@ -1,7 +1,5 @@
-//! Phase 2 read-only admin surface: global stats, chat directory, identity
-//! directory — see /home/armin/claude/warden-ui/API.md's "Admin — stats &
-//! directory" section and ROADMAP.md Phase 2. Every query here is
-//! read-only; nothing in this module mutates anything.
+//! Read-only admin surface for the web API: global stats, chat directory,
+//! identity directory (see docs/web-api.md). Nothing here mutates anything.
 const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
@@ -16,9 +14,8 @@ pub const OverviewStats = struct {
     active_chats_last_7d: i64,
 };
 
-/// `now` is the caller's own clock reading (`Io.Timestamp.now`), not
-/// `now()` inside the query — keeps this testable with a fixed instant
-/// instead of depending on wall-clock time at test-run time.
+/// `now` is the caller's own clock reading (`Io.Timestamp.now`), not `now()`
+/// inside the query.
 pub fn overview(pool: *PgPool, now: i64) !OverviewStats {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -56,19 +53,8 @@ pub const ChatSummary = struct {
     digest_enabled: bool,
 };
 
-/// Paginated by internal id, ascending — `after_id` is the last id seen
-/// (0 for the first page), matching `API.md`'s cursor convention (the
-/// caller turns `next_cursor` back into `after_id` on the following
-/// request; the id itself makes a perfectly good opaque cursor here since
-/// ids are already monotonically assigned and never reused).
-///
-/// Excludes chats the bot has left (`left_at` set — see
-/// `store/chats.zig`'s `markLeft`): this backs both the admin chat
-/// directory and, via `router.zig`'s `handleListMyChats`, the owner/
-/// bot_admin branch of `GET /api/v1/chats?mine=true` (the dropdown source
-/// for Bot View/reminders/alerts/group-admin pickers) — a left chat isn't
-/// a valid destination for anything new, even though its historical data
-/// stays queryable by id until the retention sweep purges it.
+/// Paginated by internal id, ascending — `after_id` is the last id seen (0
+/// for the first page), matching `API.md`'s cursor convention.
 pub fn listChats(pool: *PgPool, allocator: std.mem.Allocator, after_id: i64, limit: i64) ![]ChatSummary {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -194,7 +180,7 @@ pub const IdentitySummary = struct {
 
 /// Excludes bot accounts (`is_bot`) — matches `identities.findByUsername`'s
 /// own convention that bot-facing directories aren't interesting targets
-/// here. Paginated the same way as `listChats`.
+/// here.
 pub fn listIdentities(pool: *PgPool, allocator: std.mem.Allocator, after_id: i64, limit: i64) ![]IdentitySummary {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -311,14 +297,8 @@ test "overview counts messages/chats/identities and recency windows" {
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
 
-    // Deliberately realistic-scale epoch timestamps here (not the small
-    // 1000/2000 offsets `seedBasics` uses elsewhere in this file) -- the
-    // 24h/7d windows subtract 86400/604800 from `now`, so tiny offsets
-    // make the cutoff go deeply negative and every message spuriously
-    // counts as "recent" regardless of the window being tested. Found via
-    // a real full-DB test run: this test originally used 1000/2000 and
-    // passed locally by accident, then failed under CI-adjacent
-    // conditions once the cutoff math was actually exercised correctly.
+    // Deliberately realistic-scale epoch timestamps here (not the small 1000/2000
+    // offsets `seedBasics` uses elsewhere in this file).
     const chat = try chats.upsertChat(&pool, .telegram, "-100", "supergroup", "Test Chat");
     const alice = try identities.upsertIdentity(&pool, .{
         .platform = .telegram,

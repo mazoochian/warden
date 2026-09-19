@@ -8,16 +8,7 @@ const Args = struct {
     all: bool = false,
 };
 
-/// Companion to `catch_me_up` for the personal-account (TDLib) connector:
-/// lets the owner ask "what's up in <chat>" / "summarize my unread in X"
-/// and get an answer grounded in that chat's actual currently-unread
-/// messages, fetched fresh from Telegram and marked read as a side effect
-/// — the `/tdsummary` command's natural-language counterpart. Same "just
-/// fetch, let the model summarize" shape as `catch_me_up`: no nested LLM
-/// call happens inside `ChatSummarySink.summarizeUnread`. `all` switches to
-/// the last 100 messages regardless of read state (no mark-as-read side
-/// effect in that mode) — the `/tdsummary <chat> --all` companion, direct
-/// owner request (2026-08-19).
+/// Companion to `catch_me_up` for the personal-account (TDLib) connector.
 pub const tool: registry.ToolDef = .{
     .name = "summarize_unread_chat",
     .description = "Fetches messages from one of the personal Telegram account's chats. By default fetches only currently-unread messages and marks them read; pass all=true to instead fetch the last 100 messages regardless of read state (no mark-as-read side effect in that mode). `chat` can be a TDLib chat id or any substring of the chat's title/name (case-insensitive) -- use whatever the owner called it. Returns raw \"sender id: text\" lines for you to summarize yourself in your reply, not a summary -- write the actual summary yourself. Use this when the owner asks what's new/unread in a specific chat, asks you to catch them up on it, or asks for a summary of its recent/last messages.",

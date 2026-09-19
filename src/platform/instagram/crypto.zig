@@ -4,11 +4,7 @@
 //! plus RSA-PKCS1v1.5 *encryption*, which `std.crypto` in this Zig version
 //! (0.16.0) does NOT expose — it only ships RSA signature-verification
 //! primitives (`std.crypto.Certificate.rsa`), built on the public bignum
-//! modexp in `std.crypto.ff`. This file hand-rolls RSAES-PKCS1-V1_5-ENCRYPT
-//! per RFC 8017 §7.2.1 on top of that same public `std.crypto.ff` primitive
-//! — the highest-risk code in the whole Instagram connector, since a subtle
-//! bug here doesn't throw, it just produces plausible-looking wrong output.
-//! See the RSA tests below for how correctness is cross-checked.
+//! modexp in `std.crypto.ff`.
 const std = @import("std");
 const Io = std.Io;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
@@ -50,12 +46,7 @@ pub fn gcmDecrypt(
     return plaintext;
 }
 
-/// Upper bound on RSA modulus size this module supports — comfortably above
-/// any RSA key size Instagram's login endpoint has ever been observed
-/// using (2048-bit / 256-byte moduli), with headroom in case that ever
-/// changes. `std.crypto.ff.Modulus`/`Fe` need this as a comptime bound; the
-/// actual modulus byte length used at runtime comes from `modulus_bytes.len`
-/// below, not from this constant.
+/// Upper bound on RSA modulus size this module supports.
 const max_rsa_bits = 4096;
 const RsaModulus = std.crypto.ff.Modulus(max_rsa_bits);
 const RsaFe = RsaModulus.Fe;
@@ -67,17 +58,7 @@ pub const RsaError = error{
 } || std.crypto.ff.Error || std.mem.Allocator.Error;
 
 /// RSAES-PKCS1-V1_5-ENCRYPT (RFC 8017 §7.2.1): encrypts `message` with the
-/// RSA public key `(modulus_bytes, exponent)`. `modulus_bytes` is the
-/// modulus `n` as a big-endian byte string (no leading sign byte);
-/// `exponent` is the public exponent `e` (typically 65537). Returns a
-/// ciphertext exactly `modulus_bytes.len` bytes long — caller owns and
-/// frees it.
-///
-/// This is Instagram's `enc_password` scheme's RSA step: the AES-256-GCM
-/// session key gets RSA-PKCS1v1.5-encrypted with a public key Instagram's
-/// login endpoint hands out fresh per request (see `transport.zig`
-/// for the request that fetches `(modulus_bytes, exponent)` and the
-/// `key_id` that travels alongside it in the final payload).
+/// RSA public key `(modulus_bytes, exponent)`.
 pub fn rsaPkcs1v15Encrypt(
     io: Io,
     allocator: std.mem.Allocator,
@@ -94,13 +75,7 @@ pub fn rsaPkcs1v15Encrypt(
     em[0] = 0x00;
     em[1] = 0x02;
     const ps = em[2 .. k - message.len - 1];
-    // PS must contain no zero bytes (RFC 8017 §7.2.1) — that's a real
-    // padding-format requirement (a stray zero byte would be
-    // indistinguishable from the 0x00 separator on decrypt), not
-    // cosmetic, so zero bytes are rejected and redrawn rather than
-    // merely avoided-by-probability. Randomness comes from the runtime's
-    // entropy source (`std.Io.random`), matching this codebase's existing
-    // convention (e.g. `../matrix/olm.zig`'s `fillRandom`).
+    // PS must contain no zero bytes (RFC 8017 §7.2.1).
     var i: usize = 0;
     while (i < ps.len) {
         var chunk: [64]u8 = undefined;
@@ -126,13 +101,8 @@ pub fn rsaPkcs1v15Encrypt(
     return ciphertext;
 }
 
-/// Test-only RSA decrypt: same modexp primitive as `rsaPkcs1v15Encrypt`,
-/// just with the private exponent `d` instead of the public one, used
-/// below to self-verify `rsaPkcs1v15Encrypt`'s round trip without needing
-/// OpenSSL available at `zig build test` time. NOT constant-time with
-/// respect to `d` (uses `powPublic`, which is only safe when the exponent
-/// is genuinely public) — never call this outside a test with a
-/// throwaway keypair.
+/// Test-only RSA decrypt: same modexp primitive as `rsaPkcs1v15Encrypt`, just
+/// with the private exponent `d` instead of the public one.
 fn testOnlyRsaPkcs1v15Decrypt(allocator: std.mem.Allocator, modulus_bytes: []const u8, private_exponent_bytes: []const u8, ciphertext: []const u8) ![]u8 {
     const k = modulus_bytes.len;
     std.debug.assert(ciphertext.len == k);
@@ -179,9 +149,8 @@ test "gcmDecrypt rejects a tampered ciphertext" {
 }
 
 test "gcmEncrypt matches std.crypto.aead.aes_gcm's own known-answer test vector" {
-    // Same key/nonce/message/ad std lib uses in aes_gcm.zig's
-    // "Message and associated data" test — cross-checks our thin wrapper
-    // against std's own KAT rather than just round-tripping against itself.
+    // Same key/nonce/message/ad std lib uses in aes_gcm.zig's "Message and
+    // associated data" test.
     const key: [Aes256Gcm.key_length]u8 = [_]u8{0x69} ** Aes256Gcm.key_length;
     const nonce: [Aes256Gcm.nonce_length]u8 = [_]u8{0x42} ** Aes256Gcm.nonce_length;
     const m = "Test with message";
@@ -199,18 +168,8 @@ test "gcmEncrypt matches std.crypto.aead.aes_gcm's own known-answer test vector"
     try testing.expectEqualSlices(u8, &expected_tag, &enc.tag);
 }
 
-// Fixture 2048-bit RSA keypair, generated locally with
-// `openssl genrsa 2048` purely for this test (never used for anything
-// real). n/e/d extracted with `openssl asn1parse` on the PKCS#1
-// RSAPrivateKey DER structure. Manually cross-checked once at
-// implementation time: encrypted a fixed plaintext with
-// `rsaPkcs1v15Encrypt` below, wrote the ciphertext to a file, and ran
-// `openssl pkeyutl -decrypt -inkey <this keypair's priv.pem> -in
-// <ciphertext>` — it recovered the plaintext byte-for-byte, confirming
-// this implementation is wire-compatible with a real RSA implementation.
-// The in-suite test below re-verifies the same round trip using only
-// `std.crypto.ff` (via `testOnlyRsaPkcs1v15Decrypt`) so it doesn't depend
-// on OpenSSL being installed wherever `zig build test` runs.
+// Fixture 2048-bit RSA keypair, generated locally with `openssl genrsa 2048`
+// purely for this test (never used for anything real).
 const test_rsa_n_hex =
     "AC88D10ED5B6A4029DAAD38BBE957AEF4395B9931B1F088058887533219AFF" ++
     "87E7C756AE8A85953BD9BC46296DF6A66B3D9858AB90A098115F43FB8581BB9" ++

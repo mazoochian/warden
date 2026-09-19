@@ -2,17 +2,10 @@ const std = @import("std");
 const Platform = @import("../platform/interface.zig").Platform;
 
 /// Shared fields every platform's user carries, regardless of which platform
-/// they came from. Platform-specific structs (`TelegramProfile`,
-/// `MatrixProfile`, `XmppProfile`) embed this as their first field rather than
-/// inheriting from it — Zig has no class inheritance, so composition plus
-/// reaching through `.identity.*` is the idiomatic stand-in for an "ancestor"
-/// type here.
+/// they came from.
 pub const Identity = struct {
     platform: Platform,
-    /// The platform's own id for this user, as a string — Telegram: decimal
-    /// i64; Matrix: "@user:server"; XMPP: bare JID; Discord: u64 snowflake;
-    /// WhatsApp: phone number. Never parsed to a native int in shared code
-    /// since the shape varies per platform (mirrors `iface.Message.user_id`).
+    /// The platform's own id for this user, as a string — Telegram.
     native_id: []const u8,
     /// Best available display name: Telegram first[+last] name, Matrix
     /// displayname, XMPP nickname.
@@ -25,8 +18,7 @@ pub const Identity = struct {
     last_seen: i64,
 
     /// Deep-copies every string field into `allocator` — mirrors
-    /// `iface.Message.dupe`, for the same reason: detaching from a
-    /// short-lived poll-cycle arena into a per-task one.
+    /// `iface.Message.dupe`, for the same reason.
     pub fn dupe(self: Identity, allocator: std.mem.Allocator) !Identity {
         return .{
             .platform = self.platform,

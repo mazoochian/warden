@@ -4,10 +4,7 @@ const embeddings = @import("../llm/embeddings.zig");
 
 /// Legacy-shaped view kept for API compatibility (`/memory list`, the
 /// `GET/DELETE /api/v1/memory` web endpoints, the `remember_memory` LLM
-/// tool) — none of those care about the bitemporal/supersession machinery
-/// below, only "id, whose it is, what it says, when". `text` is a fact's
-/// `statement`; `created_at` is `recorded_at` (equal to `valid_from` for
-/// every fact this file creates today, since nothing here backdates one).
+/// tool).
 pub const Memory = struct {
     id: i64,
     identity_id: i64,
@@ -15,9 +12,8 @@ pub const Memory = struct {
     created_at: i64,
 };
 
-/// A fact as read back for ranking/rendering (`features/context_assembly.zig`)
-/// — carries the fields the rendered prompt needs (confidence markers,
-/// dates) that `Memory` deliberately doesn't.
+/// A fact as read back for ranking/rendering
+/// (`features/context_assembly.zig`).
 pub const RankedFact = struct {
     statement: []const u8,
     status: []const u8,
@@ -27,26 +23,7 @@ pub const RankedFact = struct {
 };
 
 /// Explicit `remember` (the `remember_memory` tool's `action=create`, or a
-/// future `/memory remember`) — always `status='pinned'`: a person asking to
-/// remember something is already-confirmed, not a tentative LLM guess, so it
-/// should never be swept up by the nightly retirement job. Predicate/object
-/// are a degenerate triple (`predicate='remembers'`, `object=text`) since an
-/// explicit remember doesn't come pre-parsed into subject/predicate/object
-/// the way an auto-extracted fact eventually will (ROADMAP.md's memory-layer
-/// phase, extractor slice) — `scope='preference'` for the same reason: a
-/// reasonable default until real scope classification exists.
-/// `embedding` is optional: a fact is worth storing whether or not this
-/// deployment has an embeddings endpoint configured. Without one the row
-/// simply has no vector, and the 0.40 similarity term of the hybrid score
-/// drops out for it (see `hybrid_score_expr`) -- it stays findable by
-/// keyword, recency and salience, and `pinnedForIdentity` (which is what
-/// an explicitly-remembered fact goes into) never needed a vector at all.
-///
-/// This used to take a non-optional `[]const f32`, which combined with the
-/// column's NOT NULL and `main.zig` only wiring the memory tool when an
-/// embeddings client existed meant that remembering anything was silently
-/// impossible without WARDEN_EMBEDDINGS_URL. See
-/// `0050_optional_embeddings.sql`.
+/// future `/memory remember`) — always `status='pinned'`.
 pub fn remember(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, text: []const u8, embedding: ?[]const f32, created_at: i64) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -69,13 +46,7 @@ pub fn remember(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, t
 }
 
 /// The `limit` closest active (non-retired, currently-valid) facts to
-/// `query_embedding` for one identity, by cosine distance — the plain
-/// vector-only search `qa.zig` used to call directly. Superseded for actual
-/// prompt assembly by `rankedStable`/`rankedTentative` (hybrid-scored, status-
-/// aware), kept here as the simpler primitive other future callers can still
-/// reach for. No approximate index (see `0048_memory_layer.sql`'s doc
-/// comment on why) — a plain sequential scan is fine at the row counts a
-/// personal bot's fact table will ever reach.
+/// `query_embedding` for one identity, by cosine distance.
 pub fn search(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: []const f32, limit: u32) ![]Memory {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -140,11 +111,7 @@ pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_i
 }
 
 /// `null` for a retired or nonexistent fact — used by `/memory forget` to
-/// check ownership before deleting, same pattern as `notes.get`. Filtering
-/// out `status='retired'` here (not just in `listForIdentity`) matches the
-/// old `memories` table's behavior, where a forgotten row was gone outright:
-/// `get` on an already-forgotten id must still read back as "no such
-/// memory", not resurrect it for a second `/memory forget`.
+/// check ownership before deleting, same pattern as `notes.get`.
 pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Memory {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -162,15 +129,7 @@ pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Memory {
 }
 
 /// Retires a fact (`status='retired'`, `valid_to=now()`) and writes a
-/// tombstone recording what it said — never a hard delete, so provenance
-/// survives (failure mode 4's "history is preserved" rule) and a future
-/// auto-extraction pass can't silently resurrect the same statement (the
-/// design brief's "honor forget absolutely" rule). Both writes happen in one
-/// transaction, same `BEGIN`/`COMMIT`/`ROLLBACK`-as-plain-statements idiom
-/// `messages.replaceRangeWithSummary` already uses (no shared transaction
-/// helper exists yet). A nonexistent/already-retired id is a silent no-op —
-/// callers (`main.zig`, `api/router.zig`) already call `get` first and only
-/// reach here once ownership is confirmed.
+/// tombstone recording what it said — never a hard delete.
 pub fn forget(pool: *PgPool, id: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -205,8 +164,8 @@ pub fn forget(pool: *PgPool, id: i64) !void {
 
 /// Cheap existence check `qa.zig`/`context_assembly.zig` use to skip the
 /// embed-and-search round trip entirely for an identity with zero active
-/// facts ever recorded — so someone who's never used this feature never
-/// pays its per-question latency/cost.
+/// facts ever recorded — so someone who's never used this feature never pays
+/// its per-question latency/cost.
 pub fn hasAny(pool: *PgPool, identity_id: i64) !bool {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -217,10 +176,8 @@ pub fn hasAny(pool: *PgPool, identity_id: i64) !bool {
     return try stmt.step();
 }
 
-/// Every currently-pinned fact for one identity — the design brief's
-/// "Pinned" context budget block: stable identity facts and standing
-/// directives, always shown, never ranked (there are meant to be few of
-/// these). Oldest first, matching `listForIdentity`.
+/// Every currently-pinned fact for one identity — the design brief's "Pinned"
+/// context budget block.
 pub fn pinnedForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ![]RankedFact {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -250,25 +207,7 @@ fn collectRanked(stmt: *@import("db.zig").Stmt, allocator: std.mem.Allocator) ![
     return out.toOwnedSlice(allocator);
 }
 
-/// The hybrid ranking formula shared by `rankedStable`/`rankedTentative` --
-/// `0.40*vector_similarity + 0.25*fts_rank + 0.20*recency + 0.15*salience`,
-/// the design brief's scoring formula. `ts_rank_cd` over a `tsvector` stands
-/// in for the brief's `bm25()` term -- Postgres has no real BM25 built in.
-/// Recency half-life is scope-dependent (identity facts effectively never
-/// decay; projects decay fastest) and salience blends confirmation count
-/// with a status multiplier, both computed in SQL rather than pulled back
-/// and blended in Zig, since Postgres already has every input in scope.
-/// The vector term is COALESCEd to 0 rather than used bare, which covers
-/// both ways it can now be absent: a *row* with no embedding (stored on a
-/// deployment with no embeddings endpoint -- see `remember`) and a *query*
-/// with none (`$2` bound NULL for the same reason). Either makes `<=>`
-/// yield NULL, which without this would poison the whole sum to NULL and
-/// sort that row arbitrarily. Contributing 0 instead means such rows rank
-/// on keyword, recency and salience alone. When no query vector is given at
-/// all the term is 0 for every row uniformly, and since this is only ever
-/// used for `ORDER BY score DESC`, dropping a constant from every row
-/// leaves the ordering untouched -- no renormalising of the other weights
-/// needed.
+/// The hybrid ranking formula shared by `rankedStable`/`rankedTentative`.
 const hybrid_score_expr =
     \\(0.40 * COALESCE(1 - (embedding <=> $2::vector), 0)
     \\ + 0.25 * ts_rank_cd(to_tsvector('english', statement), plainto_tsquery('english', $3))
@@ -279,19 +218,13 @@ const hybrid_score_expr =
     \\) AS score
 ;
 
-/// Top-`limit` `status='stable'` facts by hybrid score — the design brief's
-/// "Retrieved facts" budget block, rendered alongside pinned facts under one
-/// "About (stable)" heading by `context_assembly.zig`.
+/// Top-`limit` `status='stable'` facts by hybrid score.
 pub fn rankedStable(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: ?[]const f32, query_text: []const u8, limit: u32, now: i64) ![]RankedFact {
     return rankedByStatus(pool, allocator, identity_id, query_embedding, query_text, "stable", limit, now);
 }
 
 /// Top-`limit` `status='tentative'` facts by hybrid score -- the design
-/// brief's "tentative suppression" filter: called with a small fixed
-/// `limit` (see `context_assembly.zig`'s `tentative_facts_limit`), so only a
-/// one-off remark that already ranks in the top few for *this* question ever
-/// enters the prompt, under its own "possibly relevant, may be stale"
-/// heading rather than blended in as settled fact (failure mode 3).
+/// brief's "tentative suppression" filter: called with a small fixed `limit`.
 pub fn rankedTentative(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, query_embedding: ?[]const f32, query_text: []const u8, limit: u32, now: i64) ![]RankedFact {
     return rankedByStatus(pool, allocator, identity_id, query_embedding, query_text, "tentative", limit, now);
 }
@@ -340,13 +273,8 @@ fn testIdentity(pool: *PgPool, native_id: []const u8) !i64 {
     });
 }
 
-/// The real `facts.embedding` column is `vector(1536)` and pgvector rejects
-/// a mismatched dimension at insert time -- a real Postgres error, not just
-/// a SQL-level formality -- so test vectors must actually be 1536-wide, not
-/// a convenient short stand-in. `hot_index` set to 1.0, everything else
-/// 0.0: cheap to build, and two vectors with different `hot_index`es are
-/// maximally distant (orthogonal) under cosine distance, which is exactly
-/// what the ordering tests below need.
+/// The real `facts.embedding` column is `vector(1536)` and pgvector rejects a
+/// mismatched dimension at insert time -- a real Postgres error.
 const embedding_dimensions = @import("../llm/embeddings.zig").embedding_dimensions;
 
 fn testVector(hot_index: usize) [embedding_dimensions]f32 {
@@ -434,9 +362,8 @@ test "search orders by cosine similarity to the query vector, scoped to one iden
         .last_seen = 1000,
     });
 
-    // Not a unit vector (magnitude sqrt(2)) -- cosine distance is
-    // scale-invariant, so this is still closer to hot_index=0 than
-    // hot_index=2 is, which is all the ordering assertion below needs.
+    // Not a unit vector (magnitude sqrt(2)) -- cosine distance is scale-
+    // invariant, so this is still closer to hot_index=0 than hot_index=2 is.
     var close_vec = testVector(0);
     close_vec[5] = 0.9;
 
@@ -557,11 +484,7 @@ test "rankedStable/rankedTentative split by status and rank by hybrid score" {
 }
 
 test "remember works with no embedding at all, and the fact stays listable and rankable" {
-    // The regression this guards: memory used to require an embeddings
-    // endpoint. `remember` took a non-optional vector, the column was NOT
-    // NULL, and `main.zig` only wired the tool up when a client existed --
-    // so with no WARDEN_EMBEDDINGS_URL nothing could ever be stored, and
-    // nothing said so. Storing a fact must not depend on that endpoint.
+    // The regression this guards: memory used to require an embeddings endpoint.
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -597,10 +520,7 @@ test "remember works with no embedding at all, and the fact stays listable and r
 
 test "ranking works with no query vector, and with rows that have no embedding" {
     // Both halves of "the vector is optional": a null query embedding (no
-    // endpoint configured) and rows stored without one. Either makes the
-    // `<=>` term NULL, which before the COALESCE in hybrid_score_expr would
-    // have made the whole score NULL and ordered these rows arbitrarily --
-    // here they must still come back, ranked on the remaining terms.
+    // endpoint configured) and rows stored without one.
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);

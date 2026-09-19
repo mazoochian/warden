@@ -9,19 +9,10 @@ const feed = @import("../store/feed.zig");
 const telegram_user_platform = @import("../platform/telegram/user_connector.zig");
 const log = @import("../log.zig").scoped("curated_feed");
 
-/// How many recent posts are pulled per source per pass. TDLib's
-/// `getChatHistory` has no "since id" form, so this is the ceiling on how
-/// far behind a source can fall and still be caught up in one pass: a
-/// channel posting more than this between two passes loses the overflow.
-/// 50 an hour is a very busy channel; the alternative (paging backwards
-/// until the watermark) would let one runaway source stall an entire pass.
+/// How many recent posts are pulled per source per pass.
 const posts_per_source = 50;
 
 /// Cap on how many posts one pass will *summarise*, across all sources.
-/// The relevance filter is cheap; summarisation is not, and without a
-/// ceiling a single burst of on-topic posts could turn one tick into
-/// dozens of model calls. Overflow is left behind the watermark and picked
-/// up next pass rather than dropped.
 const max_summaries_per_pass = 12;
 
 /// Characters of a post handed to the model. Long enough for a news post,
@@ -50,21 +41,8 @@ pub const Item = struct {
     summary: []const u8,
 };
 
-/// Runs one pass: for each enabled source, pull what's new, keep what
-/// matches the policy, summarise it, and post one digest to the target
-/// channel.
-///
-/// Two-stage on purpose. The relevance check is a handful of tokens per
-/// post and discards most of them; only survivors pay for a summarisation
-/// call. Doing both in one call would mean paying full summary cost for
-/// every post in every subscribed channel, which is what makes "read
-/// everything and filter" affordable at all.
-///
-/// A source with no watermark yet (just added) is caught up silently: its
-/// watermark jumps to the newest post without emitting anything, so adding
-/// a channel never dumps its backlog into the feed.
-///
-/// Returns how many items were posted, for logging and `/feed run`.
+/// Runs one pass: for each enabled source, pull what's new, keep what matches
+/// the policy, summarise it, and post one digest to the target channel.
 pub fn runOnce(
     pool: *PgPool,
     allocator: std.mem.Allocator,
@@ -115,9 +93,9 @@ pub fn runOnce(
             continue;
         }
 
-        // Oldest first, so a digest reads in the order things happened and
-        // the per-pass ceiling truncates the *newest* rather than leaving a
-        // gap in the middle.
+        // Oldest first, so a digest reads in the order things happened and the per-
+        // pass ceiling truncates the *newest* rather than leaving a gap in the
+        // middle.
         var fresh: std.ArrayList(telegram_user_platform.TelegramUserConnector.Post) = .empty;
         for (posts) |p| {
             if (p.id > source.last_seen_message_id) try fresh.append(allocator, p);
@@ -134,9 +112,8 @@ pub fn runOnce(
 
             const body = truncate(post.text, max_post_chars);
             const relevant = isRelevant(provider, allocator, io, policy, body, max_retries) catch |err| {
-                // Treat an unreachable model as "don't know", and leave the
-                // watermark behind this post so it's reconsidered next pass
-                // rather than silently skipped.
+                // Treat an unreachable model as "don't know", and leave the watermark behind
+                // this post so it's reconsidered next pass rather than silently skipped.
                 log.warn("relevance check failed for a post in {s}: {t}", .{ source.title, err });
                 break;
             };
@@ -170,10 +147,7 @@ pub fn runOnce(
     return items.items.len;
 }
 
-/// Stage one: does this post match the policy at all? Deliberately a tiny
-/// prompt with a one-word answer — this runs on every new post in every
-/// source, so its cost is what decides whether the whole feature is
-/// affordable.
+/// Stage one: does this post match the policy at all?
 fn isRelevant(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -205,9 +179,7 @@ fn summarise(
 }
 
 /// Groups items under their source, so a digest reads as a short briefing
-/// rather than a flat list where every line has to repeat where it came
-/// from. Items arrive already grouped by source (the caller walks sources
-/// in order), so this only needs to notice when the source changes.
+/// rather than a flat list where every line has to repeat where it came from.
 pub fn renderDigest(allocator: std.mem.Allocator, items: []const Item) ![]const u8 {
     var out: Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -222,12 +194,8 @@ pub fn renderDigest(allocator: std.mem.Allocator, items: []const Item) ![]const 
         }
         try w.print("  • {s}\n", .{item.summary});
     }
-    // `toOwnedSlice`, not `written()`: `written()` is a borrowed view of
-    // just the filled part of the writer's buffer, so the caller ends up
-    // freeing a 146-byte slice of a 180-byte allocation -- a size mismatch
-    // the DebugAllocator rejects outright. The `errdefer out.deinit()`
-    // above already says this function hands ownership to the caller on
-    // success, so it has to actually transfer it.
+    // `toOwnedSlice`, not `written()`: `written()` is a borrowed view of just the
+    // filled part of the writer's buffer.
     return out.toOwnedSlice();
 }
 

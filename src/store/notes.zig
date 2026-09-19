@@ -1,12 +1,7 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// One note/list entry — chat-scoped and visible to the whole chat (same
-/// "shared within the chat, only the creator or owner may delete" model
-/// `reminders.zig`/`alerts.zig` already use), covering notes, shopping
-/// lists, wishlists, packing lists, etc. as one flat freeform primitive
-/// rather than several typed structures — see the `0024_notes.sql`
-/// migration comment.
+/// One note/list entry — chat-scoped and visible to the whole chat.
 pub const Note = struct {
     id: i64,
     chat_id: i64,
@@ -79,11 +74,7 @@ pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Note {
     };
 }
 
-/// One row for the web API's `GET /api/v1/notes` -- identity-scoped (not
-/// chat-scoped like `Note`/`listForChat` above, which back the bot's own
-/// in-chat `/notes`), so each row carries its own chat context for a "my
-/// notes across every chat" view, same shape as
-/// `reminders.PendingReminderForIdentity`/`feed_watches.FeedWatchRowForIdentity`.
+/// One row for the web API's `GET /api/v1/notes` -- identity-scoped.
 pub const NoteForIdentity = struct {
     id: i64,
     chat_id: i64,
@@ -92,14 +83,7 @@ pub const NoteForIdentity = struct {
     created_at: i64,
 };
 
-/// Notes added by any of `identity_ids` (one person's identities across
-/// platforms -- the web UI's "my notes" view, where the owner's Telegram
-/// and Matrix identities are the same person), optionally narrowed to one
-/// chat -- see
-/// `NoteForIdentity`'s doc comment for why this is a separate query from
-/// `listForChat` rather than a filter on top of it. Oldest first, same
-/// ordering (and same "reads naturally in the order items were added")
-/// `listForChat` already uses.
+/// Notes added by any of `identity_ids`.
 pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]NoteForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);

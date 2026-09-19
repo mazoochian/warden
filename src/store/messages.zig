@@ -3,13 +3,7 @@ const Db = @import("db.zig").Db;
 const Stmt = @import("db.zig").Stmt;
 const PgPool = @import("pool.zig").PgPool;
 
-/// Whether `chat_id` has ever had a single message recorded — cheap
-/// existence check (no row data pulled back) for callers that just need to
-/// know whether there's any history yet, e.g. `set_chat_monitoring`
-/// warning the owner that a freshly-subscribed chat has nothing for
-/// `get_bulletin` to show until new messages actually arrive. Fails closed
-/// to `false` on a lookup error, same as this file's other boolean-return
-/// helpers.
+/// Whether `chat_id` has ever had a single message recorded.
 pub fn hasAny(pool: *PgPool, chat_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);
@@ -21,15 +15,12 @@ pub fn hasAny(pool: *PgPool, chat_id: i64) bool {
 }
 
 /// Inserts one message row, scoped to `chat_id`/`identity_id` (the internal
-/// FK ids from `chats.upsertChat`/`identities.upsertIdentity`) — replaces
-/// the old per-chat-file `messages` table's implicit-by-filename scoping.
+/// FK ids from `chats.upsertChat`/`identities.upsertIdentity`).
 pub fn insert(pool: *PgPool, chat_id: i64, identity_id: i64, native_message_id: ?[]const u8, text: ?[]const u8, ts: i64) !void {
     return insertWithTrace(pool, chat_id, identity_id, native_message_id, text, ts, null);
 }
 
-/// `insert` for the bot's own replies, with the tool calls that produced
-/// it -- see `0052_messages_tool_trace.sql` and `formatLine` for how the
-/// trace comes back out.
+/// `insert` for the bot's own replies, with the tool calls that produced it.
 pub fn insertWithTrace(pool: *PgPool, chat_id: i64, identity_id: i64, native_message_id: ?[]const u8, text: ?[]const u8, ts: i64, tool_trace: ?[]const u8) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -67,15 +58,7 @@ pub fn pruneKeepLast(pool: *PgPool, chat_id: i64, keep: i64) !void {
 }
 
 /// Deletes every message in `chat_id` older than `cutoff_ts` (unix seconds),
-/// regardless of `text`/`is_summary` — `storage_sense.zig`'s age-based
-/// counterpart to `pruneKeepLast`'s count-based one, backing both the
-/// watermark ladder's automatic pruning and `/storage cleanup messages
-/// --before`. A summary row aging past `cutoff_ts` is deleted the same as
-/// any other row rather than special-cased: it's already a compaction of
-/// older history, so once it's old enough itself there's nothing left worth
-/// preserving. Returns the number of rows actually deleted (via `RETURNING
-/// id`, same counting idiom `recentDeletable`'s callers use elsewhere) so
-/// callers can report a real number rather than a bare "done".
+/// regardless of `text`/`is_summary`.
 pub fn deleteOlderThan(pool: *PgPool, chat_id: i64, cutoff_ts: i64) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -98,20 +81,15 @@ pub const SummaryBatch = struct {
     text: []const u8,
     min_id: i64,
     max_id: i64,
-    /// The batch's newest message's own `ts` — `resampleOldMessages` stamps
-    /// the synthetic summary row with this instead of "now", so it sorts
-    /// into place among later real messages rather than jumping to the
-    /// front of history.
+    /// The batch's newest message's own `ts` — `resampleOldMessages` stamps the
+    /// synthetic summary row with this instead of "now".
     newest_ts: i64,
     count: usize,
 };
 
 /// The oldest `batch_size` non-summary, texted messages in `chat_id` —
 /// `storage_sense.zig`'s `resampleOldMessages` compacts these into one LLM
-/// summary. `null` if the chat has nothing left to compact. Bounded to
-/// `[min_id, max_id]` rather than a time cutoff so the caller can delete
-/// exactly this range afterward without racing a message that arrives
-/// mid-summarization (see `replaceRangeWithSummary`).
+/// summary.
 pub fn oldestBatchForSummary(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, batch_size: i64) !?SummaryBatch {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -150,15 +128,7 @@ pub fn oldestBatchForSummary(pool: *PgPool, allocator: std.mem.Allocator, chat_i
 }
 
 /// Atomically replaces `[min_id, max_id]` in `chat_id` with a single
-/// `is_summary = true` row carrying `summary_text` — the id range comes
-/// from `oldestBatchForSummary`, so this only ever removes exactly the rows
-/// that were actually summarized, not "everything older than now" (which
-/// would drop a message that arrived while the LLM call was in flight).
-/// `db.zig`/`pool.zig` have no shared transaction helper yet (checked before
-/// writing this) — `BEGIN`/`COMMIT`/`ROLLBACK` run as plain statements
-/// through the same `Db.exec` every other multi-statement call here already
-/// uses, on the one connection held for the duration rather than two
-/// separate pool acquisitions.
+/// `is_summary = true` row carrying `summary_text`.
 pub fn replaceRangeWithSummary(pool: *PgPool, chat_id: i64, identity_id: i64, min_id: i64, max_id: i64, summary_text: []const u8, ts: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -175,15 +145,8 @@ pub fn replaceRangeWithSummary(pool: *PgPool, chat_id: i64, identity_id: i64, mi
     _ = try del.step();
     del.finalize();
 
-    // Reuses `min_id` (just freed by the delete above) as the summary row's
-    // own id instead of letting `BIGSERIAL` hand it a fresh one.
-    // `recentFormatted`/`recentSinceFormatted`/`pruneKeepLast` all order by
-    // `id` as a stand-in for chronological order, which holds for real
-    // messages (always inserted in arrival order) but would break here: a
-    // freshly-sequenced id is larger than every id already in the table, so
-    // a summary of the *oldest* messages would sort as the *newest* one.
-    // Claiming the just-freed `min_id` keeps it sorted exactly where the
-    // oldest message in the batch used to sit.
+    // Reuses `min_id` (just freed by the delete above) as the summary row's own
+    // id instead of letting `BIGSERIAL` hand it a fresh one.
     var ins = try db.prepare(
         \\INSERT INTO messages (id, chat_id, identity_id, native_message_id, text, ts, is_summary)
         \\VALUES ($1, $2, $3, NULL, $4, to_timestamp($5), true);
@@ -199,19 +162,7 @@ pub fn replaceRangeWithSummary(pool: *PgPool, chat_id: i64, identity_id: i64, mi
     try db.exec("COMMIT;");
 }
 
-/// Renders one "who: text"/"summary: text" line — shared by `recentFormatted`
-/// and `recentSinceFormatted` so the two don't drift on how a
-/// `storage_sense.zig`-written summary row (see `0044_storage_sense.sql`'s
-/// `is_summary` column) is told apart from a real message. A summary isn't
-/// attributed to whichever identity its row happens to carry (see
-/// `storage_sense.zig`'s `resampleOldMessages` doc comment on why that's a
-/// synthetic system identity, not a real chat participant) — the LLM/
-/// `/summary` reader only needs to know this line is compacted history, not
-/// who "sent" it.
-/// `tool_trace` (the bot's own replies only, see `insertWithTrace`) is
-/// rendered as a "[used: ...]" tag ahead of the text, so the model can
-/// see what it actually did on that turn -- the system prompt tells it
-/// what the tag means.
+/// Renders one "who: text"/"summary: text" line.
 fn formatLine(allocator: std.mem.Allocator, who: []const u8, text: []const u8, is_summary: bool, tool_trace: ?[]const u8) ![]const u8 {
     if (is_summary) return std.fmt.allocPrint(allocator, "summary: {s}", .{text});
     if (tool_trace) |trace| {
@@ -221,12 +172,7 @@ fn formatLine(allocator: std.mem.Allocator, who: []const u8, text: []const u8, i
 }
 
 /// Renders the most recent `limit` messages in `chat_id` (oldest first) as
-/// "who: text" lines, for grounding free-form LLM questions/digests in this
-/// chat's actual local history. Prefers the sender's platform username
-/// (matches the old behavior) falling back to their display name, then
-/// "unknown" — same fallback chain the old SQLite version used, just
-/// resolved through `identities` instead of a denormalized `username`
-/// column on `messages` itself.
+/// "who.
 pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, limit: i64) ![]const u8 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -250,15 +196,7 @@ pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
 }
 
 /// Same "who: text" formatting as `recentFormatted`, but windowed by wall-
-/// clock time (`since_ts`, unix seconds) rather than a flat row count —
-/// backs the `catch_me_up` LLM tool (ROADMAP.md's Phase 14), which needs
-/// "everything since N hours ago" rather than "the last N messages" so a
-/// quiet chat's catch-up isn't padded with days-old context and a noisy
-/// one isn't truncated mid-conversation. Still capped by `limit` as a hard
-/// ceiling (a very chatty chat over a long window could otherwise return
-/// an unbounded amount of text) — same belt-and-suspenders shape
-/// `recentDeletable`'s `scan_limit`/`match_limit` pair already uses for a
-/// different combination of bounds.
+/// clock time (`since_ts`, unix seconds) rather than a flat row count.
 pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, since_ts: i64, limit: i64) ![]const u8 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -290,11 +228,7 @@ pub const HistoryRow = struct {
 };
 
 /// Same rows `recentFormatted` joins into "who: text" lines, but returned
-/// unformatted with `native_message_id` included -- for callers (the
-/// personal-account chat-summary tool, the bulletin feature) that need to
-/// let the model cite a specific message id back, which a pre-joined string
-/// can't carry. `recentFormatted`/`recentSinceFormatted` stay as they are
-/// for callers (`digest.zig`) that only ever want prose-ready text.
+/// unformatted with `native_message_id` included -- for callers.
 pub fn recentRows(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, limit: i64) ![]HistoryRow {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -322,8 +256,7 @@ pub fn recentRows(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, lim
     return rows.toOwnedSlice(allocator);
 }
 
-/// Same time-windowed shape as `recentSinceFormatted`, unformatted -- see
-/// `recentRows`'s doc comment for why.
+/// Same time-windowed shape as `recentSinceFormatted`, unformatted.
 pub fn recentSinceRows(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, since_ts: i64, limit: i64) ![]HistoryRow {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -359,10 +292,7 @@ pub const MessageRef = struct {
 };
 
 /// Escapes `%`, `_`, and `\` for safe embedding in a `LIKE ... ESCAPE '\'`
-/// pattern — same approach as `chat_members.zig`'s private `likePattern`,
-/// duplicated here rather than shared cross-module (small, self-contained,
-/// matches this codebase's existing preference for module-local helpers
-/// over a shared utils file — see e.g. `http_util.zig`'s own `redactUrl`).
+/// pattern.
 fn escapeLikeLiteral(allocator: std.mem.Allocator, substring: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     try buf.append(allocator, '%');
@@ -422,14 +352,7 @@ pub fn recentDeletableByIdentity(pool: *PgPool, allocator: std.mem.Allocator, ch
 }
 
 /// Literal (non-regex) case-insensitive substring search among deletable
-/// messages, newest first — backs `/redact text <substring>`. Bounded by
-/// BOTH `match_limit` (how many matches to return) and `scan_limit` (how
-/// far back into history to look), using the same id-offset-subquery idiom
-/// `pruneKeepLast` uses to bound its own window — `COALESCE(..., 0)` makes
-/// "fewer than `scan_limit` messages exist" mean "scan everything" rather
-/// than `pruneKeepLast`'s opposite convention of no-op-ing in that case (the
-/// two functions want opposite fallback behavior from the same NULL-when-
-/// insufficient-rows subquery result, so this isn't reusable as one helper).
+/// messages, newest first — backs `/redact text <substring>`.
 pub fn searchDeletable(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, substring: []const u8, match_limit: i64, scan_limit: i64) ![]MessageRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -452,10 +375,7 @@ pub fn searchDeletable(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
 }
 
 /// Up to `scan_limit` most recent deletable+texted messages, newest first —
-/// for `/redact regex <pattern>`, which must filter client-side
-/// (`text/safe_regex.zig`'s matcher; Postgres can't run it). Callers stop
-/// consuming once they've collected enough matches or exhausted this slice,
-/// whichever comes first.
+/// for `/redact regex <pattern>`.
 pub fn recentForScan(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, scan_limit: i64) ![]MessageRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -714,9 +634,7 @@ test "searchDeletable's scan window still finds everything when fewer messages e
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Only 1 message exists, well under a 2000 scan_limit — the COALESCE
-    // fallback must still find it rather than the lower-bound subquery
-    // returning NULL and matching nothing.
+    // Only 1 message exists, well under a 2000 scan_limit.
     const matches = try searchDeletable(&pool, a, chat1, "spam", 100, 2000);
     try testing.expectEqual(@as(usize, 1), matches.len);
 }

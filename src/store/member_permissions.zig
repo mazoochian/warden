@@ -5,18 +5,7 @@ const iface = @import("../platform/interface.zig");
 const Platform = iface.Platform;
 const MemberPermission = iface.MemberPermission;
 
-/// The granular per-member permission model (`/permission`, ROADMAP.md's
-/// Phase 24) — `(chat_id, identity_id) -> permission_bits` (a
-/// `MemberPermission` bitmask), with an optional `expires_at` for a timed
-/// grant/revoke (`/permission <duration> +/-<letters> @user`) that reverts
-/// to the full/default bitmask once it lapses (see `revertExpired` below,
-/// polled the same way `main.zig`'s `checkAndSendDueReminders` is).
-///
-/// A member with no row here has the implicit default bitmask
-/// (`MemberPermission.all`, i.e. unrestricted) — same "absent row means the
-/// default" convention `feature_flags.isEnabled`/`chat_settings.
-/// getDigestEnabled` already use, rather than a migration needing to seed a
-/// row per existing member.
+/// The granular per-member permission model behind `/permission`.
 pub fn getBits(pool: *PgPool, chat_id: i64, identity_id: i64) u32 {
     const db = pool.acquire() catch return MemberPermission.all;
     defer pool.release(db);
@@ -30,16 +19,15 @@ pub fn getBits(pool: *PgPool, chat_id: i64, identity_id: i64) u32 {
     return @intCast(stmt.columnInt64(0));
 }
 
-/// `expires_at` null means permanent (until the next explicit
-/// `/permission` change); set means this row auto-reverts to
-/// `MemberPermission.all` once `revertExpired` next runs past it.
+/// `expires_at` null means permanent (until the next explicit `/permission`
+/// change); set means this row auto-reverts to `MemberPermission.all` once
+/// `revertExpired` next runs past it.
 pub fn setBits(pool: *PgPool, chat_id: i64, identity_id: i64, bits: u32, expires_at: ?i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
 
-    // `to_timestamp` is a strict Postgres builtin -- a NULL `$4` (via
-    // `bindNull` below) yields a NULL `expires_at`, no CASE needed, same as
-    // every other nullable-timestamp insert in this codebase.
+    // `to_timestamp` is a strict Postgres builtin -- a NULL `$4` (via `bindNull`
+    // below) yields a NULL `expires_at`, no CASE needed.
     var stmt = try db.prepare(
         \\INSERT INTO member_permissions (chat_id, identity_id, permission_bits, expires_at)
         \\VALUES ($1, $2, $3, to_timestamp($4))
@@ -54,10 +42,8 @@ pub fn setBits(pool: *PgPool, chat_id: i64, identity_id: i64, bits: u32, expires
     _ = try stmt.step();
 }
 
-/// One row `revertExpired`/`listExpired` needs enough of to both clear the
-/// DB state and re-apply the (now-default) bitmask on the live platform —
-/// see `main.zig`'s `checkAndRevertExpiredPermissions`, which mirrors
-/// `checkAndSendDueReminders`'s polling-loop shape.
+/// One row `revertExpired`/`listExpired` needs enough of to both clear the DB
+/// state and re-apply the (now-default) bitmask on the live platform.
 pub const Expired = struct {
     chat_id: i64,
     identity_id: i64,
@@ -66,10 +52,7 @@ pub const Expired = struct {
     native_user_id: []const u8,
 };
 
-/// Every `member_permissions` row whose `expires_at` has passed `now` —
-/// joins through to `chats`/`identities` for the native ids
-/// `checkAndRevertExpiredPermissions` needs to re-apply the default
-/// bitmask through the right connector.
+/// Every `member_permissions` row whose `expires_at` has passed `now`.
 pub fn listExpired(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]Expired {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -97,13 +80,8 @@ pub fn listExpired(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]Exp
     return out.toOwnedSlice(allocator);
 }
 
-/// Reverts one member back to the default (unrestricted) bitmask and
-/// clears `expires_at` — called once per `Expired` entry after
-/// `checkAndRevertExpiredPermissions` has attempted to re-apply the
-/// default bitmask on the live platform (attempted regardless of whether
-/// that live call succeeded, same "don't retry forever on a transient
-/// platform error" reasoning `checkAndSendDueReminders` applies to a
-/// missing connector).
+/// Reverts one member back to the default (unrestricted) bitmask and clears
+/// `expires_at`.
 pub fn revert(pool: *PgPool, chat_id: i64, identity_id: i64) !void {
     return setBits(pool, chat_id, identity_id, MemberPermission.all, null);
 }
@@ -124,8 +102,7 @@ pub const Change = struct {
 };
 
 /// Parses the `+<letters>`/`-<letters>` half of `/permission` (e.g.
-/// `"+rwpvfmodslaeti"`, `"-w"`) — see `iface.MemberPermission.bitForLetter`
-/// for the letter grammar. Duplicate letters are harmless (OR'd together).
+/// `"+rwpvfmodslaeti"`, `"-w"`).
 pub fn parseChange(text: []const u8) ParseError!Change {
     if (text.len == 0) return error.MissingSign;
     const grant = switch (text[0]) {

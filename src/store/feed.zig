@@ -11,10 +11,7 @@ pub const Source = struct {
     enabled: bool,
 };
 
-/// The feed's single-row configuration. `target_native_chat_id` and
-/// `policy` are both required before the feed does anything at all — a feed
-/// with no policy would mean "forward everything", which is the opposite of
-/// the point, and one with no destination has nowhere to post.
+/// The feed's single-row configuration.
 pub const Settings = struct {
     target_native_chat_id: ?[]const u8,
     policy: ?[]const u8,
@@ -22,17 +19,13 @@ pub const Settings = struct {
     enabled: bool,
     last_run_at: i64,
 
-    /// Whether a scheduled pass should actually do anything. Checked in one
-    /// place so the command handlers, the scheduler and the web API can't
-    /// drift on what "configured" means.
+    /// Whether a scheduled pass should actually do anything.
     pub fn isRunnable(self: Settings) bool {
         return self.enabled and self.target_native_chat_id != null and self.policy != null;
     }
 };
 
-/// Adds (or re-enables) a source. Idempotent on `native_chat_id`: adding a
-/// channel already followed refreshes its title and turns it back on
-/// without resetting the watermark, so re-adding never replays a backlog.
+/// Adds (or re-enables) a source.
 pub fn addSource(pool: *PgPool, native_chat_id: []const u8, title: []const u8) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -61,9 +54,7 @@ pub fn removeSource(pool: *PgPool, native_chat_id: []const u8) !bool {
     return stmt.step() catch false;
 }
 
-/// Every source, oldest first. `enabled_only` for the scheduler; the full
-/// list for `/feed list` and the web UI, which should still show a source
-/// that's been paused.
+/// Every source, oldest first.
 pub fn listSources(pool: *PgPool, allocator: std.mem.Allocator, enabled_only: bool) ![]Source {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -90,10 +81,7 @@ pub fn listSources(pool: *PgPool, allocator: std.mem.Allocator, enabled_only: bo
     return out.toOwnedSlice(allocator);
 }
 
-/// Moves a source's watermark forward. Deliberately `GREATEST`, never a
-/// plain assignment: passes can overlap (a slow LLM pass while the next
-/// tick fires) and a stale pass writing its lower id back would replay
-/// posts that were already summarised.
+/// Moves a source's watermark forward.
 pub fn setWatermark(pool: *PgPool, id: i64, last_seen_message_id: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -182,9 +170,7 @@ pub fn setIntervalSeconds(pool: *PgPool, interval_seconds: i64) !void {
     _ = try stmt.step();
 }
 
-/// Stamps a completed pass. Called even when a pass produced no digest —
-/// "we looked and there was nothing" is still a run, and not recording it
-/// would make the scheduler retry every tick.
+/// Stamps a completed pass.
 pub fn markRun(pool: *PgPool, now: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -300,9 +286,7 @@ test "settings default to inert, and stay inert until both target and policy are
         try testing.expectEqual(@as(i64, 3600), s.interval_seconds);
     }
 
-    // Enabled alone is not enough: with no destination and no policy there
-    // is nothing sensible to do, and "post everything somewhere" is exactly
-    // the failure mode to avoid.
+    // Enabled alone is not enough.
     try setEnabled(&pool, true);
     {
         const s = try getSettings(&pool, a);

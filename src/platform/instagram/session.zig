@@ -1,8 +1,8 @@
 //! Thin glue between `auth.zig`'s in-memory `AuthClient` and
-//! `store/instagram_sessions.zig`'s Postgres-persisted session row --
-//! load-on-startup and save-after-login, so a process restart resumes
-//! without re-authenticating (see the connector plan's ban-avoidance
-//! rationale for why that matters here more than for any other connector).
+//! `store/instagram_sessions.zig`'s Postgres-persisted session row -- load-
+//! on-startup and save-after-login, so a process restart resumes without re-
+//! authenticating (see the connector plan's ban-avoidance rationale for why
+//! that matters here more than for any other connector).
 const std = @import("std");
 const PgPool = @import("../../store/pool.zig").PgPool;
 const store = @import("../../store/instagram_sessions.zig");
@@ -10,9 +10,6 @@ const auth = @import("auth.zig");
 const transport = @import("transport.zig");
 
 /// Restores `client` from the persisted session row, if one exists.
-/// Returns `true` if a session was restored (caller should NOT then also
-/// call `login` -- treat `.ready` as already-authenticated), `false` if
-/// there's nothing to restore (first-ever run, or after a logout).
 pub fn restore(pool: *PgPool, allocator: std.mem.Allocator, client: *auth.AuthClient) !bool {
     const loaded = store.loadSession(pool, allocator) orelse return false;
     defer {
@@ -30,11 +27,7 @@ pub fn restore(pool: *PgPool, allocator: std.mem.Allocator, client: *auth.AuthCl
     return true;
 }
 
-/// Loads just the device profile half of a persisted session (if any) --
-/// used at connector startup to decide whether to generate a fresh
-/// `DeviceProfile` (first-ever run) or reuse the one already on file
-/// (every subsequent run), since a real Android app never changes its
-/// device fingerprint between sessions.
+/// Loads just the device profile half of a persisted session (if any).
 pub fn loadDeviceProfile(pool: *PgPool, allocator: std.mem.Allocator) !?transport.DeviceProfile {
     const loaded = store.loadSession(pool, allocator) orelse return null;
     allocator.free(loaded.ig_username);
@@ -52,8 +45,6 @@ pub fn loadDeviceProfile(pool: *PgPool, allocator: std.mem.Allocator) !?transpor
 
 /// Persists `client`'s current session state -- called right after a
 /// successful `login`/`submitChallengeCode`/`submit2faCode` reaches `.ready`.
-/// No-op (returns an error the caller should just log) if `client` isn't
-/// actually `.ready` -- there's nothing meaningful to save otherwise.
 pub fn save(pool: *PgPool, client: *const auth.AuthClient, profile: transport.DeviceProfile) !void {
     if (client.state != .ready) return error.NotLoggedIn;
     const user_id = client.self_user_id orelse return error.NotLoggedIn;

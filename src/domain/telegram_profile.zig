@@ -2,16 +2,10 @@ const std = @import("std");
 const Identity = @import("identity.zig").Identity;
 
 /// Telegram-specific extension of `Identity` — fields the Bot API's `User`
-/// object carries that no other platform has an equivalent of. Embeds
-/// `identity` as its first field rather than inheriting from it (see
-/// `identity.zig`'s doc comment).
+/// object carries that no other platform has an equivalent of.
 pub const TelegramProfile = struct {
     identity: Identity,
-    /// Telegram's raw `first_name` field — kept distinct from
-    /// `identity.display_name` (which combines first+last into one "best
-    /// display string" for platform-neutral consumers) since the
-    /// `telegram_profiles` table mirrors the Bot API's `User` object shape
-    /// directly.
+    /// Telegram's raw `first_name` field.
     first_name: []const u8 = "",
     last_name: ?[]const u8 = null,
     language_code: ?[]const u8 = null,

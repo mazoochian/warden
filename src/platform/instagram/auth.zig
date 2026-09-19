@@ -1,21 +1,8 @@
 //! Login / challenge / 2FA state machine for Instagram's private mobile-app
 //! API, structurally mirroring `../telegram/user_connector.zig`'s
-//! `AuthState`/`AuthStepOutcome`/`submit*` shape (see that file's doc
-//! comment) but with Instagram's own states: a plain username+password
-//! login can come back `ready` immediately, or demand a challenge code
-//! (SMS/email) or a 2FA code, each its own wait-state until the matching
-//! `submit*` call resolves it.
-//!
-//! The exact endpoint paths and response field names below are this
-//! implementation's best-effort current knowledge of Instagram's private
-//! API (same class of reverse-engineered detail as
-//! `transport.RotatingConstants`), NOT independently verified against live
-//! Instagram servers or a freshly-cloned reference library -- this
-//! development environment has no network access to do that. If a real
-//! `/iglogin start` attempt fails with an unexpected response shape, that's
-//! the first place to look, cross-checked against a current maintained
-//! library's source (e.g. instagrapi's `mixins/auth.py`/`mixins/challenge.py`)
-//! rather than assumed to be a bug in the surrounding state machine.
+//! `AuthState`/`AuthStepOutcome`/`submit*` shape but with Instagram's own
+//! states: a plain username+password login can come back `ready` immediately,
+//! or demand a challenge code (SMS/email).
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
@@ -32,9 +19,6 @@ pub const AuthState = enum {
     ready,
 };
 
-/// Mirrors `telegram_user.zig`'s `AuthStepOutcome` exactly -- see that
-/// type's doc comment for why a wrong code/password needs to report back
-/// distinctly from a timeout instead of just silently not advancing.
 pub const AuthStepOutcome = union(enum) {
     ok,
     rejected: []const u8,
@@ -42,8 +26,7 @@ pub const AuthStepOutcome = union(enum) {
 };
 
 /// Instagram's `accounts/login/` response, most fields optional since which
-/// ones are present depends entirely on which of "logged in outright",
-/// "challenge required", or "2FA required" happened.
+/// ones are present depends entirely on which of "logged in outright".
 const LoginResponseShape = struct {
     logged_in: bool = false,
     user_id: ?[]const u8 = null,
@@ -63,19 +46,13 @@ pub const AuthClient = struct {
     state: AuthState = .logged_out,
     self_user_id: ?[]const u8 = null,
     self_username: ?[]const u8 = null,
-    /// Raw `challenge_api_path` Instagram's login response carried, needed
-    /// to resubmit a challenge code against the right endpoint. Owned,
-    /// duped onto `allocator`.
+    /// Raw `challenge_api_path` Instagram's login response carried, needed to
+    /// resubmit a challenge code against the right endpoint.
     challenge_api_path: ?[]const u8 = null,
     /// `two_factor_identifier` from a 2FA-required login response, needed
     /// to submit the follow-up 2FA code. Owned, duped onto `allocator`.
     two_factor_identifier: ?[]const u8 = null,
-    /// The password submitted this login attempt -- held only in memory,
-    /// only for the duration of a pending challenge/2FA step (Instagram's
-    /// challenge-resolution and 2FA endpoints don't need it again, but some
-    /// challenge sub-flows do ask for a fresh password confirmation).
-    /// Zeroed and cleared the moment login resolves either way (`ready` or
-    /// abandoned) -- never persisted, never logged.
+    /// The password submitted this login attempt.
     pending_password: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, profile: transport.DeviceProfile, constants: transport.RotatingConstants) AuthClient {
@@ -107,10 +84,8 @@ pub const AuthClient = struct {
         }
     }
 
-    /// Restores a previously-persisted session (see `session.zig`) without
-    /// any network round trip -- the connector calls this at startup, then
-    /// treats a subsequent request's auth failure as "session actually
-    /// invalid, needs a real re-login" rather than assuming it up front.
+    /// Restores a previously-persisted session (see `session.zig`) without any
+    /// network round trip.
     pub fn restoreSession(self: *AuthClient, ig_user_id: []const u8, ig_username: []const u8, sessionid: []const u8, csrftoken: []const u8, mid: []const u8) !void {
         self.self_user_id = try self.allocator.dupe(u8, ig_user_id);
         self.self_username = try self.allocator.dupe(u8, ig_username);
@@ -121,11 +96,7 @@ pub const AuthClient = struct {
     }
 
     /// Bootstraps cookies (`mid`/`csrftoken`) via an ordinary unauthenticated
-    /// request, same first step every login flow in this API family starts
-    /// with, then returns the password-encryption key id/public key from
-    /// config (`RotatingConstants.password_encryption_key_id`/
-    /// `_pubkey_der_b64`) -- see that field's doc comment for why this isn't
-    /// sourced from the bootstrap response itself in this environment.
+    /// request.
     fn fetchPasswordPublicKey(self: *AuthClient) !struct { key_id: []const u8, public_key_der_b64: []const u8 } {
         const url = transport.base_url ++ "/si/fetch_headers/?challenge_type=signup&guid=00000000-0000-4000-8000-000000000000";
         const resp = try transport.request(self.io, self.allocator, &self.client, .GET, url, self.profile, self.constants, &self.jar, null);
@@ -137,11 +108,8 @@ pub const AuthClient = struct {
         return .{ .key_id = self.constants.password_encryption_key_id, .public_key_der_b64 = self.constants.password_encryption_pubkey_der_b64 };
     }
 
-    /// `#PWD_INSTAGRAM:4:<unix_ts>:<base64 envelope>` per the connector
-    /// plan's crypto design -- AES-256-GCM-encrypts `password` (AAD = the
-    /// timestamp string), RSA-PKCS1v1.5-encrypts the AES key, packs
-    /// `0x01 | key_id_byte | u16-LE rsa_len | rsa_ciphertext | gcm_tag | iv |
-    /// aes_ciphertext`, base64-encodes the whole envelope.
+    /// `#PWD_INSTAGRAM:4:<unix_ts>:<base64 envelope>` per the connector plan's
+    /// crypto design.
     fn buildEncPassword(self: *AuthClient, password: []const u8, key_id: []const u8, public_key_der_b64: []const u8) ![]const u8 {
         const a = self.allocator;
         const ts = Io.Timestamp.now(self.io, .real).toSeconds();
@@ -183,9 +151,8 @@ pub const AuthClient = struct {
         return std.fmt.allocPrint(a, "#PWD_INSTAGRAM:4:{d}:{s}", .{ ts, b64 });
     }
 
-    /// Parses `accounts/login/`'s (or a challenge/2FA follow-up's) response
-    /// body into `LoginResponseShape`, tolerant of whichever subset of
-    /// fields is actually present.
+    /// Parses `accounts/login/`'s (or a challenge/2FA follow-up's) response body
+    /// into `LoginResponseShape`.
     fn parseLoginResponse(allocator: std.mem.Allocator, body: []const u8) !LoginResponseShape {
         var parsed = json.parseFromSlice(json.Value, allocator, body, .{ .ignore_unknown_fields = true }) catch return .{};
         defer parsed.deinit();
@@ -227,10 +194,6 @@ pub const AuthClient = struct {
     }
 
     /// Starts (or restarts, after a `rejected` outcome) a login attempt.
-    /// `password` is used only to build `enc_password` for this one request
-    /// and is never retained beyond a pending challenge/2FA step (see
-    /// `pending_password`'s doc comment) -- the caller (the `/iglogin`
-    /// command handler) must not log it either.
     pub fn login(self: *AuthClient, username: []const u8, password: []const u8) !AuthStepOutcome {
         const a = self.allocator;
         const pubkey = self.fetchPasswordPublicKey() catch |err| {
@@ -357,8 +320,8 @@ pub const AuthClient = struct {
         return .{ .rejected = parsed.error_message orelse try a.dupe(u8, "2FA code rejected") };
     }
 
-    /// Resets local state -- the caller (`session.zig`) is responsible for
-    /// also clearing the persisted store row (`store/instagram_sessions.zig`'s
+    /// Resets local state -- the caller (`session.zig`) is responsible for also
+    /// clearing the persisted store row (`store/instagram_sessions.zig`'s
     /// `clearSession`) so a restart doesn't resurrect the logged-out session.
     pub fn logOut(self: *AuthClient) void {
         self.jar.deinit();

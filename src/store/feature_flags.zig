@@ -2,19 +2,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
-/// Bot-wide module enable/disable — see
-/// /home/armin/claude/warden-ui/ARCHITECTURE.md §5 for the split between
-/// "standalone command features" (checked directly in `main.zig`'s
-/// dispatch) and "LLM-tool-shaped features" (filtered out of
-/// `tools/registry.zig`'s list instead), and §4/the `0019_feature_flags`
-/// migration's comment for why there are deliberately no seed rows: a
-/// missing row means enabled, checked here rather than via migration-time
-/// data, so a test's `TRUNCATE ... CASCADE` can never permanently erase
-/// "every module starts on."
-///
-/// Fails open (`true`) on any pool/query error — a DB hiccup should never
-/// look like every module got disabled at once; that would be a far
-/// louder failure mode than a stale "enabled" reading for one request.
+/// Bot-wide module enable/disable.
 pub fn isEnabled(pool: *PgPool, module: []const u8) bool {
     const db = pool.acquire() catch return true;
     defer pool.release(db);
@@ -47,23 +35,13 @@ pub const ModuleCategory = enum { standalone, llm_tool };
 
 pub const ModuleInfo = struct {
     /// The exact string passed to `isEnabled`/`setEnabled` — also the
-    /// `feature_flags.module` column value, so this must never be renamed
-    /// without a migration to rewrite any existing rows.
+    /// `feature_flags.module` column value.
     key: []const u8,
     label: []const u8,
     category: ModuleCategory,
 };
 
-/// Every module this build knows how to toggle — the single source of
-/// truth both `main.zig`'s dispatch gates and the LLM tool-list filter
-/// check their own module key against, and what the admin API's module
-/// list endpoint unions against `listExplicit` to render a complete
-/// on/off list (a module never explicitly toggled has no DB row at all,
-/// per `isEnabled`'s doc comment, but must still appear in the UI).
-/// Matches /home/armin/claude/warden-ui/ARCHITECTURE.md §5's enumeration
-/// exactly — standalone commands get an early-return check in `main.zig`,
-/// LLM-tool-shaped features get filtered out of the tool list handed to
-/// the model instead.
+/// Every module this build knows how to toggle.
 pub const known_modules = [_]ModuleInfo{
     .{ .key = "reminders", .label = "Reminders", .category = .standalone },
     .{ .key = "alerts", .label = "Alerts", .category = .standalone },
@@ -85,19 +63,10 @@ pub const known_modules = [_]ModuleInfo{
     .{ .key = "power_tools", .label = "Power-User Tools", .category = .standalone },
     .{ .key = "video_download", .label = "Video Auto-Download", .category = .standalone },
     // Gates only the periodic disk check + owner alerting (storage_sense.zig's
-    // `tick`) -- the manual `/storage` command surface always works
-    // regardless, so the owner can debug even with monitoring off. Fails
-    // open like every other module here, unlike the separate
-    // WARDEN_STORAGE_SENSE_AUTOPILOT_ENABLED dynamic_config switch (which
-    // gates the ladder's destructive actions/sleep mode and must default
-    // off -- see storage_sense.zig's doc comment for why that one isn't a
-    // feature flag).
+    // `tick`) -- the manual `/storage` command surface always works regardless.
     .{ .key = "storage_sense_monitor", .label = "Storage Sense (monitoring + alerts)", .category = .standalone },
-    // The curated feed reads channels through the personal account and
-    // spends model calls filtering them, so it is worth being able to stop
-    // it from the modules page without unsetting its target or policy. It
-    // is inert until a target *and* a policy are set regardless (see
-    // store/feed.zig's Settings.isRunnable), so failing open here is safe.
+    // The curated feed reads channels through the personal account and spends
+    // model calls filtering them.
     .{ .key = "curated_feed", .label = "Curated feed (channel reader)", .category = .standalone },
     .{ .key = "weather", .label = "Weather", .category = .llm_tool },
     .{ .key = "crypto_price", .label = "Crypto Prices", .category = .llm_tool },
@@ -122,11 +91,7 @@ pub const Flag = struct {
     enabled: bool,
 };
 
-/// Every module that has ever had an explicit row written — a module
-/// never touched from the panel simply won't appear here (it's enabled by
-/// default, per `isEnabled`'s doc comment), so the caller building the
-/// modules page must union this against its own comptime list of known
-/// module names to render a complete on/off list.
+/// Every module that has ever had an explicit row written.
 pub fn listExplicit(pool: *PgPool, allocator: std.mem.Allocator) ![]Flag {
     const db = try pool.acquire();
     defer pool.release(db);

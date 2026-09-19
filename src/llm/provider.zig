@@ -7,9 +7,7 @@ pub const ToolUse = struct {
     /// Provider-issued id; must be echoed back in the matching `ToolResult`.
     id: []const u8,
     name: []const u8,
-    /// Arguments the model wants to call the tool with. Borrows from
-    /// whatever arena backs the response that produced it — see the note
-    /// on `ChatResponse`.
+    /// Arguments the model wants to call the tool with.
     input: json.Value,
 };
 
@@ -20,50 +18,25 @@ pub const ToolResult = struct {
 };
 
 /// A base64-encoded image, attached alongside a `.text` block in the same
-/// message's `content` — see `llm/attachment_content.zig`'s
-/// `imageBlockForAttachment` for the only place these currently get built,
-/// and `toolcall.zig`'s `run` for the only place one gets attached to a
-/// message. `media_type` is a real MIME type (`"image/jpeg"`, ...), never
-/// guessed at the provider-adapter layer.
+/// message's `content`.
 pub const ImageBlock = struct {
     media_type: []const u8,
     base64_data: []const u8,
 };
 
 /// A base64-encoded document (currently only PDF), attached alongside a
-/// `.text` block the same way `ImageBlock` is — see
-/// `llm/attachment_content.zig`'s `documentBlockForAttachment`.
-///
-/// Structurally identical to `ImageBlock` but deliberately a separate
-/// variant rather than a reused one: the two serialize to *different* wire
-/// shapes (Anthropic's `{"type":"document",...}` vs `{"type":"image",...}`),
-/// and only one of them has an equivalent on the generic
-/// OpenAI-compatible surface — see `llm/openai_compat.zig`'s
-/// `writeMessages` for how a document degrades there. Collapsing them into
-/// one variant with a media-type check would push that provider-specific
-/// divergence into every switch arm instead of letting the compiler force
-/// each adapter to handle the two cases explicitly.
+/// `.text` block the same way `ImageBlock` is.
 pub const DocumentBlock = struct {
     media_type: []const u8,
     base64_data: []const u8,
 };
 
-/// Which wire field a backend used to carry a reasoning model's
-/// chain-of-thought -- `reasoning_content` (DeepSeek, MiniMax, vLLM's
-/// reasoning parser) or `reasoning` (OpenRouter and gateways modelled on
-/// it). Remembered so the same field is used when the thought is sent
-/// back, never a guessed one: a backend that never emitted either would
-/// reject an unknown message key outright.
+/// Which wire field a backend used to carry a reasoning model's chain-of-
+/// thought.
 pub const ReasoningField = enum { reasoning_content, reasoning };
 
 /// A reasoning model's chain-of-thought for one assistant turn, kept in the
-/// conversation so it can be handed back on the next turn. Interleaved-
-/// thinking models (MiniMax M-series among them) require their earlier
-/// reasoning to be present alongside their tool calls: without it the
-/// follow-up turn after a tool result routinely comes back with no visible
-/// text at all -- the model has, from its point of view, already "said"
-/// everything in a thought it can no longer see. Never rendered by
-/// `textOf`; `toolcall.zig` decides whether the user gets to see it.
+/// conversation so it can be handed back on the next turn.
 pub const ThinkingBlock = struct {
     text: []const u8,
     field: ReasoningField,
@@ -92,40 +65,16 @@ pub const Tool = struct {
 };
 
 /// `max_tokens`: the response was cut off by the request's token budget
-/// (Anthropic `max_tokens`, OpenAI-style `length`) -- worth telling apart
-/// from `other`, since a truncated turn with no visible text is the classic
-/// "the model spent the whole budget thinking" failure.
+/// (Anthropic `max_tokens`, OpenAI-style `length`).
 pub const StopReason = enum { end_turn, tool_use, max_tokens, other };
 
-/// Wraps a span of answer text that represents a reasoning model's
-/// chain-of-thought (see `llm/openai_compat.zig`'s use in place of the old
-/// bare "💭 " prefix) — platform-neutral on purpose: what a *renderer* does
-/// with a wrapped span (Telegram: an expandable blockquote, see
-/// `platform/telegram/markdown_html.zig`; a platform with no special
-/// treatment yet: nothing, or strip the markers and show it plain) is that
-/// renderer's own decision, not something an LLM provider adapter should know
-/// about. Control bytes, never legitimately present in real model output, so
-/// they can't collide with anything the model writes and need no escaping.
+/// Wraps a span of answer text that represents a reasoning model's chain-of-
+/// thought.
 pub const thinking_start = "\x02";
 pub const thinking_end = "\x03";
 
 /// Fallback rendering of thinking spans for any surface that can't do
-/// something richer with them — the marker bytes are control characters, so
-/// text carrying them must never reach a user as-is.
-///
-/// Telegram's HTML path turns a span into an expandable blockquote
-/// (`platform/telegram/markdown_html.zig`); this is what everything else gets:
-/// Matrix and XMPP, which have no equivalent, and — the case that actually
-/// broke — Telegram's *own* plain-text fallback, taken whenever the API
-/// rejects the HTML attempt. That fallback sent the raw marker bytes
-/// through, so the chain-of-thought arrived as ordinary unquoted prose with
-/// the 💭 gone and no way to collapse it, looking exactly like the feature
-/// had been removed.
-///
-/// Keeps the 💭 so a thought is still visibly a thought, and puts it on its
-/// own paragraph so it reads as set apart rather than running into the
-/// answer. An unterminated span (a truncated or still-streaming response)
-/// is handled the same as a terminated one rather than being dropped.
+/// something richer with them — the marker bytes are control characters.
 pub fn renderThinkingPlain(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, text, thinking_start) == null and
         std.mem.indexOf(u8, text, thinking_end) == null) return text;
@@ -141,10 +90,7 @@ pub fn renderThinkingPlain(allocator: std.mem.Allocator, text: []const u8) ![]co
         }
         if (std.mem.startsWith(u8, text[i..], thinking_end)) {
             i += thinking_end.len;
-            // Only separate the thought from what follows if anything
-            // actually does. Appending unconditionally and trimming after
-            // would mean returning a shortened sub-slice of an owned
-            // allocation, which the caller could no longer free correctly.
+            // Only separate the thought from what follows if anything actually does.
             if (i < text.len) try out.appendSlice(allocator, "\n\n");
             continue;
         }
@@ -183,35 +129,20 @@ pub const ChatRequest = struct {
     messages: []const ChatMessage,
     tools: []const Tool = &.{},
     max_tokens: u32 = 1024,
-    /// Whether a reasoning model's chain-of-thought is passed through to
-    /// the caller. Per-request (not per-provider) since it's now a
-    /// per-chat-overridable setting (see `chat_settings.getShowThinkingOverride`)
-    /// and providers are long-lived singletons shared across every chat —
-    /// only `llm/openai_compat.zig` currently interprets this (filtering
-    /// `reasoning_content`/`reasoning` fields and inline `<think>` tags, see
-    /// its `stripThinkingBlock`); Anthropic ignores it, same as it already
-    /// ignores fields it has no equivalent concept for.
+    /// Whether a reasoning model's chain-of-thought is passed through to the
+    /// caller.
     show_thinking: bool = false,
 };
 
 /// `content` (specifically any `ToolUse.input`) borrows from an internal
-/// arena the adapter deliberately never frees — callers are expected to run
-/// requests against an arena allocator themselves (as `main.zig`'s poll
-/// loop does per cycle) so this rides along and gets reclaimed for free.
-/// Don't call this with `std.testing.allocator` directly without wrapping
-/// it in your own arena first.
+/// arena the adapter deliberately never frees.
 pub const ChatResponse = struct {
     content: []const ContentBlock,
     stop_reason: StopReason,
 };
 
 /// Reports progressively-generated answer text during a `Provider.chatStream`
-/// call. `text_so_far` is the *cumulative* visible text at each report (not
-/// a delta), so callers (see `toolcall.Progress`) can display it as-is
-/// without concatenating anything themselves. Same ptr+fn shape as
-/// `toolcall.Progress`, deliberately defined here rather than there: this
-/// module must not depend on `toolcall.zig` (the dependency runs the other
-/// way), but a provider adapter needs a sink type to report through.
+/// call.
 pub const StreamSink = struct {
     ptr: *anyopaque = undefined,
     onText: ?*const fn (ptr: *anyopaque, text_so_far: []const u8) void = null,
@@ -228,16 +159,7 @@ pub const Provider = struct {
 
     pub const VTable = struct {
         chat: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest) anyerror!ChatResponse,
-        /// Optional streaming variant: reports growing cumulative text via
-        /// `sink` as it arrives, but still returns the same full
-        /// `ChatResponse` at the end (tool_use blocks are assembled whole,
-        /// same as `chat` — only visible text streams). A provider that
-        /// doesn't implement this leaves the slot null; `chatStream`'s
-        /// wrapper below falls back to one blocking `chat()` call plus a
-        /// single final `sink.report()`, so every caller can call
-        /// `chatStream` unconditionally regardless of provider support —
-        /// same "optional slot, dumb fallback" convention as
-        /// `platform.Connector.sendPhoto`.
+        /// Optional streaming variant.
         chatStream: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest, sink: StreamSink) anyerror!ChatResponse = null,
     };
 
@@ -256,10 +178,7 @@ pub const Provider = struct {
 };
 
 /// Concatenates all `text` blocks; every other block type contributes
-/// nothing (a response that's pure tool calls has no visible text yet, a
-/// `thinking` block is the model's own scratch work, and a provider never
-/// sends an image or document block back in a response — those are
-/// request-only, built by `llm/attachment_content.zig`).
+/// nothing.
 pub fn textOf(allocator: std.mem.Allocator, content: []const ContentBlock) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -272,10 +191,8 @@ pub fn textOf(allocator: std.mem.Allocator, content: []const ContentBlock) ![]co
     return buf.toOwnedSlice(allocator);
 }
 
-/// Like `textOf`, but with every `thinking` block rendered ahead of the
-/// text as a `thinking_start`/`thinking_end` span (the same shape inline
-/// `<think>` tags are rewrapped into), for callers showing the model's
-/// reasoning to the user -- see `ChatRequest.show_thinking`.
+/// Like `textOf`, but with every `thinking` block rendered ahead of the text
+/// as a `thinking_start`/`thinking_end` span.
 pub fn textWithThinkingOf(allocator: std.mem.Allocator, content: []const ContentBlock) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);

@@ -4,19 +4,7 @@ const PgPool = @import("pool.zig").PgPool;
 const Platform = @import("../platform/interface.zig").Platform;
 
 /// Upserts a chat row (keyed by platform + native chat id) and returns its
-/// internal `chats.id` — the FK `messages`/`chat_members`/`chat_settings`
-/// key on, replacing the old "one SQLite file per chat" partitioning.
-///
-/// `chat_type`/`title` are `null` whenever the caller doesn't have fresh
-/// metadata handy (e.g. resolving a chat by id alone for a scheduled
-/// digest) — `COALESCE` keeps whatever was already stored in that case
-/// rather than clobbering it with NULL.
-///
-/// Always clears `left_at` on conflict — this is called for every real
-/// incoming message (see `main.zig`'s `processMessageTask`), so a chat the
-/// bot was previously marked as having left (see `markLeft`) automatically
-/// un-marks itself the moment the bot is re-added and a message arrives,
-/// with no separate "rejoin" code path needed.
+/// internal `chats.id`.
 pub fn upsertChat(pool: *PgPool, platform: Platform, native_chat_id: []const u8, chat_type: ?[]const u8, title: ?[]const u8) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -42,17 +30,11 @@ pub fn upsertChat(pool: *PgPool, platform: Platform, native_chat_id: []const u8,
 pub const ChatRef = struct {
     id: i64,
     native_chat_id: []const u8,
-    /// Which connector this chat belongs to — needed so a scheduled feature
-    /// (digests, reminders) can find the right connector to deliver through
-    /// once more than one platform is active, instead of assuming whichever
-    /// connector happens to be polling matches every chat_id it sees.
+    /// Which connector this chat belongs to.
     platform: Platform,
 };
 
-/// Single-chat lookup by internal id — `null` if it doesn't exist. Backs
-/// the warden-ui API's per-chat settings endpoints (Phase 4), which
-/// receive a chat by internal id from the URL and need its platform +
-/// native id to run a live group-admin check via the matching connector.
+/// Single-chat lookup by internal id — `null` if it doesn't exist.
 pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) !?ChatRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -68,20 +50,7 @@ pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) !?Chat
     };
 }
 
-/// Single-chat lookup by the *platform-native* id — the handle a caller
-/// actually has when it's holding something a human or a platform gave it
-/// (a Telegram `-100…` group id, a Matrix room id) rather than a row id it
-/// could only have learned from warden's own database.
-///
-/// Exists because `upsertChat` was previously the only native → internal
-/// resolution in the codebase, and it is a *write*: it creates the row if
-/// it's missing and clears `left_at` if it's set. Calling it to answer
-/// "which chat is this?" would invent chats warden has never seen and
-/// silently resurrect ones it had left, so any read-only caller needs this
-/// instead. Keyed on `(platform, native_chat_id)`, the same unique index
-/// `upsertChat`'s `ON CONFLICT` targets — native ids are only unique within
-/// a platform, so the platform is part of the question, not an optional
-/// filter.
+/// Single-chat lookup by the *platform-native* id.
 pub fn getByNative(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform, native_chat_id: []const u8) !?ChatRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -98,20 +67,15 @@ pub fn getByNative(pool: *PgPool, allocator: std.mem.Allocator, platform: Platfo
     };
 }
 
-/// What `/chatinfo` reports. Deliberately a separate struct from `ChatRef`
-/// rather than more fields on it: `ChatRef` is the *routing* shape (who do
-/// I deliver to, through which connector) and is built in hot paths like
-/// `listAll`, whereas this is the *display* shape and carries the two
-/// human-facing columns nothing routing-related ever needs.
+/// What `/chatinfo` reports.
 pub const ChatInfo = struct {
     id: i64,
     native_chat_id: []const u8,
     platform: Platform,
     chat_type: ?[]const u8,
     title: ?[]const u8,
-    /// Set when the bot has left/been removed and no message has arrived
-    /// since (see `markLeft`/`upsertChat`) — worth surfacing because a chat
-    /// can still be looked up, and bound, in that state.
+    /// Set when the bot has left/been removed and no message has arrived since
+    /// (see `markLeft`/`upsertChat`).
     left: bool,
 };
 
@@ -135,12 +99,8 @@ pub fn getInfoById(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) !?
     };
 }
 
-/// Marks a chat as no longer active — the bot left, was kicked, or the
-/// chat was deleted (see `main.zig`'s `processMessageTask`, which calls
-/// this on a synthetic `chat_left` message from a connector). Doesn't
-/// delete anything itself; see `deleteLeftBefore` for the actual retention
-/// sweep, and `upsertChat`'s doc comment for how this gets auto-cleared on
-/// rejoin.
+/// Marks a chat as no longer active — the bot left, was kicked, or the chat
+/// was deleted.
 pub fn markLeft(pool: *PgPool, chat_id: i64, at: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -152,24 +112,8 @@ pub fn markLeft(pool: *PgPool, chat_id: i64, at: i64) !void {
     _ = try stmt.step();
 }
 
-/// In-place id rename for Telegram's basic-group -> supergroup upgrade
-/// (see `platform/telegram/connector.zig`'s handling of `migrate_to_chat_id`):
-/// Telegram mints a brand-new chat id for the same real-world group, and
-/// without this the old row would go stale while a second row got created
-/// for the new id the moment the next message arrived — the actual cause
-/// of "duplicate" chats, not title changes (which `upsertChat`'s
-/// `ON CONFLICT` already handles correctly). Preserves the internal
-/// `chats.id` (and therefore every FK'd row: messages, reminders, alerts,
-/// settings, ...) under the new native id instead of losing history to a
-/// fresh row.
-///
-/// If a row already exists under `new_native_id` (a rare race: another
-/// worker-pool thread already processed a message addressed to the new id
-/// before this rename ran — `chats`'s poll loop has no per-chat ordering
-/// guarantee across workers), the `UNIQUE (platform, native_chat_id)`
-/// constraint makes this fail; the caller logs and moves on rather than
-/// attempting a full data merge, an accepted edge case for a
-/// once-per-group-ever event.
+/// In-place id rename for Telegram's basic-group -> supergroup upgrade (see
+/// `platform/telegram/connector.zig`'s handling of `migrate_to_chat_id`).
 pub fn renameNativeChatId(pool: *PgPool, chat_id: i64, new_native_id: []const u8) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -182,10 +126,7 @@ pub fn renameNativeChatId(pool: *PgPool, chat_id: i64, new_native_id: []const u8
 }
 
 /// Hard-deletes every chat that's been left for longer than the retention
-/// window — cascades to every FK'd table (`messages`, `chat_members`,
-/// `reminders`, `alerts`, `feed_watches`, `chat_settings`,
-/// `bot_blocked_chats`, all `ON DELETE CASCADE`). Returns the number of chats
-/// purged, purely for logging (see `main.zig`'s `checkAndPurgeLeftChats`).
+/// window.
 pub fn deleteLeftBefore(pool: *PgPool, cutoff: i64) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -199,11 +140,8 @@ pub fn deleteLeftBefore(pool: *PgPool, cutoff: i64) !i64 {
     return count;
 }
 
-/// Hard-deletes a single chat by internal id, immediately (no `left_at`
-/// grace period) — same FK cascade as `deleteLeftBefore`. Used by
-/// `cleanup_left_chats.zig`'s one-off reconciliation pass, for chats
-/// directly confirmed gone via a live platform check rather than caught by
-/// the ongoing `chat_left` event tracking.
+/// Hard-deletes a single chat by internal id, immediately (no `left_at` grace
+/// period) — same FK cascade as `deleteLeftBefore`.
 pub fn deleteById(pool: *PgPool, chat_id: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -214,10 +152,7 @@ pub fn deleteById(pool: *PgPool, chat_id: i64) !void {
     _ = try stmt.step();
 }
 
-/// Lists every known, currently-active (not left) chat — replaces
-/// `ChatStore.listExistingChatIds`'s directory scan (used at startup to
-/// restore digest scheduling; no point reconnecting a digest loop for a
-/// chat the bot isn't in anymore).
+/// Lists every known, currently-active (not left) chat.
 pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]ChatRef {
     const db = try pool.acquire();
     defer pool.release(db);

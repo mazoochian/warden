@@ -1,29 +1,6 @@
 //! Retroactive reconciliation tool: scans every currently-active Telegram
-//! chat in the database and asks Telegram directly whether the bot is
-//! still a member. Unlike the ongoing automatic housekeeping in
-//! `main.zig`/`store/chats.zig` (which only catches a chat departure from
-//! the moment `chat_left` support shipped onward, via each connector's own
-//! live event stream), this is a one-off pass for chats that already went
-//! stale *before* that tracking existed — see `store/migrations/
-//! 0022_chats_left_at.sql`.
-//!
-//! Only checks Telegram chats: the only connector actually live in
-//! production today. A Matrix/XMPP chat (if any exist) is left untouched,
-//! since there's no equivalent live "am I still in this room" check wired
-//! up for those yet.
-//!
-//! Defaults to a dry run (lists what it WOULD delete, deletes nothing) —
-//! pass `--apply` to actually delete. Deletion is immediate (bypasses the
-//! usual `markLeft` + 30-day grace period): these chats are already
-//! confirmed gone by a live API check, not freshly-departed, so there's no
-//! reason to wait.
-//!
-//! Run:
-//!   zig build cleanup-left-chats                -- dry run
-//!   zig build cleanup-left-chats -- --apply      -- actually deletes
-//!
-//! Needs WARDEN_POSTGRES_DSN and WARDEN_TELEGRAM_BOT_TOKEN in the
-//! environment, same as the main bot.
+//! chat in the database and asks Telegram directly whether the bot is still a
+//! member.
 
 const std = @import("std");
 const Io = std.Io;

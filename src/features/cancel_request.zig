@@ -1,45 +1,23 @@
-//! Backs the "🛑 Cancel" button `main.zig`'s `replyWithAnswer` attaches to
-//! the "thinking"/tool-use placeholder while a question is in flight. One
-//! entry per (native chat, placeholder message) — several questions could
-//! be in flight in the same chat at once (different askers, or the same
-//! asker firing off more than one), same "prompt id disambiguates" shape
-//! `audit_notify.PendingUndos`/`menu.Sessions` already use for their own
-//! button state.
-//!
-//! Deliberately does not itself stop an in-flight HTTP call to the model —
-//! see `llm/toolcall.zig`'s `Progress.cancelled` doc comment for why that's
-//! only checked at loop-iteration boundaries. This module's whole job is
-//! narrower: remember who's allowed to press Cancel, and flip the atomic
-//! flag `replyWithAnswer` is already watching when they do.
+//! Backs the "🛑 Cancel" button `main.zig`'s `replyWithAnswer` attaches to the
+//! "thinking"/tool-use placeholder while a question is in flight.
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
 
-/// The value carried on the "Cancel" button's `Choice` — checked by
-/// `handleCancelPicked` so a stray/unrelated `ChoicePicked` (a `/convert`
-/// format pick, a `/menu` navigation button) is never mistaken for one.
+/// The value carried on the "Cancel" button's `Choice`.
 pub const cancel_choice_value = "warden_cancel_request";
 
 const Entry = struct {
-    /// Native id (platform-specific string, e.g. Telegram's numeric user
-    /// id) of whoever asked the question this placeholder belongs to — the
-    /// only identity allowed to cancel it. Compared against the presser's
-    /// own `msg.user_id`, same idiom `/remind cancel`/`/alert cancel` use
-    /// for "only whoever set this can cancel it".
+    /// Native id (platform-specific string, e.g. Telegram's numeric user id) of
+    /// whoever asked the question this placeholder belongs to.
     asker_user_id: []const u8,
-    /// Points into the `TickerState` `replyWithAnswer` already allocated
-    /// for this request (see its own doc comment on why that's safe to
-    /// share) — flipping this is the entire effect of a successful cancel;
-    /// `toolcall.run` is the one thing that actually acts on it.
+    /// Points into the `TickerState` `replyWithAnswer` already allocated for this
+    /// request.
     cancel: *std.atomic.Value(bool),
     expires_at: i64,
 };
 
-/// In-memory, one entry per (native chat, placeholder message) — see this
-/// module's doc comment. `timeout_seconds` is a defensive backstop only
-/// (normal flow always calls `unregister` itself, via `replyWithAnswer`'s
-/// cleanup path, well before this would ever matter): it bounds how long a
-/// leaked entry (a worker that panicked mid-request, say) can linger.
+/// In-memory, one entry per (native chat, placeholder message).
 pub const InFlightRequests = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -70,9 +48,6 @@ pub const InFlightRequests = struct {
     }
 
     /// Registers `placeholder_id` as cancellable by `asker_user_id`.
-    /// `cancel` must outlive this entry — callers must `unregister` before
-    /// letting whatever it points into go away (see `Entry.cancel`'s doc
-    /// comment).
     pub fn register(self: *InFlightRequests, now: i64, native_chat_id: []const u8, placeholder_id: []const u8, asker_user_id: []const u8, cancel: *std.atomic.Value(bool)) !void {
         const owned_user = try self.allocator.dupe(u8, asker_user_id);
         errdefer self.allocator.free(owned_user);
@@ -92,8 +67,7 @@ pub const InFlightRequests = struct {
     }
 
     /// Removes the entry for (native chat, placeholder message), if any —
-    /// `replyWithAnswer` calls this once the request is done, cancelled or
-    /// not, so a stale Cancel press afterward finds nothing to act on.
+    /// `replyWithAnswer` calls this once the request is done, cancelled or not.
     pub fn unregister(self: *InFlightRequests, native_chat_id: []const u8, placeholder_id: []const u8) void {
         const key = makeKey(self.allocator, native_chat_id, placeholder_id) catch return;
         defer self.allocator.free(key);
@@ -110,11 +84,8 @@ pub const InFlightRequests = struct {
     pub const Outcome = enum { cancelled, not_found, not_yours };
 
     /// Flips the cancel flag for (native chat, placeholder message) if
-    /// `presser_user_id` matches whoever it was registered for — one-shot
-    /// in effect (the flag only ever transitions false -> true), but
-    /// deliberately not removed from the map here: `replyWithAnswer`'s own
-    /// cleanup does that once it notices the cancellation, so a second
-    /// press before then just re-flips an already-true flag harmlessly.
+    /// `presser_user_id` matches whoever it was registered for — one-shot in
+    /// effect.
     pub fn tryCancel(self: *InFlightRequests, now: i64, native_chat_id: []const u8, placeholder_id: []const u8, presser_user_id: []const u8) Outcome {
         const key = makeKey(self.allocator, native_chat_id, placeholder_id) catch return .not_found;
         defer self.allocator.free(key);
@@ -130,10 +101,7 @@ pub const InFlightRequests = struct {
         return .cancelled;
     }
 
-    /// Prunes entries past their defensive timeout — see this struct's doc
-    /// comment. Called from `main`'s ~30s scheduler tick, same cadence
-    /// `convert_flow.PendingConversions.sweepExpired`/
-    /// `menu.Sessions.sweepExpired` already run at.
+    /// Prunes entries past their defensive timeout.
     pub fn sweepExpired(self: *InFlightRequests, now: i64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -156,11 +124,8 @@ pub const InFlightRequests = struct {
     }
 };
 
-/// Consumes a `ChoicePicked` arriving anywhere, if (and only if) it is a
-/// pick of this module's own "Cancel" button — returns `false` for
-/// anything else so `main.zig`'s `handleMessage` can fall through to its
-/// other `choice_picked` consumers unchanged, same contract
-/// `audit_notify.handleUndoPicked` follows.
+/// Consumes a `ChoicePicked` arriving anywhere, if (and only if) it is a pick
+/// of this module's own "Cancel" button.
 pub fn handleCancelPicked(connector: iface.Connector, a: std.mem.Allocator, in_flight: *InFlightRequests, now: i64, msg: iface.Message, picked: iface.ChoicePicked) bool {
     if (!std.mem.eql(u8, picked.value, cancel_choice_value)) return false;
 
@@ -168,9 +133,7 @@ pub fn handleCancelPicked(connector: iface.Connector, a: std.mem.Allocator, in_f
         // `replyWithAnswer` itself edits the placeholder to say so once it
         // notices — no separate reply needed here.
         .cancelled => {},
-        // Already finished (or long expired) by the time this press
-        // landed — same "stray pick, say nothing" convention every other
-        // choice_picked consumer here follows.
+        // Already finished (or long expired) by the time this press landed.
         .not_found => {},
         .not_yours => connector.sendMessage(a, msg.chat_id, "Only the person who asked can cancel this.", msg.message_id),
     }
@@ -243,8 +206,7 @@ test "sweepExpired prunes only entries past their timeout" {
 }
 
 /// Minimal fake connector for `handleCancelPicked`'s "wrong asker" reply
-/// path — same spirit as `audit_notify.zig`'s own local fake, narrowed to
-/// just `sendMessage`.
+/// path.
 const RecordingConnector = struct {
     sent: ?[]const u8 = null,
 

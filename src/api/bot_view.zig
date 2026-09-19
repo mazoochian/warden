@@ -1,20 +1,6 @@
-//! In-memory pub/sub broadcaster for Bot View's live incoming-message feed
-//! (see /home/armin/claude/warden-ui/ARCHITECTURE.md §8) — fed by a
-//! read-only tap at the same point `main.zig`'s own message-recording
-//! already runs (right next to `recordMessage`/`recordObservedUsers`),
-//! fans new messages out to any WebSocket clients currently subscribed to
-//! that chat. Nothing about message *processing* changes: `publish` never
-//! influences whether/how a message gets answered, and a publish with zero
-//! subscribers is a cheap no-op.
-//!
-//! One `Broadcaster` lives for the process's lifetime (owned by
-//! `main.zig`, handed into `ServerContext`). Each WebSocket connection
-//! owns exactly one `Subscriber`, registered via `subscribe`/removed via
-//! `unsubscribe` -- see `router.zig`'s Bot View WS handler for the
-//! reader/writer-thread split this is built for (append+signal from
-//! `publish` must never block on a slow network write, so the WS writer
-//! side only ever touches its own `Subscriber`'s queue, never the wire,
-//! while holding a lock).
+//! In-memory pub/sub broadcaster for Bot View's live incoming-message feed —
+//! fed by a read-only tap next to `main.zig`'s `recordMessage`, fans new
+//! messages out to the WebSocket clients subscribed to that chat.
 const std = @import("std");
 const Io = std.Io;
 
@@ -38,9 +24,7 @@ pub const Subscriber = struct {
     }
 
     /// Blocks until an event is available or the subscriber is closed (see
-    /// `Broadcaster.close`) -- returns `null` once closed with nothing left
-    /// queued, the writer loop's cue to exit. Caller owns the returned
-    /// event's strings.
+    /// `Broadcaster.close`).
     pub fn nextEvent(self: *Subscriber, io: Io) ?Event {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -52,10 +36,7 @@ pub const Subscriber = struct {
     }
 };
 
-/// `chat_id -> subscriber list`, guarded by its own mutex — deliberately
-/// separate from each `Subscriber`'s own mutex so publishing to one chat's
-/// subscribers never contends with a brand new subscription on a
-/// different chat.
+/// `chat_id -> subscriber list`, guarded by its own mutex.
 pub const Broadcaster = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -66,11 +47,7 @@ pub const Broadcaster = struct {
         return .{ .allocator = allocator, .io = io };
     }
 
-    /// Never actually reached in production (`main.zig` never returns) --
-    /// provided for test/scoped-usage symmetry with every other shared-state
-    /// struct in this codebase. Does not free individual `Subscriber`s;
-    /// those are owned by whichever WS handler `subscribe`d them and must
-    /// already have been `unsubscribe`d by the time this runs.
+    /// Never actually reached in production (`main.zig` never returns).
     pub fn deinit(self: *Broadcaster) void {
         var it = self.subscribers.valueIterator();
         while (it.next()) |list| list.deinit(self.allocator);
@@ -92,9 +69,7 @@ pub const Broadcaster = struct {
     }
 
     /// Marks `sub` closed (waking its writer loop, see `Subscriber.nextEvent`)
-    /// and unregisters + frees it. Safe to call even if the writer loop
-    /// hasn't observed the close yet -- the WS handler is expected to signal
-    /// close, join the writer thread, then call this, in that order.
+    /// and unregisters + frees it.
     pub fn unsubscribe(self: *Broadcaster, chat_id: i64, sub: *Subscriber) void {
         self.mutex.lockUncancelable(self.io);
         if (self.subscribers.getPtr(chat_id)) |list| {
@@ -115,8 +90,7 @@ pub const Broadcaster = struct {
     }
 
     /// Wakes `sub`'s writer loop with no more events coming -- call before
-    /// `unsubscribe` so the writer thread has a chance to exit cleanly
-    /// (see the WS handler's defer order).
+    /// `unsubscribe` so the writer thread has a chance to exit cleanly.
     pub fn close(self: *Broadcaster, sub: *Subscriber) void {
         sub.mutex.lockUncancelable(self.io);
         sub.closed = true;
@@ -125,10 +99,6 @@ pub const Broadcaster = struct {
     }
 
     /// Fans a new message out to every current subscriber of `chat_id`.
-    /// Never blocks on network I/O: each subscriber just gets its own
-    /// heap-owned copy appended to its own queue under its own lock, woken
-    /// via its own condition -- the actual (potentially slow) WS write
-    /// happens later, on that subscriber's own writer thread.
     pub fn publish(self: *Broadcaster, chat_id: i64, sender_display_name: []const u8, text: ?[]const u8, ts: i64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

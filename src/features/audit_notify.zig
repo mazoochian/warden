@@ -1,30 +1,7 @@
-//! Phase 20 (ROADMAP.md): every managerial action against a chat that has a
-//! bound management room (see `store/management_rooms.zig`, 1:1 as of this
-//! phase) posts a structured log entry there — actor, action, before/after
-//! state, and (for the subset of actions with a clean, already-existing
-//! inverse primitive) an "Undo" button. The persistent DB row
-//! (`store/audit_log.zig`) is written unconditionally, whether or not a
-//! room is bound; the room post is a convenience notification on top of it.
-//!
-//! **Undo scope, deliberately narrow.** Only `mute`, `promote` and `demote`
-//! are undoable — each has a real, already-existing inverse the connector
-//! already supports (`unmuteUser`, `demoteUser`/`promoteUser`). `kick`/`ban` are logged but not undoable: there is no
-//! `unbanUser` vtable method anywhere in this codebase yet (adding one is
-//! its own scope, not bundled in here), and un-kicking would mean
-//! re-inviting someone, which isn't a bot capability either. `unmute` isn't
-//! undoable either — reversing it cleanly would need to know the exact
-//! prior mute-until value, and nothing reads that back from the platform
-//! today. These are documented gaps, not silently pretended-away, matching
-//! this project's standing convention for platform/feature limits.
-//!
-//! **No second "are you sure" confirmation before Undo executes.** The
-//! original plan for this phase called for one, but on implementation it
-//! would need its own second round of pending-state (a confirm-prompt
-//! nested inside the undo-prompt) for no real safety gain over the single
-//! deliberate button press every other choice-prompt flow in this codebase
-//! already treats as sufficient (`features/convert_flow.zig`'s format
-//! picker, `features/menu.zig`'s navigation) — simplified away rather than
-//! built as originally scoped.
+//! Every managerial action against a chat that has a bound management room
+//! posts a structured log entry there — actor, action, before/after state,
+//! and, for actions with a clean inverse, an "Undo" button. The persistent
+//! `audit_log` row is written whether or not a room is bound.
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
@@ -35,10 +12,7 @@ const identities = @import("../store/identities.zig");
 
 const log = std.log.scoped(.audit_notify);
 
-/// The value carried on the "Undo" button's `Choice` — checked by
-/// `handleUndoPicked` so a stray/unrelated `ChoicePicked` (e.g. a
-/// `/convert` format pick landing in the same chat) is never mistaken for
-/// an undo.
+/// The value carried on the "Undo" button's `Choice`.
 const undo_choice_value = "audit_undo";
 
 pub const AuditAction = union(enum) {
@@ -48,13 +22,8 @@ pub const AuditAction = union(enum) {
     demote: struct { target_user_id: []const u8, target_label: []const u8, was_admin_before: bool },
     kick: struct { target_user_id: []const u8, target_label: []const u8 },
     ban: struct { target_user_id: []const u8, target_label: []const u8 },
-    /// Phase 22 — none of these three act on a *member*, so there's no
-    /// `target_user_id`; `new_*`/`removed` doubles as the audit-log
-    /// "target" text. No "before" value captured (Telegram has no
-    /// `getChat`-style read wired up yet, and there's no way to read a
-    /// chat's current photo back at all) — logged as a plain change, same
-    /// documented simplification as everything else in this module that
-    /// isn't undoable.
+    /// None of these three act on a *member*, so there's no `target_user_id`;
+    /// `new_*`/`removed` doubles as the audit-log "target" text.
     title_change: struct { new_title: []const u8 },
     description_change: struct { new_description: []const u8 },
     photo_change: struct { removed: bool },
@@ -157,10 +126,8 @@ fn freeAction(a: std.mem.Allocator, action: AuditAction) void {
     }
 }
 
-/// Builds the message text posted into the bound room — actor, action
-/// title, and whatever before/after detail that `AuditAction` variant
-/// carries. Uses the same `Io.Writer.Allocating` idiom `main.zig`'s
-/// `/chatinfo`/`/manage list` already use for multi-line replies.
+/// Builds the message text posted into the bound room — actor, action title,
+/// and whatever before/after detail that `AuditAction` variant carries.
 fn formatLogText(a: std.mem.Allocator, actor_label: []const u8, action: AuditAction) []const u8 {
     var buf: std.Io.Writer.Allocating = .init(a);
     buf.writer.print("🛡️ {s}\nBy: {s}\n", .{ action.titleText(), actor_label }) catch {};
@@ -187,13 +154,7 @@ const UndoEntry = struct {
     expires_at: i64,
 };
 
-/// In-memory, one entry per (control room, prompt message) — several audit
-/// events can have live "Undo" buttons in the same room at once, unlike
-/// `group_admin.PendingConfirmations`' one-per-chat model, so the key must
-/// include the prompt's own message id. 24h timeout: unlike a ban/kick
-/// confirmation (seconds matter, the operator is actively mid-flow), an
-/// audit-log undo is something someone might reasonably want to reach for
-/// well after the fact.
+/// In-memory, one entry per (control room, prompt message).
 pub const PendingUndos = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -263,9 +224,8 @@ pub const PendingUndos = struct {
         try self.map.put(map_key, entry);
     }
 
-    /// Removes and returns the pending undo for this (room, prompt) pair,
-    /// if one exists and hasn't expired — one-shot, same as
-    /// `PendingConfirmations.take`.
+    /// Removes and returns the pending undo for this (room, prompt) pair, if one
+    /// exists and hasn't expired — one-shot, same as `PendingConfirmations.take`.
     pub fn take(self: *PendingUndos, now: i64, control_native_chat_id: []const u8, prompt_message_id: []const u8) ?UndoEntry {
         const map_key = makeKey(self.allocator, control_native_chat_id, prompt_message_id) catch return null;
         defer self.allocator.free(map_key);
@@ -288,14 +248,8 @@ pub const PendingUndos = struct {
     }
 };
 
-/// Writes the permanent `audit_log` row (always, regardless of whether a
-/// room is bound) and, if `target_chat_id` has a bound management room
-/// (`store/management_rooms.zig`, 1:1 as of this phase), posts a formatted
-/// log entry there — with an "Undo" button for the subset of actions
-/// `AuditAction.undoable` admits. `actor_label` is normally the acting
-/// user's `msg.username orelse msg.user_id` — cheap, no extra DB read, and
-/// good enough for a log line (callers wanting a resolved display name can
-/// pass one instead).
+/// Writes the permanent `audit_log` row (always, regardless of whether a room
+/// is bound) and.
 pub fn recordAndNotify(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -329,10 +283,8 @@ pub fn recordAndNotify(
                 log.err("failed to remember undo state for room #{d}: {t}", .{ room.id, err });
             };
         }
-        // `prompt_id == null` means the platform has no choice-prompt
-        // support (e.g. XMPP) — `Connector.sendChoicePrompt` already sent a
-        // plain-text fallback listing the choices, with no working button;
-        // nothing more to do.
+        // `prompt_id == null` means the platform has no choice-prompt support (e.g.
+        // XMPP).
         return;
     }
 
@@ -354,12 +306,8 @@ fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, entry: UndoEntry)
     }
 }
 
-/// Consumes a `ChoicePicked` arriving in a bound room, if (and only if) it
-/// is a pick of this module's own "Undo" button on a still-live prompt —
-/// returns `false` for anything else (a stray pick, an expired/already-used
-/// prompt, or a pick from a chat/prompt this module never registered) so
-/// `main.zig`'s `handleMessage` can fall through to its other
-/// `choice_picked` consumers (`convert_flow`, `menu`) unchanged.
+/// Consumes a `ChoicePicked` arriving in a bound room, if (and only if) it is
+/// a pick of this module's own "Undo" button on a still-live prompt.
 pub fn handleUndoPicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -385,10 +333,6 @@ pub fn handleUndoPicked(
     connector.sendMessage(a, msg.chat_id, "Undone.", msg.message_id);
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const test_support = @import("../store/test_support.zig");
@@ -445,17 +389,7 @@ test "AuditAction.undoable reflects the documented scope" {
 }
 
 /// Minimal fake connector for `recordAndNotify`/`handleUndoPicked` tests —
-/// records calls and hands back a fixed prompt id from `sendChoicePrompt`,
-/// same spirit as `platform/reply_redirect.zig`'s own `RecordingConnector`
-/// but local to this file's narrower needs.
-///
-/// `record` dupes every string into its own arena rather than storing the
-/// caller's slice as-is: `recordAndNotify` frees its own temporary buffers
-/// (`room.native_chat_id`, the formatted text) via `defer` before it
-/// returns, same as production's real connectors only ever need the bytes
-/// for the duration of the synchronous call — a test that inspects
-/// `calls` *after* `recordAndNotify` returns would otherwise be reading
-/// already-freed memory.
+/// records calls and hands back a fixed prompt id from `sendChoicePrompt`.
 const FakeConnector = struct {
     const Call = struct { kind: []const u8, chat_id: []const u8, arg: []const u8 };
 
@@ -540,14 +474,8 @@ test "recordAndNotify writes an audit_log row unconditionally, and posts+registe
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
-    // `recordAndNotify` frees its own temporary buffers (the resolved
-    // room, the formatted text) via `defer` before returning -- matching
-    // production, where callers always pass the per-message task arena, so
-    // nothing outlives one message's handling. An arena here is the
-    // correct stand-in, not a leak-suppression hack: `testing.allocator`
-    // directly would flag those as leaked, since nothing frees them
-    // individually by design (same convention `main.zig`'s own
-    // `Io.Writer.Allocating`-built replies already follow).
+    // `recordAndNotify` frees its own temporary buffers (the resolved room, the
+    // formatted text) via `defer` before returning.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

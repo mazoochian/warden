@@ -1,19 +1,15 @@
 //! Typed extraction helpers layered on top of `xml.zig`'s generic `Element`
-//! tree — for the handful of stanza shapes `client.zig`'s protocol
-//! state machine actually needs to react to (stream features, SASL
-//! outcomes, resource binding, chat/groupchat messages). Every function
-//! here takes an already-parsed `xml.Element` and dupes what it needs into
-//! `allocator`, independent of the `xml.ParsedElement` arena the caller will
-//! typically `deinit()` right after — mirrors `../matrix/types.zig`'s role as
-//! the typed layer above a lower-level parse (JSON there, hand-rolled XML
-//! here).
+//! tree — for the handful of stanza shapes `client.zig`'s protocol state
+//! machine actually needs to react to (stream features, SASL outcomes,
+//! resource binding, chat/groupchat messages). Every function here takes an
+//! already-parsed `xml.Element` and dupes what it needs into `allocator`.
 
 const std = @import("std");
 const xml = @import("xml.zig");
 
 /// `<stream:features>` — just the four things the connection state machine
-/// (`client.zig`) reacts to across the stream's three (re)negotiations
-/// (post-connect, post-STARTTLS, post-SASL).
+/// (`client.zig`) reacts to across the stream's three (re)negotiations (post-
+/// connect, post-STARTTLS, post-SASL).
 pub const StreamFeatures = struct {
     starttls: bool,
     mechanisms: []const []const u8,
@@ -44,9 +40,7 @@ pub const StreamFeatures = struct {
     }
 };
 
-/// A `<success/>` or `<failure>...</failure>` in response to `<auth>` — the
-/// failure's reason is the tag name of its single child per RFC 6120 (e.g.
-/// `<not-authorized/>`), not text content.
+/// A `<success/>` or `<failure>...</failure>` in response to `<auth>`.
 pub const SaslOutcome = union(enum) {
     success,
     failure: []const u8,
@@ -62,27 +56,21 @@ pub fn parseSaslOutcome(allocator: std.mem.Allocator, el: xml.Element) !SaslOutc
 }
 
 /// Extracts the bound full JID from a resource-binding `<iq type='result'>`
-/// response (`<iq><bind><jid>...</jid></bind></iq>`). Null if `el` isn't
-/// shaped like one (e.g. an error IQ instead).
+/// response (`<iq><bind><jid>...</jid></bind></iq>`).
 pub fn boundJid(allocator: std.mem.Allocator, el: xml.Element) !?[]const u8 {
     const bind = el.child("bind") orelse return null;
     const jid_el = bind.child("jid") orelse return null;
     return try jid_el.text(allocator);
 }
 
-/// A `<message>` stanza carrying a `<body>` — the shape both 1:1 (`type=
-/// "chat"`) and MUC (`type="groupchat"`) messages share; `client.zig` tells
-/// them apart via `type`, since MUC's `from` is `room@server/nick` rather
-/// than a real user JID (semi-anonymous by default) but the wire shape is
-/// otherwise identical.
+/// A `<message>` stanza carrying a `<body>`.
 pub const MessageStanza = struct {
     from: []const u8,
     /// Absent on the wire defaults to "normal" per RFC 6121 — never left
     /// null here so callers don't need to remember that default themselves.
     type: []const u8,
-    /// Null when this is some other kind of `<message>` (e.g. a
-    /// receipt/chat-state notification with no `<body>`) — not every
-    /// message stanza is one a human sent text in.
+    /// Null when this is some other kind of `<message>` (e.g. a receipt/chat-
+    /// state notification with no `<body>`).
     body: ?[]const u8,
     id: ?[]const u8,
 
