@@ -153,10 +153,70 @@ fn callProviderWithRetry(
     }
 }
 
+/// One executed tool call, as `RunResult.tool_calls` reports it -- enough
+/// for a caller to tell the user (and the next turn's history) what was
+/// actually done, which the final text alone often doesn't say.
+pub const ToolCallRecord = struct {
+    name: []const u8,
+    /// The arguments, JSON-serialised.
+    input_json: []const u8,
+    /// What the tool returned (or the `tool error: ...` text fed back to
+    /// the model when it failed).
+    result: []const u8,
+    is_error: bool,
+};
+
+pub const RunResult = struct {
+    /// The visible answer (thinking rendered in when `show_thinking`). May
+    /// be empty -- see `runDetailed` on what was already tried before
+    /// giving up; the caller decides what to show for that.
+    text: []const u8,
+    /// Every tool executed this run, in order.
+    tool_calls: []const ToolCallRecord,
+    /// The final model turn's stop reason.
+    stop_reason: llm.StopReason,
+};
+
+/// How many times an empty final turn is answered with a nudge before the
+/// run gives up and returns the empty text for the caller to handle. One
+/// is enough: the point is to recover a model that "already said it" in
+/// reasoning it can no longer see, not to keep prodding a model that has
+/// decided to say nothing.
+const max_empty_nudges = 1;
+
+/// Sent as a user turn when the model's final turn carried no visible
+/// text. Names the likely causes so the model can course-correct rather
+/// than repeat itself.
+const empty_turn_nudge = "Your last turn had no visible reply text -- the user saw nothing. Reply now, in plain text, with your answer (or a one-line summary of what you just did with tools). Do not call any more tools.";
+const empty_truncated_nudge = "Your last turn was cut off by the length limit before any visible reply text -- the user saw nothing. Reply now with a short, direct answer; keep any reasoning brief. Do not call any more tools.";
+
+/// `run` for callers that only want the text -- see `runDetailed`.
+pub fn run(
+    provider: llm.Provider,
+    allocator: std.mem.Allocator,
+    ctx: registry.ToolContext,
+    system: ?[]const u8,
+    user_message: []const u8,
+    tool_defs: []const registry.ToolDef,
+    progress: Progress,
+    stream: bool,
+    show_thinking: bool,
+    vision_enabled: bool,
+    documents_enabled: bool,
+    max_tokens: u32,
+    max_retries: u32,
+) ![]const u8 {
+    const result = try runDetailed(provider, allocator, ctx, system, user_message, tool_defs, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens, max_retries);
+    return result.text;
+}
+
 /// Drives one provider-agnostic conversation: sends `user_message`, and as
 /// long as the model keeps asking for tools, executes them against
 /// `tool_defs` and feeds the results back, until it produces a final text
-/// answer (or the iteration cap is hit). `stream` selects `chatStream`
+/// answer (or the iteration cap is hit). A final turn with *no* visible
+/// text gets one nudge (`empty_turn_nudge`) before the empty result is
+/// returned -- the caller can then fall back on `tool_calls` to say what
+/// happened instead of showing nothing. `stream` selects `chatStream`
 /// (progressively reports `.text` events as the model generates, see
 /// `ProgressStreamBridge`) vs. one blocking `chat` call per turn.
 /// `show_thinking`/`max_tokens` are forwarded straight into every
@@ -172,7 +232,7 @@ fn callProviderWithRetry(
 /// separate capabilities: a model can support vision and still have no way
 /// to read a PDF, which is exactly the case for the OpenAI-compatible
 /// surface (see `llm/openai_compat.zig`'s `writeMessages`).
-pub fn run(
+pub fn runDetailed(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
     ctx: registry.ToolContext,
@@ -189,8 +249,10 @@ pub fn run(
     /// the request gives up (see `callProviderWithRetry`). 0 restores the
     /// old single-attempt behaviour.
     max_retries: u32,
-) ![]const u8 {
+) !RunResult {
     const llm_tools = try toLlmTools(allocator, tool_defs);
+    var trace: std.ArrayList(ToolCallRecord) = .empty;
+    var empty_nudges: u32 = 0;
 
     var messages: std.ArrayList(llm.ChatMessage) = .empty;
     // At most one attachment block: a given message carries a single
@@ -233,30 +295,53 @@ pub fn run(
             .max_tokens = max_tokens,
         }, stream, stream_bridge.sink(), progress, max_retries);
 
-        try messages.append(allocator, .{ .role = .assistant, .content = response.content });
-
         var tool_uses: std.ArrayList(llm.ToolUse) = .empty;
         for (response.content) |block| {
             switch (block) {
                 .tool_use => |tu| try tool_uses.append(allocator, tu),
-                .text, .image, .document, .tool_result => {},
+                .text, .thinking, .image, .document, .tool_result => {},
             }
         }
 
         if (tool_uses.items.len == 0) {
-            return llm.textOf(allocator, response.content);
+            const text = try renderText(allocator, response.content, show_thinking);
+            if (std.mem.trim(u8, text, " \t\r\n").len > 0 or empty_nudges >= max_empty_nudges) {
+                return .{ .text = text, .tool_calls = try trace.toOwnedSlice(allocator), .stop_reason = response.stop_reason };
+            }
+            // Nothing visible came back. Say so and ask once more -- the
+            // empty turn itself is *not* appended: an assistant message
+            // with no text and no tool calls is rejected by Anthropic and
+            // skipped by the OpenAI writer anyway, and keeping it would only
+            // show the model its own silence as a precedent.
+            empty_nudges += 1;
+            std.log.warn("model turn had no visible text (stop={t}, thinking={d} bytes, tools so far={d}); nudging once", .{
+                response.stop_reason, llm.thinkingLenOf(response.content), trace.items.len,
+            });
+            const nudge = if (response.stop_reason == .max_tokens) empty_truncated_nudge else empty_turn_nudge;
+            try messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = nudge }}) });
+            continue;
         }
+
+        try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
         var results: std.ArrayList(llm.ContentBlock) = .empty;
         for (tool_uses.items) |tu| {
             if (progress.isCancelled()) return error.Cancelled;
             progress.report(.{ .tool_use = .{ .name = tu.name, .input_digest = hashToolInput(allocator, tu.input) } });
+            var is_error = false;
             const result_text = executeTool(ctx, tool_defs, tu) catch |err| blk: {
                 std.log.err("tool '{s}' failed: {t}", .{ tu.name, err });
+                is_error = true;
                 break :blk try std.fmt.allocPrint(allocator, "tool error: {t}", .{err});
             };
             const safe_text = try sanitizeUtf8(allocator, result_text);
             try results.append(allocator, .{ .tool_result = .{ .tool_use_id = tu.id, .content = safe_text } });
+            try trace.append(allocator, .{
+                .name = tu.name,
+                .input_json = std.json.Stringify.valueAlloc(allocator, tu.input, .{}) catch "{}",
+                .result = safe_text,
+                .is_error = is_error,
+            });
         }
         try messages.append(allocator, .{ .role = .user, .content = try results.toOwnedSlice(allocator) });
     }
@@ -276,9 +361,70 @@ pub fn run(
         .show_thinking = show_thinking,
         .max_tokens = max_tokens,
     }, stream, stream_bridge.sink(), progress, max_retries);
-    const text = try llm.textOf(allocator, response.content);
-    if (text.len > 0) return text;
+    const text = try renderText(allocator, response.content, show_thinking);
+    if (std.mem.trim(u8, text, " \t\r\n").len > 0) {
+        return .{ .text = text, .tool_calls = try trace.toOwnedSlice(allocator), .stop_reason = response.stop_reason };
+    }
     return error.ToolCallLoopExceeded;
+}
+
+/// Per-call caps for `formatTrace` -- the trace is grounding for the
+/// model's next turn, not a transcript, so arguments and results are cut
+/// to a recognisable head.
+const trace_args_max = 80;
+const trace_result_max = 160;
+const trace_total_max = 700;
+
+/// Renders a run's tool calls as one compact line -- `name(args) -> result`
+/// per call, `; `-separated, newlines flattened, each part capped (see the
+/// `trace_*` limits) -- for storing next to the bot's reply and rendering
+/// back into the chat history as "[used: ...]". `null` when no tool ran, so
+/// callers can store NULL rather than an empty string.
+pub fn formatTrace(allocator: std.mem.Allocator, tool_calls: []const ToolCallRecord) !?[]const u8 {
+    if (tool_calls.len == 0) return null;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (tool_calls, 0..) |tc, idx| {
+        if (idx != 0) try buf.appendSlice(allocator, "; ");
+        if (buf.items.len >= trace_total_max) {
+            try buf.print(allocator, "+{d} more", .{tool_calls.len - idx});
+            break;
+        }
+        try buf.appendSlice(allocator, tc.name);
+        try buf.append(allocator, '(');
+        try appendFlattened(&buf, allocator, tc.input_json, trace_args_max);
+        try buf.appendSlice(allocator, if (tc.is_error) ") -> ERROR " else ") -> ");
+        try appendFlattened(&buf, allocator, tc.result, trace_result_max);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Appends `text` with runs of whitespace collapsed to one space, cut to
+/// `max` bytes on a UTF-8 boundary with a trailing ellipsis when cut.
+fn appendFlattened(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, max: usize) !void {
+    const start = buf.items.len;
+    var last_space = false;
+    for (text) |c| {
+        const is_space = std.ascii.isWhitespace(c);
+        if (is_space and last_space) continue;
+        last_space = is_space;
+        try buf.append(allocator, if (is_space) ' ' else c);
+        if (buf.items.len - start > max) break;
+    }
+    if (buf.items.len - start > max) {
+        var end = start + max;
+        while (end > start and (buf.items[end] & 0xC0) == 0x80) end -= 1;
+        buf.shrinkRetainingCapacity(end);
+        try buf.appendSlice(allocator, "\u{2026}");
+    }
+}
+
+/// The answer as the caller should see it: field-carried reasoning
+/// (`llm.ThinkingBlock`) is rendered in ahead of the text only when
+/// `show_thinking` asks for it -- the same expandable-span shape inline
+/// `<think>` tags already get inside the text itself.
+fn renderText(allocator: std.mem.Allocator, content: []const llm.ContentBlock, show_thinking: bool) ![]const u8 {
+    return if (show_thinking) llm.textWithThinkingOf(allocator, content) else llm.textOf(allocator, content);
 }
 
 /// Forwards `llm.StreamSink` reports into this loop's own `Progress` as
@@ -779,4 +925,138 @@ test "run: a non-transient failure is not retried at all" {
 
     try testing.expectError(error.SomethingUnretryable, run(flaky.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, false, false, 1024, 3));
     try testing.expectEqual(@as(u32, 1), flaky.call_count);
+}
+
+/// Scripts a sequence of canned responses, one per model call, and records
+/// every request it was given -- for the empty-turn recovery tests below,
+/// which care about *what the loop sends next*, not just what it returns.
+const ScriptedProvider = struct {
+    script: []const llm.ChatResponse,
+    call_count: usize = 0,
+    requests: std.ArrayList([]const llm.ChatMessage) = .empty,
+
+    fn provider(self: *ScriptedProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn };
+
+    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        const self: *ScriptedProvider = @ptrCast(@alignCast(ptr));
+        try self.requests.append(allocator, try allocator.dupe(llm.ChatMessage, request.messages));
+        defer self.call_count += 1;
+        return self.script[self.call_count];
+    }
+};
+
+test "runDetailed: an empty final turn after a tool call is nudged once, and the nudge is what recovers the answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const input = try std.json.parseFromSlice(std.json.Value, a, "{\"expression\":\"2+2\"}", .{});
+    var scripted = ScriptedProvider{
+        .script = &.{
+            .{ .content = &.{.{ .tool_use = .{ .id = "call_1", .name = "calculator", .input = input.value } }}, .stop_reason = .tool_use },
+            // The MiniMax shape: thought about it, said nothing.
+            .{ .content = &.{.{ .thinking = .{ .text = "the tool said 4", .field = .reasoning_content } }}, .stop_reason = .end_turn },
+            .{ .content = &.{.{ .text = "It's 4." }}, .stop_reason = .end_turn },
+        },
+    };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    const result = try runDetailed(scripted.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false, false, false, false, 1024, 0);
+    try testing.expectEqualStrings("It's 4.", result.text);
+    try testing.expectEqual(@as(usize, 3), scripted.call_count);
+    try testing.expectEqual(llm.StopReason.end_turn, result.stop_reason);
+
+    // The trace reports the one tool that ran, with its arguments and result.
+    try testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try testing.expectEqualStrings("calculator", result.tool_calls[0].name);
+    try testing.expectEqualStrings("{\"expression\":\"2+2\"}", result.tool_calls[0].input_json);
+    try testing.expectEqualStrings("4", result.tool_calls[0].result);
+    try testing.expect(!result.tool_calls[0].is_error);
+
+    // The third request ends with the nudge as a user turn, and the empty
+    // assistant turn itself was not kept.
+    const third = scripted.requests.items[2];
+    const last = third[third.len - 1];
+    try testing.expectEqual(llm.Role.user, last.role);
+    try testing.expectEqualStrings(empty_turn_nudge, last.content[0].text);
+    for (third) |m| {
+        if (m.role == .assistant) try testing.expect(m.content[0] != .thinking);
+    }
+}
+
+test "runDetailed: a turn cut off by max_tokens with no text gets the truncation nudge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var scripted = ScriptedProvider{ .script = &.{
+        .{ .content = &.{}, .stop_reason = .max_tokens },
+        .{ .content = &.{.{ .text = "short answer" }}, .stop_reason = .end_turn },
+    } };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    const result = try runDetailed(scripted.provider(), a, ctx, null, "q", &.{}, .{}, false, false, false, false, 64, 0);
+    try testing.expectEqualStrings("short answer", result.text);
+    const second = scripted.requests.items[1];
+    try testing.expectEqualStrings(empty_truncated_nudge, second[second.len - 1].content[0].text);
+}
+
+test "runDetailed: a second empty turn is returned as empty text, not nudged forever" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var scripted = ScriptedProvider{
+        .script = &.{
+            .{ .content = &.{.{ .text = "   \n" }}, .stop_reason = .end_turn },
+            .{ .content = &.{}, .stop_reason = .end_turn },
+            // Never reached.
+            .{ .content = &.{.{ .text = "unexpected" }}, .stop_reason = .end_turn },
+        },
+    };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    const result = try runDetailed(scripted.provider(), a, ctx, null, "q", &.{}, .{}, false, false, false, false, 64, 0);
+    try testing.expectEqual(@as(usize, 0), std.mem.trim(u8, result.text, " \t\r\n").len);
+    try testing.expectEqual(@as(usize, 2), scripted.call_count);
+    try testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+}
+
+test "runDetailed renders thinking into the text only when show_thinking is on" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const script = [_]llm.ChatResponse{
+        .{ .content = &.{ .{ .thinking = .{ .text = "hmm", .field = .reasoning } }, .{ .text = "four" } }, .stop_reason = .end_turn },
+    };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    var hidden = ScriptedProvider{ .script = &script };
+    try testing.expectEqualStrings("four", (try runDetailed(hidden.provider(), a, ctx, null, "q", &.{}, .{}, false, false, false, false, 64, 0)).text);
+
+    var shown = ScriptedProvider{ .script = &script };
+    try testing.expectEqualStrings(llm.thinking_start ++ "hmm" ++ llm.thinking_end ++ "\n\nfour", (try runDetailed(shown.provider(), a, ctx, null, "q", &.{}, .{}, false, true, false, false, 64, 0)).text);
+}
+
+test "formatTrace renders one compact entry per call, flattens whitespace, caps long parts, and is null with no calls" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expect((try formatTrace(a, &.{})) == null);
+
+    const long_result = "x" ** 300;
+    const trace = (try formatTrace(a, &.{
+        .{ .name = "weather", .input_json = "{\"location\":\"Berlin\"}", .result = "Berlin:\n  12°C,\twind 3 m/s", .is_error = false },
+        .{ .name = "fetch_url", .input_json = "{}", .result = long_result, .is_error = true },
+    })).?;
+    try testing.expect(std.mem.startsWith(u8, trace, "weather({\"location\":\"Berlin\"}) -> Berlin: 12°C, wind 3 m/s; fetch_url({}) -> ERROR xxx"));
+    try testing.expect(std.mem.endsWith(u8, trace, "\u{2026}"));
+    try testing.expect(trace.len < 300);
+    try testing.expect(std.unicode.utf8ValidateSlice(trace));
 }

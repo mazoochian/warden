@@ -48,8 +48,30 @@ pub const DocumentBlock = struct {
     base64_data: []const u8,
 };
 
+/// Which wire field a backend used to carry a reasoning model's
+/// chain-of-thought -- `reasoning_content` (DeepSeek, MiniMax, vLLM's
+/// reasoning parser) or `reasoning` (OpenRouter and gateways modelled on
+/// it). Remembered so the same field is used when the thought is sent
+/// back, never a guessed one: a backend that never emitted either would
+/// reject an unknown message key outright.
+pub const ReasoningField = enum { reasoning_content, reasoning };
+
+/// A reasoning model's chain-of-thought for one assistant turn, kept in the
+/// conversation so it can be handed back on the next turn. Interleaved-
+/// thinking models (MiniMax M-series among them) require their earlier
+/// reasoning to be present alongside their tool calls: without it the
+/// follow-up turn after a tool result routinely comes back with no visible
+/// text at all -- the model has, from its point of view, already "said"
+/// everything in a thought it can no longer see. Never rendered by
+/// `textOf`; `toolcall.zig` decides whether the user gets to see it.
+pub const ThinkingBlock = struct {
+    text: []const u8,
+    field: ReasoningField,
+};
+
 pub const ContentBlock = union(enum) {
     text: []const u8,
+    thinking: ThinkingBlock,
     image: ImageBlock,
     document: DocumentBlock,
     tool_use: ToolUse,
@@ -69,7 +91,11 @@ pub const Tool = struct {
     input_schema_json: []const u8,
 };
 
-pub const StopReason = enum { end_turn, tool_use, other };
+/// `max_tokens`: the response was cut off by the request's token budget
+/// (Anthropic `max_tokens`, OpenAI-style `length`) -- worth telling apart
+/// from `other`, since a truncated turn with no visible text is the classic
+/// "the model spent the whole budget thinking" failure.
+pub const StopReason = enum { end_turn, tool_use, max_tokens, other };
 
 /// Wraps a span of answer text that represents a reasoning model's
 /// chain-of-thought (see `llm/openai_compat.zig`'s use in place of the old
@@ -230,19 +256,52 @@ pub const Provider = struct {
 };
 
 /// Concatenates all `text` blocks; every other block type contributes
-/// nothing (a response that's pure tool calls has no visible text yet, and
-/// a provider never sends an image or document block back in a response —
-/// those are request-only, built by `llm/attachment_content.zig`).
+/// nothing (a response that's pure tool calls has no visible text yet, a
+/// `thinking` block is the model's own scratch work, and a provider never
+/// sends an image or document block back in a response — those are
+/// request-only, built by `llm/attachment_content.zig`).
 pub fn textOf(allocator: std.mem.Allocator, content: []const ContentBlock) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     for (content) |block| {
         switch (block) {
             .text => |t| try buf.appendSlice(allocator, t),
-            .image, .document, .tool_use, .tool_result => {},
+            .thinking, .image, .document, .tool_use, .tool_result => {},
         }
     }
     return buf.toOwnedSlice(allocator);
+}
+
+/// Like `textOf`, but with every `thinking` block rendered ahead of the
+/// text as a `thinking_start`/`thinking_end` span (the same shape inline
+/// `<think>` tags are rewrapped into), for callers showing the model's
+/// reasoning to the user -- see `ChatRequest.show_thinking`.
+pub fn textWithThinkingOf(allocator: std.mem.Allocator, content: []const ContentBlock) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (content) |block| {
+        switch (block) {
+            .thinking => |t| if (t.text.len > 0) try buf.print(allocator, "{s}{s}{s}\n\n", .{ thinking_start, t.text, thinking_end }),
+            else => {},
+        }
+    }
+    for (content) |block| {
+        switch (block) {
+            .text => |t| try buf.appendSlice(allocator, t),
+            else => {},
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Total length of every `thinking` block -- for the log line that
+/// explains an empty visible answer.
+pub fn thinkingLenOf(content: []const ContentBlock) usize {
+    var n: usize = 0;
+    for (content) |block| {
+        if (block == .thinking) n += block.thinking.text.len;
+    }
+    return n;
 }
 
 const testing = std.testing;
@@ -286,4 +345,18 @@ test "Provider.chatStream falls back to chat() plus one final sink.report() when
     try testing.expectEqualStrings("hello", try textOf(a, response.content));
     try testing.expectEqual(@as(usize, 1), recorder.reports.items.len);
     try testing.expectEqualStrings("hello", recorder.reports.items[0]);
+}
+
+test "textWithThinkingOf renders thinking ahead of the text; textOf leaves it out" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const content: []const ContentBlock = &.{
+        .{ .thinking = .{ .text = "hmm", .field = .reasoning_content } },
+        .{ .text = "four" },
+    };
+    try testing.expectEqualStrings("four", try textOf(a, content));
+    try testing.expectEqualStrings(thinking_start ++ "hmm" ++ thinking_end ++ "\n\nfour", try textWithThinkingOf(a, content));
+    try testing.expectEqual(@as(usize, 3), thinkingLenOf(content));
 }

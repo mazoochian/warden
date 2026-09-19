@@ -167,6 +167,7 @@ fn buildPayload(allocator: std.mem.Allocator, self: *const AnthropicProvider, re
 fn parseStopReason(raw: []const u8) llm.StopReason {
     if (std.mem.eql(u8, raw, "tool_use")) return .tool_use;
     if (std.mem.eql(u8, raw, "end_turn")) return .end_turn;
+    if (std.mem.eql(u8, raw, "max_tokens")) return .max_tokens;
     return .other;
 }
 
@@ -185,9 +186,18 @@ fn writeMessages(w: *Io.Writer, messages: []const llm.ChatMessage) !void {
 
 fn writeContentBlocks(w: *Io.Writer, content: []const llm.ContentBlock) !void {
     try w.writeByte('[');
-    for (content, 0..) |block, idx| {
-        if (idx != 0) try w.writeByte(',');
+    var first = true;
+    for (content) |block| {
+        // This adapter never enables extended thinking, so it never gets a
+        // (signed) thinking block back and can't send one -- a `thinking`
+        // block here can only have come from another provider's response
+        // earlier in the same conversation. Dropped, same as the OpenAI
+        // adapter drops a native `document` block it has no shape for.
+        if (block == .thinking) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
         switch (block) {
+            .thinking => unreachable,
             .text => |t| {
                 try w.writeAll("{\"type\":\"text\",\"text\":");
                 try json.Stringify.value(t, .{}, w);

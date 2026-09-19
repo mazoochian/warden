@@ -24,12 +24,19 @@ pub fn hasAny(pool: *PgPool, chat_id: i64) bool {
 /// FK ids from `chats.upsertChat`/`identities.upsertIdentity`) — replaces
 /// the old per-chat-file `messages` table's implicit-by-filename scoping.
 pub fn insert(pool: *PgPool, chat_id: i64, identity_id: i64, native_message_id: ?[]const u8, text: ?[]const u8, ts: i64) !void {
+    return insertWithTrace(pool, chat_id, identity_id, native_message_id, text, ts, null);
+}
+
+/// `insert` for the bot's own replies, with the tool calls that produced
+/// it -- see `0052_messages_tool_trace.sql` and `formatLine` for how the
+/// trace comes back out.
+pub fn insertWithTrace(pool: *PgPool, chat_id: i64, identity_id: i64, native_message_id: ?[]const u8, text: ?[]const u8, ts: i64, tool_trace: ?[]const u8) !void {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\INSERT INTO messages (chat_id, identity_id, native_message_id, text, ts)
-        \\VALUES ($1, $2, $3, $4, to_timestamp($5));
+        \\INSERT INTO messages (chat_id, identity_id, native_message_id, text, ts, tool_trace)
+        \\VALUES ($1, $2, $3, $4, to_timestamp($5), $6);
     );
     defer stmt.finalize();
     stmt.bindInt64(1, chat_id);
@@ -37,6 +44,7 @@ pub fn insert(pool: *PgPool, chat_id: i64, identity_id: i64, native_message_id: 
     if (native_message_id) |m| stmt.bindText(3, m) else stmt.bindNull(3);
     if (text) |t| stmt.bindText(4, t) else stmt.bindNull(4);
     stmt.bindInt64(5, ts);
+    if (tool_trace) |tr| stmt.bindText(6, tr) else stmt.bindNull(6);
     _ = try stmt.step();
 }
 
@@ -200,11 +208,16 @@ pub fn replaceRangeWithSummary(pool: *PgPool, chat_id: i64, identity_id: i64, mi
 /// synthetic system identity, not a real chat participant) — the LLM/
 /// `/summary` reader only needs to know this line is compacted history, not
 /// who "sent" it.
-fn formatLine(allocator: std.mem.Allocator, who: []const u8, text: []const u8, is_summary: bool) ![]const u8 {
-    return if (is_summary)
-        std.fmt.allocPrint(allocator, "summary: {s}", .{text})
-    else
-        std.fmt.allocPrint(allocator, "{s}: {s}", .{ who, text });
+/// `tool_trace` (the bot's own replies only, see `insertWithTrace`) is
+/// rendered as a "[used: ...]" tag ahead of the text, so the model can
+/// see what it actually did on that turn -- the system prompt tells it
+/// what the tag means.
+fn formatLine(allocator: std.mem.Allocator, who: []const u8, text: []const u8, is_summary: bool, tool_trace: ?[]const u8) ![]const u8 {
+    if (is_summary) return std.fmt.allocPrint(allocator, "summary: {s}", .{text});
+    if (tool_trace) |trace| {
+        if (trace.len > 0) return std.fmt.allocPrint(allocator, "{s}: [used: {s}] {s}", .{ who, trace, text });
+    }
+    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ who, text });
 }
 
 /// Renders the most recent `limit` messages in `chat_id` (oldest first) as
@@ -219,7 +232,7 @@ pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary, m.tool_trace
         \\FROM messages m JOIN identities i ON i.id = m.identity_id
         \\WHERE m.chat_id = $1 AND m.text IS NOT NULL
         \\ORDER BY m.id DESC LIMIT $2;
@@ -230,7 +243,7 @@ pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
 
     var lines: std.ArrayList([]const u8) = .empty;
     while (try stmt.step()) {
-        try lines.append(allocator, try formatLine(allocator, stmt.columnText(0), stmt.columnText(1), stmt.columnBool(2)));
+        try lines.append(allocator, try formatLine(allocator, stmt.columnText(0), stmt.columnText(1), stmt.columnBool(2), if (stmt.columnIsNull(3)) null else stmt.columnText(3)));
     }
     std.mem.reverse([]const u8, lines.items); // rows came back newest-first
     return std.mem.join(allocator, "\n", lines.items);
@@ -251,7 +264,7 @@ pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary, m.tool_trace
         \\FROM messages m JOIN identities i ON i.id = m.identity_id
         \\WHERE m.chat_id = $1 AND m.text IS NOT NULL AND m.ts >= to_timestamp($2)
         \\ORDER BY m.id DESC LIMIT $3;
@@ -263,7 +276,7 @@ pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id
 
     var lines: std.ArrayList([]const u8) = .empty;
     while (try stmt.step()) {
-        try lines.append(allocator, try formatLine(allocator, stmt.columnText(0), stmt.columnText(1), stmt.columnBool(2)));
+        try lines.append(allocator, try formatLine(allocator, stmt.columnText(0), stmt.columnText(1), stmt.columnBool(2), if (stmt.columnIsNull(3)) null else stmt.columnText(3)));
     }
     std.mem.reverse([]const u8, lines.items); // rows came back newest-first
     return std.mem.join(allocator, "\n", lines.items);
@@ -518,6 +531,13 @@ test "insert/recentFormatted/pruneKeepLast scoped correctly per chat" {
     // A separate chat must not see chat1's messages (per-chat isolation).
     const history2 = try recentFormatted(&pool, a, chat2, 10);
     try testing.expectEqualStrings("Carol: unrelated", history2);
+
+    // The bot's own reply carries what it did; an empty trace renders like
+    // no trace at all.
+    try insertWithTrace(&pool, chat2, carol, "4", "12°C in Berlin", 1003, "weather({\"location\":\"Berlin\"}) -> 12°C");
+    try insertWithTrace(&pool, chat2, carol, "5", "plain", 1004, "");
+    const traced = try recentFormatted(&pool, a, chat2, 10);
+    try testing.expectEqualStrings("Carol: unrelated\nCarol: [used: weather({\"location\":\"Berlin\"}) -> 12°C] 12°C in Berlin\nCarol: plain", traced);
 
     try pruneKeepLast(&pool, chat1, 1);
     const pruned = try recentFormatted(&pool, a, chat1, 10);

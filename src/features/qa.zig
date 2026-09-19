@@ -31,28 +31,28 @@ pub const default_system_prompt =
     \\question and answer it on its own terms; don't let unrelated earlier
     \\messages in the history steer or color your answer.
     \\
-    \\Knowledge: you are not limited to the chat. You have tools — weather
-    \\and air quality, currency and crypto prices, a calculator, English and
-    \\slang dictionaries, Hacker News search, QR code generation, drawing
-    \\diagrams, building a word cloud out of text you provide, web search,
-    \\fetching a URL's content, setting/listing/canceling reminders
-    \\(set_reminder) — translate whatever natural-language time the user
-    \\gave into that tool's required duration shorthand yourself, except for
-    \\a named weekday ("this Friday", "on Monday"): pass the day name
-    \\straight through (see the tool's own description) rather than
-    \\computing a day offset yourself, since you don't reliably know what
-    \\day of the week today is — the current date/time given below the
-    \\question does, and the tool resolves the weekday server-side from it
-    \\— and converting a photo/document/voice/audio/video the user just sent to a
-    \\different format (convert_file), or starting the conversion flow
-    \\(begin_file_conversion) when they say they want to convert something
-    \\but haven't attached a file to this message yet — that tool just asks
-    \\them to send the file; don't use it if one's already attached here.
-    \\For anything
-    \\factual you don't confidently know (current events, prices, releases,
-    \\docs), use web_search rather than guessing or claiming you can't know;
-    \\fetch a promising result with fetch_url when the snippet isn't enough.
-    \\Say plainly when you couldn't find an answer.
+    \\Knowledge: you are not limited to the chat. The exact tools you can
+    \\call right now are listed at the end of this prompt, under "Your
+    \\tools" — that list is generated from what's actually enabled for
+    \\this chat, so it is the authority on what you can and can't do; when
+    \\someone asks what you're capable of, answer from it. A few tools need
+    \\care: for reminders (set_reminder), translate whatever natural-
+    \\language time the user gave into that tool's required duration
+    \\shorthand yourself, except for a named weekday ("this Friday", "on
+    \\Monday"): pass the day name straight through (see the tool's own
+    \\description) rather than computing a day offset yourself, since you
+    \\don't reliably know what day of the week today is — the current
+    \\date/time given below the question does, and the tool resolves the
+    \\weekday server-side from it. Converting a photo/document/voice/audio/
+    \\video the user just sent to a different format is convert_file;
+    \\begin_file_conversion starts the flow when they want to convert
+    \\something but haven't attached a file to this message yet — it just
+    \\asks them to send the file, so don't use it if one's already attached
+    \\here. For anything factual you don't confidently know (current
+    \\events, prices, releases, docs), use web_search rather than guessing
+    \\or claiming you can't know; fetch a promising result with fetch_url
+    \\when the snippet isn't enough. Say plainly when you couldn't find an
+    \\answer.
     \\
     \\Identity: every message you receive is tagged with exactly who sent
     \\it — their name, @handle if they have one, and platform id. This is
@@ -73,10 +73,57 @@ pub const default_system_prompt =
     \\decisively and answer from its result — don't guess, hedge, or pad a
     \\tool-backed answer with generic filler once you have the real data.
     \\Questions about yourself — your name, what model or LLM you are, your
-    \\capabilities — are answered directly from this prompt, never with a
-    \\tool: your name is Warden, full stop, regardless of the account handle
-    \\or display name this platform shows for you.
+    \\capabilities — are answered directly from this prompt (and the tool
+    \\list at its end), never with a tool: your name is Warden, full stop,
+    \\regardless of the account handle or display name this platform shows
+    \\for you.
+    \\
+    \\After tools: once a tool has run, always finish with a visible reply
+    \\— the user never sees tool calls or your reasoning, only your text.
+    \\Lines tagged "[used: ...]" in the chat history are your own earlier
+    \\tool calls and what they returned, so you can tell what you actually
+    \\did (and didn't do) on previous turns.
 ;
+
+/// Longest slice of a tool's description that makes it into the
+/// generated "Your tools" list -- the first sentence usually says what the
+/// tool is for; the full text still reaches the model via the tool
+/// definitions themselves.
+const tool_list_desc_max = 140;
+
+/// Renders `tool_defs` as a compact "Your tools" section for the system
+/// prompt: one line per enabled tool, name plus the head of its
+/// description. Generated per request rather than written into the
+/// prompt text, so it can never drift from what's actually callable in
+/// this chat -- the old hand-maintained prose list had fallen far behind
+/// the registry and was what the model quoted when asked what it could
+/// do. Empty string when there are no tools at all.
+pub fn renderToolList(allocator: std.mem.Allocator, tool_defs: []const registry.ToolDef) ![]const u8 {
+    if (tool_defs.len == 0) return "";
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "\n\nYour tools (everything you can call in this chat right now):\n");
+    for (tool_defs) |d| {
+        try buf.appendSlice(allocator, "- ");
+        try buf.appendSlice(allocator, d.name);
+        try buf.appendSlice(allocator, ": ");
+        try buf.appendSlice(allocator, descriptionHead(d.description));
+        try buf.append(allocator, '\n');
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// The first sentence of a tool description, capped at
+/// `tool_list_desc_max` bytes on a UTF-8 boundary.
+fn descriptionHead(description: []const u8) []const u8 {
+    var end = description.len;
+    if (std.mem.indexOf(u8, description, ". ")) |dot| end = dot + 1;
+    if (end > tool_list_desc_max) {
+        end = tool_list_desc_max;
+        while (end > 0 and (description[end] & 0xC0) == 0x80) end -= 1;
+    }
+    return std.mem.trimEnd(u8, description[0..end], " ");
+}
 
 /// Reserved token budget for a reasoning model's `<think>...</think>` phase,
 /// on top of whatever the visible answer itself needs — a chain-of-thought
@@ -160,7 +207,7 @@ pub fn answer(
     /// Retries per model call on a transient failure — see
     /// `toolcall.callProviderWithRetry`.
     max_retries: u32,
-) ![]const u8 {
+) !toolcall.RunResult {
     // ROADMAP.md's memory-layer phase: pinned/ranked facts, ranked/recent
     // daily digests, and recent chat history, all budget-capped in code —
     // see `context_assembly.zig`'s module doc comment. Never fails the
@@ -215,13 +262,16 @@ pub fn answer(
     // `main.zig`'s `sendTextOrFile`), but steering the model to stay under
     // budget up front means that rarely has to fire — most answers should
     // just read as normal chat messages, not surprise file attachments.
+    // The generated tool list goes last, whatever prompt is in force (the
+    // default, the operator's, or a per-chat persona), so a custom prompt
+    // never leaves the model guessing at its own capabilities.
     const system_with_budget = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\nLength budget: keep replies under {d} characters when at all possible — that's the active platform's message-size limit. If the answer genuinely needs to be longer (e.g. the user asked for something long-form), that's fine: anything over the limit is sent as a file attachment automatically, so don't refuse or truncate awkwardly instead of finishing your answer.",
-        .{ system_prompt orelse default_system_prompt, length_hint_chars },
+        "{s}\n\nLength budget: keep replies under {d} characters when at all possible — that's the active platform's message-size limit. If the answer genuinely needs to be longer (e.g. the user asked for something long-form), that's fine: anything over the limit is sent as a file attachment automatically, so don't refuse or truncate awkwardly instead of finishing your answer.{s}",
+        .{ system_prompt orelse default_system_prompt, length_hint_chars, try renderToolList(allocator, tool_defs) },
     );
 
-    return toolcall.run(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, vision_enabled, documents_enabled, effective_max_tokens, max_retries);
+    return toolcall.runDetailed(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, vision_enabled, documents_enabled, effective_max_tokens, max_retries);
 }
 
 test "answerMaxTokens reserves a thinking budget on top of the answer's own character-derived budget" {
@@ -229,4 +279,28 @@ test "answerMaxTokens reserves a thinking budget on top of the answer's own char
     // is (4096/3)=1365 tokens, plus the fixed thinking reserve.
     try std.testing.expectEqual(@as(u32, 4000 + 1365), answerMaxTokens(4096));
     try std.testing.expectEqual(@as(u32, 4000 + 0), answerMaxTokens(0));
+}
+
+test "renderToolList lists each enabled tool by name with the head of its description" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const defs = [_]registry.ToolDef{
+        .{ .name = "weather", .description = "Gets current weather (temperature, wind) for a city name. No API key required (Open-Meteo).", .input_schema_json = "{}", .execute = undefined },
+        .{ .name = "noop", .description = "Does nothing", .input_schema_json = "{}", .execute = undefined },
+    };
+    const out = try renderToolList(a, &defs);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Your tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- weather: Gets current weather (temperature, wind) for a city name.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Open-Meteo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- noop: Does nothing\n") != null);
+    try std.testing.expectEqualStrings("", try renderToolList(a, &.{}));
+}
+
+test "descriptionHead caps a long first sentence on a UTF-8 boundary" {
+    const long = "é" ** 100;
+    const head = descriptionHead(long);
+    try std.testing.expect(head.len <= tool_list_desc_max);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(head));
 }

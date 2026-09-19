@@ -158,11 +158,16 @@ pub const OpenAiCompatProvider = struct {
         const choice = parsed.value.choices[0];
 
         var blocks: std.ArrayList(llm.ContentBlock) = .empty;
-        const reasoning = choice.message.reasoning_content orelse choice.message.reasoning;
+        // Field-carried reasoning is kept as its own block regardless of
+        // `show_thinking` -- it has to travel back to the model on the next
+        // turn either way (see `llm.ThinkingBlock`); whether the *user*
+        // sees it is decided downstream by `toolcall.zig`.
+        if (choice.message.reasoning_content) |r| {
+            if (r.len > 0) try blocks.append(allocator, .{ .thinking = .{ .text = r, .field = .reasoning_content } });
+        } else if (choice.message.reasoning) |r| {
+            if (r.len > 0) try blocks.append(allocator, .{ .thinking = .{ .text = r, .field = .reasoning } });
+        }
         if (request.show_thinking) {
-            if (reasoning) |r| {
-                if (r.len > 0) try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "{s}{s}{s}\n\n", .{ llm.thinking_start, r, llm.thinking_end }) });
-            }
             // Some models (MiniMax-M3 among them) send chain-of-thought
             // inline in `content` as literal <think>/<thinking> tags
             // instead of (or as well as) the separate reasoning field above
@@ -200,12 +205,7 @@ pub const OpenAiCompatProvider = struct {
             try blocks.append(allocator, .{ .tool_use = .{ .id = tc.id, .name = tc.function.name, .input = args.value } });
         }
 
-        const stop_reason: llm.StopReason = if (choice.message.tool_calls.len > 0 or std.mem.eql(u8, choice.finish_reason, "tool_calls"))
-            .tool_use
-        else if (std.mem.eql(u8, choice.finish_reason, "stop"))
-            .end_turn
-        else
-            .other;
+        const stop_reason = parseStopReason(choice.finish_reason, choice.message.tool_calls.len > 0);
 
         return .{ .content = try blocks.toOwnedSlice(allocator), .stop_reason = stop_reason };
     }
@@ -235,6 +235,15 @@ pub const OpenAiCompatProvider = struct {
         return try state.finalize(allocator);
     }
 };
+
+/// `tool_calls`/`stop`/`length` are the OpenAI names; a backend that emits
+/// tool calls but a different finish reason still counts as `tool_use`.
+fn parseStopReason(finish_reason: []const u8, has_tool_calls: bool) llm.StopReason {
+    if (has_tool_calls or std.mem.eql(u8, finish_reason, "tool_calls")) return .tool_use;
+    if (std.mem.eql(u8, finish_reason, "stop")) return .end_turn;
+    if (std.mem.eql(u8, finish_reason, "length")) return .max_tokens;
+    return .other;
+}
 
 fn elapsedMs(io: Io, started: Io.Timestamp) i64 {
     return @intCast(@divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - started.toNanoseconds(), std.time.ns_per_ms));
@@ -339,6 +348,9 @@ const StreamState = struct {
     /// false — see `shownText`, called on every delta instead.
     visible_text: std.ArrayList(u8) = .empty,
     reasoning_text: std.ArrayList(u8) = .empty,
+    /// Which field the reasoning deltas arrived in -- echoed back verbatim
+    /// on later turns, see `llm.ReasoningField`. `null` until one is seen.
+    reasoning_field: ?llm.ReasoningField = null,
     tool_calls: std.ArrayList(ToolCallAccum) = .empty,
     saw_tool_calls_finish: bool = false,
     stop_reason_str: []const u8 = "",
@@ -411,9 +423,16 @@ const StreamState = struct {
                 if (shown.len > 0) self.stream_sink.report(shown);
             }
         }
-        const reasoning = delta.object.get("reasoning_content") orelse delta.object.get("reasoning");
-        if (reasoning) |r| {
-            if (r == .string and r.string.len > 0) try self.reasoning_text.appendSlice(self.allocator, r.string);
+        if (delta.object.get("reasoning_content")) |r| {
+            if (r == .string and r.string.len > 0) {
+                try self.reasoning_text.appendSlice(self.allocator, r.string);
+                self.reasoning_field = .reasoning_content;
+            }
+        } else if (delta.object.get("reasoning")) |r| {
+            if (r == .string and r.string.len > 0) {
+                try self.reasoning_text.appendSlice(self.allocator, r.string);
+                self.reasoning_field = .reasoning;
+            }
         }
 
         if (delta.object.get("tool_calls")) |tcs| {
@@ -482,8 +501,11 @@ const StreamState = struct {
     fn finalize(self: *StreamState, allocator: std.mem.Allocator) !llm.ChatResponse {
         var blocks: std.ArrayList(llm.ContentBlock) = .empty;
 
-        if (self.show_thinking and self.reasoning_text.items.len > 0) {
-            try blocks.append(allocator, .{ .text = try std.fmt.allocPrint(allocator, "{s}{s}{s}\n\n", .{ llm.thinking_start, self.reasoning_text.items, llm.thinking_end }) });
+        if (self.reasoning_text.items.len > 0) {
+            try blocks.append(allocator, .{ .thinking = .{
+                .text = try allocator.dupe(u8, self.reasoning_text.items),
+                .field = self.reasoning_field orelse .reasoning_content,
+            } });
         }
         if (self.visible_text.items.len > 0) {
             const c = try self.shownText();
@@ -501,12 +523,7 @@ const StreamState = struct {
             try blocks.append(allocator, .{ .tool_use = .{ .id = tc.id.items, .name = tc.name.items, .input = args.value } });
         }
 
-        const stop_reason: llm.StopReason = if (self.saw_tool_calls_finish or std.mem.eql(u8, self.stop_reason_str, "tool_calls"))
-            .tool_use
-        else if (std.mem.eql(u8, self.stop_reason_str, "stop"))
-            .end_turn
-        else
-            .other;
+        const stop_reason = parseStopReason(self.stop_reason_str, self.saw_tool_calls_finish);
 
         return .{ .content = try blocks.toOwnedSlice(allocator), .stop_reason = stop_reason };
     }
@@ -541,12 +558,22 @@ fn writeMessages(
         defer tool_calls.deinit(allocator);
         var tool_results: std.ArrayList(llm.ToolResult) = .empty;
         defer tool_results.deinit(allocator);
+        var reasoning_parts: std.ArrayList(u8) = .empty;
+        defer reasoning_parts.deinit(allocator);
+        var reasoning_field: ?llm.ReasoningField = null;
 
         var documents: usize = 0;
 
         for (m.content) |block| {
             switch (block) {
                 .text => |t| try text_parts.appendSlice(allocator, t),
+                // Handed back under whichever key the backend itself used
+                // (see `llm.ThinkingBlock`) -- an interleaved-thinking model
+                // needs its earlier thoughts next to its tool calls.
+                .thinking => |th| {
+                    try reasoning_parts.appendSlice(allocator, th.text);
+                    reasoning_field = th.field;
+                },
                 .image => |img| try images.append(allocator, img),
                 // No equivalent on this surface: a native document block is
                 // an Anthropic-specific shape (see `anthropic.zig`), and
@@ -612,6 +639,10 @@ fn writeMessages(
             try json.Stringify.value(text_parts.items, .{}, w);
         } else {
             try w.writeAll("null");
+        }
+        if (m.role == .assistant and reasoning_parts.items.len > 0) {
+            try w.print(",\"{s}\":", .{@tagName(reasoning_field.?)});
+            try json.Stringify.value(reasoning_parts.items, .{}, w);
         }
         if (tool_calls.items.len > 0) {
             try w.writeAll(",\"tool_calls\":[");
@@ -1003,4 +1034,76 @@ test "writeMessages: a document alongside an image keeps the image part and stil
     try testing.expectEqualStrings("text", parts[0].object.get("type").?.string);
     try testing.expect(std.mem.indexOf(u8, parts[0].object.get("text").?.string, "does not support reading documents") != null);
     try testing.expectEqualStrings("image_url", parts[1].object.get("type").?.string);
+}
+
+test "parseStopReason maps length to max_tokens and tool calls win over the finish reason" {
+    try testing.expectEqual(llm.StopReason.end_turn, parseStopReason("stop", false));
+    try testing.expectEqual(llm.StopReason.max_tokens, parseStopReason("length", false));
+    try testing.expectEqual(llm.StopReason.tool_use, parseStopReason("tool_calls", false));
+    try testing.expectEqual(llm.StopReason.tool_use, parseStopReason("stop", true));
+    try testing.expectEqual(llm.StopReason.other, parseStopReason("content_filter", false));
+}
+
+test "StreamState keeps field-carried reasoning as a thinking block (under the field's own name), separate from the visible text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var recorder = Recorder{};
+    defer recorder.reports.deinit(testing.allocator);
+    // show_thinking is off: the thought must still be kept for the model's
+    // own next turn, just not rendered to the sink.
+    var state = StreamState{ .allocator = a, .stream_sink = recorder.sink(), .show_thinking = false };
+
+    try feedLines(&state, &.{
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning\":\"let me \"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"think\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"four\"}}]}",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}",
+        "data: [DONE]",
+    });
+
+    const response = try state.finalize(a);
+    try testing.expectEqual(@as(usize, 2), response.content.len);
+    try testing.expectEqualStrings("let me think", response.content[0].thinking.text);
+    try testing.expectEqual(llm.ReasoningField.reasoning, response.content[0].thinking.field);
+    try testing.expectEqualStrings("four", response.content[1].text);
+    try testing.expectEqual(llm.StopReason.max_tokens, response.stop_reason);
+
+    try testing.expectEqual(@as(usize, 1), recorder.reports.items.len);
+    try testing.expectEqualStrings("four", recorder.reports.items[0]);
+}
+
+test "writeMessages hands an assistant turn's thinking back under the same field, next to its tool calls" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try writeMessages(testing.allocator, &out.writer, null, &.{
+        .{ .role = .user, .content = &.{.{ .text = "what's 2+2" }} },
+        .{ .role = .assistant, .content = &.{
+            .{ .thinking = .{ .text = "I should use the calculator", .field = .reasoning_content } },
+            .{ .tool_use = .{ .id = "call_1", .name = "calculator", .input = .{ .null = {} } } },
+        } },
+        .{ .role = .user, .content = &.{.{ .tool_result = .{ .tool_use_id = "call_1", .content = "4" } }} },
+    });
+
+    var parsed = try json.parseFromSlice(json.Value, testing.allocator, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const assistant = parsed.value.array.items[1].object;
+    try testing.expectEqualStrings("assistant", assistant.get("role").?.string);
+    try testing.expectEqualStrings("I should use the calculator", assistant.get("reasoning_content").?.string);
+    try testing.expect(assistant.get("reasoning") == null);
+    try testing.expectEqual(@as(usize, 1), assistant.get("tool_calls").?.array.items.len);
+    // The user turn never carries one, whatever its blocks.
+    try testing.expect(parsed.value.array.items[0].object.get("reasoning_content") == null);
+}
+
+test "writeMessages never emits a reasoning key for a turn that had no thinking block" {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+
+    try writeMessages(testing.allocator, &out.writer, null, &.{
+        .{ .role = .assistant, .content = &.{.{ .text = "plain answer" }} },
+    });
+    try testing.expect(std.mem.indexOf(u8, out.writer.buffered(), "reasoning") == null);
 }

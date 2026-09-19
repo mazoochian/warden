@@ -5887,11 +5887,11 @@ fn handleTelegramUserAutoReply(
             .native_id = msg.user_id,
         };
         const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
-        const raw_answer = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries) catch |err| {
+        const result = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries) catch |err| {
             log.err("reply_autonomy: qa.answer failed for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
-        break :blk std.mem.trim(u8, raw_answer, " \t\r\n");
+        break :blk std.mem.trim(u8, result.text, " \t\r\n");
     };
     if (answer.len == 0) return;
 
@@ -10975,7 +10975,7 @@ fn replyWithAnswer(
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
-    const raw_answer_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window, max_retries);
+    const result_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window, max_retries);
 
     // Stop the ticker before touching the placeholder ourselves. Signaled
     // cooperatively (`state.stop`) and joined with a bound, rather than
@@ -11004,7 +11004,7 @@ fn replyWithAnswer(
     }
     log.info("qa: model call for chat {s} returned", .{native_chat_id});
 
-    const raw_answer = raw_answer_or_err catch |err| {
+    const result = result_or_err catch |err| {
         if (err == error.Cancelled) {
             log.info("qa: request cancelled for chat {s}", .{native_chat_id});
             finalizePlaceholder(connector, a, native_chat_id, placeholder_id, reply_to, "🛑 Cancelled.");
@@ -11025,24 +11025,28 @@ fn replyWithAnswer(
         return;
     };
 
-    // Models occasionally produce a whitespace-only answer (e.g. after a
-    // photo-sending tool already did the visible work); Telegram rejects
-    // empty text with a 400, so don't try to send it — and don't leave the
-    // placeholder stuck showing "thinking" forever either.
-    const answer = std.mem.trim(u8, raw_answer, " \t\r\n");
-    log.info("qa: answer for chat {s} is {d} bytes (raw {d})", .{ native_chat_id, answer.len, raw_answer.len });
-    if (answer.len == 0) {
-        log.info("qa: empty answer for chat {s}, deleting placeholder", .{native_chat_id});
-        if (placeholder_id) |pid| connector.deleteMessage(a, native_chat_id, pid) catch |err| {
-            // Previously swallowed silently — if this fails (network
-            // hiccup, message already gone), the placeholder is stuck
-            // showing "thinking" forever with zero trace of why. At least
-            // log it; there's no good fallback text to edit in instead
-            // since there was never a real answer to show.
-            log.warn("qa: failed to delete empty-answer placeholder for chat {s}: {t}", .{ native_chat_id, err });
-        };
-        return;
-    }
+    // What the model actually did this turn, kept with its reply in the
+    // history (see `messages.insertWithTrace`) so the next turn can see
+    // its own earlier tool calls instead of just the prose it ended on.
+    const tool_trace = toolcall.formatTrace(a, result.tool_calls) catch null;
+
+    // The loop already nudged the model once for a visible reply (see
+    // `toolcall.runDetailed`), so an empty answer here means it had
+    // nothing to say twice over. That used to delete the placeholder and
+    // leave nothing behind -- to the user, the bot just went quiet, and to
+    // the next turn there was no record anything had happened. Now the
+    // placeholder becomes a short visible fallback instead, and the turn
+    // is recorded with its tool trace like any other. Telegram rejects
+    // empty text with a 400, so the fallback is also what keeps this path
+    // sendable at all.
+    const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
+    const answer = if (trimmed.len > 0) trimmed else blk: {
+        log.warn("qa: empty answer for chat {s} after nudge (stop={t}, tools={d}: {s})", .{
+            native_chat_id, result.stop_reason, result.tool_calls.len, tool_trace orelse "-",
+        });
+        break :blk if (result.tool_calls.len > 0) "\u{2705} Done." else "I couldn't put together a reply to that -- could you rephrase or ask again?";
+    };
+    log.info("qa: answer for chat {s} is {d} bytes (raw {d}, tools {d})", .{ native_chat_id, answer.len, result.text.len, result.tool_calls.len });
 
     if (answer.len > max_message_len) {
         // Too long for this platform's limit — editing the placeholder
@@ -11071,7 +11075,22 @@ fn replyWithAnswer(
         log.err("qa: failed to resolve bot identity for chat {s}: {t}", .{ native_chat_id, err });
         return;
     };
-    recordMessage(pool, chat_id, bot_identity_id, null, answer, now, retention_messages);
+    recordBotReply(pool, chat_id, bot_identity_id, answer, tool_trace, now, retention_messages);
+}
+
+/// `recordMessage` for the bot's own reply, with the tool trace that
+/// produced it (see `toolcall.formatTrace`).
+fn recordBotReply(pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, text: []const u8, tool_trace: ?[]const u8, ts: i64, retention: i64) void {
+    messages.insertWithTrace(pool, chat_id, identity_id, null, text, ts, tool_trace) catch |err| {
+        log.err("failed to insert bot reply for chat {d}: {t}", .{ chat_id, err });
+        return;
+    };
+    chat_members.touch(pool, chat_id, identity_id, ts) catch |err| {
+        log.err("failed to touch chat_members for chat {d}: {t}", .{ chat_id, err });
+    };
+    messages.pruneKeepLast(pool, chat_id, retention) catch |err| {
+        log.err("prune failed for chat {d}: {t}", .{ chat_id, err });
+    };
 }
 
 fn replyWithWordcloud(
