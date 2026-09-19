@@ -79,20 +79,20 @@ pub const FeedWatchRowForIdentity = struct {
 };
 
 /// Watches added by one identity, optionally narrowed to one chat — see
-/// `reminders.listForIdentity`'s doc comment for why this is separate
+/// `reminders.listForIdentities`'s doc comment for why this is separate
 /// from `listPending`.
-pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]FeedWatchRowForIdentity {
+pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]FeedWatchRowForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
         \\SELECT f.id, f.chat_id, c.title, f.feed_url
         \\FROM feed_watches f JOIN chats c ON c.id = f.chat_id
-        \\WHERE f.identity_id = $1 AND ($2::bigint IS NULL OR f.chat_id = $2)
+        \\WHERE f.identity_id = ANY($1::bigint[]) AND ($2::bigint IS NULL OR f.chat_id = $2)
         \\ORDER BY f.id ASC;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
     if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
 
     var out: std.ArrayList(FeedWatchRowForIdentity) = .empty;
@@ -337,7 +337,7 @@ test "create/dueForCheck/markChecked/listPending/remove" {
     try testing.expect(!(try remove(&pool, chat_id, "https://example.com/feed.xml")));
 }
 
-test "listForIdentity/getById/removeById" {
+test "listForIdentities/getById/removeById" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -360,11 +360,11 @@ test "listForIdentity/getById/removeById" {
     try testing.expect(try create(&pool, chat1, alice, "https://example.com/a.xml"));
     try testing.expect(try create(&pool, chat2, alice, "https://example.com/b.xml"));
 
-    const all = try listForIdentity(&pool, a, alice, null);
+    const all = try listForIdentities(&pool, a, &.{alice}, null);
     try testing.expectEqual(@as(usize, 2), all.len);
     try testing.expectEqualStrings("Chat One", all[0].chat_title.?);
 
-    const narrowed = try listForIdentity(&pool, a, alice, chat1);
+    const narrowed = try listForIdentities(&pool, a, &.{alice}, chat1);
     try testing.expectEqual(@as(usize, 1), narrowed.len);
 
     const ref = (try getById(&pool, a, narrowed[0].id)) orelse return error.TestExpectedValue;

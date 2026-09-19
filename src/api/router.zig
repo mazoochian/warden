@@ -3599,27 +3599,66 @@ fn callersOwnIdentity(ctx: *const ServerContext, request: *http.Server.Request, 
     return identity_ids[0];
 }
 
-/// Resolves the identity to scope a `GET` list by: an explicit
+/// Every identity the caller *is*: the ones linked to their account, plus
+/// -- when the account is the owner's -- every configured owner identity
+/// (`Config.owners`) that has an `identities` row. Login only ever links
+/// the one identity the OIDC provider vouched for (Telegram), while the
+/// owner's notes/reminders/expenses on Matrix or XMPP are recorded against
+/// that platform's identity row for the same person -- before this, the
+/// "my notes" views only ever showed the Telegram half. Caller frees.
+fn callersIdentityIds(ctx: *const ServerContext, ra: RequesterAuth) ![]i64 {
+    var out: std.ArrayList(i64) = .empty;
+    errdefer out.deinit(ctx.allocator);
+
+    const linked = try accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id);
+    defer ctx.allocator.free(linked);
+    try out.appendSlice(ctx.allocator, linked);
+
+    if (ra.roles.owner) {
+        for (ctx.config.owners) |owner| {
+            const ref = (identities.findByNativeId(ctx.pool, ctx.allocator, owner.platform, owner.owner_id) catch null) orelse continue;
+            ctx.allocator.free(ref.display_name);
+            ctx.allocator.free(ref.native_id);
+            if (std.mem.indexOfScalar(i64, out.items, ref.id) == null) try out.append(ctx.allocator, ref.id);
+        }
+    }
+    return out.toOwnedSlice(ctx.allocator);
+}
+
+/// Resolves the identities to scope a `GET` list by: an explicit
 /// `?identity_id=` (owner/bot_admin only -- viewing on behalf of someone
-/// else), else the caller's own first linked identity (same "exactly one
-/// identity per account today" simplification as `handleGetMySettings`).
-fn resolveListIdentity(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8, ra: RequesterAuth) !?i64 {
+/// else) as a one-element set, else every identity the caller is (see
+/// `callersIdentityIds`). `null` means a response was already sent;
+/// otherwise the caller frees the slice.
+fn resolveListIdentities(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8, ra: RequesterAuth) !?[]i64 {
     if (queryParam(target, "identity_id")) |id_str| {
         if (!ra.roles.owner and !ra.roles.bot_admin) {
             try respondError(request, .forbidden, "forbidden", "admin access required to view on behalf of another identity");
             return null;
         }
-        return std.fmt.parseInt(i64, id_str, 10) catch {
+        const id = std.fmt.parseInt(i64, id_str, 10) catch {
             try respondError(request, .bad_request, "bad_request", "invalid identity_id");
             return null;
         };
+        return try ctx.allocator.dupe(i64, &.{id});
     }
-    return try callersOwnIdentity(ctx, request, ra.account_id);
+    const ids = callersIdentityIds(ctx, ra) catch |err| {
+        log.err("resolve-list-identities: failed for account {d}: {t}", .{ ra.account_id, err });
+        try respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+        return null;
+    };
+    if (ids.len == 0) {
+        ctx.allocator.free(ids);
+        try respondError(request, .internal_server_error, "internal", "account has no linked identity");
+        return null;
+    }
+    return ids;
 }
 
 /// Resolves the creator identity for a `POST` (create): an explicit
 /// `identity_id` in the body (owner/bot_admin only), else whichever of the
-/// caller's own identities is a member of `chat_id` -- mirroring
+/// caller's own identities (`callersIdentityIds`, so the owner's Matrix
+/// identity is found for a Matrix room) is a member of `chat_id` -- mirroring
 /// `/remind`/`/alert`/`/watch`'s own "open to anyone currently in the
 /// chat" authorization. Also verifies `chat_id` names a real chat.
 fn resolveCreateIdentity(ctx: *const ServerContext, request: *http.Server.Request, ra: RequesterAuth, chat_id: i64, explicit_identity_id: ?i64) !?i64 {
@@ -3641,7 +3680,7 @@ fn resolveCreateIdentity(ctx: *const ServerContext, request: *http.Server.Reques
         return id;
     }
 
-    const identity_ids = accounts.listIdentityIds(ctx.pool, ctx.allocator, ra.account_id) catch |err| {
+    const identity_ids = callersIdentityIds(ctx, ra) catch |err| {
         log.err("resolve-create-identity: failed to list identities for account {d}: {t}", .{ ra.account_id, err });
         try respondError(request, .internal_server_error, "internal", "failed to resolve identity");
         return null;
@@ -3681,7 +3720,8 @@ const CreateReminderBody = struct {
 /// chat -- a deliberate difference documented in API.md.
 fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
+    defer ctx.allocator.free(identity_ids);
     const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
         std.fmt.parseInt(i64, c, 10) catch {
             return respondError(request, .bad_request, "bad_request", "invalid chat_id");
@@ -3689,8 +3729,8 @@ fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request,
     else
         null;
 
-    const items = reminders.listForIdentity(ctx.pool, ctx.allocator, identity_id, chat_id) catch |err| {
-        log.err("list-reminders: failed for identity {d}: {t}", .{ identity_id, err });
+    const items = reminders.listForIdentities(ctx.pool, ctx.allocator, identity_ids, chat_id) catch |err| {
+        log.err("list-reminders: failed for account {d}: {t}", .{ ra.account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load reminders");
     };
     defer {
@@ -3701,9 +3741,12 @@ fn handleListReminders(ctx: *const ServerContext, request: *http.Server.Request,
         ctx.allocator.free(items);
     }
 
-    const date_format = user_settings.getEffectiveDateFormat(ctx.pool, ctx.allocator, identity_id);
-    const time_format = user_settings.getEffectiveTimeFormat(ctx.pool, ctx.allocator, identity_id);
-    const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, identity_id);
+    // Display preferences come from the primary identity (the account's
+    // own linked one is always first in the set -- see `callersIdentityIds`).
+    const primary_identity_id = identity_ids[0];
+    const date_format = user_settings.getEffectiveDateFormat(ctx.pool, ctx.allocator, primary_identity_id);
+    const time_format = user_settings.getEffectiveTimeFormat(ctx.pool, ctx.allocator, primary_identity_id);
+    const offset_minutes = user_settings.getEffectiveOffsetMinutes(ctx.pool, ctx.allocator, primary_identity_id);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
@@ -3868,7 +3911,7 @@ fn handleCancelReminder(ctx: *const ServerContext, request: *http.Server.Request
 }
 
 // --- Announcements (ROADMAP.md Phase 16) -- chat-scoped, not identity-
-// scoped-across-chats like Reminders above: `reminders.listForIdentity`
+// scoped-across-chats like Reminders above: `reminders.listForIdentities`
 // is deliberately hard-filtered to `kind = 'reminder'` (see its own doc
 // comment), since a scheduled announcement is a chat-level admin object,
 // not a personal one. `reminders.listPending`, already built for
@@ -4024,7 +4067,8 @@ const CreateAlertBody = struct {
 /// `handleListReminders`.
 fn handleListAlerts(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
+    defer ctx.allocator.free(identity_ids);
     const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
         std.fmt.parseInt(i64, c, 10) catch {
             return respondError(request, .bad_request, "bad_request", "invalid chat_id");
@@ -4032,8 +4076,8 @@ fn handleListAlerts(ctx: *const ServerContext, request: *http.Server.Request, ta
     else
         null;
 
-    const items = alert_store.listForIdentity(ctx.pool, ctx.allocator, identity_id, chat_id) catch |err| {
-        log.err("list-alerts: failed for identity {d}: {t}", .{ identity_id, err });
+    const items = alert_store.listForIdentities(ctx.pool, ctx.allocator, identity_ids, chat_id) catch |err| {
+        log.err("list-alerts: failed for account {d}: {t}", .{ ra.account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load alerts");
     };
     defer {
@@ -4164,7 +4208,8 @@ const CreateWatchBody = struct {
 /// its adder -- see `handleDeleteWatch`.
 fn handleListWatches(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
+    defer ctx.allocator.free(identity_ids);
     const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
         std.fmt.parseInt(i64, c, 10) catch {
             return respondError(request, .bad_request, "bad_request", "invalid chat_id");
@@ -4172,8 +4217,8 @@ fn handleListWatches(ctx: *const ServerContext, request: *http.Server.Request, t
     else
         null;
 
-    const items = feed_watches.listForIdentity(ctx.pool, ctx.allocator, identity_id, chat_id) catch |err| {
-        log.err("list-watches: failed for identity {d}: {t}", .{ identity_id, err });
+    const items = feed_watches.listForIdentities(ctx.pool, ctx.allocator, identity_ids, chat_id) catch |err| {
+        log.err("list-watches: failed for account {d}: {t}", .{ ra.account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load watches");
     };
     defer {
@@ -4280,7 +4325,8 @@ const CreateNoteBody = struct {
 /// chat" by default -- see `notes_store.NoteForIdentity`'s doc comment.
 fn handleListNotes(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
+    defer ctx.allocator.free(identity_ids);
     const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
         std.fmt.parseInt(i64, c, 10) catch {
             return respondError(request, .bad_request, "bad_request", "invalid chat_id");
@@ -4288,8 +4334,8 @@ fn handleListNotes(ctx: *const ServerContext, request: *http.Server.Request, tar
     else
         null;
 
-    const items = notes_store.listForIdentity(ctx.pool, ctx.allocator, identity_id, chat_id) catch |err| {
-        log.err("list-notes: failed for identity {d}: {t}", .{ identity_id, err });
+    const items = notes_store.listForIdentities(ctx.pool, ctx.allocator, identity_ids, chat_id) catch |err| {
+        log.err("list-notes: failed for account {d}: {t}", .{ ra.account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load notes");
     };
     defer {
@@ -4388,10 +4434,14 @@ fn handleDeleteNote(ctx: *const ServerContext, request: *http.Server.Request, id
 /// intends, not just an inconsistency.
 fn handleListMemory(ctx: *const ServerContext, request: *http.Server.Request) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    const identity_id = (try callersOwnIdentity(ctx, request, ra.account_id)) orelse return;
+    const identity_ids = callersIdentityIds(ctx, ra) catch |err| {
+        log.err("list-memory: failed to resolve identities for account {d}: {t}", .{ ra.account_id, err });
+        return respondError(request, .internal_server_error, "internal", "failed to resolve identity");
+    };
+    defer ctx.allocator.free(identity_ids);
 
-    const items = facts.listForIdentity(ctx.pool, ctx.allocator, identity_id) catch |err| {
-        log.err("list-memory: failed for identity {d}: {t}", .{ identity_id, err });
+    const items = facts.listForIdentities(ctx.pool, ctx.allocator, identity_ids) catch |err| {
+        log.err("list-memory: failed for account {d}: {t}", .{ ra.account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load memories");
     };
     defer {
@@ -4571,7 +4621,8 @@ const CreateSubscriptionBody = struct {
 /// chat-scoped and shows every contributor's entries together.
 fn handleListExpenses(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
+    defer ctx.allocator.free(identity_ids);
 
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena_state.deinit();
@@ -4594,16 +4645,16 @@ fn handleListExpenses(ctx: *const ServerContext, request: *http.Server.Request, 
     else
         null;
 
-    const items = expenses_store.listForIdentity(
+    const items = expenses_store.listForIdentities(
         ctx.pool,
         arena,
-        identity_id,
+        identity_ids,
         chat_id,
         category,
         since,
         paginationParams(target).limit,
     ) catch |err| {
-        log.err("list-expenses: failed for identity {d}: {t}", .{ identity_id, err });
+        log.err("list-expenses: failed for account {d}: {t}", .{ ra.account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load expenses");
     };
     return respondJson(ctx, request, .ok, .{ .items = items });
@@ -4922,7 +4973,8 @@ fn handleDeleteBudget(ctx: *const ServerContext, request: *http.Server.Request, 
 /// risk drifting from what `/subscription list` reports in chat.
 fn handleListSubscriptions(ctx: *const ServerContext, request: *http.Server.Request, target: []const u8) !void {
     const ra = (try requireLoggedIn(ctx, request)) orelse return;
-    const identity_id = (try resolveListIdentity(ctx, request, target, ra)) orelse return;
+    const identity_ids = (try resolveListIdentities(ctx, request, target, ra)) orelse return;
+    defer ctx.allocator.free(identity_ids);
 
     const chat_id: ?i64 = if (queryParam(target, "chat_id")) |c|
         std.fmt.parseInt(i64, c, 10) catch {
@@ -4935,8 +4987,8 @@ fn handleListSubscriptions(ctx: *const ServerContext, request: *http.Server.Requ
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const rows = subscriptions_store.listForIdentity(ctx.pool, arena, identity_id, chat_id) catch |err| {
-        log.err("list-subscriptions: failed for identity {d}: {t}", .{ identity_id, err });
+    const rows = subscriptions_store.listForIdentities(ctx.pool, arena, identity_ids, chat_id) catch |err| {
+        log.err("list-subscriptions: failed for account {d}: {t}", .{ ra.account_id, err });
         return respondError(request, .internal_server_error, "internal", "failed to load subscriptions");
     };
 

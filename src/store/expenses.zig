@@ -42,7 +42,7 @@ pub fn create(pool: *PgPool, chat_id: i64, identity_id: i64, amount_cents: i64, 
 /// Most recent `limit` expenses in `chat_id`, newest first, optionally
 /// narrowed to one `category` and/or a `since_ts` floor -- backs
 /// `/expense list`. Same NULL-coalescing optional-filter idiom
-/// `notes.listForIdentity` already uses for its own optional `chat_id`.
+/// `notes.listForIdentities` already uses for its own optional `chat_id`.
 pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, category: ?[]const u8, since_ts: ?i64, limit: i64) ![]Expense {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -99,10 +99,10 @@ pub const ExpenseForIdentity = struct {
 /// from `listForChat` rather than a filter on top of it. Newest first,
 /// same ordering `listForChat` already uses (most recent spending is what
 /// you actually want to see first).
-pub fn listForIdentity(
+pub fn listForIdentities(
     pool: *PgPool,
     allocator: std.mem.Allocator,
-    identity_id: i64,
+    identity_ids: []const i64,
     chat_id: ?i64,
     category: ?[]const u8,
     since_ts: ?i64,
@@ -115,14 +115,14 @@ pub fn listForIdentity(
         \\SELECT e.id, e.chat_id, c.title, e.amount_cents, e.currency, e.category, e.description,
         \\       EXTRACT(EPOCH FROM e.created_at)::bigint
         \\FROM expenses e JOIN chats c ON c.id = e.chat_id
-        \\WHERE e.identity_id = $1
+        \\WHERE e.identity_id = ANY($1::bigint[])
         \\  AND ($2::bigint IS NULL OR e.chat_id = $2)
         \\  AND ($3::text IS NULL OR e.category = $3)
         \\  AND ($4::bigint IS NULL OR e.created_at >= to_timestamp($4))
         \\ORDER BY e.created_at DESC LIMIT $5;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
     if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
     if (category) |c| stmt.bindText(3, c) else stmt.bindNull(3);
     if (since_ts) |s| stmt.bindInt64(4, s) else stmt.bindNull(4);
@@ -292,7 +292,7 @@ test "listForChat filters by category and since_ts" {
     try testing.expectEqual(@as(i64, 3000), since_recent[0].amount_cents);
 }
 
-test "listForIdentity scopes by identity across chats, narrowed by chat/category/since" {
+test "listForIdentities scopes by identity across chats, narrowed by chat/category/since" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -312,24 +312,24 @@ test "listForIdentity scopes by identity across chats, narrowed by chat/category
     _ = try create(&pool, chat1, bob, 9999, "USD", "food", null, 3000);
 
     // Alice's own spending, across every chat -- bob's row never appears.
-    const alice_all = try listForIdentity(&pool, a, alice, null, null, null, 100);
+    const alice_all = try listForIdentities(&pool, a, &.{alice}, null, null, null, 100);
     try testing.expectEqual(@as(usize, 2), alice_all.len);
     try testing.expectEqual(@as(i64, 2000), alice_all[0].amount_cents); // newest first
     try testing.expectEqualStrings("Chat One", alice_all[1].chat_title.?);
     try testing.expectEqual(@as(?[]const u8, null), alice_all[0].chat_title); // chat2 has no title
 
-    const alice_chat1 = try listForIdentity(&pool, a, alice, chat1, null, null, 100);
+    const alice_chat1 = try listForIdentities(&pool, a, &.{alice}, chat1, null, null, 100);
     try testing.expectEqual(@as(usize, 1), alice_chat1.len);
 
-    const alice_food = try listForIdentity(&pool, a, alice, null, "food", null, 100);
+    const alice_food = try listForIdentities(&pool, a, &.{alice}, null, "food", null, 100);
     try testing.expectEqual(@as(usize, 1), alice_food.len);
     try testing.expectEqualStrings("food", alice_food[0].category);
 
-    const alice_recent = try listForIdentity(&pool, a, alice, null, null, 1500, 100);
+    const alice_recent = try listForIdentities(&pool, a, &.{alice}, null, null, 1500, 100);
     try testing.expectEqual(@as(usize, 1), alice_recent.len);
     try testing.expectEqual(@as(i64, 2000), alice_recent[0].amount_cents);
 
-    const bob_all = try listForIdentity(&pool, a, bob, null, null, null, 100);
+    const bob_all = try listForIdentities(&pool, a, &.{bob}, null, null, null, 100);
     try testing.expectEqual(@as(usize, 1), bob_all.len);
 }
 

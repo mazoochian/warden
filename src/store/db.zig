@@ -287,6 +287,22 @@ pub const Stmt = struct {
         self.count = @max(self.count, i + 1);
     }
 
+    /// Binds a `bigint[]` in Postgres's text array literal form
+    /// (`{1,2,3}`) -- pair it with `= ANY($n::bigint[])` in the SQL. An
+    /// empty slice binds `{}`, which matches nothing.
+    pub fn bindInt64Array(self: *Stmt, idx: c_int, values: []const i64) void {
+        const i: usize = @intCast(idx - 1);
+        var buf: std.Io.Writer.Allocating = .init(self.arena.allocator());
+        buf.writer.writeByte('{') catch unreachable;
+        for (values, 0..) |v, n| {
+            if (n != 0) buf.writer.writeByte(',') catch unreachable;
+            buf.writer.print("{d}", .{v}) catch unreachable;
+        }
+        buf.writer.writeByte('}') catch unreachable;
+        self.values[i] = self.arena.allocator().dupeZ(u8, buf.writer.buffered()) catch unreachable;
+        self.count = @max(self.count, i + 1);
+    }
+
     pub fn bindNull(self: *Stmt, idx: c_int) void {
         const i: usize = @intCast(idx - 1);
         self.values[i] = null;

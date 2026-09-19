@@ -191,18 +191,18 @@ pub const PendingReminderForIdentity = struct {
 /// happens to share the table, not one of the caller's own reminders. The
 /// panel therefore has no announcement surface at all yet — a deliberate
 /// gap, noted in ROADMAP.md's Phase 16 rather than half-built here.
-pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]PendingReminderForIdentity {
+pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]PendingReminderForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
         \\SELECT r.id, r.chat_id, c.title, r.message, EXTRACT(EPOCH FROM r.due_at)::bigint, r.recur_interval_seconds
         \\FROM reminders r JOIN chats c ON c.id = r.chat_id
-        \\WHERE r.delivered_at IS NULL AND r.kind = 'reminder' AND r.identity_id = $1 AND ($2::bigint IS NULL OR r.chat_id = $2)
+        \\WHERE r.delivered_at IS NULL AND r.kind = 'reminder' AND r.identity_id = ANY($1::bigint[]) AND ($2::bigint IS NULL OR r.chat_id = $2)
         \\ORDER BY r.due_at ASC;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
     if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
 
     var out: std.ArrayList(PendingReminderForIdentity) = .empty;
@@ -379,7 +379,7 @@ test "a recurring reminder reschedules instead of being marked delivered" {
     try testing.expectEqual(@as(usize, 1), due_again.len);
 }
 
-test "listForIdentity scopes by identity across chats, optionally narrowed to one" {
+test "listForIdentities scopes by identity across chats, optionally narrowed to one" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -410,15 +410,15 @@ test "listForIdentity scopes by identity across chats, optionally narrowed to on
     _ = try create(&pool, chat2, alice, "alice in chat2", 3000, null);
     _ = try create(&pool, chat1, bob, "bob in chat1", 4000, null);
 
-    const alice_all = try listForIdentity(&pool, a, alice, null);
+    const alice_all = try listForIdentities(&pool, a, &.{alice}, null);
     try testing.expectEqual(@as(usize, 2), alice_all.len);
     try testing.expectEqualStrings("Chat One", alice_all[0].chat_title.?);
 
-    const alice_chat1 = try listForIdentity(&pool, a, alice, chat1);
+    const alice_chat1 = try listForIdentities(&pool, a, &.{alice}, chat1);
     try testing.expectEqual(@as(usize, 1), alice_chat1.len);
     try testing.expectEqualStrings("alice in chat1", alice_chat1[0].message);
 
-    const bob_all = try listForIdentity(&pool, a, bob, null);
+    const bob_all = try listForIdentities(&pool, a, &.{bob}, null);
     try testing.expectEqual(@as(usize, 1), bob_all.len);
 }
 
@@ -474,7 +474,7 @@ test "announcements share the table but never leak into a reminder listing (or v
     try testing.expect(saw_announcement);
 
     // The web panel's identity-scoped view stays reminders-only.
-    const mine = try listForIdentity(&pool, a, identity_id, null);
+    const mine = try listForIdentities(&pool, a, &.{identity_id}, null);
     try testing.expectEqual(@as(usize, 1), mine.len);
     try testing.expectEqual(rem_id, mine[0].id);
 }

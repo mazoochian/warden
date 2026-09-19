@@ -91,7 +91,7 @@ pub const SubscriptionForIdentity = struct {
 /// -- see `SubscriptionForIdentity`'s doc comment for why this is a
 /// separate query from `listForChat`. Oldest first, same ordering
 /// `listForChat` already uses.
-pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]SubscriptionForIdentity {
+pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]SubscriptionForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);
 
@@ -99,11 +99,11 @@ pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id:
         \\SELECT s.id, s.chat_id, c.title, s.name, s.amount_cents, s.currency, s.interval_days,
         \\       EXTRACT(EPOCH FROM s.created_at)::bigint
         \\FROM subscriptions s JOIN chats c ON c.id = s.chat_id
-        \\WHERE s.identity_id = $1 AND ($2::bigint IS NULL OR s.chat_id = $2)
+        \\WHERE s.identity_id = ANY($1::bigint[]) AND ($2::bigint IS NULL OR s.chat_id = $2)
         \\ORDER BY s.created_at ASC;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
     if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
 
     var out: std.ArrayList(SubscriptionForIdentity) = .empty;
@@ -207,7 +207,7 @@ test "monthlyEquivalentCents normalizes weekly/monthly/yearly intervals to a 30-
     try testing.expectEqual(@as(i64, 3000), monthlyEquivalentCents(700, 7)); // $7/wk -> $30/mo
 }
 
-test "listForIdentity scopes by identity across chats, optionally narrowed to one" {
+test "listForIdentities scopes by identity across chats, optionally narrowed to one" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -226,16 +226,16 @@ test "listForIdentity scopes by identity across chats, optionally narrowed to on
     _ = try create(&pool, chat2, alice, "Spotify", 999, "USD", 30, 2000);
     _ = try create(&pool, chat1, bob, "Hulu", 799, "USD", 30, 3000);
 
-    const alice_all = try listForIdentity(&pool, a, alice, null);
+    const alice_all = try listForIdentities(&pool, a, &.{alice}, null);
     try testing.expectEqual(@as(usize, 2), alice_all.len);
     try testing.expectEqualStrings("Netflix", alice_all[0].name); // oldest first
     try testing.expectEqualStrings("Chat One", alice_all[0].chat_title.?);
     try testing.expectEqual(@as(?[]const u8, null), alice_all[1].chat_title); // chat2 has no title
 
-    const alice_chat2 = try listForIdentity(&pool, a, alice, chat2);
+    const alice_chat2 = try listForIdentities(&pool, a, &.{alice}, chat2);
     try testing.expectEqual(@as(usize, 1), alice_chat2.len);
     try testing.expectEqualStrings("Spotify", alice_chat2[0].name);
 
-    const bob_all = try listForIdentity(&pool, a, bob, null);
+    const bob_all = try listForIdentities(&pool, a, &.{bob}, null);
     try testing.expectEqual(@as(usize, 1), bob_all.len); // never sees alice's
 }

@@ -110,24 +110,30 @@ pub fn search(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, que
 
 /// Every active fact for one identity, oldest first — for `/memory list`.
 pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ![]Memory {
+    return listForIdentities(pool, allocator, &.{identity_id});
+}
+
+/// Same across a set of identities (one person's identities on several
+/// platforms -- the web UI's view), still oldest first.
+pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64) ![]Memory {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT id, statement, EXTRACT(EPOCH FROM recorded_at)::bigint
-        \\FROM facts WHERE identity_id = $1 AND status != 'retired'
+        \\SELECT id, identity_id, statement, EXTRACT(EPOCH FROM recorded_at)::bigint
+        \\FROM facts WHERE identity_id = ANY($1::bigint[]) AND status != 'retired'
         \\ORDER BY recorded_at ASC;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
 
     var out: std.ArrayList(Memory) = .empty;
     while (try stmt.step()) {
         try out.append(allocator, .{
             .id = stmt.columnInt64(0),
-            .identity_id = identity_id,
-            .text = try allocator.dupe(u8, stmt.columnText(1)),
-            .created_at = stmt.columnInt64(2),
+            .identity_id = stmt.columnInt64(1),
+            .text = try allocator.dupe(u8, stmt.columnText(2)),
+            .created_at = stmt.columnInt64(3),
         });
     }
     return out.toOwnedSlice(allocator);

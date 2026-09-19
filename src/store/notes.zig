@@ -92,23 +92,26 @@ pub const NoteForIdentity = struct {
     created_at: i64,
 };
 
-/// Notes added by one identity, optionally narrowed to one chat -- see
+/// Notes added by any of `identity_ids` (one person's identities across
+/// platforms -- the web UI's "my notes" view, where the owner's Telegram
+/// and Matrix identities are the same person), optionally narrowed to one
+/// chat -- see
 /// `NoteForIdentity`'s doc comment for why this is a separate query from
 /// `listForChat` rather than a filter on top of it. Oldest first, same
 /// ordering (and same "reads naturally in the order items were added")
 /// `listForChat` already uses.
-pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]NoteForIdentity {
+pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]NoteForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
         \\SELECT n.id, n.chat_id, c.title, n.text, EXTRACT(EPOCH FROM n.created_at)::bigint
         \\FROM notes n JOIN chats c ON c.id = n.chat_id
-        \\WHERE n.identity_id = $1 AND ($2::bigint IS NULL OR n.chat_id = $2)
+        \\WHERE n.identity_id = ANY($1::bigint[]) AND ($2::bigint IS NULL OR n.chat_id = $2)
         \\ORDER BY n.created_at ASC;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
     if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
 
     var out: std.ArrayList(NoteForIdentity) = .empty;
@@ -180,7 +183,7 @@ test "create/listForChat/get/delete" {
     try testing.expectEqual(@as(usize, 0), (try listForChat(&pool, a, chat_id)).len);
 }
 
-test "listForIdentity scopes by identity across chats, optionally narrowed to one" {
+test "listForIdentities scopes by identity across chats, optionally narrowed to one" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -211,16 +214,24 @@ test "listForIdentity scopes by identity across chats, optionally narrowed to on
     _ = try create(&pool, chat2, alice, "alice in chat2", 2000);
     _ = try create(&pool, chat1, bob, "bob in chat1", 3000);
 
-    const alice_all = try listForIdentity(&pool, a, alice, null);
+    const alice_all = try listForIdentities(&pool, a, &.{alice}, null);
     try testing.expectEqual(@as(usize, 2), alice_all.len);
     try testing.expectEqualStrings("Chat One", alice_all[0].chat_title.?);
 
-    const alice_chat1 = try listForIdentity(&pool, a, alice, chat1);
+    const alice_chat1 = try listForIdentities(&pool, a, &.{alice}, chat1);
     try testing.expectEqual(@as(usize, 1), alice_chat1.len);
     try testing.expectEqualStrings("alice in chat1", alice_chat1[0].text);
 
-    const bob_all = try listForIdentity(&pool, a, bob, null);
+    const bob_all = try listForIdentities(&pool, a, &.{bob}, null);
     try testing.expectEqual(@as(usize, 1), bob_all.len);
+
+    // One person with two identities (the owner on Telegram and Matrix)
+    // sees both sets together, still oldest first.
+    const both = try listForIdentities(&pool, a, &.{ alice, bob }, null);
+    try testing.expectEqual(@as(usize, 3), both.len);
+    try testing.expectEqualStrings("bob in chat1", both[2].text);
+
+    try testing.expectEqual(@as(usize, 0), (try listForIdentities(&pool, a, &.{}, null)).len);
 }
 
 test "listForChat scopes by chat" {

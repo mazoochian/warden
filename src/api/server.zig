@@ -289,6 +289,7 @@ const identities = @import("../store/identities.zig");
 const chats_store = @import("../store/chats.zig");
 const bot_admins = @import("../store/bot_admins.zig");
 const convert = @import("../features/convert.zig");
+const notes_store = @import("../store/notes.zig");
 
 fn testConfig() config_mod.Config {
     return .{
@@ -1086,4 +1087,74 @@ test "settings PATCH and announcement POST answer instead of aborting after the 
         const response = try req.receiveHead(&.{});
         try testing.expectEqual(.ok, response.head.status);
     }
+}
+
+// The owner logs in through one platform's identity (OIDC vouches for the
+// Telegram account), but writes notes from every platform the bot is on --
+// each recorded against that platform's own identity row. The "my notes"
+// list has to cover all of them, or a note taken on Matrix simply never
+// shows up in the web UI, which is exactly what happened.
+test "my notes list covers every one of the owner's platform identities, not just the logged-in one" {
+    const gpa = std.heap.page_allocator;
+
+    const db = try gpa.create(Db);
+    db.* = try test_support.openTestDb(gpa) orelse return error.SkipZigTest;
+    const pool = try gpa.create(PgPool);
+    pool.* = try PgPool.wrapForTest(gpa, testing.io, db);
+
+    const telegram_owner = try identities.getOrCreateMinimal(pool, .telegram, "777", "Owner", null, false, 1000);
+    const matrix_owner = try identities.getOrCreateMinimal(pool, .matrix, "@owner:example.org", "Owner", null, false, 1000);
+    const stranger = try identities.getOrCreateMinimal(pool, .telegram, "778", "Stranger", null, false, 1000);
+    const tg_chat = try chats_store.upsertChat(pool, .telegram, "-1007770000", "supergroup", "TG Chat");
+    const mx_chat = try chats_store.upsertChat(pool, .matrix, "!room:example.org", "room", "MX Room");
+
+    _ = try notes_store.create(pool, tg_chat, telegram_owner, "from telegram", 1000);
+    _ = try notes_store.create(pool, mx_chat, matrix_owner, "from matrix", 2000);
+    _ = try notes_store.create(pool, tg_chat, stranger, "not mine", 3000);
+
+    const config = try gpa.create(config_mod.Config);
+    config.* = testConfig();
+    config.owners = &.{
+        .{ .platform = .telegram, .owner_id = "777" },
+        .{ .platform = .matrix, .owner_id = "@owner:example.org" },
+    };
+
+    const ctx = try gpa.create(ServerContext);
+    ctx.* = .{ .allocator = gpa, .io = testing.io, .pool = pool, .config = config };
+
+    const listener = try gpa.create(Io.net.Server);
+    listener.* = try bind(testing.io, 0);
+    const port = listener.socket.address.getPort();
+
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
+
+    var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+
+    // Logged in as the Telegram identity only -- the Matrix one is never
+    // linked to the account, same as production.
+    const cookie = try devLogin(&client, port, telegram_owner);
+    defer testing.allocator.free(cookie);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api/v1/notes", .{port});
+    var req = try client.request(.GET, try std.Uri.parse(url), .{
+        .keep_alive = false,
+        .extra_headers = &.{.{ .name = "cookie", .value = cookie }},
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+    var response = try req.receiveHead(&.{});
+    try testing.expectEqual(.ok, response.head.status);
+    const body = try readBody(&response, testing.allocator);
+    defer testing.allocator.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"from telegram\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"from matrix\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"not mine\"") == null);
 }
