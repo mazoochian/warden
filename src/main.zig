@@ -41,7 +41,7 @@ const rate_limits = @import("store/rate_limits.zig");
 const member_permissions = @import("store/member_permissions.zig");
 const bot_config = @import("store/bot_config.zig");
 const bot_admins = @import("store/bot_admins.zig");
-const bot_allowlist = @import("store/bot_allowlist.zig");
+const bot_blocklist = @import("store/bot_blocklist.zig");
 const bot_pending_grants = @import("store/bot_pending_grants.zig");
 const trivial_reply = @import("features/trivial_reply.zig");
 const redact_feature = @import("features/redact.zig");
@@ -138,10 +138,10 @@ const delegate_generate_image_tool = @import("tools/delegate_generate_image.zig"
 /// the platform's own UI (Telegram's "/" autocomplete / attachment menu)
 /// instead of only working for people who already know the exact text to
 /// type — see `handleHelp`/`help_text` below for the fuller reference,
-/// including the owner/bot-admin-only `/token /credit /scraper /adduser
-/// /removeuser /allowchat /disallowchat /addadmin /removeadmin /sudo
-/// /storage` deliberately left out of this public menu (see their own
-/// dispatch-table gates in `handleMessage`).
+/// including the owner/bot-admin-only `/scraper /blockuser /unblockuser
+/// /blockchat /unblockchat /addadmin /removeadmin /sudo /storage`
+/// deliberately left out of this public menu (see their own dispatch-table
+/// gates in `handleMessage`).
 const public_commands = [_]iface.CommandSpec{
     .{ .name = "help", .description = "Show available commands and how to talk to Warden." },
     .{ .name = "menu", .description = "Open a button-driven menu of every module (alerts, watches, stats, admin, settings, help)." },
@@ -218,12 +218,11 @@ const public_commands = [_]iface.CommandSpec{
 /// `/alias add sendas ...` in a chat and have the owner's own later
 /// `/sendas` there expand into text of the aliaser's choosing.
 const reserved_command_names_extra = [_][]const u8{
-    "token",      "credit",       "scraper",  "adduser",     "removeuser",
-    "allowchat",  "disallowchat", "addadmin", "removeadmin", "sudo",
-    "storage",    "feed",         "tdlogin",  "tdlogout",    "iglogin",
-    "sendas",     "tdsend",       "tdchats",  "tdsearch",    "tdsummary",
-    "autonomy",   "drafts",       "approve",  "discard",     "slowmode",
-    "permission", "tag",
+    "scraper",  "blockuser",   "unblockuser", "blockchat",  "unblockchat",
+    "addadmin", "removeadmin", "sudo",        "storage",    "feed",
+    "tdlogin",  "tdlogout",    "iglogin",     "sendas",     "tdsend",
+    "tdchats",  "tdsearch",    "tdsummary",   "autonomy",   "drafts",
+    "approve",  "discard",     "slowmode",    "permission", "tag",
 };
 
 /// True if `name` (no leading slash) is a real built-in command -- checked
@@ -244,7 +243,7 @@ test "isReservedCommandName covers both the public menu and the owner-only extra
     try std.testing.expect(isReservedCommandName("ping"));
     try std.testing.expect(isReservedCommandName("PING"));
     try std.testing.expect(isReservedCommandName("sudo"));
-    try std.testing.expect(isReservedCommandName("Token"));
+    try std.testing.expect(isReservedCommandName("BlockUser"));
     try std.testing.expect(!isReservedCommandName("gm"));
     try std.testing.expect(!isReservedCommandName("standup"));
     // AUDIT-2026-09-03 CORE-3: the fifteen the list used to be missing.
@@ -355,16 +354,12 @@ const help_text_admin =
     \\  skips the in-group confirmation (the bound room's audit log still
     \\  sees it regardless); /silent on|off makes -s the default here
     \\
-    \\Tokens and credits (reply to a user, or pass @username, to view/set)
-    \\/token [balance] [@user] -- lets a non-admin run one /kick or /ban
-    \\  per token. Chat admins/bot admins can grant these
-    \\/credit [balance] [@user] -- 1 credit per LLM question. Bot
-    \\  admin/owner only (spends real API cost)
-    \\
-    \\Bot admins (trusted bot-wide -- owner only to grant/revoke)
-    \\/addadmin, /removeadmin, /adduser, /removeuser -- reply to a user,
-    \\  or pass @username/id, to grant/revoke that role
-    \\/allowchat, /disallowchat -- allow/disallow this whole chat
+    \\Access (owner/bot admin only). Everyone can talk to me unless blocked
+    \\/addadmin, /removeadmin -- reply to a user, or pass @username/id,
+    \\  to grant/revoke the bot-admin role (trusted bot-wide)
+    \\/blockuser, /unblockuser -- reply to a user, or pass @username/id,
+    \\  to stop me responding to them anywhere (or undo that)
+    \\/blockchat, /unblockchat -- stop responding in this whole chat
     \\/whois [@user|id] -- their name/username/id/flags. Admin/owner only
     \\/chatinfo [native id] -- this chat's internal id, platform, type and
     \\  title; pass a native id to look up another chat on this platform
@@ -1483,7 +1478,7 @@ fn processMessageTask(
         // LLM call), fires for any sender -- see `checkKeywordAlerts`'s own
         // doc comment for why this sits at the same "passive content
         // observation" tier as `recordMessage`/`bcast.publish` above rather
-        // than behind the owner/credits gates real Q&A uses.
+        // than behind the owner-only gate real Q&A uses.
         if (feature_flags.isEnabled(pool, "keyword_alerts")) {
             if (msg.text) |t| checkKeywordAlerts(connector, a, pool, chat_id, msg, t);
         }
@@ -1572,7 +1567,7 @@ fn processMessageTask(
     // owner's personal account, reading and marking-read their DMs, moving
     // their bulletin cursor -- so they're only wired when the sender is the
     // owner, same as `.memory`'s "absent means the tool can't run" rule
-    // below. Every bot admin, and every credit-holding user whenever
+    // below. Every bot admin, and every user whenever
     // `WARDEN_LLM_OWNER_ONLY=false`, reaches this code path; before this
     // gate they all got these sinks, with their own identity as "owner".
     // `filterEnabledTools` also stops offering the tools to the model when
@@ -1794,9 +1789,9 @@ fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, m
         }
         break :blk try identities.getOrCreateMinimal(pool, connector.platform(), msg.user_id, msg.username orelse msg.user_id, msg.username, false, ts);
     };
-    // Completes a grant queued by `/adduser`/`/addadmin` against a
+    // Completes a grant queued by `/blockuser`/`/addadmin` against a
     // `@username` the bot had no identity for yet — checked on every
-    // message that carries a username, before `handleMessage`'s allowlist
+    // message that carries a username, before `handleMessage`'s blocklist
     // gate ever runs, so this same (this person's very first) message
     // already sees the completed grant. See `store/bot_pending_grants.zig`.
     if (msg.username) |username| {
@@ -1806,15 +1801,15 @@ fn resolveSenderIdentity(pool: *store_pool.PgPool, connector: iface.Connector, m
 }
 
 fn completePendingGrants(pool: *store_pool.PgPool, platform: iface.Platform, username: []const u8, identity_id: i64) void {
-    const pending_user = bot_pending_grants.takePending(pool, platform, username, .allowed_user) catch |err| blk: {
-        log.err("failed to check pending user-allow grant for @{s}: {t}", .{ username, err });
+    const pending_block = bot_pending_grants.takePending(pool, platform, username, .blocked_user) catch |err| blk: {
+        log.err("failed to check pending user-block for @{s}: {t}", .{ username, err });
         break :blk null;
     };
-    if (pending_user) |added_by| {
-        bot_allowlist.addAllowedUser(pool, identity_id, added_by) catch |err| {
-            log.err("failed to complete pending user-allow grant for @{s}: {t}", .{ username, err });
+    if (pending_block) |added_by| {
+        bot_blocklist.blockUser(pool, identity_id, added_by) catch |err| {
+            log.err("failed to complete pending user-block for @{s}: {t}", .{ username, err });
         };
-        log.notice("completed pending allow-user grant for @{s} (identity {d})", .{ username, identity_id });
+        log.notice("completed pending user-block for @{s} (identity {d})", .{ username, identity_id });
     }
 
     const pending_admin = bot_pending_grants.takePending(pool, platform, username, .bot_admin) catch |err| blk: {
@@ -2241,7 +2236,7 @@ fn modeArgOrReplyText(arg: []const u8, reply_to_text: ?[]const u8) ?[]const u8 {
 /// (/translate, /rewrite, /eli5, /brainstorm) — each one just builds a
 /// mode-specific instruction as `question` (see the dispatch table in
 /// `handleMessage`) and routes it through the exact same LLM-answering
-/// pipeline plain addressed Q&A uses: dynamic owner-only/credits gates,
+/// pipeline plain addressed Q&A uses: the dynamic owner-only gate,
 /// /persona and /thinking overrides, the placeholder+ticker flow, tool-
 /// calling, streaming — all via `replyWithAnswer`, same as
 /// `isAddressedToBot`'s own branch. Deliberately skips that branch's
@@ -2274,14 +2269,6 @@ fn handleModeCommand(
     const dyn = resolveLlmDynamicSettings(pool, a, config);
     const is_privileged = is_owner or is_bot_admin;
     if (dyn.owner_only and !is_privileged) return;
-
-    if (!is_privileged and !(identities.spendCredit(pool, identity_id) catch |err| blk: {
-        log.err("qa: credit spend check failed for identity {d}: {t}", .{ identity_id, err });
-        break :blk false;
-    })) {
-        connector.sendMessage(a, msg.chat_id, "You're out of LLM credits — ask the bot owner for more.", msg.message_id);
-        return;
-    }
 
     const system_prompt = chat_settings.getSystemPromptOverride(pool, a, chat_id) orelse config.system_prompt;
     const show_thinking = chat_settings.getShowThinkingOverride(pool, chat_id) orelse dyn.show_thinking;
@@ -2493,16 +2480,17 @@ test "isOwnBotDm: matches the bot's own DM by its native chat id" {
 ///     owner typing `/stats` (or `/kick`, or `/sudo ...`) must not have it
 ///     dispatched as a command, because any reply would be composed and sent
 ///     out under the owner's own identity.
-///   * **It never takes `ignored` on allowlist grounds either.** That same
-///     "never the owner" property means `auth.isOwner` — which compares
-///     `msg.user_id` against `WARDEN_TELEGRAM_USER_OWNER_ID`, the owner's
-///     *own* id — can never match here, and neither can `bot_admins`/the
-///     allowlist for a contact who was never explicitly added. Routing this
-///     through the normal gate therefore dropped every single
-///     personal-account message on the floor, which silently made
-///     `reply_autonomy` dead code: `/autonomy draft` and `/autonomy auto`
-///     stored and read back fine and then never once fired. Fixed
-///     2026-09-03.
+///   * **It never takes `ignored` on access-list grounds either.** That
+///     same "never the owner" property means `auth.isOwner` — which
+///     compares `msg.user_id` against `WARDEN_TELEGRAM_USER_OWNER_ID`, the
+///     owner's *own* id — can never match here, and neither can
+///     `bot_admins`. Under the old allowlist, routing this through the
+///     normal gate dropped every single personal-account message on the
+///     floor, which silently made `reply_autonomy` dead code: `/autonomy
+///     draft` and `/autonomy auto` stored and read back fine and then never
+///     once fired. Fixed 2026-09-03. The blocklist that replaced it is
+///     skipped here for the same reason -- a block is about the *bot's*
+///     chats, not the owner's own account.
 ///
 ///   * **It never manages Warden's own DM with the owner.** The personal
 ///     account has a direct chat with Warden's Bot API account like any
@@ -2520,38 +2508,49 @@ test "isOwnBotDm: matches the bot's own DM by its native chat id" {
 ///     but the numeric id can't -- the same "compare the numeric id, never
 ///     the username" rule `auth.isOwner` already follows.
 ///
-/// Skipping the allowlist is safe here and only here, because
+/// Skipping the access gate is safe here and only here, because
 /// `reply_autonomy` is its own deliberate opt-in and is fail-closed (`.off`
 /// resolves until the owner turns a chat on). That is emphatically not true
-/// of a bot connector, where the allowlist is the only thing between a
-/// stranger and the LLM — which is why this tests for `.telegram_user`
-/// specifically rather than "is a personal-account platform": the Instagram
-/// connector has no `reply_autonomy` path, so exempting it would just hand
-/// its DMs straight to `isAddressedToBot`.
+/// of a bot connector, where the blocklist (and the owner-only LLM gate
+/// further down) is what stands between a stranger and the LLM — which is
+/// why this tests for `.telegram_user` specifically rather than "is a
+/// personal-account platform": the Instagram connector has no
+/// `reply_autonomy` path, so exempting it would just hand its DMs straight
+/// to `isAddressedToBot`.
+///
+/// `blocked` is "this sender, or this whole chat, is on the blocklist" --
+/// the bot answers everyone else. Owners and bot admins can't be blocked
+/// (the check is short-circuited before it's even queried).
 pub fn routeIncoming(
     platform: iface.Platform,
     is_owner: bool,
     is_bot_admin: bool,
-    allowlisted: bool,
+    blocked: bool,
     is_own_bot_dm: bool,
 ) Route {
     if (platform == .telegram_user) {
         if (is_own_bot_dm) return .ignored;
         return .personal_account_autonomy;
     }
-    if (is_owner or is_bot_admin or allowlisted) return .command_and_qa;
-    return .ignored;
+    if (is_owner or is_bot_admin) return .command_and_qa;
+    if (blocked) return .ignored;
+    return .command_and_qa;
 }
 
-test "routeIncoming: a personal-account message reaches autonomy even though nothing about its sender is allowed" {
-    // The exact shape of the bug: an inbound DM on the owner's personal
-    // account is always from someone else, so is_owner/is_bot_admin/
-    // allowlisted are all false -- and it must STILL be routed to the
-    // autonomy path rather than dropped. Routing it through the normal gate
-    // is what made draft/auto mode silently do nothing.
+test "routeIncoming: a personal-account message reaches autonomy whatever its sender's standing" {
+    // The exact shape of the original bug: an inbound DM on the owner's
+    // personal account is always from someone else, so is_owner/
+    // is_bot_admin are false -- and it must STILL be routed to the autonomy
+    // path rather than dropped. Routing it through the normal gate is what
+    // made draft/auto mode silently do nothing. A block doesn't change
+    // that either.
     try std.testing.expectEqual(
         Route.personal_account_autonomy,
         routeIncoming(.telegram_user, false, false, false, false),
+    );
+    try std.testing.expectEqual(
+        Route.personal_account_autonomy,
+        routeIncoming(.telegram_user, false, false, true, false),
     );
 }
 
@@ -2562,26 +2561,27 @@ test "routeIncoming: a personal-account message is never dispatched as a command
     // grant full access on any other platform.
     for ([_]bool{ false, true }) |is_owner| {
         for ([_]bool{ false, true }) |is_bot_admin| {
-            for ([_]bool{ false, true }) |allowlisted| {
+            for ([_]bool{ false, true }) |blocked| {
                 try std.testing.expectEqual(
                     Route.personal_account_autonomy,
-                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted, false),
+                    routeIncoming(.telegram_user, is_owner, is_bot_admin, blocked, false),
                 );
             }
         }
     }
 }
 
-test "routeIncoming: bot connectors keep the allowlist gate exactly as it was" {
-    // Every non-personal platform: owner, bot admin, or explicitly
-    // allowlisted gets through; a stranger doesn't. The personal-account
-    // carve-out must not have loosened this for anyone else -- Instagram
-    // especially, since it has no reply_autonomy path of its own.
+test "routeIncoming: bot connectors answer everyone except the blocked; owner and bot admins can't be blocked" {
+    // Every non-personal platform: a stranger gets through by default now,
+    // a blocked sender/chat doesn't, and the owner/bot-admin tiers ignore
+    // the block entirely. The personal-account carve-out must not have
+    // changed this for anyone else -- Instagram especially, since it has no
+    // reply_autonomy path of its own.
     for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, true, false, false));
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, true, false, false));
-        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, true, false));
-        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, false, false));
+        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, true, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, true, true, false));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, true, true, false));
     }
 }
 
@@ -2598,10 +2598,10 @@ test "routeIncoming: the personal account's DM with Warden's own bot is left alo
     // Whatever else the message looks like.
     for ([_]bool{ false, true }) |is_owner| {
         for ([_]bool{ false, true }) |is_bot_admin| {
-            for ([_]bool{ false, true }) |allowlisted| {
+            for ([_]bool{ false, true }) |blocked| {
                 try std.testing.expectEqual(
                     Route.ignored,
-                    routeIncoming(.telegram_user, is_owner, is_bot_admin, allowlisted, true),
+                    routeIncoming(.telegram_user, is_owner, is_bot_admin, blocked, true),
                 );
             }
         }
@@ -2615,7 +2615,8 @@ test "routeIncoming: the self-DM carve-out is scoped to the personal account" {
     // bot connector and has to keep working exactly as before.
     for ([_]iface.Platform{ .telegram, .matrix, .xmpp, .discord, .whatsapp, .instagram }) |platform| {
         try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, true, false, false, true));
-        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, false, true));
+        try std.testing.expectEqual(Route.command_and_qa, routeIncoming(platform, false, false, false, true));
+        try std.testing.expectEqual(Route.ignored, routeIncoming(platform, false, false, true, true));
     }
 }
 
@@ -2686,16 +2687,17 @@ fn handleMessage(
     // continuation paths below, for uniformity: a disallowed sender gets no
     // action taken on any kind of message, not just slash commands).
     // `routeIncoming` owns the decision and documents the reasoning,
-    // including why the personal-account connector skips both the allowlist
+    // including why the personal-account connector skips both the blocklist
     // and the command chain entirely.
     //
-    // Owners and bot admins bypass the allowlist unconditionally; everyone
-    // else needs their own identity or their current chat explicitly
-    // allowed. Silent — this is "will the bot talk here at all", not a
-    // moderation decision, so it doesn't announce itself. Message
-    // recording/stats (`recordMessage`/`recordObservedUsers`) already ran
-    // earlier in `processMessageTask`, before `handleMessage`, and are
-    // unaffected by any of this.
+    // The bot talks to everyone by default; a sender is turned away only if
+    // they, or the whole chat, are on the blocklist (`/blockuser`,
+    // `/blockchat`). Owners and bot admins are never blocked. Silent — this
+    // is "will the bot talk here at all", not a moderation decision, so it
+    // doesn't announce itself. Message recording/stats
+    // (`recordMessage`/`recordObservedUsers`) already ran earlier in
+    // `processMessageTask`, before `handleMessage`, and are unaffected by
+    // any of this.
     const is_owner = auth.isOwner(config, connector.platform(), msg.user_id);
     // The owner is the highest privilege there is and shouldn't need a
     // redundant `bot_admins` row on top of that — before this, `is_bot_admin`
@@ -2713,13 +2715,12 @@ fn handleMessage(
         platform,
         is_owner,
         is_bot_admin,
-        // `and` short-circuits, so the allowlist is only actually queried
-        // for a non-owner, non-admin on a bot connector — the same messages
-        // that paid for these two lookups before. The leading platform check
-        // keeps them off the personal-account path, whose route ignores this
-        // argument entirely.
+        // `and` short-circuits, so the blocklist is only actually queried
+        // for a non-owner, non-admin on a bot connector. The leading
+        // platform check keeps the lookups off the personal-account path,
+        // whose route ignores this argument entirely.
         platform != .telegram_user and !is_owner and !is_bot_admin and
-            (bot_allowlist.isUserAllowed(pool, identity_id) or bot_allowlist.isChatAllowed(pool, chat_id)),
+            (bot_blocklist.isUserBlocked(pool, identity_id) or bot_blocklist.isChatBlocked(pool, chat_id)),
         is_own_bot_dm,
     )) {
         .ignored => return false,
@@ -2745,7 +2746,7 @@ fn handleMessage(
         // isAwaitingFormat/else split below; returns `false` (not handled)
         // for anything that isn't its own button, so a stray pick still
         // falls through to convert_flow/menu normally.
-        if (audit_notify.handleUndoPicked(connector, a, pool, pending_undos, now, msg, picked)) {
+        if (audit_notify.handleUndoPicked(connector, a, pending_undos, now, msg, picked)) {
             return false;
         }
         // Same "checked on its own first, false for anything not its own"
@@ -2802,7 +2803,7 @@ fn handleMessage(
     // commands, so they can check status/disable autopilot/clean up by hand
     // without SSH. `recordMessage`/`bcast.publish`/keyword alerts already
     // ran in `processMessageTask` before `handleMessage` was ever called
-    // (see this function's own doc comment on the owner/allowlist gate
+    // (see this function's own doc comment on the owner/blocklist gate
     // above), so message history is preserved through a sleep episode --
     // only the write-heavier stuff below (LLM replies, tool calls, command
     // dispatch) is what's actually skipped.
@@ -2976,25 +2977,25 @@ fn handleMessage(
         handleVideoQualityCommand(connector, a, config, pool, chat_id, identity_id, sudo_active, msg, text);
     } else if (std.mem.eql(u8, text, "/mute") or std.mem.startsWith(u8, text, "/mute ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "mute")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "mute")) return false;
         const vis = resolveVisibility(pool, a, chat_id, std.mem.trim(u8, text["/mute".len..], " "), is_bot_admin);
         group_admin.mute(connector, a, msg, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
     } else if (std.mem.eql(u8, text, "/unmute") or std.mem.startsWith(u8, text, "/unmute ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "unmute")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "unmute")) return false;
         const vis = resolveVisibility(pool, a, chat_id, std.mem.trim(u8, text["/unmute".len..], " "), is_bot_admin);
         group_admin.unmute(connector, a, msg, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
     } else if (std.mem.eql(u8, text, "/pin")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "pin")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "pin")) return false;
         group_admin.pin(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/unpin")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "unpin")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "unpin")) return false;
         group_admin.unpin(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/delete")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "delete")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "delete")) return false;
         group_admin.deleteMessage(connector, a, msg);
     } else if (std.mem.eql(u8, text, "/promote") or std.mem.startsWith(u8, text, "/promote ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
@@ -3014,15 +3015,15 @@ fn handleMessage(
         group_admin.demote(connector, a, msg, now, auditCtxWithVisibility(pool, pending_undos, chat_id, identity_id, msg, vis.visibility));
     } else if (std.mem.eql(u8, text, "/kick") or std.mem.startsWith(u8, text, "/kick ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "kick")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "kick")) return false;
         handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, is_bot_admin, now, msg, text, "/kick", .kick);
     } else if (std.mem.eql(u8, text, "/ban") or std.mem.startsWith(u8, text, "/ban ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "ban")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "ban")) return false;
         handleKickBanCommand(connector, a, pool, chat_id, identity_id, pending_undos, is_bot_admin, now, msg, text, "/ban", .ban);
     } else if (std.mem.eql(u8, text, "/confirm")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "confirm")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "confirm")) return false;
         group_admin.confirm(connector, a, pending, now, msg);
     } else if (std.mem.eql(u8, text, "/cancel")) {
         // Three tiers, tried in order — a pending conversion or an open
@@ -3038,7 +3039,7 @@ fn handleMessage(
             reply(connector, a, msg.chat_id, msg.message_id, "Menu prompt cancelled.");
         } else {
             if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-            if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "cancel")) return false;
+            if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "cancel")) return false;
             group_admin.cancel(connector, a, pending, msg);
         }
     } else if (std.mem.eql(u8, text, "/slowmode") or std.mem.startsWith(u8, text, "/slowmode ")) {
@@ -3046,34 +3047,28 @@ fn handleMessage(
         // /mute/etc -- it's the same moderation-tier feature set, not its
         // own toggle.
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "slowmode")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "slowmode")) return false;
         handleSlowmodeCommand(connector, a, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/permission") or std.mem.startsWith(u8, text, "/permission ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "permission")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "permission")) return false;
         handlePermissionCommand(connector, a, pool, chat_id, now, msg, text);
     } else if (std.mem.eql(u8, text, "/tag") or std.mem.startsWith(u8, text, "/tag ")) {
         if (!feature_flags.isEnabled(pool, "group_admin")) return false;
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, true, "tag")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "tag")) return false;
         handleTagCommand(connector, a, pool, now, msg, text);
-    } else if (std.mem.startsWith(u8, text, "/token")) {
-        if (!auth.checkTokenGrantAccess(connector, a, config, msg, is_bot_admin)) return false;
-        handleToken(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text);
-    } else if (std.mem.eql(u8, text, "/credit") or std.mem.startsWith(u8, text, "/credit ")) {
+    } else if (std.mem.eql(u8, text, "/blockuser") or std.mem.startsWith(u8, text, "/blockuser ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
-        handleCredit(connector, a, pool, chat_id, identity_id, pending_undos, now, msg, text);
-    } else if (std.mem.eql(u8, text, "/adduser") or std.mem.startsWith(u8, text, "/adduser ")) {
+        handleBlockUserCommand(connector, a, config, pool, identity_id, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/unblockuser") or std.mem.startsWith(u8, text, "/unblockuser ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
-        handleAddUserCommand(connector, a, pool, identity_id, now, msg, text);
-    } else if (std.mem.eql(u8, text, "/removeuser") or std.mem.startsWith(u8, text, "/removeuser ")) {
+        handleUnblockUserCommand(connector, a, pool, now, msg, text);
+    } else if (std.mem.eql(u8, text, "/blockchat")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
-        handleRemoveUserCommand(connector, a, pool, now, msg, text);
-    } else if (std.mem.eql(u8, text, "/allowchat")) {
+        handleBlockChatCommand(connector, a, pool, chat_id, identity_id, msg);
+    } else if (std.mem.eql(u8, text, "/unblockchat")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
-        handleAllowChatCommand(connector, a, pool, chat_id, identity_id, msg);
-    } else if (std.mem.eql(u8, text, "/disallowchat")) {
-        if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
-        handleDisallowChatCommand(connector, a, pool, chat_id, msg);
+        handleUnblockChatCommand(connector, a, pool, chat_id, msg);
     } else if (std.mem.eql(u8, text, "/addadmin") or std.mem.startsWith(u8, text, "/addadmin ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleAddAdminCommand(connector, a, pool, identity_id, now, msg, text);
@@ -3099,7 +3094,7 @@ fn handleMessage(
         // `/manage bind`, which authorizes against the target chat's admins.
         // No token fallback — a token buys one moderation action (see
         // `checkGroupAdminAccess`), not a lookup.
-        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "chatinfo")) return false;
+        if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "chatinfo")) return false;
         handleChatInfoCommand(connector, a, pool, chat_id, msg, text);
     } else if (std.mem.eql(u8, text, "/manage") or std.mem.startsWith(u8, text, "/manage ")) {
         if (!feature_flags.isEnabled(pool, "management_rooms")) return false;
@@ -3347,8 +3342,8 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/poll") or std.mem.startsWith(u8, text, "/poll ")) {
         // ROADMAP.md's Phase 16: group/Telegram quality-of-life. No LLM call
         // involved (plain string splitting + a native API call), so unlike
-        // the messaging-mode commands above this needs no owner/credits
-        // gate -- same "open to anyone allowed in the chat" tier as
+        // the messaging-mode commands above this needs no owner-only
+        // gate -- same "open to anyone in the chat" tier as
         // /wordcloud//stats.
         if (!feature_flags.isEnabled(pool, "polls")) return false;
         handlePollCommand(connector, a, msg, text);
@@ -3375,10 +3370,10 @@ fn handleMessage(
 
         // A greeting/ack/sign-off addressed to the bot doesn't need a real
         // (paid) LLM call to answer meaningfully — short-circuit with an
-        // instant canned reply instead. Checked before the owner-only/
-        // credit gates below: this costs nothing, so it isn't subject to
-        // either (a random allowed user's "hi" gets a friendly reply
-        // regardless of whether they're privileged enough for real Q&A).
+        // instant canned reply instead. Checked before the owner-only gate
+        // below: this costs nothing, so it isn't subject to it (a random
+        // user's "hi" gets a friendly reply regardless of whether they're
+        // privileged enough for real Q&A).
         if (dyn.skip_trivial_messages and trivial_reply.isTrivialMessage(a, text)) {
             const canned = trivial_reply.pickResponse(@intCast(now));
             connector.sendMessage(a, msg.chat_id, canned, msg.message_id);
@@ -3391,18 +3386,6 @@ fn handleMessage(
         // answer my owner" to the whole group.
         const is_privileged = is_owner or is_bot_admin;
         if (dyn.owner_only and !is_privileged) return false;
-        // Credits gate LLM usage specifically (spends the owner's real API
-        // budget) — separate from, and checked after, the owner-only gate
-        // above. Owner/bot admins get unlimited use; unlike the allowlist
-        // gate, running out of credits gets a reply (the sender IS allowed
-        // to talk to the bot, just out of budget) rather than silence.
-        if (!is_privileged and !(identities.spendCredit(pool, identity_id) catch |err| blk: {
-            log.err("qa: credit spend check failed for identity {d}: {t}", .{ identity_id, err });
-            break :blk false;
-        })) {
-            connector.sendMessage(a, msg.chat_id, "You're out of LLM credits — ask the bot owner for more.", msg.message_id);
-            return false;
-        }
         const replied_to = if (msg.reply_to_is_me) msg.reply_to_text else null;
         const resolved = resolveQuestion(connector, a, io, config, pool, tool_ctx, msg, text);
         // Per-chat /persona override, falling back to the global default —
@@ -3482,9 +3465,9 @@ test "normalizeCommandMention strips a qualifier naming us, preserving trailing 
     defer a.free(out);
     try std.testing.expectEqualStrings("/ping", out);
 
-    const out2 = normalizeCommandMention(a, "/token@warden_bot 123 add", "warden_bot").?;
+    const out2 = normalizeCommandMention(a, "/kick@warden_bot 123 add", "warden_bot").?;
     defer a.free(out2);
-    try std.testing.expectEqualStrings("/token 123 add", out2);
+    try std.testing.expectEqualStrings("/kick 123 add", out2);
 }
 
 test "normalizeCommandMention matches the qualifier case-insensitively" {
@@ -6180,25 +6163,6 @@ fn handleScraperCommand(
     }
 }
 
-/// Splits an arg string like "5 @alice", "@alice 5", "@alice", or "5" into
-/// its balance and `@username` pieces, order-independent — a lone numeric
-/// token is the balance, a lone `@`-prefixed token is the username, and
-/// either may be absent. Shared by `/token` and `/credit`, whose arg shape
-/// is identical (`<balance> [@username]`, either order).
-fn parseBalanceAndUsernameArgs(arg: []const u8) struct { balance_str: []const u8, username_arg: []const u8 } {
-    var balance_str: []const u8 = "";
-    var username_arg: []const u8 = "";
-    var it = std.mem.tokenizeScalar(u8, arg, ' ');
-    while (it.next()) |tok| {
-        if (tok.len > 0 and tok[0] == '@') {
-            username_arg = tok;
-        } else if (balance_str.len == 0) {
-            balance_str = tok;
-        }
-    }
-    return .{ .balance_str = balance_str, .username_arg = username_arg };
-}
-
 /// Resolves a command's target identity, in order: a reply to the target's
 /// message; failing that, an `@username` argument (`identities.
 /// findByUsername` — exact-match, platform-scoped); failing that, a bare
@@ -6219,9 +6183,8 @@ fn parseBalanceAndUsernameArgs(arg: []const u8) struct { balance_str: []const u8
 /// either way, since a username alone doesn't carry a native id to create
 /// the row with.
 ///
-/// `null` when nothing is present/resolvable. Shared by `/token`, `/credit`,
-/// `/adduser`, `/removeuser`, `/addadmin`, `/removeadmin`, `/kick`, `/ban`,
-/// `/whois`.
+/// `null` when nothing is present/resolvable. Shared by `/blockuser`,
+/// `/unblockuser`, `/addadmin`, `/removeadmin`, `/kick`, `/ban`, `/whois`.
 fn resolveTargetIdentity(pool: *store_pool.PgPool, connector: iface.Connector, a: std.mem.Allocator, now: i64, msg: iface.Message, target_arg: []const u8, create_if_missing: bool) !?identities.IdentityRef {
     if (replyTarget(msg)) |target| {
         // `msg.reply_to_username` (not `target.label`, which already
@@ -6245,109 +6208,11 @@ fn resolveTargetIdentity(pool: *store_pool.PgPool, connector: iface.Connector, a
     return null;
 }
 
-fn handleToken(
-    connector: iface.Connector,
-    a: std.mem.Allocator,
-    pool: *store_pool.PgPool,
-    chat_id: i64,
-    identity_id: i64,
-    pending_undos: *audit_notify.PendingUndos,
-    now: i64,
-    msg: iface.Message,
-    text: []const u8,
-) void {
-    const arg = std.mem.trim(u8, text["/token".len..], " ");
-    const parsed = parseBalanceAndUsernameArgs(arg);
-
-    const target = (resolveTargetIdentity(pool, connector, a, now, msg, parsed.username_arg, true) catch |err| {
-        log.err("token: failed to resolve target: {t}", .{err});
-        return;
-    }) orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username) you want to view/change tokens for.");
-        return;
-    };
-    // If there is no balance argument, get the current token count and reply with it.
-    if (parsed.balance_str.len == 0) {
-        const count = chat_members.getTokens(pool, chat_id, target.id, 0);
-        const message = std.fmt.allocPrint(a, "Current token count: {}", .{count}) catch |err| {
-            log.err("token: failed to allocate message string: {t}", .{err});
-            return; // Exit the function early since we couldn't format the message
-        };
-        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
-        return;
-    }
-    // Else set the token count to the parsed value and reply with a confirmation.
-    const count = std.fmt.parseInt(i64, parsed.balance_str, 10) catch 0;
-    log.debug("token: parsed count {d}", .{count});
-    const prev_balance = chat_members.getTokens(pool, chat_id, target.id, 0);
-    chat_members.setTokens(pool, chat_id, target.id, count) catch |err| {
-        log.err("token: failed to set tokens: {t}", .{err});
-        return;
-    };
-    audit_notify.recordAndNotify(connector, a, pool, pending_undos, now, chat_id, msg.chat_id, identity_id, msg.username orelse msg.user_id, .{ .token_grant = .{ .target_identity_id = target.id, .target_label = target.display_name, .prev_balance = prev_balance, .new_balance = count } });
-    const message = std.fmt.allocPrint(a, "token count updated to {}", .{count}) catch |err| {
-        log.err("token: failed to allocate message string: {t}", .{err});
-        return; // Exit the function early since we couldn't format the message
-    };
-    connector.sendMessage(a, msg.chat_id, message, msg.message_id);
-}
-
-/// `/credit` — same shape as `/token` (reply-or-`@username` targeting,
-/// `<balance> [@username]` argument order), but backed by
-/// `identities.getCredits`/`setCredits` (global per-identity) instead of
-/// `chat_members`'s per-chat tokens. Gate (`auth.isOwnerOrBotAdmin`) is
-/// checked by the caller. `chat_id` is only used to resolve which bound
-/// room (if any) an audit entry posts into — credits themselves aren't
-/// chat-scoped.
-fn handleCredit(
-    connector: iface.Connector,
-    a: std.mem.Allocator,
-    pool: *store_pool.PgPool,
-    chat_id: i64,
-    identity_id: i64,
-    pending_undos: *audit_notify.PendingUndos,
-    now: i64,
-    msg: iface.Message,
-    text: []const u8,
-) void {
-    const arg = std.mem.trim(u8, text["/credit".len..], " ");
-    const parsed = parseBalanceAndUsernameArgs(arg);
-
-    const target = (resolveTargetIdentity(pool, connector, a, now, msg, parsed.username_arg, true) catch |err| {
-        log.err("credit: failed to resolve target: {t}", .{err});
-        return;
-    }) orelse {
-        reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username) you want to view/change credits for.");
-        return;
-    };
-    if (parsed.balance_str.len == 0) {
-        const count = identities.getCredits(pool, target.id, 0);
-        const message = std.fmt.allocPrint(a, "Current credit count: {}", .{count}) catch |err| {
-            log.err("credit: failed to allocate message string: {t}", .{err});
-            return;
-        };
-        connector.sendMessage(a, msg.chat_id, message, msg.message_id);
-        return;
-    }
-    const count = std.fmt.parseInt(i64, parsed.balance_str, 10) catch 0;
-    const prev_balance = identities.getCredits(pool, target.id, 0);
-    identities.setCredits(pool, target.id, count) catch |err| {
-        log.err("credit: failed to set credits: {t}", .{err});
-        return;
-    };
-    audit_notify.recordAndNotify(connector, a, pool, pending_undos, now, chat_id, msg.chat_id, identity_id, msg.username orelse msg.user_id, .{ .credit_grant = .{ .target_identity_id = target.id, .target_label = target.display_name, .prev_balance = prev_balance, .new_balance = count } });
-    const message = std.fmt.allocPrint(a, "credit count updated to {}", .{count}) catch |err| {
-        log.err("credit: failed to allocate message string: {t}", .{err});
-        return;
-    };
-    connector.sendMessage(a, msg.chat_id, message, msg.message_id);
-}
-
-/// The six bot-management commands (`/adduser /removeuser /allowchat
-/// /disallowchat /addadmin /removeadmin`) share this shape: resolve a
+/// The six bot-management commands (`/blockuser /unblockuser /blockchat
+/// /unblockchat /addadmin /removeadmin`) share this shape: resolve a
 /// target identity (reply-or-`@username`), call one store mutation, reply
 /// with a plain confirmation. Gate (`auth.isOwnerOrBotAdmin`) is checked by
-/// the caller in every case; `granted_by`/`added_by` is always the acting
+/// the caller in every case; `granted_by`/`blocked_by` is always the acting
 /// identity (`identity_id`, already resolved by `processMessageTask` before
 /// `handleMessage` runs).
 /// A bare `@username` argument (not a reply) — used as the fallback path
@@ -6361,7 +6226,7 @@ fn usernameFromArg(arg: []const u8) ?[]const u8 {
 }
 
 /// `/kick`/`/ban [@username | user_id]` — same reply-or-`@username`-or-raw-id
-/// targeting as `/adduser`/`/addadmin` (via `resolveTargetIdentity`), which
+/// targeting as `/blockuser`/`/addadmin` (via `resolveTargetIdentity`), which
 /// `group_admin.zig`'s `requestConfirmation` never had: it only ever
 /// resolved a reply, so `/kick @spammer`/`/kick 123456789` silently matched
 /// no dispatch branch at all (see the exact-`eql` match this replaced).
@@ -6590,78 +6455,86 @@ fn handleTagCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *sto
     }
 }
 
-fn handleAddUserCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
-    const arg = std.mem.trim(u8, text["/adduser".len..], " ");
+fn handleBlockUserCommand(connector: iface.Connector, a: std.mem.Allocator, config: *const config_mod.Config, pool: *store_pool.PgPool, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/blockuser".len..], " ");
     if (resolveTargetIdentity(pool, connector, a, now, msg, arg, true) catch |err| {
-        log.err("adduser: failed to resolve target: {t}", .{err});
+        log.err("blockuser: failed to resolve target: {t}", .{err});
         return;
     }) |target| {
-        bot_allowlist.addAllowedUser(pool, target.id, identity_id) catch |err| {
-            log.err("adduser: failed to add: {t}", .{err});
+        // A block on the owner or a bot admin would be a no-op at the gate
+        // (they're checked before the blocklist) -- refuse it outright
+        // rather than store a row that silently does nothing.
+        if (auth.isOwner(config, connector.platform(), target.native_id) or bot_admins.isBotAdmin(pool, target.id)) {
+            const message = std.fmt.allocPrint(a, "{s} is the owner or a bot admin and can't be blocked.", .{target.display_name}) catch return;
+            connector.sendMessage(a, msg.chat_id, message, msg.message_id);
+            return;
+        }
+        bot_blocklist.blockUser(pool, target.id, identity_id) catch |err| {
+            log.err("blockuser: failed to block: {t}", .{err});
             return;
         };
-        const message = std.fmt.allocPrint(a, "{s} can now use this bot.", .{target.display_name}) catch return;
+        const message = std.fmt.allocPrint(a, "{s} is blocked -- I won't respond to them anywhere.", .{target.display_name}) catch return;
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
         return;
     }
     // Not a reply, and no identity exists yet for this @username (the bot
-    // has never seen a message from them) — queue the grant instead of
+    // has never seen a message from them) — queue the block instead of
     // failing; it completes automatically the moment they do message (see
     // `resolveSenderIdentity`/`completePendingGrants`).
     if (usernameFromArg(arg)) |username| {
-        bot_pending_grants.addPending(pool, connector.platform(), username, .allowed_user, identity_id) catch |err| {
-            log.err("adduser: failed to queue pending grant for @{s}: {t}", .{ username, err });
+        bot_pending_grants.addPending(pool, connector.platform(), username, .blocked_user, identity_id) catch |err| {
+            log.err("blockuser: failed to queue pending block for @{s}: {t}", .{ username, err });
             return;
         };
-        const message = std.fmt.allocPrint(a, "@{s} isn't known to me yet -- they'll be allowed automatically as soon as they message me.", .{username}) catch return;
+        const message = std.fmt.allocPrint(a, "@{s} isn't known to me yet -- they'll be blocked automatically as soon as they message me.", .{username}) catch return;
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
         return;
     }
-    reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username or their user id) you want to allow.");
+    reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username or their user id) you want to block.");
 }
 
-fn handleRemoveUserCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
-    const arg = std.mem.trim(u8, text["/removeuser".len..], " ");
+fn handleUnblockUserCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, now: i64, msg: iface.Message, text: []const u8) void {
+    const arg = std.mem.trim(u8, text["/unblockuser".len..], " ");
     if (resolveTargetIdentity(pool, connector, a, now, msg, arg, true) catch |err| {
-        log.err("removeuser: failed to resolve target: {t}", .{err});
+        log.err("unblockuser: failed to resolve target: {t}", .{err});
         return;
     }) |target| {
-        bot_allowlist.removeAllowedUser(pool, target.id) catch |err| {
-            log.err("removeuser: failed to remove: {t}", .{err});
+        bot_blocklist.unblockUser(pool, target.id) catch |err| {
+            log.err("unblockuser: failed to unblock: {t}", .{err});
             return;
         };
-        const message = std.fmt.allocPrint(a, "{s} can no longer use this bot (unless their chat is allowed).", .{target.display_name}) catch return;
+        const message = std.fmt.allocPrint(a, "{s} is no longer blocked.", .{target.display_name}) catch return;
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
         return;
     }
     // No resolvable identity — the only thing left to undo is a pending
-    // (not yet completed) grant queued by an earlier /adduser @username.
+    // (not yet completed) block queued by an earlier /blockuser @username.
     if (usernameFromArg(arg)) |username| {
-        bot_pending_grants.removePending(pool, connector.platform(), username, .allowed_user) catch |err| {
-            log.err("removeuser: failed to cancel pending grant for @{s}: {t}", .{ username, err });
+        bot_pending_grants.removePending(pool, connector.platform(), username, .blocked_user) catch |err| {
+            log.err("unblockuser: failed to cancel pending block for @{s}: {t}", .{ username, err });
             return;
         };
-        const message = std.fmt.allocPrint(a, "@{s} won't be allowed automatically anymore.", .{username}) catch return;
+        const message = std.fmt.allocPrint(a, "@{s} won't be blocked automatically anymore.", .{username}) catch return;
         connector.sendMessage(a, msg.chat_id, message, msg.message_id);
         return;
     }
-    reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username or their user id) you want to remove.");
+    reply(connector, a, msg.chat_id, msg.message_id, "Reply to the user (or pass @username or their user id) you want to unblock.");
 }
 
-fn handleAllowChatCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, msg: iface.Message) void {
-    bot_allowlist.addAllowedChat(pool, chat_id, identity_id) catch |err| {
-        log.err("allowchat: failed to add: {t}", .{err});
+fn handleBlockChatCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, identity_id: i64, msg: iface.Message) void {
+    bot_blocklist.blockChat(pool, chat_id, identity_id) catch |err| {
+        log.err("blockchat: failed to block: {t}", .{err});
         return;
     };
-    connector.sendMessage(a, msg.chat_id, "This chat is now allowed to use the bot.", msg.message_id);
+    connector.sendMessage(a, msg.chat_id, "This chat is blocked -- I'll only respond to the owner and bot admins here. /unblockchat undoes it.", msg.message_id);
 }
 
-fn handleDisallowChatCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message) void {
-    bot_allowlist.removeAllowedChat(pool, chat_id) catch |err| {
-        log.err("disallowchat: failed to remove: {t}", .{err});
+fn handleUnblockChatCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, chat_id: i64, msg: iface.Message) void {
+    bot_blocklist.unblockChat(pool, chat_id) catch |err| {
+        log.err("unblockchat: failed to unblock: {t}", .{err});
         return;
     };
-    connector.sendMessage(a, msg.chat_id, "This chat can no longer use the bot (unless individually-allowed users remain).", msg.message_id);
+    connector.sendMessage(a, msg.chat_id, "This chat is no longer blocked.", msg.message_id);
 }
 
 fn handleAddAdminCommand(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, identity_id: i64, now: i64, msg: iface.Message, text: []const u8) void {
@@ -6992,10 +6865,10 @@ fn handleChatInfoCommand(connector: iface.Connector, a: std.mem.Allocator, pool:
 /// derived-not-stored trust flags (`bot admin`, `superuser`) so this doubles
 /// as a way to sanity-check the access-control state described in the
 /// README's "Access control" section. Gated owner-or-bot-admin, same tier as
-/// `/adduser`/`/addadmin` (see the caller in `handleMessage`).
+/// `/blockuser`/`/addadmin` (see the caller in `handleMessage`).
 ///
 /// Uses `resolveTargetIdentity`'s `create_if_missing = false` path for a
-/// bare-id argument — unlike `/kick`/`/adduser`/etc., this is a read-only
+/// bare-id argument — unlike `/kick`/`/blockuser`/etc., this is a read-only
 /// info command, so a native id the bot has genuinely never seen should
 /// report "no record" rather than fabricate a placeholder row just to
 /// answer the lookup.
@@ -7156,7 +7029,7 @@ fn handleManageCommand(connector: iface.Connector, a: std.mem.Allocator, config:
 ///     chat while the operator's follow-up message arrives from wherever
 ///     `/as` was typed, so the flow could be started but never finished.
 ///   * The LLM-backed commands (`/joke`, `/translate`, `/note`, ...) —
-///     they spend real credits and produce conversation, not administration.
+///     they spend real API budget and produce conversation, not administration.
 ///     Nothing about them is unsafe to relay; they're simply out of scope
 ///     for a management-room surface, and the list is cheap to widen later.
 const as_relayable_commands = [_][]const u8{
@@ -7184,18 +7057,12 @@ const as_relayable_commands = [_][]const u8{
     "briefing",
     "alias",
     "template",
-    "allowchat",
-    "disallowchat",
+    "blockchat",
+    "unblockchat",
     "announce",
     "photo",
     "title",
     "description",
-    // Identity/balance grants scoped to *this* chat (`/token`) or the
-    // target identity (`/credit`) — chat-scoped in the sense that matters
-    // here: the command names a target user via reply/`@username`, which
-    // survives the relay exactly like every moderation command above.
-    "token",
-    "credit",
     // Read-only reports about the target chat.
     "stats",
     "wordcloud",
@@ -7480,8 +7347,7 @@ test "the /as allow-list admits chat-scoped admin commands and refuses everythin
     // allow-list's own doc comment for `/redact`'s re-examined reasoning).
     try std.testing.expect(isRelayableUnderAs("redact"));
     try std.testing.expect(isRelayableUnderAs("announce"));
-    try std.testing.expect(isRelayableUnderAs("token"));
-    try std.testing.expect(isRelayableUnderAs("credit"));
+    try std.testing.expect(isRelayableUnderAs("blockchat"));
     // Added in Phase 22 -- none of these act on a message either.
     try std.testing.expect(isRelayableUnderAs("photo"));
     try std.testing.expect(isRelayableUnderAs("title"));
@@ -7592,7 +7458,7 @@ fn handleRedactCommand(
         return;
     }
 
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "redact")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "redact")) return;
 
     if (std.mem.startsWith(u8, arg, "text ")) {
         const substring = std.mem.trim(u8, arg["text ".len..], " ");
@@ -7933,7 +7799,7 @@ fn handleAnnounceCommand(
         return;
     }
 
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "announce")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "announce")) return;
 
     if (std.mem.eql(u8, first_word, "cancel")) {
         const rest = std.mem.trim(u8, it.rest(), " ");
@@ -8125,7 +7991,7 @@ fn handleAutopinCommand(
         return;
     };
 
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "autopin")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "autopin")) return;
 
     chat_settings.setAutopinAnnouncements(pool, chat_id, want) catch |err| {
         log.err("autopin: failed to persist for chat {d}: {t}", .{ chat_id, err });
@@ -8176,7 +8042,7 @@ fn handleSilentCommand(
         return;
     };
 
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "silent")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "silent")) return;
 
     chat_settings.setSilentByDefault(pool, chat_id, want) catch |err| {
         log.err("silent: failed to persist for chat {d}: {t}", .{ chat_id, err });
@@ -8214,7 +8080,7 @@ fn handlePhotoCommand(
     text: []const u8,
     attachment_path: ?[]const u8,
 ) void {
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "photo")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "photo")) return;
     const raw_arg = std.mem.trim(u8, text["/photo".len..], " ");
     const vis = resolveVisibility(pool, a, chat_id, raw_arg, is_superuser);
 
@@ -8268,7 +8134,7 @@ fn handleTitleCommand(
     msg: iface.Message,
     text: []const u8,
 ) void {
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "title")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "title")) return;
     const raw_arg = std.mem.trim(u8, text["/title".len..], " ");
     const vis = resolveVisibility(pool, a, chat_id, raw_arg, is_superuser);
     const new_title = vis.rest;
@@ -8303,7 +8169,7 @@ fn handleDescriptionCommand(
     msg: iface.Message,
     text: []const u8,
 ) void {
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "description")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "description")) return;
     const raw_arg = std.mem.trim(u8, text["/description".len..], " ");
     const vis = resolveVisibility(pool, a, chat_id, raw_arg, is_superuser);
     const new_description = vis.rest;
@@ -8372,7 +8238,7 @@ fn handleVideoDownloadCommand(
         return;
     };
 
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "videodownload")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "videodownload")) return;
 
     chat_settings.setVideoDownloadEnabled(pool, chat_id, want) catch |err| {
         log.err("videodownload: failed to persist for chat {d}: {t}", .{ chat_id, err });
@@ -8426,7 +8292,7 @@ fn handleVideoQualityCommand(
         return;
     };
 
-    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, false, "videoquality")) return;
+    if (!auth.checkGroupAdminAccess(connector, a, config, pool, chat_id, identity_id, msg, sudo_active, "videoquality")) return;
 
     chat_settings.setVideoDownloadLossy(pool, chat_id, want_lossy) catch |err| {
         log.err("videoquality: failed to persist for chat {d}: {t}", .{ chat_id, err });
@@ -8709,15 +8575,13 @@ const max_summary_hours: i64 = 24 * 14;
 /// effect, so it can't answer "what happened this morning" without
 /// disturbing the schedule; `catch_me_up` is an LLM *tool*, reachable only
 /// by addressing the bot in natural language and only when the asker clears
-/// the owner-only/credits gate on free-form Q&A. This is the plain,
-/// predictable command form: name a window, get a summary, change nothing.
+/// the owner-only gate on free-form Q&A. This is the plain, predictable
+/// command form: name a window, get a summary, change nothing.
 ///
-/// **Access** deliberately matches `/digest now` (open to anyone allowed in
-/// the chat, no credits spent) rather than the messaging-mode commands'
-/// owner/credits gate: it summarizes only this chat's own already-logged
-/// history and can't be steered into arbitrary generation. The alternative
-/// — charging a credit like `/translate` does — is recorded in ROADMAP.md
-/// as the obvious knob to turn if this ever gets abused.
+/// **Access** deliberately matches `/digest now` (open to anyone in the
+/// chat) rather than the messaging-mode commands' owner-only gate: it
+/// summarizes only this chat's own already-logged history and can't be
+/// steered into arbitrary generation.
 fn handleSummaryCommand(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -9104,7 +8968,7 @@ fn formatKeywordAlerts(a: std.mem.Allocator, listed: []const keyword_alerts.Keyw
 /// tracked words doesn't spam the chat. Fires for *any* sender (this is a
 /// passive content observation, same "every message is logged regardless
 /// of who sent it" tier as recording itself, not a privileged action), and
-/// is a plain string scan -- no LLM call, so no credits/owner gate either.
+/// is a plain string scan -- no LLM call, so no owner-only gate either.
 /// Errors loading the tracked list are logged and swallowed, same "never
 /// let a side feature block the main flow" convention `bcast.publish`'s
 /// own call site uses.
@@ -11309,17 +11173,17 @@ fn menuPerform(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.Outcome {
             group_admin.unpin(ctx.connector, ctx.a, ctx.msg);
             break :blk .{ .show = .group_admin };
         },
-        .settings_global_allowchat => blk: {
-            bot_allowlist.addAllowedChat(ctx.pool, ctx.chat_id, ctx.identity_id) catch |err| {
-                log.err("menu: allowchat failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
+        .settings_global_blockchat => blk: {
+            bot_blocklist.blockChat(ctx.pool, ctx.chat_id, ctx.identity_id) catch |err| {
+                log.err("menu: blockchat failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
             };
-            break :blk menuSendAndShow(ctx, "This chat is now allowed to use the bot.", .settings_global);
+            break :blk menuSendAndShow(ctx, "This chat is blocked -- only the owner and bot admins get replies here now.", .settings_global);
         },
-        .settings_global_disallowchat => blk: {
-            bot_allowlist.removeAllowedChat(ctx.pool, ctx.chat_id) catch |err| {
-                log.err("menu: disallowchat failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
+        .settings_global_unblockchat => blk: {
+            bot_blocklist.unblockChat(ctx.pool, ctx.chat_id) catch |err| {
+                log.err("menu: unblockchat failed for chat {s}: {t}", .{ ctx.msg.chat_id, err });
             };
-            break :blk menuSendAndShow(ctx, "This chat is no longer allowed to use the bot.", .settings_global);
+            break :blk menuSendAndShow(ctx, "This chat is no longer blocked.", .settings_global);
         },
         .settings_global_scraper => blk: {
             const snap = bot_config.loadScraperConfig(ctx.pool, ctx.a);
@@ -11512,8 +11376,8 @@ fn menuResumeAwaitingInput(id: menu_tree.NodeId, ctx: menu.ActionContext) menu.O
         },
         .settings_global_addadmin => menuResumeViaTextAdd(ctx, "/addadmin", handleAddAdminCommand),
         .settings_global_removeadmin => menuResumeViaText(ctx, "/removeadmin", handleRemoveAdminCommand),
-        .settings_global_adduser => menuResumeViaTextAdd(ctx, "/adduser", handleAddUserCommand),
-        .settings_global_removeuser => menuResumeViaText(ctx, "/removeuser", handleRemoveUserCommand),
+        .settings_global_blockuser => handleBlockUserCommand(ctx.connector, ctx.a, ctx.config, ctx.pool, ctx.identity_id, ctx.now, ctx.msg, menuSyntheticText(ctx, "/blockuser")),
+        .settings_global_unblockuser => menuResumeViaText(ctx, "/unblockuser", handleUnblockUserCommand),
         .settings_global_whois => handleWhoisCommand(ctx.connector, ctx.a, ctx.config, ctx.pool, ctx.now, ctx.msg, menuSyntheticText(ctx, "/whois")),
         .settings_chat_magicword => handleMagicWord(ctx.connector, ctx.a, ctx.config, ctx.pool, ctx.chat_id, ctx.msg, menuSyntheticText(ctx, "/magicword")),
         .settings_chat_persona => handlePersonaCommand(ctx.connector, ctx.a, ctx.config, ctx.pool, ctx.chat_id, ctx.msg, menuSyntheticText(ctx, "/persona")),
@@ -11660,7 +11524,7 @@ test {
     _ = @import("store/bot_config.zig");
     _ = @import("store/messages.zig");
     _ = @import("store/bot_admins.zig");
-    _ = @import("store/bot_allowlist.zig");
+    _ = @import("store/bot_blocklist.zig");
     _ = @import("store/bot_pending_grants.zig");
     _ = @import("features/trivial_reply.zig");
     _ = @import("text/safe_regex.zig");

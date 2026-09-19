@@ -3,7 +3,6 @@ const Config = @import("config.zig").Config;
 const iface = @import("platform/interface.zig");
 const Platform = iface.Platform;
 const PgPool = @import("store/pool.zig").PgPool;
-const chat_members = @import("store/chat_members.zig");
 
 /// Single choke point for the owner check: every feature handler must be
 /// reached only through here (or through the other functions in this file,
@@ -17,12 +16,8 @@ pub fn isOwner(config: *const Config, platform: Platform, user_id: []const u8) b
 }
 
 /// The permission ladder for group-moderation-tier commands (`/mute
-/// /unmute /pin /unpin /delete /kick /ban /confirm /cancel`) — the single
-/// place token gating happens, replacing the old bug where
-/// `group_admin.requestConfirmation` unconditionally re-checked tokens even
-/// after the caller had already proven they were the owner or a live
-/// platform admin. Checked in order, each tier a strict fallback from the
-/// one before:
+/// /unmute /pin /unpin /delete /kick /ban /confirm /cancel`). Checked in
+/// order, each tier a strict fallback from the one before:
 ///
 ///   1. Owner — always allowed.
 ///   2. `sudo_active` (the caller has already verified the sender is a bot
@@ -32,15 +27,16 @@ pub fn isOwner(config: *const Config, platform: Platform, user_id: []const u8) b
 ///      <action_name>" so the override is never silent. This is the ONLY
 ///      way a bot admin's non-platform-scoped status elevates a platform-
 ///      scoped action: without `/sudo`, a bot admin falls straight through
-///      to tiers 3/4 like anyone else.
-///   3. A live platform admin of this specific chat — allowed, unchanged
-///      from the pre-existing behavior.
-///   4. If `allow_token_fallback`: spends one of the sender's per-chat
-///      tokens if they have any, otherwise replies that they don't and
-///      denies.
-///   5. Otherwise: denied, silently (matches the pre-existing convention —
+///      to tier 3 like anyone else.
+///   3. A live platform admin of this specific chat — allowed.
+///   4. Otherwise: denied, silently (matches the pre-existing convention —
 ///      an unauthorized attempt at a moderation command doesn't announce
 ///      itself to the whole chat).
+///
+/// There used to be a further tier that let a plain member spend one of a
+/// per-chat stock of "tokens" an admin had granted them; that mechanism is
+/// gone (RBAC is the whole model now), so `pool`/`chat_id`/`identity_id`
+/// are unused here today and kept only so the many call sites don't churn.
 ///
 /// `action_name` (e.g. "kick") names the action in both the sudo-grant
 /// message and error logs.
@@ -53,9 +49,11 @@ pub fn checkGroupAdminAccess(
     identity_id: i64,
     msg: iface.Message,
     sudo_active: bool,
-    allow_token_fallback: bool,
     action_name: []const u8,
 ) bool {
+    _ = pool;
+    _ = chat_id;
+    _ = identity_id;
     if (isOwner(config, connector.platform(), msg.user_id)) return true;
 
     if (sudo_active) {
@@ -69,20 +67,7 @@ pub fn checkGroupAdminAccess(
         std.log.warn("auth: platform admin check failed for user {s} in chat {s}: {t}", .{ msg.user_id, msg.chat_id, err });
         break :blk false;
     };
-    if (is_platform_admin) return true;
-
-    if (!allow_token_fallback) return false;
-
-    var count = chat_members.getTokens(pool, chat_id, identity_id, 0);
-    if (count <= 0) {
-        connector.sendMessage(a, msg.chat_id, "You do not have enough tokens to perform this action", msg.message_id);
-        return false;
-    }
-    count -= 1;
-    chat_members.setTokens(pool, chat_id, identity_id, count) catch |err| {
-        std.log.err("auth: failed to spend token for identity {d}: {t}", .{ identity_id, err });
-    };
-    return true;
+    return is_platform_admin;
 }
 
 /// Gate for a management-room action (`/manage bind`/`/manage unbind`/
@@ -90,31 +75,18 @@ pub fn checkGroupAdminAccess(
 /// `checkGroupAdminAccess`, which checks admin-of-the-*current*-chat via
 /// `msg.chat_id`, these actions target a chat other than the one the
 /// command was typed in, so `native_chat_id` here is the *target's*
-/// native id, not `msg.chat_id`. No `sudo`/token fallback tiers — a bot
-/// admin who isn't also the owner or a live admin of the target chat has
-/// no business binding/unbinding/notifying it.
+/// native id, not `msg.chat_id`. No `sudo` tier — a bot admin who isn't
+/// also the owner or a live admin of the target chat has no business
+/// binding/unbinding/notifying it.
 pub fn isOwnerOrLiveAdminOfChat(connector: iface.Connector, a: std.mem.Allocator, config: *const Config, native_chat_id: []const u8, user_id: []const u8) bool {
     if (isOwner(config, connector.platform(), user_id)) return true;
     return connector.isGroupAdmin(a, native_chat_id, user_id) catch false;
 }
 
-/// Gate for `/token`: owner, a bot admin (unconditionally — there's no
-/// platform check to override here, this is a direct grant, not an
-/// elevation past a failed check, so `/sudo` is never needed), or a live
-/// platform admin of the current chat (that chat's own admins can grant
-/// tokens for their own chat). No side-effect message on denial — matches
-/// `/token`'s pre-existing owner-only silent-reject convention.
-pub fn checkTokenGrantAccess(connector: iface.Connector, a: std.mem.Allocator, config: *const Config, msg: iface.Message, is_bot_admin: bool) bool {
-    if (isOwner(config, connector.platform(), msg.user_id)) return true;
-    if (is_bot_admin) return true;
-    return connector.isGroupAdmin(a, msg.chat_id, msg.user_id) catch false;
-}
-
-/// Gate for `/credit` and the six bot-management commands (`/adduser
-/// /removeuser /allowchat /disallowchat /addadmin /removeadmin`) — owner or
-/// bot admin only, no platform/token fallback at all. Credits spend the
-/// owner's real LLM API budget, so (unlike tokens) a chat's own platform
-/// admins can't grant them.
+/// Gate for the six bot-management commands (`/blockuser /unblockuser
+/// /blockchat /unblockchat /addadmin /removeadmin`) — owner or bot admin
+/// only, no platform-admin fallback: these act bot-wide, not on one chat,
+/// so a chat's own admins have no say in them.
 pub fn isOwnerOrBotAdmin(config: *const Config, platform: Platform, user_id: []const u8, is_bot_admin: bool) bool {
     return isOwner(config, platform, user_id) or is_bot_admin;
 }
@@ -228,7 +200,7 @@ fn baseMsg() iface.Message {
     return .{ .chat_id = "chat1", .user_id = "42", .username = "alice" };
 }
 
-test "checkGroupAdminAccess: owner is always allowed, no token/platform check" {
+test "checkGroupAdminAccess: owner is always allowed, no platform check" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -243,7 +215,7 @@ test "checkGroupAdminAccess: owner is always allowed, no token/platform check" {
     const chat_id = try chats.upsertChat(&pool, .telegram, "chat1", null, null);
     const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
 
-    try testing.expect(checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, true, "kick"));
+    try testing.expect(checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, "kick"));
     try testing.expectEqual(@as(usize, 0), stub.sent_messages.items.len);
 }
 
@@ -265,12 +237,12 @@ test "checkGroupAdminAccess: sudo_active grants access and sends the grant messa
     var msg = baseMsg();
     msg.identity = .{ .platform = .telegram, .native_id = "42", .display_name = "Armin Mazoochian", .first_seen = 1000, .last_seen = 1000 };
 
-    try testing.expect(checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, msg, true, true, "kick"));
+    try testing.expect(checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, msg, true, "kick"));
     try testing.expectEqual(@as(usize, 1), stub.sent_messages.items.len);
     try testing.expectEqualStrings("Armin Mazoochian has been granted superuser permissions for action: kick", stub.sent_messages.items[0]);
 }
 
-test "checkGroupAdminAccess: without sudo, a non-admin non-owner falls through to the token check" {
+test "checkGroupAdminAccess: without sudo, a non-admin non-owner is denied silently" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -285,18 +257,11 @@ test "checkGroupAdminAccess: without sudo, a non-admin non-owner falls through t
     const chat_id = try chats.upsertChat(&pool, .telegram, "chat1", null, null);
     const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
 
-    // No tokens yet — denied, with the "not enough tokens" reply.
-    try testing.expect(!checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, true, "kick"));
-    try testing.expectEqual(@as(usize, 1), stub.sent_messages.items.len);
-    try testing.expectEqualStrings("You do not have enough tokens to perform this action", stub.sent_messages.items[0]);
-
-    // Grant a token, retry — allowed, and the token is spent.
-    try chat_members.setTokens(&pool, chat_id, identity_id, 1);
-    try testing.expect(checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, true, "kick"));
-    try testing.expectEqual(@as(i64, 0), chat_members.getTokens(&pool, chat_id, identity_id, -1));
+    try testing.expect(!checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, "kick"));
+    try testing.expectEqual(@as(usize, 0), stub.sent_messages.items.len);
 }
 
-test "checkGroupAdminAccess: a live platform admin is allowed without spending a token" {
+test "checkGroupAdminAccess: a live platform admin is allowed" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -311,30 +276,7 @@ test "checkGroupAdminAccess: a live platform admin is allowed without spending a
     const chat_id = try chats.upsertChat(&pool, .telegram, "chat1", null, null);
     const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
 
-    try testing.expect(checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, true, "kick"));
-    try testing.expectEqual(@as(i64, 0), chat_members.getTokens(&pool, chat_id, identity_id, 0));
-}
-
-test "checkGroupAdminAccess: allow_token_fallback=false denies a non-admin non-owner silently, even with tokens" {
-    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
-    defer db.close();
-    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
-    defer pool.deinitTestWrap();
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const config = testConfig("999");
-    var stub = StubConnector{};
-    const chat_id = try chats.upsertChat(&pool, .telegram, "chat1", null, null);
-    const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
-    try chat_members.setTokens(&pool, chat_id, identity_id, 5);
-
-    try testing.expect(!checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, false, "redact"));
-    try testing.expectEqual(@as(usize, 0), stub.sent_messages.items.len);
-    // Untouched — the token fallback never ran.
-    try testing.expectEqual(@as(i64, 5), chat_members.getTokens(&pool, chat_id, identity_id, 0));
+    try testing.expect(checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, "kick"));
 }
 
 test "checkGroupAdminAccess: a failed platform-admin check fails closed, not open" {
@@ -352,23 +294,7 @@ test "checkGroupAdminAccess: a failed platform-admin check fails closed, not ope
     const chat_id = try chats.upsertChat(&pool, .telegram, "chat1", null, null);
     const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
 
-    try testing.expect(!checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, true, "kick"));
-}
-
-test "checkTokenGrantAccess: owner, bot admin, or platform admin can grant tokens; a plain user can't" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const owner_config = testConfig("42");
-    const other_config = testConfig("999");
-    var admin_stub = StubConnector{ .is_group_admin = true };
-    var plain_stub = StubConnector{};
-
-    try testing.expect(checkTokenGrantAccess(plain_stub.connector(), a, &owner_config, baseMsg(), false));
-    try testing.expect(checkTokenGrantAccess(plain_stub.connector(), a, &other_config, baseMsg(), true));
-    try testing.expect(checkTokenGrantAccess(admin_stub.connector(), a, &other_config, baseMsg(), false));
-    try testing.expect(!checkTokenGrantAccess(plain_stub.connector(), a, &other_config, baseMsg(), false));
+    try testing.expect(!checkGroupAdminAccess(stub.connector(), a, &config, &pool, chat_id, identity_id, baseMsg(), false, "kick"));
 }
 
 test "isOwnerOrLiveAdminOfChat: owner or a live admin of the named chat passes, a plain user doesn't" {

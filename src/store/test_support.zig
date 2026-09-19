@@ -21,7 +21,7 @@ fn truncateAll(db: *Db) !void {
         \\TRUNCATE TABLE messages, chat_members, telegram_profiles, matrix_profiles,
         \\  xmpp_profiles, chat_settings, chats, identities, bot_config,
         \\  crypto_account, crypto_sessions, crypto_megolm_outbound, crypto_megolm_inbound,
-        \\  bot_admins, bot_allowed_users, bot_allowed_chats, bot_pending_grants,
+        \\  bot_admins, bot_blocked_users, bot_blocked_chats, bot_pending_grants,
         \\  accounts, oauth_providers, management_room_bindings, notes,
         \\  facts, fact_tombstones, daily_digests, period_rollups, retrieval_log,
         \\  instagram_sessions, instagram_thread_watermarks, reply_drafts, feed_sources,

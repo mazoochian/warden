@@ -6,7 +6,7 @@ const PgPool = @import("pool.zig").PgPool;
 /// the project's very first mutating endpoint rather than retrofitted
 /// later, per /home/armin/claude/warden-ui/ARCHITECTURE.md §4's reasoning.
 /// Since Phase 20 (ROADMAP.md), chat-command admin actions
-/// (mute/kick/promote/token/credit/...) write here too, via
+/// (mute/kick/promote/...) write here too, via
 /// `features/audit_notify.zig`. `account_id` and `identity_id` are two
 /// independent nullable actor columns, not alternates of the same thing —
 /// `account_id` references warden-ui's `accounts` (a web login),

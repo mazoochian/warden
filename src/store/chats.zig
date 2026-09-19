@@ -184,7 +184,7 @@ pub fn renameNativeChatId(pool: *PgPool, chat_id: i64, new_native_id: []const u8
 /// Hard-deletes every chat that's been left for longer than the retention
 /// window — cascades to every FK'd table (`messages`, `chat_members`,
 /// `reminders`, `alerts`, `feed_watches`, `chat_settings`,
-/// `bot_allowlist`, all `ON DELETE CASCADE`). Returns the number of chats
+/// `bot_blocked_chats`, all `ON DELETE CASCADE`). Returns the number of chats
 /// purged, purely for logging (see `main.zig`'s `checkAndPurgeLeftChats`).
 pub fn deleteLeftBefore(pool: *PgPool, cutoff: i64) !i64 {
     const db = try pool.acquire();

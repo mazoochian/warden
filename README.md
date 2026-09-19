@@ -7,7 +7,7 @@ Postgres database, and a `.env` file.
 
 # Features
 - **LLM Q&A** — mention the bot, reply to it, or say the magic word; answers stream in place with live tool use (web search, page scraping, weather, prices, ...).
-- **Owner-only access** — nobody talks to the bot until the owner allows them; a bot-admin role and `/sudo` cover the rest.
+- **Access control** — the bot answers everyone by default, with the free-form LLM Q&A owner-only unless you open it up; the owner can block any user or chat, and a bot-admin role plus `/sudo` cover the rest.
 - **Group moderation** — mute, kick, ban, redact, slow mode, welcome messages, and scheduled announcements, gated by the chat's live platform admins.
 - **Management rooms** — moderate a chat from a private room with a full audit log and one-tap undo.
 - **Reminders and alerts** — one-off or recurring reminders, plus standing crypto/weather/AQI watches, all in natural language.

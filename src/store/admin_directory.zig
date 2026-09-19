@@ -188,8 +188,7 @@ pub const IdentitySummary = struct {
     display_name: []const u8,
     username: ?[]const u8,
     is_bot_admin: bool,
-    is_allowed: bool,
-    credits: i64,
+    is_blocked: bool,
     last_seen: ?i64,
 };
 
@@ -201,13 +200,13 @@ pub fn listIdentities(pool: *PgPool, allocator: std.mem.Allocator, after_id: i64
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT i.id, i.platform, i.display_name, i.username, i.credits,
+        \\SELECT i.id, i.platform, i.display_name, i.username,
         \\  EXTRACT(EPOCH FROM i.last_seen)::bigint,
         \\  (ba.identity_id IS NOT NULL),
-        \\  (au.identity_id IS NOT NULL)
+        \\  (bu.identity_id IS NOT NULL)
         \\FROM identities i
         \\LEFT JOIN bot_admins ba ON ba.identity_id = i.id
-        \\LEFT JOIN bot_allowed_users au ON au.identity_id = i.id
+        \\LEFT JOIN bot_blocked_users bu ON bu.identity_id = i.id
         \\WHERE i.id > $1 AND NOT i.is_bot
         \\ORDER BY i.id
         \\LIMIT $2;
@@ -223,10 +222,9 @@ pub fn listIdentities(pool: *PgPool, allocator: std.mem.Allocator, after_id: i64
             .platform = std.meta.stringToEnum(Platform, stmt.columnText(1)) orelse .telegram,
             .display_name = try allocator.dupe(u8, stmt.columnText(2)),
             .username = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
-            .credits = stmt.columnInt64(4),
-            .last_seen = if (stmt.columnIsNull(5)) null else stmt.columnInt64(5),
-            .is_bot_admin = stmt.columnBool(6),
-            .is_allowed = stmt.columnBool(7),
+            .last_seen = if (stmt.columnIsNull(4)) null else stmt.columnInt64(4),
+            .is_bot_admin = stmt.columnBool(5),
+            .is_blocked = stmt.columnBool(6),
         });
     }
     return out.toOwnedSlice(allocator);
@@ -239,8 +237,7 @@ pub const IdentityDetail = struct {
     display_name: []const u8,
     username: ?[]const u8,
     is_bot_admin: bool,
-    is_allowed: bool,
-    credits: i64,
+    is_blocked: bool,
     last_seen: ?i64,
 };
 
@@ -249,13 +246,13 @@ pub fn getIdentityDetail(pool: *PgPool, allocator: std.mem.Allocator, identity_i
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT i.id, i.platform, i.native_id, i.display_name, i.username, i.credits,
+        \\SELECT i.id, i.platform, i.native_id, i.display_name, i.username,
         \\  EXTRACT(EPOCH FROM i.last_seen)::bigint,
         \\  (ba.identity_id IS NOT NULL),
-        \\  (au.identity_id IS NOT NULL)
+        \\  (bu.identity_id IS NOT NULL)
         \\FROM identities i
         \\LEFT JOIN bot_admins ba ON ba.identity_id = i.id
-        \\LEFT JOIN bot_allowed_users au ON au.identity_id = i.id
+        \\LEFT JOIN bot_blocked_users bu ON bu.identity_id = i.id
         \\WHERE i.id = $1;
     );
     defer stmt.finalize();
@@ -268,10 +265,9 @@ pub fn getIdentityDetail(pool: *PgPool, allocator: std.mem.Allocator, identity_i
         .native_id = try allocator.dupe(u8, stmt.columnText(2)),
         .display_name = try allocator.dupe(u8, stmt.columnText(3)),
         .username = if (stmt.columnIsNull(4)) null else try allocator.dupe(u8, stmt.columnText(4)),
-        .credits = stmt.columnInt64(5),
-        .last_seen = if (stmt.columnIsNull(6)) null else stmt.columnInt64(6),
-        .is_bot_admin = stmt.columnBool(7),
-        .is_allowed = stmt.columnBool(8),
+        .last_seen = if (stmt.columnIsNull(5)) null else stmt.columnInt64(5),
+        .is_bot_admin = stmt.columnBool(6),
+        .is_blocked = stmt.columnBool(7),
     };
 }
 
@@ -282,7 +278,7 @@ const identities = @import("identities.zig");
 const messages = @import("messages.zig");
 const chat_members = @import("chat_members.zig");
 const bot_admins = @import("bot_admins.zig");
-const bot_allowlist = @import("bot_allowlist.zig");
+const bot_blocklist = @import("bot_blocklist.zig");
 
 fn seedBasics(pool: *PgPool) !struct { chat: i64, alice: i64, bob: i64 } {
     const chat = try chats.upsertChat(pool, .telegram, "-100", "supergroup", "Test Chat");
@@ -427,7 +423,7 @@ test "getChatDetail returns settings, counts, and recent messages newest-first" 
     try testing.expectEqual(@as(?ChatDetail, null), try getChatDetail(&pool, a, seed.chat + 999));
 }
 
-test "listIdentities excludes bots and reports admin/allowlist/credits flags" {
+test "listIdentities excludes bots and reports admin/blocked flags" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -444,7 +440,7 @@ test "listIdentities excludes bots and reports admin/allowlist/credits flags" {
         .last_seen = 1000,
     });
     try bot_admins.addBotAdmin(&pool, seed.alice, seed.bob);
-    try bot_allowlist.addAllowedUser(&pool, seed.bob, seed.alice);
+    try bot_blocklist.blockUser(&pool, seed.bob, seed.alice);
 
     const page = try listIdentities(&pool, a, 0, 50);
     defer {
@@ -456,9 +452,9 @@ test "listIdentities excludes bots and reports admin/allowlist/credits flags" {
     }
     try testing.expectEqual(@as(usize, 2), page.len); // bot excluded
     try testing.expect(page[0].is_bot_admin);
-    try testing.expect(!page[0].is_allowed);
+    try testing.expect(!page[0].is_blocked);
     try testing.expect(!page[1].is_bot_admin);
-    try testing.expect(page[1].is_allowed);
+    try testing.expect(page[1].is_blocked);
 }
 
 test "getIdentityDetail returns full profile or null" {

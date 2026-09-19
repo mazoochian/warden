@@ -48,10 +48,10 @@ pub const NodeId = enum {
     settings_global,
     settings_global_addadmin,
     settings_global_removeadmin,
-    settings_global_adduser,
-    settings_global_removeuser,
-    settings_global_allowchat,
-    settings_global_disallowchat,
+    settings_global_blockuser,
+    settings_global_unblockuser,
+    settings_global_blockchat,
+    settings_global_unblockchat,
     settings_global_whois,
     settings_global_scraper,
     settings_chat,
@@ -122,9 +122,7 @@ pub const NodeKind = enum {
 ///
 /// `.chat_admin` is deliberately stricter than the slash-command ladder in
 /// `auth.checkGroupAdminAccess`: owner or a live platform admin only. There's
-/// no `/sudo` prefix to type on a button, and silently spending one of the
-/// presser's per-chat tokens (that ladder's tier 4) on a tap would be a
-/// surprising way to lose a token.
+/// no `/sudo` prefix to type on a button.
 pub const MinRole = enum { anyone, chat_admin, bot_admin, owner };
 
 pub const MenuNode = struct {
@@ -474,14 +472,14 @@ const table = [_]MenuNode{
         .children = &.{
             .{ .id = .settings_global_addadmin, .emoji = "➕", .label = "Add bot admin" },
             .{ .id = .settings_global_removeadmin, .emoji = "➖", .label = "Remove bot admin" },
-            .{ .id = .settings_global_adduser, .emoji = "✅", .label = "Allow a user" },
-            .{ .id = .settings_global_removeuser, .emoji = "🚫", .label = "Remove a user" },
-            .{ .id = .settings_global_allowchat, .emoji = "🟢", .label = "Allow this chat" },
-            .{ .id = .settings_global_disallowchat, .emoji = "🔴", .label = "Disallow this chat" },
+            .{ .id = .settings_global_blockuser, .emoji = "🚫", .label = "Block a user" },
+            .{ .id = .settings_global_unblockuser, .emoji = "✅", .label = "Unblock a user" },
+            .{ .id = .settings_global_blockchat, .emoji = "🔴", .label = "Block this chat" },
+            .{ .id = .settings_global_unblockchat, .emoji = "🟢", .label = "Unblock this chat" },
             .{ .id = .settings_global_whois, .emoji = "🔎", .label = "Look up a user (/whois)" },
             .{ .id = .settings_global_scraper, .emoji = "🕷", .label = "Scraper config" },
         },
-        .help_body = "The owner is always treated as a bot admin here too, everywhere one is checked — no need to add yourself.",
+        .help_body = "Everyone can talk to the bot unless blocked. The owner is always treated as a bot admin here too, everywhere one is checked — no need to add yourself.",
     },
     .{
         .id = .settings_global_addadmin,
@@ -500,32 +498,32 @@ const table = [_]MenuNode{
         .prompt = "Reply to the user, or send @username or their user id, to remove them as a bot admin.",
     },
     .{
-        .id = .settings_global_adduser,
+        .id = .settings_global_blockuser,
         .parent = .settings_global,
-        .title = "✅ Allow a user",
+        .title = "🚫 Block a user",
         .kind = .awaiting_input,
         .min_role = .bot_admin,
-        .prompt = "Reply to the user, or send @username or their user id, to let them use this bot.",
+        .prompt = "Reply to the user, or send @username or their user id, to stop the bot responding to them anywhere.",
     },
     .{
-        .id = .settings_global_removeuser,
+        .id = .settings_global_unblockuser,
         .parent = .settings_global,
-        .title = "🚫 Remove a user",
+        .title = "✅ Unblock a user",
         .kind = .awaiting_input,
         .min_role = .bot_admin,
-        .prompt = "Reply to the user, or send @username or their user id, to remove them.",
+        .prompt = "Reply to the user, or send @username or their user id, to unblock them.",
     },
     .{
-        .id = .settings_global_allowchat,
+        .id = .settings_global_blockchat,
         .parent = .settings_global,
-        .title = "🟢 Allow this chat",
+        .title = "🔴 Block this chat",
         .kind = .action,
         .min_role = .bot_admin,
     },
     .{
-        .id = .settings_global_disallowchat,
+        .id = .settings_global_unblockchat,
         .parent = .settings_global,
-        .title = "🔴 Disallow this chat",
+        .title = "🟢 Unblock this chat",
         .kind = .action,
         .min_role = .bot_admin,
     },

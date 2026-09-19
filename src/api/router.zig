@@ -1938,12 +1938,6 @@ fn handleDeleteKeywordAlert(ctx: *const ServerContext, request: *http.Server.Req
 //     and clicking the button *is* the deliberate elevation. Still sends the
 //     same "granted superuser permissions" message into the real chat, so
 //     the elevation is never silent, matching the original design intent.
-//   - `allow_token_fallback` is always `false` — API.md's own description of
-//     this ladder lists exactly three tiers (platform admin / bot admin /
-//     owner), no token-spend tier, and spending a per-chat token is a
-//     conversational-command mechanic that doesn't map cleanly onto a web
-//     form (the "not enough tokens" reply would land in the real chat as an
-//     unexplained bot message, attributed to nothing the chat itself saw).
 // ---------------------------------------------------------------------------
 
 const ChatActionCtx = struct {
@@ -2090,7 +2084,7 @@ fn handleSetMemberPermissions(ctx: *const ServerContext, request: *http.Server.R
     const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
     const body = (try readJsonBodyLeaky(request, arena, SetMemberPermissionsBody, 256)) orelse return;
 
-    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, true, "permission")) {
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "permission")) {
         return respondError(request, .forbidden, "forbidden", "not authorized to change permissions in this chat");
     }
     const target_native_id = (try resolveTargetNativeId(ctx, request, arena, identity_id)) orelse return;
@@ -2135,7 +2129,7 @@ fn handleSetMemberTag(ctx: *const ServerContext, request: *http.Server.Request, 
     const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
     const body = (try readJsonBodyLeaky(request, arena, SetMemberTagBody, 256)) orelse return;
 
-    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, true, "tag")) {
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "tag")) {
         return respondError(request, .forbidden, "forbidden", "not authorized to set a tag in this chat");
     }
     const target_native_id = (try resolveTargetNativeId(ctx, request, arena, identity_id)) orelse return;
@@ -2180,7 +2174,7 @@ fn handleChatActionKick(ctx: *const ServerContext, request: *http.Server.Request
     const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
     const body = (try readJsonBodyLeaky(request, arena, ModTargetBody, 1024)) orelse return;
 
-    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "kick")) {
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "kick")) {
         return respondError(request, .forbidden, "forbidden", "not authorized to kick in this chat");
     }
     const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
@@ -2205,7 +2199,7 @@ fn handleChatActionBan(ctx: *const ServerContext, request: *http.Server.Request,
     const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
     const body = (try readJsonBodyLeaky(request, arena, ModTargetBody, 1024)) orelse return;
 
-    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "ban")) {
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "ban")) {
         return respondError(request, .forbidden, "forbidden", "not authorized to ban in this chat");
     }
     const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
@@ -2230,7 +2224,7 @@ fn handleChatActionMute(ctx: *const ServerContext, request: *http.Server.Request
     const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
     const body = (try readJsonBodyLeaky(request, arena, MuteBody, 1024)) orelse return;
 
-    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "mute")) {
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "mute")) {
         return respondError(request, .forbidden, "forbidden", "not authorized to mute in this chat");
     }
     const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
@@ -2263,7 +2257,7 @@ fn handleChatActionUnmute(ctx: *const ServerContext, request: *http.Server.Reque
     const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
     const body = (try readJsonBodyLeaky(request, arena, ModTargetBody, 1024)) orelse return;
 
-    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "unmute")) {
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "unmute")) {
         return respondError(request, .forbidden, "forbidden", "not authorized to unmute in this chat");
     }
     const target_native_id = (try resolveTargetNativeId(ctx, request, arena, body.identity_id)) orelse return;
@@ -2349,7 +2343,7 @@ fn handleChatActionPin(ctx: *const ServerContext, request: *http.Server.Request,
     const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
     const body = (try readJsonBodyLeaky(request, arena, PinBody, 1024)) orelse return;
 
-    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "pin")) {
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "pin")) {
         return respondError(request, .forbidden, "forbidden", "not authorized to pin in this chat");
     }
 
@@ -2373,7 +2367,7 @@ fn handleChatActionUnpin(ctx: *const ServerContext, request: *http.Server.Reques
 
     const ac = (try beginChatAction(ctx, request, arena, chat_id)) orelse return;
 
-    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "unpin")) {
+    if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "unpin")) {
         return respondError(request, .forbidden, "forbidden", "not authorized to unpin in this chat");
     }
 
@@ -2410,7 +2404,7 @@ fn handleChatActionRedact(ctx: *const ServerContext, request: *http.Server.Reque
         };
         redact_feature.redactRegex(ac.connector, arena, ctx.pool, chat_id, ac.actor_msg, pattern);
     } else {
-        if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, false, "redact")) {
+        if (!perm_auth.checkGroupAdminAccess(ac.connector, arena, ctx.config, ctx.pool, chat_id, ac.actor_identity_id, ac.actor_msg, ac.ra.roles.bot_admin, "redact")) {
             return respondError(request, .forbidden, "forbidden", "not authorized to redact in this chat");
         }
         if (std.mem.eql(u8, body.mode, "text")) {

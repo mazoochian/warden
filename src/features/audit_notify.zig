@@ -6,11 +6,9 @@
 //! (`store/audit_log.zig`) is written unconditionally, whether or not a
 //! room is bound; the room post is a convenience notification on top of it.
 //!
-//! **Undo scope, deliberately narrow.** Only `mute`, `promote`, `demote`,
-//! `token_grant` and `credit_grant` are undoable this phase — each has a
-//! real, already-existing inverse the connector or store already supports
-//! (`unmuteUser`, `demoteUser`/`promoteUser`, restoring a previous
-//! balance). `kick`/`ban` are logged but not undoable: there is no
+//! **Undo scope, deliberately narrow.** Only `mute`, `promote` and `demote`
+//! are undoable — each has a real, already-existing inverse the connector
+//! already supports (`unmuteUser`, `demoteUser`/`promoteUser`). `kick`/`ban` are logged but not undoable: there is no
 //! `unbanUser` vtable method anywhere in this codebase yet (adding one is
 //! its own scope, not bundled in here), and un-kicking would mean
 //! re-inviting someone, which isn't a bot capability either. `unmute` isn't
@@ -33,7 +31,6 @@ const iface = @import("../platform/interface.zig");
 const store_pool = @import("../store/pool.zig");
 const management_rooms = @import("../store/management_rooms.zig");
 const audit_log = @import("../store/audit_log.zig");
-const chat_members = @import("../store/chat_members.zig");
 const identities = @import("../store/identities.zig");
 
 const log = std.log.scoped(.audit_notify);
@@ -51,8 +48,6 @@ pub const AuditAction = union(enum) {
     demote: struct { target_user_id: []const u8, target_label: []const u8, was_admin_before: bool },
     kick: struct { target_user_id: []const u8, target_label: []const u8 },
     ban: struct { target_user_id: []const u8, target_label: []const u8 },
-    token_grant: struct { target_identity_id: i64, target_label: []const u8, prev_balance: i64, new_balance: i64 },
-    credit_grant: struct { target_identity_id: i64, target_label: []const u8, prev_balance: i64, new_balance: i64 },
     /// Phase 22 — none of these three act on a *member*, so there's no
     /// `target_user_id`; `new_*`/`removed` doubles as the audit-log
     /// "target" text. No "before" value captured (Telegram has no
@@ -72,8 +67,6 @@ pub const AuditAction = union(enum) {
             .demote => "chat.action.demote",
             .kick => "chat.action.kick",
             .ban => "chat.action.ban",
-            .token_grant => "chat.action.token",
-            .credit_grant => "chat.action.credit",
             .title_change => "chat.action.title",
             .description_change => "chat.action.description",
             .photo_change => "chat.action.photo",
@@ -88,8 +81,6 @@ pub const AuditAction = union(enum) {
             .demote => "Demoted",
             .kick => "Kicked",
             .ban => "Banned",
-            .token_grant => "Tokens changed",
-            .credit_grant => "Credits changed",
             .title_change => "Title changed",
             .description_change => "Description changed",
             .photo_change => |p| if (p.removed) "Photo removed" else "Photo changed",
@@ -104,8 +95,6 @@ pub const AuditAction = union(enum) {
             .demote => |x| x.target_label,
             .kick => |x| x.target_label,
             .ban => |x| x.target_label,
-            .token_grant => |x| x.target_label,
-            .credit_grant => |x| x.target_label,
             .title_change => |x| x.new_title,
             .description_change => |x| x.new_description,
             .photo_change => |x| if (x.removed) "removed" else "changed",
@@ -114,7 +103,7 @@ pub const AuditAction = union(enum) {
 
     fn undoable(self: AuditAction) bool {
         return switch (self) {
-            .mute, .token_grant, .credit_grant => true,
+            .mute => true,
             .promote => |p| !p.was_admin_before,
             .demote => |d| d.was_admin_before,
             .unmute, .kick, .ban, .title_change, .description_change, .photo_change => false,
@@ -130,8 +119,6 @@ fn dupeAction(a: std.mem.Allocator, action: AuditAction) !AuditAction {
         .demote => |m| .{ .demote = .{ .target_user_id = try a.dupe(u8, m.target_user_id), .target_label = try a.dupe(u8, m.target_label), .was_admin_before = m.was_admin_before } },
         .kick => |m| .{ .kick = .{ .target_user_id = try a.dupe(u8, m.target_user_id), .target_label = try a.dupe(u8, m.target_label) } },
         .ban => |m| .{ .ban = .{ .target_user_id = try a.dupe(u8, m.target_user_id), .target_label = try a.dupe(u8, m.target_label) } },
-        .token_grant => |m| .{ .token_grant = .{ .target_identity_id = m.target_identity_id, .target_label = try a.dupe(u8, m.target_label), .prev_balance = m.prev_balance, .new_balance = m.new_balance } },
-        .credit_grant => |m| .{ .credit_grant = .{ .target_identity_id = m.target_identity_id, .target_label = try a.dupe(u8, m.target_label), .prev_balance = m.prev_balance, .new_balance = m.new_balance } },
         .title_change => |m| .{ .title_change = .{ .new_title = try a.dupe(u8, m.new_title) } },
         .description_change => |m| .{ .description_change = .{ .new_description = try a.dupe(u8, m.new_description) } },
         .photo_change => |m| .{ .photo_change = .{ .removed = m.removed } },
@@ -164,8 +151,6 @@ fn freeAction(a: std.mem.Allocator, action: AuditAction) void {
             a.free(m.target_user_id);
             a.free(m.target_label);
         },
-        .token_grant => |m| a.free(m.target_label),
-        .credit_grant => |m| a.free(m.target_label),
         .title_change => |m| a.free(m.new_title),
         .description_change => |m| a.free(m.new_description),
         .photo_change => {},
@@ -186,8 +171,6 @@ fn formatLogText(a: std.mem.Allocator, actor_label: []const u8, action: AuditAct
         .demote => |m| buf.writer.print("Target: {s}\nWas admin before: {s}", .{ m.target_label, if (m.was_admin_before) "yes" else "no" }) catch {},
         .kick => |m| buf.writer.print("Target: {s}", .{m.target_label}) catch {},
         .ban => |m| buf.writer.print("Target: {s}", .{m.target_label}) catch {},
-        .token_grant => |m| buf.writer.print("Target: {s}\nTokens: {d} \xe2\x86\x92 {d}", .{ m.target_label, m.prev_balance, m.new_balance }) catch {},
-        .credit_grant => |m| buf.writer.print("Target: {s}\nCredits: {d} \xe2\x86\x92 {d}", .{ m.target_label, m.prev_balance, m.new_balance }) catch {},
         .title_change => |m| buf.writer.print("New title: {s}", .{m.new_title}) catch {},
         .description_change => |m| buf.writer.print("New description: {s}", .{m.new_description}) catch {},
         .photo_change => {},
@@ -356,7 +339,7 @@ pub fn recordAndNotify(
     connector.sendMessage(a, room.native_chat_id, text, null);
 }
 
-fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, entry: UndoEntry) !void {
+fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, entry: UndoEntry) !void {
     switch (entry.action) {
         .mute => |m| try connector.unmuteUser(a, entry.target_native_chat_id, m.target_user_id),
         .promote => |p| {
@@ -367,8 +350,6 @@ fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool
             if (!d.was_admin_before) return error.NothingToUndo;
             try connector.promoteUser(a, entry.target_native_chat_id, d.target_user_id);
         },
-        .token_grant => |t| try chat_members.setTokens(pool, entry.target_chat_id, t.target_identity_id, t.prev_balance),
-        .credit_grant => |c| try identities.setCredits(pool, c.target_identity_id, c.prev_balance),
         .unmute, .kick, .ban, .title_change, .description_change, .photo_change => return error.NotUndoable,
     }
 }
@@ -382,7 +363,6 @@ fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool
 pub fn handleUndoPicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    pool: *store_pool.PgPool,
     pending_undos: *PendingUndos,
     now: i64,
     msg: iface.Message,
@@ -396,7 +376,7 @@ pub fn handleUndoPicked(
         freeAction(a, entry.action);
     }
 
-    applyUndo(connector, a, pool, entry) catch |err| {
+    applyUndo(connector, a, entry) catch |err| {
         log.err("undo failed: {t}", .{err});
         connector.sendMessage(a, msg.chat_id, "Couldn't undo that — it may need to be reverted manually.", msg.message_id);
         return true;
@@ -462,8 +442,6 @@ test "AuditAction.undoable reflects the documented scope" {
     try testing.expect(!(AuditAction{ .promote = .{ .target_user_id = "1", .target_label = "x", .was_admin_before = true } }).undoable());
     try testing.expect((AuditAction{ .demote = .{ .target_user_id = "1", .target_label = "x", .was_admin_before = true } }).undoable());
     try testing.expect(!(AuditAction{ .demote = .{ .target_user_id = "1", .target_label = "x", .was_admin_before = false } }).undoable());
-    try testing.expect((AuditAction{ .token_grant = .{ .target_identity_id = 1, .target_label = "x", .prev_balance = 0, .new_balance = 5 } }).undoable());
-    try testing.expect((AuditAction{ .credit_grant = .{ .target_identity_id = 1, .target_label = "x", .prev_balance = 0, .new_balance = 5 } }).undoable());
 }
 
 /// Minimal fake connector for `recordAndNotify`/`handleUndoPicked` tests —
@@ -610,10 +588,6 @@ test "recordAndNotify writes an audit_log row unconditionally, and posts+registe
 }
 
 test "handleUndoPicked applies the inverse action and consumes the pending entry" {
-    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
-    defer db.close();
-    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
-    defer pool.deinitTestWrap();
     const a = testing.allocator;
 
     var pending = PendingUndos.init(a, testing.io, 60);
@@ -626,7 +600,7 @@ test "handleUndoPicked applies the inverse action and consumes the pending entry
     const msg = iface.Message{ .chat_id = "control-native", .user_id = "1", .message_id = "op-msg" };
     const picked = iface.ChoicePicked{ .prompt_message_id = "prompt-1", .value = undo_choice_value };
 
-    try testing.expect(handleUndoPicked(fake.connector(), a, &pool, &pending, 1010, msg, picked));
+    try testing.expect(handleUndoPicked(fake.connector(), a, &pending, 1010, msg, picked));
 
     try testing.expectEqual(@as(usize, 2), fake.calls.items.len);
     try testing.expectEqualStrings("unmuteUser", fake.calls.items[0].kind);
@@ -635,7 +609,7 @@ test "handleUndoPicked applies the inverse action and consumes the pending entry
     try testing.expectEqualStrings("sendMessage", fake.calls.items[1].kind);
 
     // One-shot: the pending entry was consumed, so a second pick is a no-op.
-    try testing.expect(!handleUndoPicked(fake.connector(), a, &pool, &pending, 1010, msg, picked));
+    try testing.expect(!handleUndoPicked(fake.connector(), a, &pending, 1010, msg, picked));
 }
 
 test "handleUndoPicked returns false for a pick that isn't this module's own undo button" {
@@ -643,11 +617,10 @@ test "handleUndoPicked returns false for a pick that isn't this module's own und
     defer pending.deinit();
     var fake = FakeConnector.init(testing.allocator);
     defer fake.deinit();
-    var pool: store_pool.PgPool = undefined;
 
     const msg = iface.Message{ .chat_id = "chat", .user_id = "1" };
     const picked = iface.ChoicePicked{ .prompt_message_id = "prompt-1", .value = "some_other_flow" };
-    try testing.expect(!handleUndoPicked(fake.connector(), testing.allocator, &pool, &pending, 1000, msg, picked));
+    try testing.expect(!handleUndoPicked(fake.connector(), testing.allocator, &pending, 1000, msg, picked));
 }
 
 const PgPool = store_pool.PgPool;

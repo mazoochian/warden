@@ -4,16 +4,17 @@ const PgPool = @import("pool.zig").PgPool;
 const Platform = @import("../platform/interface.zig").Platform;
 
 /// Which grant a pending-by-username row promises — see this module's
-/// callers (`main.zig`'s `/adduser`/`/addadmin` handlers, which queue one of
-/// these; `resolveSenderIdentity`, which completes it once the identity is
-/// known) for the full flow.
+/// callers (`main.zig`'s `/blockuser`/`/addadmin` handlers, which queue one
+/// of these; `resolveSenderIdentity`, which completes it once the identity
+/// is known) for the full flow. A "grant" of `blocked_user` is a block
+/// applied the moment that username first shows up.
 pub const Kind = enum {
-    allowed_user,
+    blocked_user,
     bot_admin,
 
     fn label(self: Kind) []const u8 {
         return switch (self) {
-            .allowed_user => "allowed_user",
+            .blocked_user => "blocked_user",
             .bot_admin => "bot_admin",
         };
     }
@@ -40,7 +41,7 @@ pub fn addPending(pool: *PgPool, platform: Platform, username: []const u8, kind:
 }
 
 /// Cancels a pending grant before it's ever completed — no-op if there
-/// wasn't one. Used by `/removeuser`/`/removeadmin` when the target still
+/// wasn't one. Used by `/unblockuser`/`/removeadmin` when the target still
 /// has no resolvable identity (nothing else to "remove" in that case).
 pub fn removePending(pool: *PgPool, platform: Platform, username: []const u8, kind: Kind) !void {
     const db = try pool.acquire();
@@ -91,18 +92,18 @@ test "addPending is idempotent; takePending consumes it exactly once" {
 
     const owner = try identities.getOrCreateMinimal(&pool, .telegram, "1", "owner", null, false, 1000);
 
-    try addPending(&pool, .telegram, "Newcomer", .allowed_user, owner);
-    try addPending(&pool, .telegram, "Newcomer", .allowed_user, owner); // idempotent re-queue
+    try addPending(&pool, .telegram, "Newcomer", .blocked_user, owner);
+    try addPending(&pool, .telegram, "Newcomer", .blocked_user, owner); // idempotent re-queue
 
     // Case-insensitive: queued as "Newcomer", found via "newcomer".
-    const found = try takePending(&pool, .telegram, "newcomer", .allowed_user);
+    const found = try takePending(&pool, .telegram, "newcomer", .blocked_user);
     try testing.expectEqual(owner, found.?);
 
     // Consumed — a second take finds nothing.
-    try testing.expect(try takePending(&pool, .telegram, "newcomer", .allowed_user) == null);
+    try testing.expect(try takePending(&pool, .telegram, "newcomer", .blocked_user) == null);
 }
 
-test "allowed_user and bot_admin pending grants for the same username are independent" {
+test "blocked_user and bot_admin pending grants for the same username are independent" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -110,11 +111,11 @@ test "allowed_user and bot_admin pending grants for the same username are indepe
 
     const owner = try identities.getOrCreateMinimal(&pool, .telegram, "1", "owner", null, false, 1000);
 
-    try addPending(&pool, .telegram, "alice", .allowed_user, owner);
+    try addPending(&pool, .telegram, "alice", .blocked_user, owner);
     try addPending(&pool, .telegram, "alice", .bot_admin, owner);
 
-    try testing.expect(try takePending(&pool, .telegram, "alice", .allowed_user) != null);
-    // The bot_admin grant is untouched by consuming the allowed_user one.
+    try testing.expect(try takePending(&pool, .telegram, "alice", .blocked_user) != null);
+    // The bot_admin grant is untouched by consuming the blocked_user one.
     try testing.expect(try takePending(&pool, .telegram, "alice", .bot_admin) != null);
 }
 
@@ -126,9 +127,9 @@ test "removePending cancels a queued grant without ever completing it" {
 
     const owner = try identities.getOrCreateMinimal(&pool, .telegram, "1", "owner", null, false, 1000);
 
-    try addPending(&pool, .telegram, "alice", .allowed_user, owner);
-    try removePending(&pool, .telegram, "alice", .allowed_user);
-    try testing.expect(try takePending(&pool, .telegram, "alice", .allowed_user) == null);
+    try addPending(&pool, .telegram, "alice", .blocked_user, owner);
+    try removePending(&pool, .telegram, "alice", .blocked_user);
+    try testing.expect(try takePending(&pool, .telegram, "alice", .blocked_user) == null);
 }
 
 test "removePending on something never queued is a no-op, not an error" {
@@ -137,7 +138,7 @@ test "removePending on something never queued is a no-op, not an error" {
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
 
-    try removePending(&pool, .telegram, "nobody", .allowed_user);
+    try removePending(&pool, .telegram, "nobody", .blocked_user);
 }
 
 test "pending grants are platform-scoped" {
@@ -147,8 +148,8 @@ test "pending grants are platform-scoped" {
     defer pool.deinitTestWrap();
 
     const owner = try identities.getOrCreateMinimal(&pool, .telegram, "1", "owner", null, false, 1000);
-    try addPending(&pool, .telegram, "alice", .allowed_user, owner);
+    try addPending(&pool, .telegram, "alice", .blocked_user, owner);
 
-    try testing.expect(try takePending(&pool, .matrix, "alice", .allowed_user) == null);
-    try testing.expect(try takePending(&pool, .telegram, "alice", .allowed_user) != null);
+    try testing.expect(try takePending(&pool, .matrix, "alice", .blocked_user) == null);
+    try testing.expect(try takePending(&pool, .telegram, "alice", .blocked_user) != null);
 }

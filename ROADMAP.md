@@ -277,6 +277,50 @@ Per-pass ceilings (`posts_per_source`, `max_summaries_per_pass`,
 `max_post_chars`) bound what one tick can cost; overflow stays behind the
 watermark for the next pass rather than being dropped.
 
+**Owner-reported fixes and access-model change, 2026-09-19.**
+
+- **Notes taken on Matrix never showed in the web UI.** Not a Matrix bug:
+  every "my ..." API list (`notes`, `reminders`, `alerts`, `watches`,
+  `memory`, `expenses`, `subscriptions`) scoped to the account's *first*
+  linked identity, and the OIDC login only ever links the Telegram one --
+  so anything the owner wrote from their Matrix or XMPP identity was
+  invisible. `router.callersIdentityIds` now resolves the account's linked
+  identities plus every configured owner identity, the store queries take
+  the set (`= ANY($1::bigint[])`, `Stmt.bindInt64Array`), and
+  `resolveCreateIdentity` searches the same set so creating from the UI in
+  a Matrix room picks the Matrix identity.
+- **Empty replies ("the bot deletes its thinking message and says
+  nothing").** The OpenAI-compatible adapter dropped a reasoning model's
+  `reasoning_content`/`reasoning` between turns. Interleaved-thinking
+  models (MiniMax M-series, the live provider) need their earlier reasoning
+  next to their tool calls; without it the turn after a tool result
+  routinely came back with no visible text. The thought is now kept as an
+  `llm.ContentBlock.thinking` and echoed back under the same field name;
+  the loop also nudges once on an empty final turn (with a length-limit
+  variant when the turn was cut off -- `StopReason.max_tokens` is new),
+  and whatever is still empty after that becomes a visible fallback in the
+  placeholder instead of a silent delete.
+- **The model not knowing what it did or can do.** Two halves: the
+  system prompt's tool paragraph was a hand-written list years behind the
+  registry, and only the final prose of a reply was ever recorded, so a
+  turn done entirely by a side-effecting tool left nothing in the history.
+  `qa.renderToolList` now generates a "Your tools" section from the tools
+  enabled for the chat, and the bot's own replies are stored with a compact
+  tool trace (`0052`, `messages.tool_trace`) rendered back into the
+  history as `[used: name(args) -> result]`.
+- **Credits and tokens removed; allowlist flipped to a blocklist.** Both
+  balance systems (`identities.credits` / `/credit`, `chat_members.tokens`
+  / `/token`, the token tier of `auth.checkGroupAdminAccess`) are gone --
+  RBAC (owner, bot admins, a chat's live platform admins) is the whole
+  permission model. The bot now answers everyone by default; `/blockuser`,
+  `/unblockuser`, `/blockchat`, `/unblockchat` (and the matching `/menu`
+  entries) replace `/adduser`/`/removeuser`/`/allowchat`/`/disallowchat`.
+  Owners and bot admins can't be blocked. The owner-only LLM gate
+  (`WARDEN_LLM_OWNER_ONLY`) is unchanged and still the thing between a
+  stranger and the model bill. Migration `0053` drops the old tables and
+  columns; the API's identity records report `is_blocked` instead of
+  `is_allowed`/`credits`.
+
 
 **Also unplanned, shipped outside the phase sequence** (direct user
 request, 2026-08-18): `/tdsummary <chat id or name>` and its natural-

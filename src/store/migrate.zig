@@ -64,6 +64,7 @@ const migrations = [_]Migration{
     .{ .version = 50, .name = "0050_optional_embeddings", .sql = @embedFile("migrations/0050_optional_embeddings.sql") },
     .{ .version = 51, .name = "0051_curated_feed", .sql = @embedFile("migrations/0051_curated_feed.sql") },
     .{ .version = 52, .name = "0052_messages_tool_trace", .sql = @embedFile("migrations/0052_messages_tool_trace.sql") },
+    .{ .version = 53, .name = "0053_blocklist_drop_credits_tokens", .sql = @embedFile("migrations/0053_blocklist_drop_credits_tokens.sql") },
 };
 
 /// Applies every migration not yet recorded in `schema_migrations`, each
