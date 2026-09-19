@@ -17,6 +17,12 @@ Postgres database, and a `.env` file.
 - **Personal Telegram account** — the bot can ghostwrite replies into your own account's composer for approval.
 - **Button menu** — `/menu` drives every module without remembering command syntax; `/help` lists them all.
 
+# Documentation
+`docs/` describes how Warden works — architecture, access control, the LLM
+pipeline, platforms, features, storage, operations, testing, and the design
+decisions behind them. Start at `docs/README.md`. `ROADMAP.md` is the
+chronological development log.
+
 # Platforms
 - **Telegram** — the primary target; everything works here.
 - **Matrix** — plaintext and end-to-end encrypted rooms, auto-joins on invite.
@@ -65,7 +71,7 @@ export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
 ```
 
 Every other knob — optional integrations, timeouts, retention, logging —
-is read and documented in `src/config.zig`.
+is read in `src/config.zig` and listed in `docs/configuration.md`.
 
 Then run:
 ```bash
