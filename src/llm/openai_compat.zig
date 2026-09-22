@@ -73,7 +73,9 @@ pub const OpenAiCompatProvider = struct {
     const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn };
 
     /// Shared request-body builder for both `chatFn` and `chatStreamFn` — the
-    /// only difference between the two is `"stream":true`.
+    /// only difference between the two is the `"stream"` flag, which is always
+    /// sent explicitly: some gateways default to an SSE body when it is absent,
+    /// and the non-streaming path needs a plain JSON object back.
     fn buildPayload(allocator: std.mem.Allocator, self: *const OpenAiCompatProvider, request: llm.ChatRequest, stream: bool) ![]const u8 {
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
@@ -88,7 +90,7 @@ pub const OpenAiCompatProvider = struct {
             try w.writeAll(",\"tools\":");
             try writeTools(allocator, w, request.tools);
         }
-        if (stream) try w.writeAll(",\"stream\":true");
+        try w.writeAll(if (stream) ",\"stream\":true" else ",\"stream\":false");
         try w.writeByte('}');
         return allocator.dupe(u8, w.buffered());
     }
