@@ -6,11 +6,8 @@ const audit_notify = @import("audit_notify.zig");
 
 pub const ActionKind = enum { ban, kick };
 
-/// Bundles what `mute`/`unmute`/`promote`/`demote` need to log an audit
-/// entry (Phase 20, ROADMAP.md) alongside the action itself — a small
-/// struct rather than four more positional parameters on each function,
-/// since each is already called from more than one site (the main dispatch
-/// chain and `/menu`'s resume-awaiting-input path).
+/// Bundles what `mute`/`unmute`/`promote`/`demote` need to log an audit entry
+/// alongside the action itself.
 pub const AuditContext = struct {
     pool: *store_pool.PgPool,
     pending_undos: *audit_notify.PendingUndos,
@@ -18,41 +15,16 @@ pub const AuditContext = struct {
     /// store-layer calls need (`chats.id`, not the platform-native id).
     chat_id: i64,
     actor_identity_id: i64,
-    /// Cheap, no-DB-read actor label for the log line — `msg.username
-    /// orelse msg.user_id` at the call site is enough; a resolved display
-    /// name isn't worth an extra query here.
+    /// Cheap, no-DB-read actor label for the log line.
     actor_label: []const u8,
-    /// Phase 23's `-s`/`-p` flags (or a chat's own `/silent on` default) —
-    /// `.normal` logs and confirms exactly as before; `.silent` still logs
-    /// to the bound room but skips the in-group confirmation reply;
-    /// `.phantom` skips both. See `parseVisibility`'s doc comment for how
-    /// this is derived.
+    /// `-s`/`-p` flags (or a chat's own `/silent on` default).
     visibility: Visibility = .normal,
 };
 
 pub const Visibility = enum { normal, silent, phantom };
 
-/// Parses a leading/trailing `-s`/`-p` token out of `arg`'s
-/// whitespace-separated tokens (either position — "before or after the
-/// target" per the original ask), returning the remaining tokens rejoined
-/// with single spaces and the resulting `Visibility`.
-///
-/// `-p` is silently downgraded to `-s` unless `is_superuser` — a non-
-/// superuser's misfired `-p` shouldn't block an otherwise-valid action
-/// with a hard error, matching this project's existing "explain and
-/// continue" tone for a tier mismatch (see `/redact regex`'s owner/sudo
-/// gate, which denies the *regex* mode outright rather than half-running
-/// it — the difference here is `-p` is a modifier on an action that's
-/// still valid without it, so downgrading is the more useful failure
-/// mode). Callers wanting to surface that downgrade to the user can
-/// compare the returned `Visibility` against what a bare `-p` would have
-/// asked for.
-///
-/// A chat's own `/silent on` default (`chat_settings.getSilentByDefault`)
-/// is deliberately NOT applied here — callers combine it with the parsed
-/// result themselves (`.normal` from parsing, chat default silent =>
-/// `.silent`), since only the caller knows whether this command is one
-/// the per-chat default should apply to.
+/// Parses a leading/trailing `-s`/`-p` token out of `arg`'s whitespace-
+/// separated tokens.
 pub fn parseVisibility(a: std.mem.Allocator, arg: []const u8, is_superuser: bool) struct { visibility: Visibility, rest: []const u8 } {
     var it = std.mem.tokenizeScalar(u8, arg, ' ');
     var visibility: Visibility = .normal;
@@ -82,16 +54,7 @@ const PendingAction = struct {
     expires_at: i64,
 };
 
-/// Ban/kick require the owner to confirm before they actually happen —
-/// mute/pin/delete are reversible enough (or low-blast-radius enough) to
-/// act on immediately. One pending action per chat: a second confirmable
-/// command in the same chat simply replaces whatever was pending.
-///
-/// Accessed from concurrently-running per-message tasks (see `PgPool`'s
-/// doc comment for why), so `map` needs a lock; `lockUncancelable` is used
-/// throughout since these are quick in-memory operations, not I/O, and
-/// keeping `set`/`take`/`clear`'s existing signatures (no new error to
-/// propagate) avoids rippling `try`/`catch` into every call site.
+/// Ban/kick require the owner to confirm before they actually happen.
 pub const PendingConfirmations = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -170,9 +133,7 @@ pub const PendingConfirmations = struct {
 };
 
 /// A command that names/targets a user (everything except mute's implicit
-/// duration) needs a reply to resolve who it's about — Telegram messages
-/// don't carry structured "@mention" targeting in a way we parse, so
-/// replying to the target's message is the one reliable mechanism.
+/// duration) needs a reply to resolve who it's about.
 fn replyTarget(msg: iface.Message) ?struct { user_id: []const u8, label: []const u8 } {
     const user_id = msg.reply_to_user_id orelse return null;
     const label = msg.reply_to_username orelse user_id;
@@ -206,7 +167,7 @@ pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Messa
         reportFailure(connector, a, msg.chat_id, msg.message_id, "unmute", err);
         return;
     };
-    // Not undoable (see `audit_notify.AuditAction.undoable`'s doc comment)
+    // Not undoable
     // -- logged for the record regardless.
     if (audit.visibility != .phantom) {
         audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .unmute = .{ .target_user_id = target.user_id, .target_label = target.label } });
@@ -214,22 +175,12 @@ pub fn unmute(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Messa
     if (audit.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "Unmuted {s}.", .{target.label});
 }
 
-/// Grants real platform admin/moderator standing — unlike every other
-/// command in this file, gated owner-only rather than open to any
-/// existing chat admin (see `main.zig`'s dispatch: it checks
-/// `auth.isOwner` directly here instead of `isAuthorizedForGroupAdmin`).
-/// Deliberately immediate, no `/confirm` step — the owner is already
-/// fully trusted for everything else, and a confirm step mainly guards
-/// against a *different* admin acting rashly, which doesn't apply once
-/// this is owner-only.
+/// Grants real platform admin/moderator standing.
 pub fn promote(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, now: i64, audit: AuditContext) void {
     const target = replyTarget(msg) orelse {
         connector.sendMessage(a, msg.chat_id, "Reply to the message of the person you want to promote.", msg.message_id);
         return;
     };
-    // Read before mutating -- this is the "before" state `audit_notify`
-    // needs both to log accurately and to know whether an Undo (demote)
-    // would actually reverse something (see `AuditAction.undoable`).
     const was_admin_before = connector.isGroupAdmin(a, msg.chat_id, target.user_id) catch false;
     connector.promoteUser(a, msg.chat_id, target.user_id) catch |err| {
         reportFailure(connector, a, msg.chat_id, msg.message_id, "promote", err);
@@ -290,18 +241,7 @@ pub fn deleteMessage(connector: iface.Connector, a: std.mem.Allocator, msg: ifac
     connector.sendMessage(a, msg.chat_id, "Deleted.", msg.message_id);
 }
 
-/// Runs the ban/kick action immediately against `target_user_id` — a native
-/// platform id the caller has already resolved (reply target, `@username`,
-/// or a raw id; see `main.zig`'s `resolveTargetIdentity`/
-/// `handleKickBanCommand`). Targeting used to be this function's own job,
-/// hardcoded to `replyTarget(msg)` alone — the bug that made `/kick
-/// @username` and `/kick <user_id>` silently do nothing (no dispatch branch
-/// even matched them; see `handleMessage`'s old exact-`eql` match). Resolving
-/// the target is now entirely the caller's job, same division as
-/// permission: (owner / sudo bot admin / live platform admin / spend-a-token
-/// fallback) is checked once by `main.zig` via `auth.checkGroupAdminAccess`
-/// before this ever runs, and this function no longer touches the database
-/// at all.
+/// Runs the ban/kick action immediately against `target_user_id`.
 pub fn requestConfirmation(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -329,10 +269,6 @@ pub fn requestConfirmation(
             audit_notify.recordAndNotify(connector, a, audit.pool, audit.pending_undos, now, audit.chat_id, msg.chat_id, audit.actor_identity_id, audit.actor_label, .{ .ban = .{ .target_user_id = target_user_id, .target_label = target_label } });
         }
     }
-    // No in-group confirmation existed here before Phase 23 (see
-    // ROADMAP.md's Phase 8 backlog note on `/confirm`/`/cancel` being dead
-    // code for kick/ban) -- adding one, gated on `.normal`, is what makes
-    // `-s` mean something for these two, not just a no-op flag.
     if (audit.visibility == .normal) reply(connector, a, msg.chat_id, msg.message_id, "{s} {s}.", .{ actionVerbPast(kind), target_label });
 }
 

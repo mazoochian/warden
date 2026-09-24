@@ -7,7 +7,7 @@ Postgres database, and a `.env` file.
 
 # Features
 - **LLM Q&A** — mention the bot, reply to it, or say the magic word; answers stream in place with live tool use (web search, page scraping, weather, prices, ...).
-- **Owner-only access** — nobody talks to the bot until the owner allows them; a bot-admin role and `/sudo` cover the rest.
+- **Access control** — the bot answers everyone by default, with the free-form LLM Q&A owner-only unless you open it up; the owner can block any user or chat, and a bot-admin role plus `/sudo` cover the rest.
 - **Group moderation** — mute, kick, ban, redact, slow mode, welcome messages, and scheduled announcements, gated by the chat's live platform admins.
 - **Management rooms** — moderate a chat from a private room with a full audit log and one-tap undo.
 - **Reminders and alerts** — one-off or recurring reminders, plus standing crypto/weather/AQI watches, all in natural language.
@@ -16,6 +16,12 @@ Postgres database, and a `.env` file.
 - **Memory and persona** — per-user facts that follow you across chats, and a per-chat system prompt override.
 - **Personal Telegram account** — the bot can ghostwrite replies into your own account's composer for approval.
 - **Button menu** — `/menu` drives every module without remembering command syntax; `/help` lists them all.
+
+# Documentation
+`docs/` describes how Warden works — architecture, access control, the LLM
+pipeline, platforms, features, storage, operations, testing, and the design
+decisions behind them. Start at `docs/README.md`. `ROADMAP.md` is the
+chronological development log.
 
 # Platforms
 - **Telegram** — the primary target; everything works here.
@@ -65,7 +71,7 @@ export WARDEN_POSTGRES_DSN=postgresql://user:password@host:5432/warden
 ```
 
 Every other knob — optional integrations, timeouts, retention, logging —
-is read and documented in `src/config.zig`.
+is read in `src/config.zig` and listed in `docs/configuration.md`.
 
 Then run:
 ```bash

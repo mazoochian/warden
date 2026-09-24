@@ -1,14 +1,5 @@
-//! HTTP+WebSocket accept loop for warden-ui's API (see
-//! /home/armin/claude/warden-ui/ARCHITECTURE.md §1) — built on
-//! `std.http.Server` (confirmed present in this Zig toolchain, including
-//! native WebSocket upgrade support), not a hand-rolled HTTP parser.
-//!
-//! Mirrors `worker_pool.zig`'s existing `WorkerPool` shape (one accept
-//! loop feeding a bounded pool of real OS threads) rather than inventing
-//! new concurrency machinery — same reasoning as the per-connector
-//! message-processing pools already in `main.zig`: a slow/stuck API
-//! request should occupy one worker, never the whole API surface, and
-//! `accept()`'s own loop should never itself block on request handling.
+//! HTTP+WebSocket accept loop for the web API (see docs/web-api.md), built
+//! on `std.http.Server` including its native WebSocket upgrade.
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
@@ -25,63 +16,28 @@ const router = @import("router.zig");
 const log = @import("../log.zig").scoped("api");
 
 /// Everything a request handler needs — deliberately a plain passthrough
-/// bundle, same `ptr`-bag convention as `menu.zig`'s `ActionContext`
-/// (never reached into directly by `server.zig`'s own accept-loop code,
-/// just carried from `main.zig`'s startup through to `router.zig`'s
-/// handlers).
+/// bundle.
 pub const ServerContext = struct {
     allocator: std.mem.Allocator,
     io: Io,
     pool: *store_pool.PgPool,
     config: *const config_mod.Config,
     /// Live platform connectors, for handlers that need to check *current*
-    /// platform-admin status (Phase 4's group settings) rather than
-    /// anything cached in the DB — see `ARCHITECTURE.md` §7's "Group
-    /// admin" tier. Defaults to empty so existing tests that don't touch
-    /// group-admin-gated endpoints don't need updating.
+    /// platform-admin status (the group settings) rather than anything cached in
+    /// the DB — see `ARCHITECTURE.md` §7's "Group admin" tier.
     connectors: []const iface.Connector = &.{},
-    /// Phase 6 "Bot View" -- `null` until `main.zig` hands in the
-    /// process-lifetime broadcaster it also feeds from the message-
-    /// recording tap. Optional (not a plain pointer) so existing tests that
-    /// never touch Bot View's endpoints don't need updating; those
-    /// endpoints themselves treat `null` as "feature unavailable" (500),
-    /// which should never actually happen outside tests since `main.zig`
-    /// always sets this before starting the API server.
+    /// "Bot View" -- `null` until `main.zig` hands in the process- lifetime
+    /// broadcaster it also feeds from the message- recording tap.
     bot_view: ?*bot_view.Broadcaster = null,
-    /// Phase 7 hardening (see `rate_limit.zig`'s doc comment). `null` in
-    /// every test that doesn't specifically exercise rate limiting means
-    /// "not limited" (fail open), not "feature unavailable" -- unlike
-    /// `bot_view` above, a missing limiter is a safe default, not a
-    /// broken one. `auth_limiter` covers the anonymous auth-flow
-    /// endpoints (dev-login, OIDC start/callback); `bot_view_send_limiter`
-    /// covers `POST /api/v1/bot-view/send`, keyed per-account since that
-    /// endpoint is already authenticated by the time it runs.
     auth_limiter: ?*rate_limit.Limiter = null,
     bot_view_send_limiter: ?*rate_limit.Limiter = null,
-    /// The personal-account (TDLib) connector, if `WARDEN_TELEGRAM_USER_*`
-    /// is configured — `null` otherwise, same "feature unavailable" meaning
-    /// as `bot_view` above. Distinct from `connectors` (which only carries
-    /// the generic `iface.Connector` vtable): the login-flow endpoints
-    /// (`/api/v1/telegram-user/*`) need the concrete type's
-    /// `submitPhoneNumber`/`submitAuthCode`/`submitPassword`/`authState`,
-    /// none of which are (or should be) part of the platform-agnostic
-    /// vtable every connector implements.
+    /// The personal-account (TDLib) connector, if `WARDEN_TELEGRAM_USER_*` is
+    /// configured — `null` otherwise.
     telegram_user: ?*telegram_user_platform.TelegramUserConnector = null,
     /// The bot's LLM provider — needed by the `/api/v1/telegram-user/
     /// chats/summarize` endpoint (see `router.zig`'s `handleTelegramUser
-    /// SummarizeChat`), which reuses `features/chat_summary.zig`'s exact
-    /// same LLM summarization call the bot's own `/tdsummary` command
-    /// uses. `null` in every test that doesn't specifically exercise that
-    /// endpoint, same "safe-for-tests default" convention every other
-    /// optional field on this struct already follows.
+    /// SummarizeChat`).
     llm_provider: ?llm.Provider = null,
-    /// Phase D's pending "reply on my behalf" drafts (see
-    /// `reply_drafts.PendingDrafts`'s own doc comment) — the same
-    /// process-lifetime, mutex-guarded instance `/drafts`/`/approve`/
-    /// `/discard` already share with the message-processing path. `null`
-    /// in every test that doesn't specifically exercise the
-    /// `/api/v1/telegram-user/drafts*` endpoints, same "feature
-    /// unavailable" meaning as `telegram_user` above.
     pending_drafts: ?*reply_drafts.PendingDrafts = null,
 };
 
@@ -90,12 +46,8 @@ const ConnectionItem = struct {
     stream: Io.net.Stream,
 };
 
-/// Binds `port` and runs the accept loop forever — never returns under
-/// normal operation, same "long-lived, no shutdown path" shape as
-/// `main.zig`'s connector poll loops and `WorkerPool` itself. Thin
-/// wrapper around `bind`+`serve`, split apart so a test can bind port `0`
-/// (kernel-assigned) and read back the real port before starting `serve`
-/// on its own thread — see this file's tests.
+/// Binds `port` and runs the accept loop forever — never returns under normal
+/// operation.
 pub fn run(ctx: *const ServerContext, port: u16, worker_count: usize) !void {
     var listener = try bind(ctx.io, port);
     defer listener.deinit(ctx.io);
@@ -107,12 +59,7 @@ pub fn bind(io: Io, port: u16) !Io.net.Server {
     return address.listen(io, .{ .reuse_address = true });
 }
 
-/// Cooperative stop signal for `serve`. Production passes `null` and the
-/// loop runs forever as it always has; tests pass one so the accept thread
-/// and its workers can be wound down at the end of the test instead of
-/// running for the rest of the test binary. Use `Stop.shutdown` rather than
-/// setting `flag` by hand — a `serve` parked in `accept` won't notice the
-/// flag until a connection arrives.
+/// Cooperative stop signal for `serve`.
 pub const Stop = struct {
     flag: std.atomic.Value(bool) = .init(false),
 
@@ -120,12 +67,8 @@ pub const Stop = struct {
         return self.flag.load(.acquire);
     }
 
-    /// Signals `serve` to stop and then makes one throwaway connection to
-    /// `port` purely to wake the blocked `accept`, so this returns only once
-    /// the loop has actually observed the flag. Closing the listener out
-    /// from under `accept` would be the other way to unblock it, but that
-    /// races with the accept thread over a file descriptor the kernel is
-    /// free to hand back out for something else the moment it's closed.
+    /// Signals `serve` to stop and then makes one throwaway connection to `port`
+    /// purely to wake the blocked `accept`.
     pub fn shutdown(self: *Stop, io: Io, port: u16) void {
         self.flag.store(true, .release);
         const address = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
@@ -151,10 +94,8 @@ pub fn serve(ctx: *const ServerContext, listener: *Io.net.Server, worker_count: 
             log.warn("accept failed: {t}", .{err});
             continue;
         };
-        // Checked again after `accept` returns because the connection that
-        // just arrived is usually `Stop.shutdown`'s own throwaway one, which
-        // has nothing to serve and would otherwise be handed to a worker
-        // that's about to be told to stop.
+        // Checked again after `accept` returns because the connection that just
+        // arrived is usually `Stop.shutdown`'s own throwaway one.
         if (stop) |s| if (s.shouldStop()) {
             stream.close(ctx.io);
             return;
@@ -166,11 +107,8 @@ pub fn serve(ctx: *const ServerContext, listener: *Io.net.Server, worker_count: 
     }
 }
 
-/// One request/response cycle over one accepted TCP connection — no
-/// keep-alive/pipelining across multiple requests yet (the simplest
-/// correct thing; see `ROADMAP.md`'s Phase 0 notes for revisiting this if
-/// connection-per-request overhead ever actually matters at warden-ui's
-/// traffic scale, which is unlikely to be the bottleneck any time soon).
+/// One request/response cycle over one accepted TCP connection — no keep-
+/// alive/pipelining across multiple requests yet.
 fn handleConnection(item: ConnectionItem) void {
     defer item.stream.close(item.ctx.io);
 
@@ -182,32 +120,13 @@ fn handleConnection(item: ConnectionItem) void {
 
     const started = Io.Timestamp.now(item.ctx.io, .real);
     var request = http_server.receiveHead() catch |err| {
-        // A closed/reset connection before any bytes arrive is routine
-        // (browsers/load balancers probe and disconnect) — not worth
-        // logging at warn.
+        // A closed/reset connection before any bytes arrive is routine (browsers/load
+        // balancers probe and disconnect) — not worth logging at warn.
         log.debug("failed to receive request head: {t}", .{err});
         return;
     };
     // Two upstream asserts in `std.http.Server` turn a malformed request head
-    // into a process abort, and `-Doptimize=ReleaseSafe` (the Dockerfile's
-    // mode) keeps both live, so a single unauthenticated request could take
-    // every connector down with the API. Screened here, once, rather than at
-    // the ~26 `readerExpectNone` call sites in `router.zig`:
-    //
-    //  * A body-carrying method with neither `content-length` nor
-    //    `transfer-encoding` reaches `assert(transfer_encoding != .none or
-    //    content_length != null)` inside `Request.discardBody`, which every
-    //    `respond` on a keep-alive connection runs -- including the 401 from
-    //    `requireLoggedIn` and the 404 fallthrough, neither of which reads a
-    //    body. `Head.parse` doesn't reject the combination itself. 411 is the
-    //    RFC 7231 answer.
-    //  * `Request.readerExpectNone` asserts `head.expect == null`, so any
-    //    request with an `expect:` header panics at the first body read. Stock
-    //    curl sends `expect: 100-continue` for a large body, so this fired on
-    //    legitimate `/api/v1/convert` uploads too, not just hostile ones.
-    //    Answered properly here (write the continuation, flush it so the
-    //    client actually starts sending, then clear `expect` so the handlers'
-    //    own reads are unchanged); any other expectation is a 417.
+    // into a process abort, and `-Doptimize=ReleaseSafe`.
     if (request.head.method.requestHasBody() and
         request.head.transfer_encoding == .none and request.head.content_length == null)
     {
@@ -231,13 +150,7 @@ fn handleConnection(item: ConnectionItem) void {
         };
     }
 
-    // One line per request -- method, path, outcome, elapsed -- through
-    // the same tabular logger every other subsystem uses (Phase 7's
-    // "production observability" item), not a second logging convention.
-    // The individual handler-level `log.err`/`log.warn` calls already
-    // scattered through `router.zig` stay as-is for the *why* on failure;
-    // this is just the *that a request happened at all* line, since none
-    // existed before at any level besides "receive/handling failed".
+    // One line per request -- method, path, outcome, elapsed.
     const method_name = @tagName(request.head.method);
     const target = item.ctx.allocator.dupe(u8, request.head.target) catch request.head.target;
     defer if (target.ptr != request.head.target.ptr) item.ctx.allocator.free(target);
@@ -256,19 +169,9 @@ fn handleConnection(item: ConnectionItem) void {
 }
 
 /// A refusal sent before any handler runs, for a request head this server
-/// can't safely process at all. `keep_alive = false` is the point: it keeps
-/// `respond` out of `discardBody`'s body-discarding path (whose assert is
-/// exactly what the 411 case above is avoiding), and it's honest --
-/// `handleConnection` closes the connection after one request regardless.
+/// can't safely process at all.
 fn respondFatalHeadError(request: *http.Server.Request, status: http.Status, code: []const u8, message: []const u8) void {
     // Clearing `expect` is what makes the 417 above actually reach the client.
-    // `respond` starts by calling `writeExpectContinue` itself, and that
-    // returns `error.HttpExpectationFailed` -- before writing a single byte --
-    // for any expectation that isn't `100-continue`. It also doesn't clear
-    // `expect` on that error path, so the failed call in `handleConnection`
-    // leaves it set and the `catch {}` below silently swallowed the whole
-    // response: the client got an empty reply and a closed connection instead
-    // of the status. The expectation is answered by this refusal, so drop it.
     request.head.expect = null;
 
     var buf: [256]u8 = undefined;
@@ -289,6 +192,7 @@ const identities = @import("../store/identities.zig");
 const chats_store = @import("../store/chats.zig");
 const bot_admins = @import("../store/bot_admins.zig");
 const convert = @import("../features/convert.zig");
+const notes_store = @import("../store/notes.zig");
 
 fn testConfig() config_mod.Config {
     return .{
@@ -340,22 +244,7 @@ fn findSetCookie(head: http.Client.Response.Head) ?[]const u8 {
     return null;
 }
 
-// Exercises the real accept loop over an actual loopback TCP socket --
-// `bind`/`serve` are called directly (not `run`, and never through
-// `main()`/`Config.load`), so this needs no Telegram bot token/real
-// credentials at all, sidestepping the one reason this couldn't be
-// smoke-tested by just running the real bot locally tonight (a second
-// live long-poller on the same token would 409-conflict with the
-// already-deployed production instance).
-//
-// Everything the detached `serve` thread below touches (`ctx`, `pool`,
-// `db`, `listener`) is heap-allocated via `page_allocator` and
-// deliberately never freed/closed/joined -- the exact same tradeoff
-// `worker_pool.zig`'s own tests already establish and justify: a
-// stack-local value here would be a real use-after-free the moment the
-// accept loop's thread wakes up after this function returns, since
-// there is no shutdown path for `serve` (by design, same as every other
-// long-lived loop in this codebase).
+// Exercises the real accept loop over an actual loopback TCP socket.
 test "full HTTP round trip: unauthenticated session, dev-login, authenticated session, logout" {
     const gpa = std.heap.page_allocator;
 
@@ -379,11 +268,8 @@ test "full HTTP round trip: unauthenticated session, dev-login, authenticated se
 
     var stop: Stop = .{};
     const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
-    // Registered before the request-side defers below so it runs after them:
-    // the client is finished with the server by the time the loop is told to
-    // stop. Joined rather than detached so the accept thread and its workers
-    // are gone when the test returns, instead of staying live for the rest of
-    // the test binary.
+    // Registered before the request-side defers below so it runs after them: the
+    // client is finished with the server by the time the loop is told to stop.
     defer {
         stop.shutdown(testing.io, port);
         thread.join();
@@ -456,10 +342,8 @@ test "full HTTP round trip: unauthenticated session, dev-login, authenticated se
             .extra_headers = &.{.{ .name = "cookie", .value = cookie }},
         });
         defer req.deinit();
-        // POST always asserts `requestHasBody()` even for a zero-length
-        // body -- unlike GET, `sendBodiless()` isn't valid here (found the
-        // hard way: `assert(!r.method.requestHasBody())` inside
-        // `std.http.Client.Request.sendBodilessUnflushed` aborts otherwise).
+        // POST always asserts `requestHasBody()` even for a zero-length body --
+        // unlike GET, `sendBodiless()` isn't valid here.
         req.transfer_encoding = .{ .content_length = 0 };
         var body_writer = try req.sendBodyUnflushed(&.{});
         try body_writer.end();
@@ -485,18 +369,10 @@ test "full HTTP round trip: unauthenticated session, dev-login, authenticated se
     }
 }
 
-/// Stands in for a real platform connector -- just enough of `iface.Connector`
-/// for Bot View's send endpoint (`platform`/`poll`/`sendMessage`; every other
-/// vtable entry is optional and left null). Same shape as `auth.zig`'s own
-/// `StubConnector`.
+/// Stands in for a real platform connector.
 const BotViewStubConnector = struct {
     /// Used for `sent_messages`' own storage -- deliberately *not* the
-    /// `allocator` a `sendMessage` call is given, which is the calling
-    /// handler's own short-lived per-request arena (freed the moment that
-    /// handler returns). Storing into/appending text pointing into that
-    /// arena would be a real use-after-free the moment a test reads
-    /// `sent_messages` back afterward -- found the hard way, via a real
-    /// segfault, before this field existed.
+    /// `allocator` a `sendMessage` call is given.
     store_allocator: std.mem.Allocator,
     sent_messages: std.ArrayList([]const u8) = .empty,
 
@@ -552,10 +428,8 @@ fn devLogin(client: *http.Client, port: u16, identity_id: i64) ![]const u8 {
     return try testing.allocator.dupe(u8, raw_cookie[0..semi]);
 }
 
-/// Reads exactly one WebSocket frame's payload off `reader`, asserting it's
-/// a text frame. `reader` is the raw stream reader -- server frames are
-/// never masked (only client-to-server frames are, per RFC 6455), so no
-/// unmasking is needed here, unlike `Server.WebSocket.readSmallMessage`.
+/// Reads exactly one WebSocket frame's payload off `reader`, asserting it's a
+/// text frame.
 fn readOneWsTextFrame(allocator: std.mem.Allocator, reader: *Io.Reader) ![]u8 {
     const header = try reader.takeArray(2);
     const opcode = header[0] & 0x0f;
@@ -571,9 +445,7 @@ fn readOneWsTextFrame(allocator: std.mem.Allocator, reader: *Io.Reader) ![]u8 {
 }
 
 // Same "everything heap-allocated via page_allocator, deliberately never
-// freed" tradeoff as the round-trip test above -- `serve`'s thread has no
-// shutdown path, so nothing it might still touch can be stack-local or
-// torn down when this function returns.
+// freed" tradeoff as the round-trip test above.
 test "bot view: WS is owner-only and delivers a published event; send posts through the connector" {
     const gpa = std.heap.page_allocator;
 
@@ -606,11 +478,8 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
 
     var stop: Stop = .{};
     const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
-    // Registered before the request-side defers below so it runs after them:
-    // the client is finished with the server by the time the loop is told to
-    // stop. Joined rather than detached so the accept thread and its workers
-    // are gone when the test returns, instead of staying live for the rest of
-    // the test binary.
+    // Registered before the request-side defers below so it runs after them: the
+    // client is finished with the server by the time the loop is told to stop.
     defer {
         stop.shutdown(testing.io, port);
         thread.join();
@@ -664,8 +533,7 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
     }
 
     // Owner: real WS handshake over a raw socket (`std.http.Client` has no
-    // WebSocket support), then a server-side `publish` must arrive as a
-    // JSON text frame.
+    // WebSocket support).
     {
         const host_name = try Io.net.HostName.init("127.0.0.1");
         const stream = try host_name.connect(testing.io, port, .{ .mode = .stream });
@@ -683,14 +551,7 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
 
         var recv_buf: [1024]u8 = undefined;
         var stream_reader = stream.reader(testing.io, &recv_buf);
-        // `takeDelimiterExclusive` does NOT consume the delimiter itself
-        // (confirmed reading the stdlib source -- it tosses only the
-        // returned, delimiter-excluded slice), so it desyncs a multi-line
-        // parse: the next call would immediately see the previous line's
-        // leftover '\n' and return an empty slice without ever advancing
-        // into the following header line. `takeDelimiterInclusive`
-        // consumes through and past the delimiter, which is what a
-        // line-by-line parse actually needs.
+        // `takeDelimiterExclusive` does NOT consume the delimiter itself.
         const status_line = try stream_reader.interface.takeDelimiterInclusive('\n');
         try testing.expect(std.mem.indexOf(u8, status_line, "101") != null);
         while (true) {
@@ -698,14 +559,8 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
             if (std.mem.eql(u8, line, "\r\n")) break;
         }
 
-        // The 101 response completing (just parsed above) only proves the
-        // handshake itself is done, not that `handleBotViewWs`'s own
-        // `subscribe` call (a couple lines later, server-side) has run yet
-        // -- give it a moment before publishing. A publish issued before
-        // `subscribe` completes would simply never be delivered (same as
-        // real production pub/sub semantics, no replay/queueing for a
-        // not-yet-registered subscriber), so this is a real, if generous,
-        // wait rather than an arbitrary sleep.
+        // The 101 response completing (just parsed above) only proves the handshake
+        // itself is done.
         Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
         broadcaster.publish(chat_id, "alice", "hello there", 12345);
 
@@ -718,13 +573,7 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
         try testing.expect(std.mem.indexOf(u8, payload, chat_id_str) != null);
     }
 
-    // Closing the raw socket above only unblocks *this* thread's next
-    // step -- `handleBotViewWs`'s own reader loop (on a worker-pool
-    // thread) needs a moment to notice the close, join its writer thread,
-    // and return, before that worker's stack-local buffers (`server.zig`'s
-    // `handleConnection`) are safe to consider done with this connection.
-    // A generous wait here, not a synchronization primitive, since there's
-    // no handle back to that specific worker thread from a test.
+    // Closing the raw socket above only unblocks *this* thread's next step.
     Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
 
     // Owner: send-as-bot calls straight through to the connector and
@@ -751,39 +600,18 @@ test "bot view: WS is owner-only and delivers a published event; send posts thro
         try testing.expectEqual(.ok, response.head.status);
     }
 
-    // Give the send above a moment to land on the stub before asserting --
-    // `handleBotViewSend` finishes (and the response is sent) synchronously
-    // with the `sendMessage` call itself, so this is really just here for
-    // clarity, not because of any real race.
+    // Give the send above a moment to land on the stub before asserting.
     try testing.expectEqual(@as(usize, 1), stub.sent_messages.items.len);
     try testing.expectEqualStrings("reply from the owner", stub.sent_messages.items[0]);
 }
 
 // Regression test for a real bug (found by hand testing the web panel's
-// Convert page against a real browser): `handleConvert` read the
-// `boundary` out of the Content-Type header via `findHeader`, which
-// borrows straight from `request.head_buffer` -- the same connection-level
-// buffer `readerExpectNone`'s body reader reuses once the body needs more
-// bytes than `receiveHead` already had buffered. Any upload whose body
-// didn't already fit in that initial buffered read (in practice, anything
-// much past a few hundred bytes) silently clobbered `boundary` before
-// `multipart.parse` ever read it, so `multipart.find(parts, "file")`
-// always came back empty -- "missing a \"file\" part" for every real
-// upload, while curl/test bodies small enough to land in one read kept
-// passing. The body below is well past both that threshold and the 16KB
-// connection buffer, so a regression here reproduces reliably.
+// Convert page against a real browser).
 test "convert endpoint: a real multipart POST whose body exceeds one buffered read still finds the file part" {
     const gpa = std.heap.page_allocator;
 
-    // This posts a real txt -> md conversion, which shells out to pandoc
-    // (see `features/convert.zig`), so it needs pandoc present exactly like
-    // the conversion tests in that file — which all skip when it isn't.
-    // This one didn't, and so hard-failed with a 500 on any machine without
-    // it; CI was the machine in question. The regression it actually guards
-    // is multipart parsing across a buffer boundary, not pandoc, so
-    // skipping when the tool is absent loses nothing it's here to protect.
-    // CI installs pandoc so it really runs there rather than quietly
-    // skipping.
+    // This posts a real txt -> md conversion, which shells out to pandoc (see
+    // `features/convert.zig`).
     {
         var probe = std.heap.ArenaAllocator.init(testing.allocator);
         defer probe.deinit();
@@ -809,11 +637,8 @@ test "convert endpoint: a real multipart POST whose body exceeds one buffered re
 
     var stop: Stop = .{};
     const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
-    // Registered before the request-side defers below so it runs after them:
-    // the client is finished with the server by the time the loop is told to
-    // stop. Joined rather than detached so the accept thread and its workers
-    // are gone when the test returns, instead of staying live for the rest of
-    // the test binary.
+    // Registered before the request-side defers below so it runs after them: the
+    // client is finished with the server by the time the loop is told to stop.
     defer {
         stop.shutdown(testing.io, port);
         thread.join();
@@ -863,9 +688,7 @@ test "convert endpoint: a real multipart POST whose body exceeds one buffered re
 }
 
 /// Sends `raw` verbatim over a fresh TCP connection to the test server and
-/// returns everything it writes back — the only way to exercise a request head
-/// no HTTP client would produce (`std.http.Client` won't omit
-/// `content-length`, and its `expect` handling is its own).
+/// returns everything it writes back.
 fn rawRequest(allocator: std.mem.Allocator, port: u16, raw: []const u8) ![]u8 {
     var address = Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
     const stream = try address.connect(testing.io, .{ .mode = .stream });
@@ -880,10 +703,8 @@ fn rawRequest(allocator: std.mem.Allocator, port: u16, raw: []const u8) ![]u8 {
     var stream_reader = stream.reader(testing.io, &recv_buf);
 
     // Accumulated chunk by chunk rather than with `allocRemaining`, which
-    // discards everything it read if the stream ends in a reset -- and it
-    // does here: the server answers a bad head and closes with the request
-    // body still unread, so the response arrives and *then* the connection is
-    // reset. The bytes are the point of the test, so keep them.
+    // discards everything it read if the stream ends in a reset -- and it does
+    // here.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     while (out.items.len < 64 * 1024) {
@@ -896,11 +717,7 @@ fn rawRequest(allocator: std.mem.Allocator, port: u16, raw: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-// AUDIT-2026-09-03 API-1/API-2: both of these used to abort the process
-// (`panic: reached unreachable code` from `discardBody`, and the
-// `head.expect == null` assert in `readerExpectNone`) rather than answer, and
-// the first needed no session at all. The real assertion in both cases is that
-// the third request below still gets served -- i.e. the process is alive.
+// AUDIT-2026-09-03 API-1/API-2.
 test "a malformed request head is refused instead of aborting the process" {
     const gpa = std.heap.page_allocator;
 
@@ -921,11 +738,8 @@ test "a malformed request head is refused instead of aborting the process" {
 
     var stop: Stop = .{};
     const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
-    // Registered before the request-side defers below so it runs after them:
-    // the client is finished with the server by the time the loop is told to
-    // stop. Joined rather than detached so the accept thread and its workers
-    // are gone when the test returns, instead of staying live for the rest of
-    // the test binary.
+    // Registered before the request-side defers below so it runs after them: the
+    // client is finished with the server by the time the loop is told to stop.
     defer {
         stop.shutdown(testing.io, port);
         thread.join();
@@ -992,11 +806,7 @@ fn jsonRequest(client: *http.Client, port: u16, method: http.Method, path: []con
 
 // AUDIT-2026-09-03 API-5: both handlers called `resolveAuth` again after
 // taking the body reader, to re-check the owner tier and to stamp the audit
-// row. `findCookie` iterates the request headers, and `std.http.Server`
-// asserts the connection is still at `received_head` to do that -- so every
-// successful settings PATCH (after all ten setters had committed) and every
-// announcement POST aborted the process. As with the malformed-head test
-// above, the real assertion is the last request: the server is still there.
+// row.
 test "settings PATCH and announcement POST answer instead of aborting after the body read" {
     const gpa = std.heap.page_allocator;
 
@@ -1023,11 +833,8 @@ test "settings PATCH and announcement POST answer instead of aborting after the 
 
     var stop: Stop = .{};
     const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
-    // Registered before the request-side defers below so it runs after them:
-    // the client is finished with the server by the time the loop is told to
-    // stop. Joined rather than detached so the accept thread and its workers
-    // are gone when the test returns, instead of staying live for the rest of
-    // the test binary.
+    // Registered before the request-side defers below so it runs after them: the
+    // client is finished with the server by the time the loop is told to stop.
     defer {
         stop.shutdown(testing.io, port);
         thread.join();
@@ -1042,8 +849,7 @@ test "settings PATCH and announcement POST answer instead of aborting after the 
     var path_buf: [96]u8 = undefined;
 
     // The whole-object PATCH with nothing owner-gated changing: reaches the
-    // audit-row `resolveAuth` at the very end, which is the one every
-    // successful call hit.
+    // audit-row `resolveAuth` at the very end.
     {
         const path = try std.fmt.bufPrint(&path_buf, "/api/v1/chats/{d}/settings", .{chat_id});
         const body =
@@ -1086,4 +892,71 @@ test "settings PATCH and announcement POST answer instead of aborting after the 
         const response = try req.receiveHead(&.{});
         try testing.expectEqual(.ok, response.head.status);
     }
+}
+
+// The owner logs in through one platform's identity (OIDC vouches for the
+// Telegram account), but writes notes from every platform the bot is on.
+test "my notes list covers every one of the owner's platform identities, not just the logged-in one" {
+    const gpa = std.heap.page_allocator;
+
+    const db = try gpa.create(Db);
+    db.* = try test_support.openTestDb(gpa) orelse return error.SkipZigTest;
+    const pool = try gpa.create(PgPool);
+    pool.* = try PgPool.wrapForTest(gpa, testing.io, db);
+
+    const telegram_owner = try identities.getOrCreateMinimal(pool, .telegram, "777", "Owner", null, false, 1000);
+    const matrix_owner = try identities.getOrCreateMinimal(pool, .matrix, "@owner:example.org", "Owner", null, false, 1000);
+    const stranger = try identities.getOrCreateMinimal(pool, .telegram, "778", "Stranger", null, false, 1000);
+    const tg_chat = try chats_store.upsertChat(pool, .telegram, "-1007770000", "supergroup", "TG Chat");
+    const mx_chat = try chats_store.upsertChat(pool, .matrix, "!room:example.org", "room", "MX Room");
+
+    _ = try notes_store.create(pool, tg_chat, telegram_owner, "from telegram", 1000);
+    _ = try notes_store.create(pool, mx_chat, matrix_owner, "from matrix", 2000);
+    _ = try notes_store.create(pool, tg_chat, stranger, "not mine", 3000);
+
+    const config = try gpa.create(config_mod.Config);
+    config.* = testConfig();
+    config.owners = &.{
+        .{ .platform = .telegram, .owner_id = "777" },
+        .{ .platform = .matrix, .owner_id = "@owner:example.org" },
+    };
+
+    const ctx = try gpa.create(ServerContext);
+    ctx.* = .{ .allocator = gpa, .io = testing.io, .pool = pool, .config = config };
+
+    const listener = try gpa.create(Io.net.Server);
+    listener.* = try bind(testing.io, 0);
+    const port = listener.socket.address.getPort();
+
+    var stop: Stop = .{};
+    const thread = try std.Thread.spawn(.{}, serve, .{ ctx, listener, @as(usize, 2), &stop });
+    defer {
+        stop.shutdown(testing.io, port);
+        thread.join();
+    }
+
+    var client: http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+
+    // Logged in as the Telegram identity only -- the Matrix one is never
+    // linked to the account, same as production.
+    const cookie = try devLogin(&client, port, telegram_owner);
+    defer testing.allocator.free(cookie);
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api/v1/notes", .{port});
+    var req = try client.request(.GET, try std.Uri.parse(url), .{
+        .keep_alive = false,
+        .extra_headers = &.{.{ .name = "cookie", .value = cookie }},
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+    var response = try req.receiveHead(&.{});
+    try testing.expectEqual(.ok, response.head.status);
+    const body = try readBody(&response, testing.allocator);
+    defer testing.allocator.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"from telegram\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"from matrix\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"not mine\"") == null);
 }

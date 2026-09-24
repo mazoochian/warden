@@ -10,9 +10,7 @@ const Args = struct {
 
 /// The LLM-tool front end for `chat_settings.monitor_importance`
 /// (`0045_chat_monitoring.sql`) -- an owner-declared, static per-chat
-/// setting, not a classifier that reads a chat's own content. `chat`
-/// accepts a TDLib chat id or any title substring, same resolution as
-/// `send_personal_message`. `importance: off` clears monitoring.
+/// setting.
 pub const tool: registry.ToolDef = .{
     .name = "set_chat_monitoring",
     .description = "Sets whether Warden actively monitors a personal-account chat for bulletins (get_bulletin), and how important it is. `chat` is a TDLib chat id or any substring of the chat's title (use list_personal_chats first if unsure). `importance: off` stops monitoring it. Only call this when the owner has explicitly asked to enable/adjust/disable monitoring for a chat -- never proactively, and never based on reading the chat's own content.",

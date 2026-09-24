@@ -2,12 +2,7 @@ const std = @import("std");
 const Identity = @import("identity.zig").Identity;
 
 /// Instagram-specific extension of `Identity`, populated by
-/// `src/platform/instagram/connector.zig`'s poll loop. `full_name` is
-/// Instagram's separate display-name field (distinct from
-/// `identity.username`, the `@handle`); `is_private` reflects whether the
-/// account's posts are visible to non-followers, which matters for
-/// `platform/instagram/media.zig`'s public-then-authenticated media-info
-/// fallback.
+/// `src/platform/instagram/connector.zig`'s poll loop.
 pub const InstagramProfile = struct {
     identity: Identity,
     full_name: ?[]const u8 = null,

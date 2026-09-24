@@ -2,23 +2,8 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
-/// The DB-backed subset of today's env-only `Config` fields that are safe
-/// to expose as live-editable from warden-ui — see
-/// /home/armin/claude/warden-ui/ARCHITECTURE.md §6 for the full
-/// secrets-vs-safe-tunables triage. A missing row for a key means "use the
-/// env-sourced `Config` default" — every `get*` function here takes that
-/// default as a parameter for exactly that reason, mirroring
-/// `config.zig`'s own `parseBoolEnv`-style "parse or fall back" shape so
-/// callers read the same either way regardless of which source won.
-///
-/// Deliberately generic (plain string keys, not one function per setting)
-/// since the set of dynamic keys is expected to grow — see `config.zig`'s
-/// own env var list for the exact keys expected to move here over time
-/// (pool/timeout tunables, digest interval, LLM behavior flags, retention,
-/// etc. — never secrets, DSNs, or tokens; those stay env-only by design).
-/// Fails closed to the caller's default on any pool/query error, same
-/// convention as `feature_flags.isEnabled`'s fail-open — a config read
-/// failing should silently keep today's behavior, not surface as a crash.
+/// The DB-backed subset of today's env-only `Config` fields that are safe to
+/// expose as live-editable from warden-ui.
 fn getRaw(pool: *PgPool, allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -31,11 +16,8 @@ fn getRaw(pool: *PgPool, allocator: std.mem.Allocator, key: []const u8) ?[]const
     return allocator.dupe(u8, stmt.columnText(0)) catch null;
 }
 
-/// Always returns memory owned by `allocator` (including when falling
-/// back to `default`, which gets duped too) — a uniform ownership
-/// contract so callers can unconditionally `allocator.free()` the result
-/// regardless of which source it came from, rather than needing to know
-/// whether this particular call hit the DB or the fallback.
+/// Always returns memory owned by `allocator` (including when falling back to
+/// `default`, which gets duped too).
 pub fn getString(pool: *PgPool, allocator: std.mem.Allocator, key: []const u8, default: []const u8) ![]const u8 {
     return getRaw(pool, allocator, key) orelse try allocator.dupe(u8, default);
 }
@@ -52,17 +34,13 @@ pub fn getI64(pool: *PgPool, allocator: std.mem.Allocator, key: []const u8, defa
     return parseI64(raw, default);
 }
 
-/// Split out from `getBool` so callers that already have a raw value in
-/// hand (`listAll`'s bulk fetch, used where several keys are read together
-/// on one hot path — see `main.zig`'s `resolveLlmDynamicSettings`) don't
-/// need a second round trip through `getRaw` just to parse it.
+/// Split out from `getBool` so callers that already have a raw value in hand.
 pub fn parseBool(raw: []const u8, default: bool) bool {
     if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
     if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
     return default;
 }
 
-/// See `parseBool`'s doc comment — same reasoning.
 pub fn parseI64(raw: []const u8, default: i64) i64 {
     return std.fmt.parseInt(i64, raw, 10) catch default;
 }
@@ -72,13 +50,7 @@ pub const KV = struct {
     value: []const u8,
 };
 
-/// Every row in `dynamic_config`, in one query — for hot paths that read
-/// several keys together (e.g. every free-form LLM turn reads six of
-/// them), where six separate `pool.acquire()`/query round trips per
-/// message would be real, not theoretical, overhead (this codebase has
-/// already hit Postgres pool exhaustion under load once — see
-/// `warden-hang-fix-2026-07-22` territory). Callers own the returned
-/// slice and each `KV`'s strings.
+/// Every row in `dynamic_config`, in one query.
 pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]KV {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -97,8 +69,7 @@ pub fn listAll(pool: *PgPool, allocator: std.mem.Allocator) ![]KV {
 }
 
 /// Finds `key` in a `listAll`-fetched row set and parses it as a bool,
-/// falling back to `default` if absent or unparseable — the bulk-fetch
-/// equivalent of `getBool`.
+/// falling back to `default` if absent or unparseable.
 pub fn findBool(rows: []const KV, key: []const u8, default: bool) bool {
     for (rows) |row| {
         if (std.mem.eql(u8, row.key, key)) return parseBool(row.value, default);
@@ -106,7 +77,6 @@ pub fn findBool(rows: []const KV, key: []const u8, default: bool) bool {
     return default;
 }
 
-/// See `findBool`'s doc comment — same shape, for `i64`.
 pub fn findI64(rows: []const KV, key: []const u8, default: i64) i64 {
     for (rows) |row| {
         if (std.mem.eql(u8, row.key, key)) return parseI64(row.value, default);
@@ -149,13 +119,7 @@ pub const KnownKey = struct {
     kind: ValueKind,
 };
 
-/// Every `dynamic_config` key this build actually reads back live — see
-/// `main.zig`'s `resolveLlmDynamicSettings` and the two single-key reads
-/// next to `recordMessage`/the digest-interval check. The single source
-/// of truth the admin config API (`GET`/`PATCH /api/v1/admin/config`)
-/// checks against: only these are ever accepted on `PATCH` — everything
-/// else (secrets, identity, restart-required tunables) is display-only,
-/// per /home/armin/claude/warden-ui/ARCHITECTURE.md §6.
+/// Every `dynamic_config` key this build actually reads back live.
 pub const known_keys = [_]KnownKey{
     .{ .key = "WARDEN_RETENTION_MESSAGES", .label = "Message retention (per chat)", .kind = .i64 },
     .{ .key = "WARDEN_DIGEST_INTERVAL_SECONDS", .label = "Digest interval (seconds)", .kind = .i64 },
@@ -166,21 +130,12 @@ pub const known_keys = [_]KnownKey{
     .{ .key = "WARDEN_LLM_MAX_TOKENS", .label = "LLM max tokens override (0 = none)", .kind = .i64 },
     .{ .key = "WARDEN_LLM_HISTORY_MESSAGES", .label = "LLM conversation history window", .kind = .i64 },
     .{ .key = "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", .label = "Skip LLM call for trivial messages", .kind = .bool },
-    // Clamped to 0-10 when read back (see main.zig's
-    // resolveLlmDynamicSettings) -- a negative value would wrap on the cast
-    // to u32 and a huge one would keep a dead request alive for hours.
+    // Clamped to 0-10 when read back (see main.zig's resolveLlmDynamicSettings).
     .{ .key = "WARDEN_LLM_MAX_RETRIES", .label = "LLM retries on a transient failure (0 = never retry)", .kind = .i64 },
-    // "anthropic" or "openai_compat" only, and only one actually
-    // configured with credentials -- validated in api/router.zig's
-    // handleAdminSetConfig (needs live Config access this module doesn't
-    // have), not here. See llm/dynamic_provider.zig for the runtime side.
+    // "anthropic" or "openai_compat" only, and only one actually configured with
+    // credentials.
     .{ .key = "WARDEN_LLM_PROVIDER", .label = "Active LLM provider", .kind = .string },
-    // storage_sense.zig's watermark ladder -- see its own doc comment for
-    // the full 80/90/95 progression these back. Deliberately not including
-    // WARDEN_STORAGE_SENSE_LAST_HIGH_ALERT_TS/_SLEEP_ACTIVE/
-    // _SLEEP_ENTERED_TS here: those are the ladder's own runtime
-    // bookkeeping, not an owner tunable, and keeping them off this list
-    // means the admin PATCH API can't accidentally corrupt them.
+    // Storage_sense.zig's watermark ladder.
     .{ .key = "WARDEN_STORAGE_SENSE_LOW_WATERMARK_PCT", .label = "Storage sense: low watermark % (starts pruning/resampling)", .kind = .i64 },
     .{ .key = "WARDEN_STORAGE_SENSE_HIGH_WATERMARK_PCT", .label = "Storage sense: high watermark % (starts daily owner alerts)", .kind = .i64 },
     .{ .key = "WARDEN_STORAGE_SENSE_FLOOD_WATERMARK_PCT", .label = "Storage sense: flood watermark % (triggers sleep mode)", .kind = .i64 },

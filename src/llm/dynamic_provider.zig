@@ -3,31 +3,16 @@ const llm = @import("provider.zig");
 const dynamic_config = @import("../store/dynamic_config.zig");
 const PgPool = @import("../store/pool.zig").PgPool;
 
-/// Wraps whichever real providers were configured at startup (see
-/// `config.zig`'s `Config.llm_anthropic`/`Config.llm_openai_compat`)
-/// behind one `llm.Provider` interface, re-checking `dynamic_config`'s
-/// `WARDEN_LLM_PROVIDER` on every call instead of fixing the choice once
-/// at process startup — see /home/armin/claude/warden-ui/ARCHITECTURE.md
-/// §6 and ROADMAP.md Phase 3 ("Decided 2026-07-28 (Armin):
-/// WARDEN_LLM_PROVIDER becomes hot-swappable"). Every downstream caller
-/// (`qa.answer`, `toolcall.run`, etc.) keeps passing around a plain
-/// `llm.Provider` value exactly as before — this wrapper absorbs the
-/// hot-swap logic entirely inside its own vtable implementation, no
-/// call-site changes needed anywhere else in the codebase.
+/// Wraps whichever real providers were configured at startup.
 pub const DynamicLlmProvider = struct {
     pool: *PgPool,
     anthropic: ?llm.Provider,
     openai_compat: ?llm.Provider,
-    /// Whichever provider actually has credentials, used whenever the
-    /// requested one (from `dynamic_config`, or the startup default if
-    /// unset) isn't configured — so a bad/stale/never-set override can
-    /// never leave the bot with no working provider at all. This is
-    /// always one of `anthropic`/`openai_compat` (`Config.load` already
-    /// guarantees at least one exists).
+    /// Whichever provider actually has credentials, used whenever the requested
+    /// one.
     fallback: llm.Provider,
-    /// The provider `WARDEN_LLM_PROVIDER` selected at startup — the
-    /// default `dynamic_config` falls back to when no DB override exists,
-    /// same "missing row means default" convention as everywhere else.
+    /// The provider `WARDEN_LLM_PROVIDER` selected at startup — the default
+    /// `dynamic_config` falls back to when no DB override exists.
     default_provider_name: []const u8,
 
     pub fn provider(self: *DynamicLlmProvider) llm.Provider {

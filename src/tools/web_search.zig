@@ -6,9 +6,7 @@ const http_util = @import("../http_util.zig");
 
 const Args = struct { query: []const u8 };
 
-/// How many results to hand back to the model. SearXNG typically returns
-/// dozens; past the first handful they stop adding signal and just burn
-/// context.
+/// How many results to hand back to the model.
 const max_results = 8;
 /// Snippets are clipped so one verbose result can't crowd out the rest.
 const max_snippet_len = 400;
@@ -60,8 +58,7 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
 }
 
 /// Parses a SearXNG JSON response body and renders the top results as
-/// numbered "title / url / snippet" blocks for the model. Split from
-/// `execute` so it's testable without a live instance.
+/// numbered "title / url / snippet" blocks for the model.
 fn formatResults(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
     var parsed = std.json.parseFromSlice(
         SearxResponse,
@@ -69,9 +66,8 @@ fn formatResults(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         body,
         .{ .ignore_unknown_fields = true, .allocate = .alloc_always },
     ) catch {
-        // Most common cause: the instance has `format=json` disabled and
-        // answered with an HTML error page. Say so instead of a bare parse
-        // error, since it's an instance-config problem, not a query problem.
+        // Most common cause: the instance has `format=json` disabled and answered
+        // with an HTML error page.
         return error.SearxngBadResponse;
     };
     defer parsed.deinit();

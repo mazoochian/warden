@@ -6,20 +6,14 @@ const safe_regex = @import("../text/safe_regex.zig");
 const log = @import("../log.zig").scoped("redact");
 
 /// Hard cap on how many messages a single `/redact` invocation can delete,
-/// across every mode — bulk-deleting chat history is more destructive than
-/// a single `/kick`, so this stays well below what a group-admin-tier
-/// action would otherwise be trusted to do unbounded.
+/// across every mode.
 pub const max_redact_count: i64 = 100;
 /// How far back into a chat's history `text`/`regex` mode will look for
-/// matches — bounds the work a single invocation can force regardless of
-/// how deep in history a match might be (see `store/messages.zig`'s
-/// `searchDeletable`/`recentForScan`).
+/// matches.
 pub const max_scan_window: i64 = 2000;
 
 /// Best-effort: one failed deletion (message already gone, bot lost admin
-/// rights mid-batch, ...) doesn't abort the rest — matches
-/// `group_admin.zig`'s "log and continue" spirit for individual-action
-/// failures, just applied across a batch instead of a single action.
+/// rights mid-batch, ...) doesn't abort the rest.
 fn deleteAll(connector: iface.Connector, a: std.mem.Allocator, chat_id_native: []const u8, refs: []const messages.MessageRef) usize {
     var deleted: usize = 0;
     for (refs) |ref| {
@@ -43,24 +37,6 @@ fn reportDeleted(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Me
 
 /// `/redact <N>` (no reply target, no text/regex filter) — deletes the last
 /// `n` messages in the chat, clamped to `max_redact_count`.
-///
-/// On Telegram, whose `message_id` is a contiguous per-chat integer counter,
-/// this walks backward from the `/redact` command's own message id
-/// (`redactLastNByIdWalk`) rather than consulting the `messages` table at
-/// all — the bot's own DB is a record of what it happened to see, not the
-/// chat's actual history, and this mode's whole point ("delete the last N
-/// messages", full stop) doesn't need to know anything about a message
-/// beyond its id to delete it. This is what actually reaches a message from
-/// another bot, or one sent before this bot was in the chat/online, which
-/// `recentDeletable`'s DB-only view could never have logged in the first
-/// place. Every other mode (reply-scoped, `text`, `regex`) still needs
-/// message *content* to filter on, which id-walking can't provide, so those
-/// stay DB-backed (`redactUserLastN`/`redactText`/`redactRegex` below).
-///
-/// Falls back to the DB-backed `redactLastNFromDb` when the platform isn't
-/// Telegram, or the command message's own id isn't a parseable integer
-/// (shouldn't happen for a real Telegram message, but fails safe rather than
-/// silently deleting nothing).
 pub fn redactLastN(connector: iface.Connector, a: std.mem.Allocator, pool: *PgPool, chat_id: i64, msg: iface.Message, n: i64) void {
     if (connector.platform() == .telegram) {
         if (msg.message_id) |mid_str| {
@@ -73,12 +49,7 @@ pub fn redactLastN(connector: iface.Connector, a: std.mem.Allocator, pool: *PgPo
     redactLastNFromDb(connector, a, pool, chat_id, msg, n);
 }
 
-/// Walks backward `count` ids from `from_message_id` (the `/redact` command's
-/// own message, so it gets swept up too — matching `redactLastNFromDb`,
-/// which already included it: `recordMessage` logs every message, including
-/// slash commands, before `handleMessage`/this ever runs), best-effort
-/// deleting each regardless of whether the bot ever saw that id — see
-/// `redactLastN`'s doc comment for why.
+/// Walks backward `count` ids from `from_message_id`.
 fn redactLastNByIdWalk(connector: iface.Connector, a: std.mem.Allocator, msg: iface.Message, from_message_id: i64, n: i64) void {
     const count = @min(@max(n, 0), max_redact_count);
     if (count == 0) {
@@ -90,10 +61,7 @@ fn redactLastNByIdWalk(connector: iface.Connector, a: std.mem.Allocator, msg: if
     while (i < count) : (i += 1) {
         const candidate = from_message_id - i;
         if (candidate <= 0) break;
-        // Heap-allocated (not a reused stack buffer): `deleteMessage`
-        // implementations are free to retain the string past this call
-        // returning (e.g. a test stub recording it for later assertions),
-        // so each candidate needs its own stable allocation.
+        // Heap-allocated (not a reused stack buffer).
         const id_str = std.fmt.allocPrint(a, "{d}", .{candidate}) catch continue;
         connector.deleteMessage(a, msg.chat_id, id_str) catch |err| {
             log.warn("failed to delete message {d}: {t}", .{ candidate, err });
@@ -117,9 +85,8 @@ fn redactLastNFromDb(connector: iface.Connector, a: std.mem.Allocator, pool: *Pg
     reportDeleted(connector, a, msg, deleteAll(connector, a, msg.chat_id, refs), refs.len);
 }
 
-/// `/redact [N]` as a reply to a user's message — deletes that sender's
-/// last `n` messages (or up to `max_redact_count` if `n` is absent/
-/// non-positive).
+/// `/redact [N]` as a reply to a user's message — deletes that sender's last
+/// `n` messages (or up to `max_redact_count` if `n` is absent/ non-positive).
 pub fn redactUserLastN(connector: iface.Connector, a: std.mem.Allocator, pool: *PgPool, chat_id: i64, msg: iface.Message, target_identity_id: i64, n: i64) void {
     const count = if (n <= 0) max_redact_count else @min(n, max_redact_count);
     const refs = messages.recentDeletableByIdentity(pool, a, chat_id, target_identity_id, count) catch |err| {
@@ -142,12 +109,7 @@ pub fn redactText(connector: iface.Connector, a: std.mem.Allocator, pool: *PgPoo
     reportDeleted(connector, a, msg, deleteAll(connector, a, msg.chat_id, refs), refs.len);
 }
 
-/// `/redact regex <pattern>` — see `text/safe_regex.zig` for why this is
-/// safe against a hostile/careless pattern (ReDoS-immune by construction,
-/// plus its own compile-time length/complexity caps). Matching happens
-/// client-side (Postgres can't run this engine), scanning up to
-/// `max_scan_window` recent messages and stopping once `max_redact_count`
-/// matches are found.
+/// `/redact regex <pattern>`.
 pub fn redactRegex(connector: iface.Connector, a: std.mem.Allocator, pool: *PgPool, chat_id: i64, msg: iface.Message, pattern: []const u8) void {
     if (pattern.len == 0) {
         connector.sendMessage(a, msg.chat_id, "Usage: /redact regex <pattern>", msg.message_id);
@@ -182,9 +144,7 @@ const chats = @import("../store/chats.zig");
 const msg_insert = @import("../store/messages.zig").insert;
 
 /// Minimal `Connector` stub — records every `sendMessage`/`deleteMessage`
-/// call so tests can assert on them, and can be told to fail specific
-/// message ids to exercise `deleteAll`'s "one failure doesn't abort the
-/// batch" behavior. Same shape as `auth.zig`'s own `StubConnector`.
+/// call so tests can assert on them.
 const StubConnector = struct {
     fail_ids: []const []const u8 = &.{},
     deleted_ids: std.ArrayList([]const u8) = .empty,

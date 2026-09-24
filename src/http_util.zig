@@ -1,65 +1,6 @@
-//! Shared one-shot GET/POST helpers over `std.http.Client.fetch`, used by
-//! the Telegram client and the LLM provider adapters alike so each of them
-//! doesn't hand-roll the same response-buffering boilerplate. The one
-//! exception is `postJsonSSE`, built on `std.http.Client`'s lower-level
-//! request/receiveHead/reader primitives instead of `fetch` — it streams
-//! the response line-by-line for Server-Sent-Events endpoints rather than
-//! buffering the whole body; see its own doc comment for how its retry/
-//! timeout story differs from everything else here.
-//!
-//! All helpers request `keep_alive = false` and additionally retry transient
-//! connection errors (see `isTransient`) up to two more times with a short
-//! backoff between attempts. Both measures exist because middleboxes
-//! (VPN tunnels/exit nodes, NAT timeouts) kill idle connections without
-//! close-notify: no reuse means a request can't land on a connection that
-//! died in the pool, and the retries cover one being killed mid-request
-//! (e.g. during a 30s Telegram long poll). The backoff gives a flaky link a
-//! moment to recover instead of failing two attempts back-to-back within
-//! milliseconds. Retrying is safe even for non-idempotent Telegram sends,
-//! since the failed attempt died before a response — worst case is a
-//! duplicated chat message, preferred over a silently dropped one.
-//! Non-2xx responses are an error (`error.HttpRequestFailed`) rather than
-//! a body handed back as if it were the real content; the body prefix is
-//! logged for diagnosis, capped so an HTML error page can't flood the log.
-//!
-//! Every request also runs under `fetchWithTimeout`: `std.http.Client` has
-//! no built-in per-request deadline, and warden's poll loop is single-
-//! threaded and single-connector, so one stalled socket (dead connection,
-//! a resolver that hangs instead of erroring) would otherwise freeze the
-//! entire bot indefinitely — confirmed in production: a DNS hiccup left a
-//! `getUpdates` connection sitting open for minutes with no timeout to cut
-//! it off.
-//!
-//! `fetchWithTimeout` runs the fetch on a real `std.Thread` and polls a
-//! completion flag from the caller; on timeout it **detaches and abandons**
-//! that thread rather than trying to cancel it. An earlier version used
-//! `Io.concurrent` + `Future.cancel` instead, on the theory that `cancel`
-//! "genuinely interrupts the stuck operation" — that's true only for calls
-//! that pass through an `Io`-native cancellation point. `std.http.Client`
-//! doesn't: `ConnectTcpOptions.timeout` is declared but never read anywhere
-//! in `std/http/Client.zig`, and `Client.fetch` has no way to bound a
-//! socket read at all. Confirmed live 2026-07-21: a remote peer that
-//! accepted the connection and then went silent (no data, no close) left
-//! `cancel()` blocked *waiting for a task to unwind that never would*,
-//! which froze the entire bot for 5+ minutes at 0% CPU with no error ever
-//! logged — worse than not having a timeout at all, since it looked like a
-//! deadline was enforced when it wasn't. Detaching trades that unbounded
-//! wait for a small, bounded leak (the request's cloned inputs plus
-//! whatever the orphaned thread manages to buffer) on the rare occasions a
-//! peer actually stalls like this — see `FetchShared`'s doc comment for how
-//! the leak is kept safe rather than a use-after-free.
-//!
-//! That safety claim was only half-true until 2026-08-04, and the half that
-//! was false is what produced this module's long-standing "flaky" crash. An
-//! abandoned thread keeps running against three things: its buffers, its
-//! allocator, and its `http.Client`. Only the first was ever copied. The
-//! other two were borrowed from the caller — `client.allocator` is a
-//! per-message arena at nearly every call site, and the client itself is a
-//! stack local with a `defer client.deinit()` under it — so a timed-out
-//! request would have its arena freed and its connection pool torn down
-//! while the detached thread was still transacting on both. Now all three
-//! live in the `FetchShared`/`StreamShared` the thread owns (allocated from
-//! `detached_gpa`), so "detach and abandon" really is just a leak.
+//! Shared one-shot GET/POST helpers over `std.http.Client.fetch`, used by the
+//! Telegram client and the LLM provider adapters alike so each of them
+//! doesn't hand-roll the same response-buffering boilerplate.
 
 const std = @import("std");
 const Io = std.Io;
@@ -71,67 +12,22 @@ const max_logged_body = 400;
 
 /// The allocator for every byte an abandoned request thread can still touch
 /// after `fetchWithTimeout`/`postJsonSSE` has returned to its caller.
-///
-/// Deliberately NOT `client.allocator`, which is what this module used
-/// until 2026-08-04. Nearly every call site builds its `http.Client` with a
-/// per-message arena (`.{ .allocator = ctx.allocator, .io = ctx.io }` — see
-/// `tools/*.zig`, `api/oidc.zig`, `features/transcribe.zig`), and that
-/// arena is freed the moment `error.RequestTimedOut` propagates out. So the
-/// "bounded leak" this module's doc describes was, at those call sites,
-/// actually a use-after-free: the detached thread kept writing its response
-/// into memory the caller had already reclaimed. `page_allocator` is
-/// process-lifetime and thread-safe, which is precisely what a thread
-/// nobody will ever join again needs; the sizes involved (a URL, a payload,
-/// a few headers, one response buffer) make its page granularity a
-/// non-issue.
 const detached_gpa = std.heap.page_allocator;
 
-/// Generous enough to never trip during legitimate slow operations (a 25s
-/// Telegram long poll, a quick tool API call) while still bounding a truly
-/// stuck connection to a finite wait instead of forever. NOT used for LLM
-/// provider calls — see `llm_timeout_ns`: CPU-only local inference can
-/// legitimately take minutes to process a large prompt (warden's full tool
-/// schemas + chat history easily runs to thousands of tokens), which blew
-/// straight through this budget in production and got canceled mid-flight
-/// before it ever had a chance to finish.
+/// Generous enough to never trip during legitimate slow operations.
 const default_timeout_ns: u64 = 45 * std.time.ns_per_s;
 /// Budget for `getWithTimeout`, for tool calls made *while the user is
-/// actively waiting mid-conversation* (`scrape_site`'s per-page fetches
-/// especially — up to `max_pages` of these can chain in one tool call, so
-/// each one individually needs to stay well under `default_timeout_ns` or
-/// the compound worst case balloons: 5 pages x 45s each is nearly 4
-/// minutes for ONE tool call, and `toolcall.run` can invoke tools across up
-/// to 6 iterations. Confirmed in production: a single scrape_site call
-/// chaining several slow/unreachable pages was the actual cause of a
-/// "stuck thinking" report that turned out to still be running, just very
-/// slowly, well past the point a chat reply should ever take.
+/// actively waiting mid-conversation*.
 pub const tool_timeout_ns: u64 = 20 * std.time.ns_per_s;
 /// Budget for `postJsonWithTimeout`, used only by the LLM provider adapters
-/// (`llm/anthropic.zig`, `llm/openai_compat.zig`). Was 5 minutes while
-/// running a slow CPU-only local model with large prompts; back down to a
-/// couple minutes now that the active provider is a fast cloud model
-/// (Anthropic) — a real hang should surface quickly, not leave the "thinking"
-/// placeholder sitting for minutes before anyone finds out something's wrong.
-/// Still well above normal latency (a tool-heavy multi-turn answer is
-/// typically single-digit seconds), just not "accommodate a slow CPU" long.
+/// (`llm/anthropic.zig`, `llm/openai_compat.zig`).
 pub const llm_timeout_ns: u64 = 2 * std.time.ns_per_min;
-/// How often the caller checks whether the background fetch finished —
-/// bounds how much latency this wrapper adds on top of a fast, healthy
-/// request.
+/// How often the caller checks whether the background fetch finished — bounds
+/// how much latency this wrapper adds on top of a fast, healthy request.
 const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
 /// Deep-copies the parts of a `FetchOptions` that are borrowed from the
-/// caller (a URL built with `std.fmt.allocPrint` into an arena, a JSON
-/// payload, per-request headers) into memory this module owns outright,
-/// plus a private response buffer instead of writing into the caller's own
-/// `response_writer`. Needed because `fetchWithTimeout` may detach the
-/// thread running the actual request and return to the caller — which can
-/// then free its arena/stack frame — while that thread keeps running. Every
-/// byte the thread touches from this point on must be reachable only
-/// through `FetchShared`, never through the original `FetchOptions`, or an
-/// abandoned request becomes a use-after-free instead of a plain memory
-/// leak. On the normal (non-timeout) path this is freed right away by
-/// `freeShared`; on timeout it's deliberately never freed (see module doc).
+/// caller.
 const FetchShared = struct {
     done: std.atomic.Value(bool) = .init(false),
     result: http.Client.FetchError!http.Client.FetchResult = undefined,
@@ -139,33 +35,8 @@ const FetchShared = struct {
     url: []const u8,
     payload: ?[]const u8,
     extra_headers: []const http.Header,
-    /// The request runs on *this* client, not the caller's, for the same
-    /// lifetime reason the buffers above are copies. The caller's client is
-    /// typically a stack local with a `defer client.deinit()` right beneath
-    /// it (`tools/weather.zig`, `tools/fetch_url.zig`, and a dozen more), so
-    /// on the timeout path the caller would return, `deinit()` would free
-    /// the connection pool this thread is still transacting on, and then
-    /// the stack frame holding the whole client would go away — a
-    /// use-after-free on every timed-out request, which is exactly the crash
-    /// this module's own regression test was hitting. Owning the client here
-    /// means the detached thread's entire working set is reachable only
-    /// through `FetchShared`, so abandoning it stays the plain bounded leak
-    /// the module doc claims it is.
-    ///
-    /// Known cost, accepted deliberately: a fresh client rescans the system
-    /// CA bundle on its first HTTPS request (`Client.zig`'s `client.now ==
-    /// null` check), so every request now re-reads and re-parses the cert
-    /// store instead of reusing a long-lived client's cached copy. For the
-    /// per-invocation clients in `tools/*.zig` this changes nothing — they
-    /// already paid it per call — but the long-lived ones
-    /// (`platform/telegram/client.zig`, `platform/matrix/client.zig`, the LLM
-    /// adapters) now pay it per request too. It is small next to the network
-    /// round trip it precedes, though not free on a 1-vCPU host. The way to
-    /// get it back is one process-wide client shared by every request (its
-    /// pool and CA bundle are already lock-guarded, and a process-lifetime
-    /// client is trivially safe to detach from) — deliberately NOT done in
-    /// the same change as a crash fix, since it reshapes connection
-    /// handling for the whole bot.
+    /// The request runs on *this* client, not the caller's, for the same lifetime
+    /// reason the buffers above are copies.
     client: http.Client,
 };
 
@@ -207,18 +78,7 @@ fn fetchAndFlag(base_options: http.Client.FetchOptions, shared: *FetchShared) vo
     shared.done.store(true, .release);
 }
 
-/// Builds the heap-owned `FetchShared` for one request. Split out from
-/// `fetchWithTimeout` so its `errdefer`s stay scoped to just the cloning
-/// itself: an `errdefer` guards everything from its declaration to the end
-/// of the *enclosing function*, so if these lived inline in
-/// `fetchWithTimeout` they'd still be armed all the way through
-/// `try shared.result` far below — double-freeing `shared`'s contents
-/// alongside the later, correct `defer freeShared(...)` on any request
-/// that legitimately fails (a very ordinary outcome, not a bug on its own)
-/// instead of only on a real setup-time allocation failure. Confirmed live
-/// by this file's own test suite: two matrix crypto tests whose HTTP send
-/// fails as expected crashed with a general-protection fault inside a
-/// second, spurious `freeHeaders` call.
+/// Builds the heap-owned `FetchShared` for one request.
 fn buildFetchShared(io: Io, options: http.Client.FetchOptions) !*FetchShared {
     const url = switch (options.location) {
         .url => |u| u,
@@ -243,20 +103,14 @@ fn buildFetchShared(io: Io, options: http.Client.FetchOptions) !*FetchShared {
     return shared;
 }
 
-/// Also its own function for the same reason as `buildFetchShared`: an
-/// `errdefer` here needs to free `shared` only if spawning genuinely
-/// fails, without staying armed into `fetchWithTimeout`'s later, normal
-/// `defer freeShared(...)` on the request-completed-but-failed path.
+/// Also its own function for the same reason as `buildFetchShared`.
 fn spawnFetch(options: http.Client.FetchOptions, shared: *FetchShared) !std.Thread {
     errdefer freeShared(shared);
     return std.Thread.spawn(.{}, fetchAndFlag, .{ options, shared });
 }
 
 /// Runs `client.fetch(options)` with a hard wall-clock deadline of
-/// `timeout_ns` (see module doc for why this exists, and why it detaches
-/// rather than cancels). Returns `error.RequestTimedOut` if it doesn't
-/// finish in time. `options.location` must be `.url` — the only variant
-/// this module ever builds.
+/// `timeout_ns`.
 fn fetchWithTimeout(client: *http.Client, options: http.Client.FetchOptions, timeout_ns: u64) !http.Client.FetchResult {
     const shared = try buildFetchShared(client.io, options);
     const thread = try spawnFetch(options, shared);
@@ -276,8 +130,7 @@ fn fetchWithTimeout(client: *http.Client, options: http.Client.FetchOptions, tim
         return result;
     }
 
-    // Deliberately not joined or freed — see module doc and `FetchShared`'s
-    // doc comment for why this is a bounded leak, not a use-after-free.
+    // Deliberately not joined or freed.
     var url_buf: [512]u8 = undefined;
     log.warn("request timed out after {d}ms, detaching the stalled connection: {s} {s}", .{
         @divTrunc(timeout_ns, std.time.ns_per_ms),
@@ -289,8 +142,7 @@ fn fetchWithTimeout(client: *http.Client, options: http.Client.FetchOptions, tim
 }
 
 /// Best-effort URL extraction for a log line — `options.location` is always
-/// `.url` in practice (see this function's doc comment above), but this
-/// stays defensive rather than asserting, since it only feeds a log message.
+/// `.url` in practice.
 fn urlOf(options: http.Client.FetchOptions) []const u8 {
     return switch (options.location) {
         .url => |u| u,
@@ -299,17 +151,12 @@ fn urlOf(options: http.Client.FetchOptions) []const u8 {
 }
 
 /// Total attempts per request; the delay before each retry grows so a brief
-/// outage (VPN reroute, WiFi blip) can pass instead of burning all attempts
-/// within milliseconds of each other.
+/// outage.
 const max_attempts = 3;
 const backoff_ms = [max_attempts - 1]i64{ 500, 2000 };
 
 /// Errors where the connection died (or never came up) through no fault of
-/// the request itself — the only ones worth retrying. `RequestTimedOut` is
-/// deliberately NOT here: retrying a request that was merely slow (not
-/// broken) just multiplies the wait for no benefit — up to 3x with nothing
-/// to show for it — instead of surfacing a clear failure after one full,
-/// already-generous budget.
+/// the request itself — the only ones worth retrying.
 fn isTransient(err: anyerror) bool {
     return switch (err) {
         error.HttpConnectionClosing,
@@ -332,16 +179,10 @@ pub fn get(client: *http.Client, allocator: std.mem.Allocator, url: []const u8) 
     return getWithTimeout(client, allocator, url, default_timeout_ns);
 }
 
-/// Like `get`, but with a caller-chosen deadline — see `tool_timeout_ns`'s
-/// doc comment for why an interactive-tool fetch needs a much shorter
-/// budget than this module's other callers.
 pub fn getWithTimeout(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, timeout_ns: u64) ![]u8 {
     return getWithHeadersTimeout(client, allocator, url, &.{}, timeout_ns);
 }
 
-/// Like `get`, but with extra headers (e.g. an `Authorization: Bearer ...`
-/// a bot-token-in-the-URL API like Telegram's doesn't need, but Matrix's
-/// does on every request).
 pub fn getWithHeaders(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, extra_headers: []const http.Header) ![]u8 {
     return getWithHeadersTimeout(client, allocator, url, extra_headers, default_timeout_ns);
 }
@@ -376,15 +217,7 @@ fn getOnce(client: *http.Client, allocator: std.mem.Allocator, url: []const u8, 
 pub const StatusAndBody = struct { status: http.Status, body: []u8 };
 
 /// Like `get`, but returns the HTTP status alongside the body instead of
-/// treating any non-2xx response as fatal — for a caller that needs to
-/// distinguish a specific, meaningful error status (e.g. Telegram's
-/// 400/403 for "this chat isn't reachable by the bot anymore," used by
-/// `cleanup_left_chats.zig` to tell "genuinely gone" apart from "just a
-/// flaky request") from an ordinary transport failure or an unrelated
-/// server error, which the caller should NOT treat the same way. Still
-/// retries genuine transient transport failures exactly like `get` does —
-/// only the "what does a non-2xx status mean" decision moves to the
-/// caller.
+/// treating any non-2xx response as fatal.
 pub fn getAllowingAnyStatus(client: *http.Client, allocator: std.mem.Allocator, url: []const u8) !StatusAndBody {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
@@ -416,10 +249,8 @@ pub fn postJson(
     return postJsonTimed(client, allocator, url, extra_headers, payload, default_timeout_ns);
 }
 
-/// Like `postJson`, but with a caller-chosen deadline instead of the
-/// default — used by the LLM provider adapters, which need a much longer
-/// budget than everything else calling into this module (see
-/// `llm_timeout_ns`'s doc comment).
+/// Like `postJson`, but with a caller-chosen deadline instead of the default
+/// — used by the LLM provider adapters.
 pub fn postJsonWithTimeout(
     client: *http.Client,
     allocator: std.mem.Allocator,
@@ -475,11 +306,8 @@ fn postJsonOnce(
     return response_writer.toOwnedSlice();
 }
 
-/// Like `postJson`, but for an arbitrary content type (e.g.
-/// multipart/form-data with binary bytes) rather than always
-/// application/json. `extra_headers` is almost always `&.{}` (Telegram
-/// needs nothing extra); Matrix's media upload needs its bearer token here
-/// since it can't embed one in the URL the way Telegram's bot token is.
+/// Like `postJson`, but for an arbitrary content type (e.g. multipart/form-
+/// data with binary bytes) rather than always application/json.
 pub fn postRaw(
     client: *http.Client,
     allocator: std.mem.Allocator,
@@ -523,8 +351,7 @@ fn postRawOnce(
 }
 
 /// Like `postJson`, but with `PUT` — Matrix's `/send`/`/state` endpoints use
-/// PUT (the client picks the transaction/state key, making the request
-/// naturally idempotent), unlike Telegram's POST-only Bot API.
+/// PUT.
 pub fn putJson(
     client: *http.Client,
     allocator: std.mem.Allocator,
@@ -566,24 +393,13 @@ fn putJsonOnce(
 }
 
 /// One line read from a Server-Sent-Events response body, handed to
-/// `postJsonSSE`'s caller as it arrives. `ptr`/`onLine` rather than a plain
-/// closure — same ptr+fn idiom used throughout this codebase (see
-/// `platform.Connector`) since Zig has no capturing closures.
+/// `postJsonSSE`'s caller as it arrives.
 pub const SseLineSink = struct {
     ptr: *anyopaque,
     onLine: *const fn (ptr: *anyopaque, line: []const u8) anyerror!void,
 };
 
-/// Wraps a caller's `SseLineSink` so it can be silenced after the fact:
-/// once `abandoned` is set, `onLine` becomes a no-op instead of touching
-/// `inner.ptr` — needed because `postJsonSSE` may detach the thread that
-/// calls it and return to a caller who then frees whatever `inner.ptr`
-/// pointed at. `abandoned` is set right before detaching, so every
-/// subsequent call becomes safe; the one call that might already be
-/// in-flight at that exact instant is the only window this can't close —
-/// same inherent limit as any non-preemptive cancellation, see this file's
-/// module doc for why a real (blocking, wait-for-unwind) cancel isn't safe
-/// to rely on here either.
+/// Wraps a caller's `SseLineSink` so it can be silenced after the fact.
 const SinkGuard = struct {
     inner: SseLineSink,
     abandoned: std.atomic.Value(bool) = .init(false),
@@ -598,13 +414,6 @@ const SinkGuard = struct {
     }
 };
 
-/// See `FetchShared`'s doc comment for the general reasoning — same idea
-/// for the streaming path. `url`/`payload`/`extra_headers` are owned
-/// copies rather than the caller's own memory. Internal buffers
-/// (`postJsonSSEOnce`'s redirect/decompress buffers) are allocated from
-/// `client.allocator` rather than the caller-supplied allocator once this
-/// runs on its own thread, since that allocator may be an arena the caller
-/// frees the moment `postJsonSSE` returns `error.RequestTimedOut`.
 const StreamShared = struct {
     done: std.atomic.Value(bool) = .init(false),
     result: anyerror!void = undefined,
@@ -630,11 +439,7 @@ fn streamJsonSSEAndFlag(shared: *StreamShared) void {
 }
 
 /// Split out for the same reason as `fetchWithTimeout`'s
-/// `buildFetchShared`/`spawnFetch` — see those doc comments. An `errdefer`
-/// declared inline in `postJsonSSE` would still be armed by the time
-/// `shared.result` (an ordinary request failure, not a bug) propagates out
-/// near the bottom of that function, double-freeing alongside the later
-/// `defer freeStreamShared(...)`.
+/// `buildFetchShared`/`spawnFetch`.
 fn buildStreamShared(io: Io, url: []const u8, extra_headers: []const http.Header, payload: []const u8, sink: SseLineSink) !*StreamShared {
     const shared = try detached_gpa.create(StreamShared);
     errdefer detached_gpa.destroy(shared);
@@ -660,28 +465,7 @@ fn spawnStream(shared: *StreamShared) !std.Thread {
 }
 
 /// Like `postJson`, but for a Server-Sent-Events endpoint (`"stream":true`
-/// set in `payload` by the caller) — invokes `sink.onLine` once per line
-/// read from the response body as it arrives, instead of buffering the
-/// whole response before returning. Each caller (the LLM provider adapters)
-/// owns interpreting the lines itself, since SSE payload shapes differ per
-/// API; this only handles the shared transport mechanics (connect, send,
-/// read-loop, timeout) — same detach-on-timeout pattern as
-/// `fetchWithTimeout`, just wrapping a read-loop instead of one blocking
-/// `client.fetch()` call. See this file's module doc for why detaching
-/// (not a blocking `Future.cancel`) is the safe choice here.
-///
-/// Unlike every other helper in this file, this does NOT retry on a
-/// transient connection error once streaming has begun (any line already
-/// reached `sink`) — retrying from scratch after the caller has already
-/// acted on partial data (e.g. edited it into a chat message, or started
-/// accumulating a tool call's arguments) would silently corrupt whatever
-/// state it's built up so far. A failure after the first line is a hard
-/// error, same as any other request failure the caller (`toolcall.run` via
-/// the LLM provider adapters) already knows how to surface.
-///
-/// `allocator` is accepted for API-compatibility with existing callers but
-/// deliberately unused — see `StreamShared`'s doc comment for why the
-/// implementation only ever uses `client.allocator` now.
+/// set in `payload` by the caller).
 pub fn postJsonSSE(
     client: *http.Client,
     allocator: std.mem.Allocator,
@@ -724,10 +508,6 @@ fn postJsonSSEOnce(
     const uri = try std.Uri.parse(url);
 
     var req = try client.request(.POST, uri, .{
-        // Matches `fetch()`'s own POST-with-payload default (it overrides
-        // `RequestOptions`'s plain "follow 3 redirects" default to
-        // `.unhandled` whenever a payload is present) — re-sending a POST
-        // body after a redirect isn't something to do implicitly.
         .redirect_behavior = .unhandled,
         .extra_headers = extra_headers,
         .headers = .{ .content_type = .{ .override = "application/json" } },
@@ -761,9 +541,8 @@ fn postJsonSSEOnce(
         return error.HttpRequestFailed;
     }
 
-    // Sized to comfortably hold one SSE line (a large streamed tool-call
-    // argument fragment, say) — `takeDelimiterExclusive` fails with
-    // `error.StreamTooLong` if a single line exceeds this.
+    // Sized to comfortably hold one SSE line (a large streamed tool-call argument
+    // fragment, say).
     var transfer_buffer: [32 * 1024]u8 = undefined;
     var decompress: http.Decompress = undefined;
     // Same conditional sizing `fetch()` itself uses — most LLM APIs don't
@@ -783,25 +562,14 @@ test "getWithTimeout returns RequestTimedOut instead of hanging forever when a p
     const io = testing.io;
 
     var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-    // Heap-allocated and never deinit'd for the same lifetime reason as
-    // `client` below: the acceptor thread is detached and holds this
-    // pointer, so a stack-local server would dangle the moment this test
-    // returns (the acceptor is still inside `accept`, or about to close the
-    // connection, well after that). A listening socket held open for the
-    // rest of the test binary's life is the cheap, safe end of that trade.
+    // Heap-allocated and never deinit'd for the same lifetime reason as `client`
+    // below: the acceptor thread is detached and holds this pointer.
     const server = try std.heap.page_allocator.create(Io.net.Server);
     server.* = try address.listen(io, .{ .reuse_address = true });
     const port = server.socket.address.getPort();
 
-    // Accepts the connection and then goes silent forever: no read, no
-    // write, no close. This is exactly what the real remote peer did in
-    // production — not a connection error (which already retries/fails
-    // fast), but a peer that looks alive and simply never answers. That's
-    // the one failure mode `std.http.Client` has no way to bound on its
-    // own (see this file's module doc), and the one the old
-    // `Io.concurrent` + `Future.cancel` implementation couldn't actually
-    // escape either, since cancellation only fires at `Io`-native
-    // cancelation points that a stuck raw socket read never reaches.
+    // Accepts the connection and then goes silent forever: no read, no write, no
+    // close.
     const Acceptor = struct {
         fn run(srv: *Io.net.Server, accept_io: Io) void {
             var conn = srv.accept(accept_io) catch return;
@@ -812,23 +580,8 @@ test "getWithTimeout returns RequestTimedOut instead of hanging forever when a p
     const thread = try std.Thread.spawn(.{}, Acceptor.run, .{ server, io });
     defer thread.detach();
 
-    // A plain stack local with a `defer client.deinit()`, exactly like every
-    // real call site (`tools/weather.zig`, `tools/fetch_url.zig`, ...) — and
-    // that is the point of writing it this way rather than heap-allocating
-    // it. Until 2026-08-04 this shape was a use-after-free on the timeout
-    // path: `fetchWithTimeout` detached a thread that was still inside
-    // `client.fetch(...)`, then this frame returned, `deinit()` tore down
-    // the connection pool that thread was transacting on, and the frame
-    // holding the client went away. The fault landed ~30s later (when the
-    // silent peer below finally closes the socket) on a *detached* thread,
-    // so it aborted whichever unrelated test happened to hold the main
-    // thread just then — which is why it read for weeks as a mystery flake
-    // in `store/crypto.zig` or `features/briefing.zig`, and why running the
-    // blamed test alone always "passed" (a short run exits before the fuse
-    // burns down). The request now runs on a client owned by `FetchShared`,
-    // so the caller's client is untouched after detach. Keeping this a
-    // stack local means this test exercises the production shape and would
-    // catch that ownership regressing.
+    // A plain stack local with a `defer client.deinit()`, exactly like every real
+    // call site (`tools/weather.zig`, `tools/fetch_url.zig`, ...).
     var client: http.Client = .{ .allocator = std.heap.page_allocator, .io = io };
     defer client.deinit();
 
@@ -840,28 +593,13 @@ test "getWithTimeout returns RequestTimedOut instead of hanging forever when a p
     const elapsed_ns = Io.Timestamp.now(io, .real).toNanoseconds() - started.toNanoseconds();
 
     try testing.expectError(error.RequestTimedOut, result);
-    // Generous upper bound — this asserts "didn't hang indefinitely," not
-    // exact timing. Failing here means the timeout mechanism regressed
-    // back to blocking on the stuck peer instead of detaching from it.
+    // Generous upper bound — this asserts "didn't hang indefinitely," not exact
+    // timing.
     try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }
 
 /// Reads `reader` line-by-line until end of stream, handing each one
-/// (delimiter stripped) to `sink.onLine`. Split out from `postJsonSSEOnce`
-/// so it's testable against an in-memory reader — no real socket needed —
-/// since this exact loop previously had a real, severe bug: using
-/// `takeDelimiterExclusive` instead of `takeDelimiterInclusive`.
-/// `takeDelimiterExclusive` does NOT consume the delimiter itself (see its
-/// own doc comment: advances "up to but not past" it), so every line's
-/// `\n` was left sitting unconsumed in the buffer — the next call re-found
-/// that same already-buffered byte and returned an empty match instantly,
-/// forever: a genuine zero-progress spin burning 100% CPU. Confirmed live
-/// against the real router: thousands of 0-byte "lines" per millisecond
-/// after the first real chunk, every time a blank SSE separator line
-/// (`data: {...}\n\n` — completely normal, standard SSE framing) was hit.
-/// `takeDelimiterInclusive` actually advances past the delimiter each call,
-/// so real progress is always made; the delimiter (and a preceding `\r`,
-/// if present) is trimmed off below instead of relied on to be absent.
+/// (delimiter stripped) to `sink.onLine`.
 fn drainSseLines(reader: *Io.Reader, sink: SseLineSink) !void {
     while (true) {
         const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
@@ -882,7 +620,6 @@ fn checkStatus(method: []const u8, url: []const u8, status: http.Status, body: [
 
 /// Telegram bot API URLs carry the bot token as a path segment
 /// ("…/bot<token>/method") — mask it so error logs never leak the secret.
-/// Returns `url` unchanged when there's nothing to redact.
 fn redactUrl(buf: []u8, url: []const u8) []const u8 {
     const marker = "/bot";
     const i = std.mem.indexOf(u8, url, marker) orelse return url;
@@ -938,11 +675,7 @@ const LineRecorder = struct {
     }
     fn onLine(ptr: *anyopaque, line: []const u8) anyerror!void {
         const self: *LineRecorder = @ptrCast(@alignCast(ptr));
-        // Bounds a would-be regression: an infinite zero-progress loop
-        // (see `drainSseLines`'s doc comment) would blow way past any
-        // real SSE stream's line count long before a test runner's own
-        // timeout ever kicked in, so failing fast here turns "the test
-        // suite hangs" into a normal, readable assertion failure.
+        // Bounds a would-be regression: an infinite zero-progress loop.
         if (self.lines.items.len > 1000) return error.TooManyLines;
         self.lines.append(std.testing.allocator, line) catch return error.OutOfMemory;
     }
@@ -999,12 +732,7 @@ test "drainSseLines stops cleanly at end of stream, including an unterminated tr
 
     try drainSseLines(&reader, recorder.sink());
 
-    // The final line has no trailing delimiter, so it's silently dropped
-    // (matches `takeDelimiterInclusive`'s documented EndOfStream
-    // behavior) rather than looped on or fabricated — real SSE streams
-    // always end on a clean blank line, so this only matters for a
-    // connection that dies mid-line, where there's nothing sensible to
-    // return anyway.
+    // The final line has no trailing delimiter.
     try testing.expectEqual(@as(usize, 2), recorder.lines.items.len);
     try testing.expectEqualStrings("data: x", recorder.lines.items[0]);
     try testing.expectEqualStrings("", recorder.lines.items[1]);

@@ -1,10 +1,8 @@
-//! Instagram media resolution: shortcode -> `media_pk` decoding, and a
-//! media-info fetch that tries an unauthenticated call first and falls back
-//! to the authenticated private endpoint -- the latter is what makes
-//! private-account/geo-gated content the owner follows reachable at all
-//! (see `video_download.zig`'s planned fallback integration). Endpoint
-//! shapes are this implementation's best-effort current knowledge, same
-//! caveat as `auth.zig`'s doc comment.
+//! Instagram media resolution: shortcode -> `media_pk` decoding, and a media-
+//! info fetch that tries an unauthenticated call first and falls back to the
+//! authenticated private endpoint -- the latter is what makes private-
+//! account/geo-gated content the owner follows reachable at all (see
+//! `video_download.zig`'s planned fallback integration).
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
@@ -13,21 +11,13 @@ const transport = @import("transport.zig");
 const auth = @import("auth.zig");
 const log = @import("../../log.zig").scoped("instagram");
 
-/// Instagram's shortcode alphabet -- the URL-safe base64 alphabet, applied
-/// to the numeric `media_pk` 6 bits per character, most-significant first,
-/// with no padding. Public, stable encoding (unlike the private-API request
-/// plumbing elsewhere in this connector) -- used by every public gallery/
-/// embed URL Instagram has ever generated.
+/// Instagram's shortcode alphabet.
 const shortcode_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 pub const ShortcodeError = error{InvalidShortcode};
 
 /// Decodes an Instagram shortcode (e.g. "CqIbtWpMXtN" from
-/// `instagram.com/p/CqIbtWpMXtN/`) into its numeric `media_pk`. Widened to
-/// `u128` internally since a long shortcode's raw 6-bits-per-char decode can
-/// exceed `u64` even though every real `media_pk` fits comfortably within
-/// it -- truncated back down at the end, which is lossless for any actual
-/// Instagram media id.
+/// `instagram.com/p/CqIbtWpMXtN/`) into its numeric `media_pk`.
 pub fn mediaPkFromShortcode(shortcode: []const u8) ShortcodeError!u64 {
     var acc: u128 = 0;
     for (shortcode) |c| {
@@ -69,8 +59,7 @@ pub const MediaInfo = struct {
 };
 
 /// Parses one `items[]` entry from `media/{pk}/info/`'s response into
-/// `MediaInfo` -- picks the first (highest-priority, per Instagram's own
-/// ordering) `video_versions[]`/`image_versions2.candidates[]` entry.
+/// `MediaInfo`.
 fn parseMediaItem(allocator: std.mem.Allocator, item: json.ObjectMap) !MediaInfo {
     var video_url: ?[]const u8 = null;
     if (item.get("video_versions")) |vv| if (vv == .array and vv.array.items.len > 0) {
@@ -110,12 +99,7 @@ fn parseMediaInfoBody(allocator: std.mem.Allocator, body: []const u8) !?MediaInf
     return try parseMediaItem(allocator, items.items[0].object);
 }
 
-/// Fetches media info for `media_pk` via the authenticated private endpoint
-/// -- the fallback path when a plain unauthenticated fetch (e.g.
-/// `video_download.zig`'s `yt-dlp` attempt) has already failed, meaning the
-/// content needs the logged-in session's own visibility (a private account
-/// the owner follows, or the owner's own non-public content). `null` if the
-/// response doesn't parse or carries no usable candidate.
+/// Fetches media info for `media_pk` via the authenticated private endpoint.
 pub fn fetchMediaInfoAuthenticated(io: Io, allocator: std.mem.Allocator, client: *http.Client, auth_client: *auth.AuthClient, media_pk: u64) !?MediaInfo {
     const url = try std.fmt.allocPrint(allocator, "{s}/media/{d}/info/", .{ transport.base_url, media_pk });
     defer allocator.free(url);

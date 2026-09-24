@@ -1,13 +1,7 @@
-//! Matrix E2E encryption protocol logic layered on `olm.zig`'s libolm
-//! binding — building/signing the JSON shapes `/keys/upload` (and, once
+//! Matrix E2E encryption protocol logic layered on `olm.zig`'s libolm binding
+//! — building/signing the JSON shapes `/keys/upload` (and, once
 //! encrypt/decrypt are wired up, `/keys/claim`, `/sendToDevice`, room
-//! `m.room.encrypted` events) need. Deliberately hand-builds the small,
-//! fully-known JSON shapes below directly rather than pulling in a generic
-//! canonical-JSON serializer: Matrix's signing convention (object keys in
-//! lexicographic order, no whitespace) only needs to hold for these two
-//! fixed-shape objects, and hand-writing them in already-sorted key order
-//! is simpler to audit than a general canonicalizer would be for a single
-//! call site.
+//! `m.room.encrypted` events) need.
 
 const std = @import("std");
 const json = std.json;
@@ -18,10 +12,8 @@ const raw = @import("client.zig");
 const store_pool = @import("../../store/pool.zig");
 const store_crypto = @import("../../store/crypto.zig");
 
-/// Both algorithms this device ever offers — Olm for to-device (key
-/// exchange) messages, Megolm for room messages. Every device key upload
-/// advertises both, matching how there's no partial-encryption-support
-/// concept for a single device in the Matrix spec.
+/// Both algorithms this device ever offers — Olm for to-device (key exchange)
+/// messages, Megolm for room messages.
 const device_algorithms_json = "[\"m.olm.v1.curve25519-aes-sha2\",\"m.megolm.v1.aes-sha2\"]";
 
 const IdentityKeys = struct {
@@ -32,18 +24,12 @@ const IdentityKeys = struct {
 fn parseIdentityKeys(allocator: std.mem.Allocator, account: *olm.Account) !std.json.Parsed(IdentityKeys) {
     const raw_json = try account.identityKeysJson(allocator);
     defer allocator.free(raw_json);
-    // `.alloc_always`, not the default: without it, parsed strings can
-    // alias `raw_json` directly (no escapes to unescape, so nothing forces
-    // a copy) — `raw_json` is freed by the `defer` above right as this
-    // returns, which left `identity.value.*` dangling (found live: a
-    // segfault deep in `std.fmt` formatting the now-freed slice).
+    // `.alloc_always`, not the default: without it, parsed strings can alias
+    // `raw_json` directly (no escapes to unescape, so nothing forces a copy).
     return std.json.parseFromSlice(IdentityKeys, allocator, raw_json, .{ .allocate = .alloc_always });
 }
 
 /// Builds and signs this device's `device_keys` object for `/keys/upload`.
-/// The signature covers the object with the `signatures` field itself
-/// omitted (Matrix's standard "sign everything except your own signature"
-/// rule) — computed here, then spliced into the final returned JSON.
 pub fn deviceKeysJson(allocator: std.mem.Allocator, account: *olm.Account, user_id: []const u8, device_id: []const u8) ![]u8 {
     var identity = try parseIdentityKeys(allocator, account);
     defer identity.deinit();
@@ -72,22 +58,15 @@ const OneTimeKeysRaw = struct {
 };
 
 /// Signs every currently-unpublished one-time key and returns the
-/// `one_time_keys` object for `/keys/upload` — `signed_curve25519`, not
-/// plain `curve25519`: an unsigned one-time key lets anyone claiming it
-/// impersonate this device to whoever established a session with it,
-/// since there'd be nothing tying the key to the account's identity.
-/// Caller should call `account.markKeysAsPublished()` (and persist the
-/// account) once the upload actually succeeds.
+/// `one_time_keys` object for `/keys/upload` — `signed_curve25519`.
 pub fn signedOneTimeKeysJson(allocator: std.mem.Allocator, account: *olm.Account, user_id: []const u8, device_id: []const u8) ![]u8 {
     const raw_json = try account.oneTimeKeysJson(allocator);
     defer allocator.free(raw_json);
     return signKeysJson(allocator, account, user_id, device_id, raw_json);
 }
 
-/// Same signing logic `signedOneTimeKeysJson` uses, applied to the
-/// account's fallback key — `Account.fallbackKeyJson` returns the same
-/// `{"curve25519": {...}}` shape `oneTimeKeysJson` does, just for the
-/// single (unpublished) fallback key.
+/// Same signing logic `signedOneTimeKeysJson` uses, applied to the account's
+/// fallback key — `Account.fallbackKeyJson` returns the same.
 pub fn signedFallbackKeyJson(allocator: std.mem.Allocator, account: *olm.Account, user_id: []const u8, device_id: []const u8) ![]u8 {
     const raw_json = try account.fallbackKeyJson(allocator);
     defer allocator.free(raw_json);
@@ -125,9 +104,7 @@ fn signKeysJson(allocator: std.mem.Allocator, account: *olm.Account, user_id: []
     return out.toOwnedSlice();
 }
 
-/// Wraps `device_keys`/`one_time_keys` (either may be null — a topping-up
-/// call after the first upload only needs to send fresh one-time keys)
-/// into the full `/keys/upload` request body.
+/// Wraps `device_keys`/`one_time_keys`.
 pub fn uploadKeysPayload(allocator: std.mem.Allocator, device_keys_json: ?[]const u8, one_time_keys_json: ?[]const u8, fallback_keys_json: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -152,14 +129,7 @@ pub fn uploadKeysPayload(allocator: std.mem.Allocator, device_keys_json: ?[]cons
 
 const OwnIdentityKeys = struct { curve25519: []const u8, ed25519: []const u8 };
 
-/// Extracts both of this device's own identity keys in one parse —
-/// `curve25519` for picking the right to-device `ciphertext` map entry on
-/// decrypt, `ed25519` for the `keys`/`recipient_keys` fields every outbound
-/// Olm to-device payload envelope must carry (see `shareWithNewDevices`;
-/// omitting these is what silently broke every outgoing room-key share
-/// until found live 2026-07-20 — Element validates them before ever
-/// looking at the `m.room_key` content, and to-device decrypt failures
-/// aren't surfaced anywhere in its UI).
+/// Extracts both of this device's own identity keys in one parse.
 fn extractOwnIdentityKeys(allocator: std.mem.Allocator, account: *olm.Account) !OwnIdentityKeys {
     var identity = try parseIdentityKeys(allocator, account);
     defer identity.deinit();
@@ -169,12 +139,7 @@ fn extractOwnIdentityKeys(allocator: std.mem.Allocator, account: *olm.Account) !
     };
 }
 
-/// The bot's live, in-memory Matrix crypto state — one process-wide Olm
-/// account plus whatever DB pool/pickle key it needs to load/save per-
-/// device Olm sessions and per-room Megolm sessions as they're used.
-/// Embedded in `platform/matrix/connector.zig`'s `MatrixConnector` as
-/// `?State` (null when `WARDEN_MATRIX_PICKLE_KEY` isn't set — encryption
-/// stays inert).
+/// The bot's live, in-memory Matrix crypto state.
 pub const State = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -183,45 +148,24 @@ pub const State = struct {
     account: olm.Account,
     user_id: []const u8,
     device_id: []const u8,
-    /// This device's own curve25519 identity key, base64 — cached since
-    /// every to-device decrypt needs it to pick the right `ciphertext` map
-    /// entry, and re-deriving it from `account` each time would be
-    /// wasteful (and require re-parsing JSON on every sync cycle).
+    /// This device's own curve25519 identity key, base64.
     own_curve25519: []const u8,
     /// This device's own ed25519 fingerprint, base64 — required in the
-    /// `keys`/`recipient_keys` fields of every outbound Olm to-device
-    /// payload envelope (see `shareWithNewDevices`'s doc comment).
+    /// `keys`/`recipient_keys` fields of every outbound Olm to-device payload
+    /// envelope.
     own_ed25519: []const u8,
     /// Needed by the outbound (encrypt) path — `/keys/query`, `/keys/claim`,
     /// `/sendToDevice` — to discover and message a room's other devices.
-    /// Not owned: points at `MatrixConnector.client`, which outlives this
-    /// `State` (see `enableCrypto`).
     client: *raw.Client,
-    /// Every method that touches `account` or a per-device/per-room Olm
-    /// object must hold this — those are plain (non-atomic) libolm structs,
-    /// and decrypt (driven by the poll loop's own thread) and encrypt
-    /// (driven by per-message tasks) can genuinely run concurrently. DB
-    /// reads/writes are cheap to keep inside the same critical section
-    /// rather than trying to split locking finer.
+    /// Every method that touches `account` or a per-device/per-room Olm object
+    /// must hold this.
     mutex: std.Io.Mutex = .init,
-    /// In-flight interactive (SAS/emoji) device verification ceremonies,
-    /// keyed by `transaction_id`. In-memory only — no DB persistence, see
-    /// `verification.VerificationSession`'s doc comment for why. Guarded
-    /// by `mutex` alongside everything else: verification traffic is
-    /// human-paced (minutes between steps), not hot-path, so a separate
-    /// lock would add complexity for no real concurrency win.
+    /// In-flight interactive (SAS/emoji) device verification ceremonies, keyed by
+    /// `transaction_id`.
     verifications: std.StringHashMapUnmanaged(verification.VerificationSession) = .empty,
 
-    /// Loads the persisted account, or creates and uploads a fresh one if
-    /// this is the first run — see `main.zig`'s call site for the
-    /// won't-finish-tonight framing this was originally built under, now
-    /// extended with the actual encrypt/decrypt this doc comment's sibling
-    /// methods implement. Errors loudly (rather than silently recreating)
-    /// if a persisted account's device_id doesn't match the access
-    /// token's current device — see the git history around this exact
-    /// check for why: reusing an already-crypto-initialized device (e.g.
-    /// one already opened in Element) silently produces keys the server
-    /// keeps but no client will ever validate against warden's identity.
+    /// Loads the persisted account, or creates and uploads a fresh one if this is
+    /// the first run.
     pub fn load(allocator: std.mem.Allocator, io: std.Io, pool: *store_pool.PgPool, pickle_key: []const u8, client: *raw.Client) !State {
         var who = try client.whoami(allocator);
         defer who.deinit();
@@ -267,10 +211,8 @@ pub const State = struct {
         var account = try olm.Account.create(allocator, io);
         errdefer account.deinit(allocator);
 
-        // 20 is an arbitrary starting batch — `topUpOneTimeKeysIfNeeded`
-        // (driven by `/sync`'s `device_one_time_keys_count`) replenishes
-        // it as keys get claimed, so this initial size only needs to
-        // cover activity between now and the first sync cycle.
+        // 20 is an arbitrary starting batch — `topUpOneTimeKeysIfNeeded` (driven by
+        // `/sync`'s `device_one_time_keys_count`) replenishes it as keys get claimed.
         try account.generateOneTimeKeys(allocator, io, 20);
         try account.generateFallbackKey(allocator, io);
         const device_keys_json = try deviceKeysJson(allocator, &account, user_id, device_id);
@@ -319,16 +261,9 @@ pub const State = struct {
         self.verifications.deinit(self.allocator);
     }
 
-    /// Tops up this device's one-time-key pool once the server-reported
-    /// count (from `/sync`'s `device_one_time_keys_count`) drops below
-    /// half of what libolm allows — same threshold real clients use.
-    /// Previously the account's initial batch of 20, generated once at
-    /// first startup, was never replenished at all: every key claimed
-    /// against this device by someone establishing a session (see
-    /// `client.zig`'s `claimOneTimeKey`, the *other* direction — someone
-    /// else claiming *our* keys) permanently shrank the pool until it hit
-    /// zero and every future session establishment with this device
-    /// failed outright.
+    /// Tops up this device's one-time-key pool once the server-reported count
+    /// (from `/sync`'s `device_one_time_keys_count`) drops below half of what
+    /// libolm allows — same threshold real clients use.
     pub fn topUpOneTimeKeysIfNeeded(self: *State, allocator: std.mem.Allocator, current_signed_curve25519_count: i64) !void {
         const max_keys = self.account.maxOneTimeKeys();
         if (current_signed_curve25519_count >= @as(i64, @intCast(max_keys / 2))) return;
@@ -341,11 +276,7 @@ pub const State = struct {
         if (needed == 0) return;
 
         try self.account.generateOneTimeKeys(allocator, self.io, needed);
-        // Regenerated on every top-up cycle too — a fresh fallback key is
-        // cheap, and libolm keeps the immediately-previous one usable
-        // internally (`generateFallbackKey`'s doc comment), so replacing
-        // it here can't strand an in-flight `/keys/claim` against the old
-        // one.
+        // Regenerated on every top-up cycle too.
         try self.account.generateFallbackKey(allocator, self.io);
         const otk_json = try signedOneTimeKeysJson(allocator, &self.account, self.user_id, self.device_id);
         defer allocator.free(otk_json);
@@ -364,12 +295,8 @@ pub const State = struct {
         std.log.info("matrix e2ee: topped up one-time keys ({d} + {d} -> {d})", .{ current_signed_curve25519_count, needed, max_keys });
     }
 
-    /// Decrypts an incoming to-device `m.room.encrypted` (Olm) event and,
-    /// if the payload is an `m.room_key`, stores the resulting inbound
-    /// Megolm session. Logs and returns on any failure — a single
-    /// malformed/undecryptable to-device event (e.g. addressed to a
-    /// different device that happens to share this sync, or referencing a
-    /// session we've lost) shouldn't interrupt the sync loop.
+    /// Decrypts an incoming to-device `m.room.encrypted` (Olm) event and, if the
+    /// payload is an `m.room_key`, stores the resulting inbound Megolm session.
     pub fn handleToDeviceEvent(self: *State, sender: []const u8, content: types.OlmEncryptedContent) void {
         self.handleToDeviceEventFallible(sender, content) catch |err| {
             std.log.warn("matrix e2ee: failed to handle to-device event from {s}: {t}", .{ sender, err });
@@ -387,9 +314,7 @@ pub const State = struct {
 
         var session: olm.Session = undefined;
         if (entry.type == 0) {
-            // PRE_KEY — always (re-)establishes the session for this
-            // sender, matching the "one session per sender" simplification
-            // documented on `store/crypto.zig`'s `StoredSession`.
+            // PRE_KEY — always (re-)establishes the session for this sender.
             const body_for_establish = try allocator.dupe(u8, entry.body);
             defer allocator.free(body_for_establish);
             session = try olm.Session.createInbound(allocator, &self.account, body_for_establish);
@@ -403,19 +328,14 @@ pub const State = struct {
         }
         defer session.deinit(allocator);
 
-        // decrypt needs its own fresh copy of the ciphertext — whichever
-        // branch above already consumed `entry.body` once (establishing
-        // the session, or just as a matter of libolm's general "input is
-        // destroyed" contract), and `Session.decrypt` destroys its input
-        // too.
+        // Decrypt needs its own fresh copy of the ciphertext.
         const body_for_decrypt = try allocator.dupe(u8, entry.body);
         defer allocator.free(body_for_decrypt);
         const plaintext = try session.decrypt(allocator, entry.type, body_for_decrypt);
         defer allocator.free(plaintext);
 
-        // Persist the session's now-advanced ratchet state regardless of
-        // what the plaintext turns out to be — skipping this would make
-        // the *next* message from this sender fail to decrypt.
+        // Persist the session's now-advanced ratchet state regardless of what the
+        // plaintext turns out to be.
         const session_id = try session.id(allocator);
         defer allocator.free(session_id);
         const pickled = try session.pickle(allocator, self.pickle_key);
@@ -427,12 +347,6 @@ pub const State = struct {
         if (!std.mem.eql(u8, payload.value.type, "m.room_key")) return;
         if (!std.mem.eql(u8, payload.value.content.algorithm, "m.megolm.v1.aes-sha2")) return;
 
-        // Mirrors matrix-js-sdk's own `OlmDecryption.decryptEvent` checks
-        // (see `buildRoomKeyPayload`'s doc comment for the send-side bug
-        // this is the receive-side counterpart of) — a mismatch here
-        // shouldn't happen with a well-behaved sender, so unlike the
-        // routine "not an m.room_key" check above, it's worth a warning:
-        // either a bug (ours or theirs) or a misdirected/forged message.
         if (!std.mem.eql(u8, payload.value.sender, sender)) {
             std.log.warn("matrix e2ee: to-device room key claims sender {s}, but envelope says {s} — ignoring", .{ payload.value.sender, sender });
             return;
@@ -454,21 +368,7 @@ pub const State = struct {
         std.log.info("matrix e2ee: received room key for {s} (session {s}) from {s}", .{ payload.value.content.room_id, payload.value.content.session_id, sender });
     }
 
-    /// Answers a to-device `m.room_key_request` — the reactive counterpart
-    /// to `shareWithNewDevices`'s proactive share, needed because to-device
-    /// delivery is best-effort, not guaranteed (matrix-org/synapse#6450
-    /// documents to-device events vanishing server-side with no error on
-    /// either end). Without this, a client that missed the original share
-    /// — or ran `/discardsession` to force a retry — has no way to ever
-    /// recover, which is exactly what was found live 2026-07-20 testing
-    /// that command against this bot before this existed.
-    ///
-    /// Deliberately conservative: only answers requests from **this
-    /// account's own other devices** (`sender == self.user_id`), never a
-    /// different user — there's no device-verification story yet (see
-    /// `client.zig`'s `claimOneTimeKey` doc comment) to safely vet a
-    /// stranger's request, and forwarding a room key to an unvetted
-    /// device would defeat the point of the room being encrypted at all.
+    /// Answers a to-device `m.room_key_request`.
     pub fn handleRoomKeyRequest(self: *State, sender: []const u8, content: types.RoomKeyRequestContent) void {
         self.handleRoomKeyRequestFallible(sender, content) catch |err| {
             std.log.warn("matrix e2ee: failed to handle room key request from {s}: {t}", .{ sender, err });
@@ -507,12 +407,8 @@ pub const State = struct {
         const their_curve25519 = curveKeyFor(dev_obj, content.requesting_device_id) orelse return;
         const their_ed25519 = ed25519KeyFor(dev_obj, content.requesting_device_id) orelse return;
 
-        // Same envelope shape `shareWithNewDevices` uses for `m.room_key`,
-        // just `m.forwarded_room_key` with the extra fields that event
-        // type requires — the originating device's curve25519 (this
-        // session's `sender_key`, i.e. `body.sender_key`, not necessarily
-        // us) and an empty forwarding chain (we're not re-forwarding an
-        // already-forwarded key here).
+        // Same envelope shape `shareWithNewDevices` uses for `m.room_key`, just
+        // `m.forwarded_room_key` with the extra fields that event type requires.
         const payload = try std.fmt.allocPrint(
             allocator,
             "{{\"sender\":\"{s}\",\"sender_device\":\"{s}\",\"keys\":{{\"ed25519\":\"{s}\"}},\"recipient\":\"{s}\",\"recipient_keys\":{{\"ed25519\":\"{s}\"}},\"type\":\"m.forwarded_room_key\",\"content\":{{\"algorithm\":\"m.megolm.v1.aes-sha2\",\"room_id\":\"{s}\",\"session_id\":\"{s}\",\"session_key\":\"{s}\",\"sender_key\":\"{s}\",\"forwarding_curve25519_key_chain\":[]}}}}",
@@ -524,12 +420,8 @@ pub const State = struct {
         std.log.info("matrix e2ee: answered room key request from {s}/{s} for session {s}", .{ sender, content.requesting_device_id, body.session_id });
     }
 
-    /// Parses `content_json` (hand-built, matching this file's usual
-    /// convention) into a `json.Value` and sends it as one to-device
-    /// `event_type` event. Verification events are sent **unencrypted** —
-    /// unlike `shareRoomKeyWithDevice`, this never touches Olm, since the
-    /// whole point of a verification ceremony is establishing trust before
-    /// any of it exists yet.
+    /// Parses `content_json` (hand-built, matching this file's usual convention)
+    /// into a `json.Value` and sends it as one to-device `event_type` event.
     fn sendVerificationEvent(self: *State, event_type: []const u8, user_id: []const u8, device_id: []const u8, content_json: []const u8) !void {
         const allocator = self.allocator;
         var parsed = try json.parseFromSlice(json.Value, allocator, content_json, .{});
@@ -537,11 +429,8 @@ pub const State = struct {
         try self.client.sendToDevice(allocator, event_type, user_id, device_id, parsed.value);
     }
 
-    /// Removes an expired (older than `verification.session_max_age_s`)
-    /// entry from `verifications` — called lazily at the top of every
-    /// verification handler rather than via a background timer, matching
-    /// how this bot has no periodic-task infrastructure beyond the poll
-    /// loop already driving everything else. Caller must hold `mutex`.
+    /// Removes an expired (older than `verification.session_max_age_s`) entry
+    /// from `verifications`.
     fn sweepExpiredVerifications(self: *State) void {
         const allocator = self.allocator;
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
@@ -562,9 +451,8 @@ pub const State = struct {
         }
     }
 
-    /// Sends `m.key.verification.cancel` (best-effort — a failed send
-    /// doesn't block local cleanup) and removes the session. Caller must
-    /// already hold `mutex`.
+    /// Sends `m.key.verification.cancel` (best-effort — a failed send doesn't
+    /// block local cleanup) and removes the session.
     fn cancelVerification(self: *State, transaction_id: []const u8, their_device_id: []const u8, code: []const u8, reason: []const u8) !void {
         const allocator = self.allocator;
         const cancel_json = try std.fmt.allocPrint(allocator, "{{\"transaction_id\":\"{s}\",\"code\":\"{s}\",\"reason\":\"{s}\"}}", .{ transaction_id, code, reason });
@@ -580,17 +468,7 @@ pub const State = struct {
         }
     }
 
-    /// Entry point for a self-verification ceremony: an incoming
-    /// `m.key.verification.request` from one of this account's own other
-    /// devices (e.g. Element, verifying the bot's session so it stops
-    /// showing an "unverified device" warning — see `ROADMAP.md`). This
-    /// bot only ever *responds*, never initiates — see
-    /// `verification.zig`'s module doc for why that's a deliberate scope
-    /// choice, not just what happened to get built first. Per the spec's
-    /// tie-break rule, whichever side sends `m.key.verification.ready` is
-    /// the one that auto-selects the method and sends `m.key.verification.
-    /// start` next — since we always respond (never request), that's
-    /// always us, so both are sent here together.
+    /// Entry point for a self-verification ceremony.
     pub fn handleVerificationRequest(self: *State, sender: []const u8, content: types.VerificationRequestContent) void {
         self.handleVerificationRequestFallible(sender, content) catch |err| {
             std.log.warn("matrix e2ee: failed to handle verification request from {s}: {t}", .{ sender, err });
@@ -622,9 +500,7 @@ pub const State = struct {
             return;
         }
 
-        // Pin the requesting device's real ed25519 key now — see
-        // `VerificationSession.their_ed25519`'s doc comment for why this
-        // must never be re-resolved later in the ceremony.
+        // Pin the requesting device's real ed25519 key now.
         var queried = try self.client.queryKeys(allocator, &.{self.user_id});
         defer queried.deinit();
         const device_keys = queried.value.object.get("device_keys") orelse return;
@@ -645,19 +521,7 @@ pub const State = struct {
         defer allocator.free(ready_json);
         try self.sendVerificationEvent("m.key.verification.ready", sender, content.from_device, ready_json);
 
-        // Field order here isn't cosmetic: `verification.commitment`
-        // hashes this exact string later (once the accepter's key
-        // arrives), and the spec's commitment formula is defined over the
-        // *canonical* JSON of this content — keys sorted lexicographically
-        // — not whatever order they're written in. Element independently
-        // canonicalizes whatever `start` content it receives before
-        // hashing its own copy for comparison, so if this string isn't
-        // already in sorted-key order, the two sides' hashes silently
-        // never match (found live 2026-07-20: every verification attempt
-        // failed with `m.mismatched_commitment` until this was fixed —
-        // sorted order is alphabetical: from_device, hashes,
-        // key_agreement_protocols, message_authentication_codes, method,
-        // short_authentication_string, transaction_id).
+        // Field order here isn't cosmetic.
         const start_json = try std.fmt.allocPrint(
             allocator,
             "{{\"from_device\":\"{s}\",\"hashes\":[\"sha256\"],\"key_agreement_protocols\":[\"curve25519-hkdf-sha256\"],\"message_authentication_codes\":[\"hkdf-hmac-sha256.v2\"],\"method\":\"m.sas.v1\",\"short_authentication_string\":[\"decimal\",\"emoji\"],\"transaction_id\":\"{s}\"}}",
@@ -810,14 +674,8 @@ pub const State = struct {
         const expected_key_id = try std.fmt.allocPrint(allocator, "ed25519:{s}", .{session.their_device_id});
         defer allocator.free(expected_key_id);
 
-        // The `KEY_IDS` MAC covers *every* key id present in `mac` —
-        // found live 2026-07-20: this can't be hardcoded to just the
-        // device key. If the other side's own identity is already
-        // locally verified on its side, it also includes a MAC over its
-        // cross-signing master key (per the research behind this
-        // feature — matrix-rust-sdk's `get_mac_content` does this
-        // conditionally), so the sorted, comma-joined list must be
-        // derived from whatever keys they actually sent, not assumed.
+        // The `KEY_IDS` MAC covers *every* key id present in `mac` — found live
+        // 2026-07-20: this can't be hardcoded to just the device key.
         const sent_key_ids = try allocator.dupe([]const u8, content.mac.map.keys());
         defer allocator.free(sent_key_ids);
         std.mem.sort([]const u8, sent_key_ids, {}, struct {
@@ -841,12 +699,7 @@ pub const State = struct {
             return;
         }
 
-        // Only the device-key MAC is required — an additional master
-        // cross-signing-key MAC entry (sent conditionally, only if
-        // Element's own identity is already locally verified on its
-        // side) is logged if present but not checked: what protects
-        // *this* side of the ceremony is confirming *their device*,
-        // which this already does.
+        // Only the device-key MAC is required.
         const their_mac = content.mac.map.get(expected_key_id) orelse {
             try self.cancelVerification(content.transaction_id, session.their_device_id, "m.key_mismatch", "missing device key MAC");
             return;
@@ -878,12 +731,8 @@ pub const State = struct {
         };
     }
 
-    /// We already send our own `done` (and remove the session) right
-    /// after successfully validating their MAC in `handleVerificationMac`
-    /// — so a session still present here when *their* `done` arrives
-    /// would mean the two sides disagree about whether the ceremony
-    /// succeeded, worth a warning; the common case is simply that the
-    /// session's already gone by the time this fires, which is fine.
+    /// We already send our own `done` (and remove the session) right after
+    /// successfully validating their MAC in `handleVerificationMac`.
     fn handleVerificationDoneFallible(self: *State, sender: []const u8, content: types.VerificationDoneContent) !void {
         if (!std.mem.eql(u8, sender, self.user_id)) return;
         const allocator = self.allocator;
@@ -916,13 +765,8 @@ pub const State = struct {
         }
     }
 
-    /// Decrypts a room-timeline `m.room.encrypted` (Megolm) event using
-    /// whatever inbound session is on file for `(room_id, sender_key,
-    /// session_id)`. Returns null (not an error) when no matching session
-    /// exists yet — the room key just hasn't arrived, or hasn't been
-    /// processed, yet; `platform/matrix/connector.zig`'s `pollFn` treats that
-    /// the same as "can't read this one" rather than a hard failure. Caller
-    /// owns and must `.deinit()` the returned `Parsed` value.
+    /// Decrypts a room-timeline `m.room.encrypted` (Megolm) event using whatever
+    /// inbound session is on file for `(room_id, sender_key, session_id)`.
     pub fn decryptRoomEvent(self: *State, allocator: std.mem.Allocator, room_id: []const u8, content: types.MegolmEncryptedContent) !?json.Parsed(types.DecryptedRoomEventPayload) {
         if (!std.mem.eql(u8, content.algorithm, "m.megolm.v1.aes-sha2")) return null;
 
@@ -949,12 +793,7 @@ pub const State = struct {
 
         var parsed = try json.parseFromSlice(types.DecryptedRoomEventPayload, allocator, decrypted.plaintext, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
         errdefer parsed.deinit();
-        // Anti-replay check mirroring matrix-js-sdk's own decrypt
-        // validation (found live 2026-07-20, the mirror-image bug of
-        // `shareWithNewDevices`'s missing to-device envelope fields):
-        // the *plaintext* must carry the same `room_id` this session
-        // belongs to, or a session key could be replayed to forge a
-        // message into a different room.
+        // Anti-replay check mirroring matrix-js-sdk's own decrypt validation.
         if (!std.mem.eql(u8, parsed.value.room_id, room_id)) return error.RoomIdMismatch;
         return parsed;
     }
@@ -964,25 +803,7 @@ pub const State = struct {
         session_id: []const u8,
     };
 
-    /// Encrypts `plaintext_event_json` (a full `{"type":...,"content":...}`
-    /// room event, matching the shape `DecryptedRoomEventPayload` parses on
-    /// the receive side) for `room_id`'s outbound Megolm session — creating
-    /// one if none exists yet, and sharing its key (via Olm-encrypted
-    /// `m.room_key` to-device events) with any currently-joined member
-    /// device that hasn't received it yet before encrypting. This is the
-    /// fix for the original bug report: without this, every outgoing
-    /// `m.room.message` went out as plaintext into a room whose other
-    /// members' clients only ever expect `m.room.encrypted` — accepted by
-    /// the server, but not rendered as a normal message by any compliant
-    /// client. Caller owns the returned `ciphertext`/`session_id`.
-    ///
-    /// Rotates the outbound session — forcing a brand-new one, re-shared
-    /// from scratch — once it's older than this, matching the rough
-    /// order of magnitude real clients use (time-based, not
-    /// message-count-based: this bot's per-room volume is low enough that
-    /// a message-count threshold would rarely trigger, and time-based
-    /// rotation needs no schema change since `crypto_megolm_outbound`
-    /// already tracks `created_at`).
+    /// Encrypts `plaintext_event_json`.
     const megolm_session_max_age_s: i64 = 7 * std.time.s_per_day;
 
     fn shouldRotateSession(now_unix: i64, created_at_unix: i64) bool {
@@ -1029,12 +850,8 @@ pub const State = struct {
         const session_id = try group_session.id(allocator);
         errdefer allocator.free(session_id);
 
-        // Persist the session's advanced ratchet state and the (possibly
-        // just-expanded) shared_with set regardless of what happens next —
-        // skipping this would re-share the room key with already-shared
-        // devices on the next send, and re-sending a message with an
-        // unpersisted ratchet state would desync from what was actually
-        // transmitted.
+        // Persist the session's advanced ratchet state and the (possibly just-
+        // expanded) shared_with set regardless of what happens next.
         const pickled = try group_session.pickle(allocator, self.pickle_key);
         defer allocator.free(pickled);
         const shared_with_json = try serializeSharedWith(allocator, &shared_with);
@@ -1045,12 +862,9 @@ pub const State = struct {
     }
 
     /// Queries `room_id`'s currently-joined members' devices and shares
-    /// `group_session`'s key (via a fresh or existing per-device Olm
-    /// session) with any device not already present in `shared_with`,
-    /// adding it once shared. Best-effort: a single device's share failing
-    /// (e.g. it has no one-time keys left to claim) is logged and skipped
-    /// rather than aborting the whole send — better to reach the devices
-    /// that *do* work than to block every send on one uncooperative device.
+    /// `group_session`'s key (via a fresh or existing per-device Olm session)
+    /// with any device not already present in `shared_with`, adding it once
+    /// shared.
     fn shareWithNewDevices(self: *State, allocator: std.mem.Allocator, room_id: []const u8, group_session: *olm.OutboundGroupSession, shared_with: *std.StringHashMapUnmanaged(void)) !void {
         const members = try self.client.joinedMembers(allocator, room_id);
         defer {
@@ -1134,9 +948,7 @@ pub const State = struct {
         return curve_val.string;
     }
 
-    /// Sibling to `curveKeyFor` — the target device's ed25519 fingerprint,
-    /// needed for the `recipient_keys.ed25519` field every outbound Olm
-    /// to-device payload envelope must carry (see `shareWithNewDevices`).
+    /// Sibling to `curveKeyFor` — the target device's ed25519 fingerprint.
     fn ed25519KeyFor(dev_obj: json.Value, device_id: []const u8) ?[]const u8 {
         if (dev_obj != .object) return null;
         const keys_obj = dev_obj.object.get("keys") orelse return null;
@@ -1159,26 +971,7 @@ pub const State = struct {
         session_key: []const u8,
     };
 
-    /// Builds the plaintext Olm-encrypts into an `m.room_key` to-device
-    /// event. Hand-built, not `json.Stringify`-through-a-struct — same
-    /// established pattern as the rest of this file; every field here is a
-    /// server/library-generated opaque token or a Matrix id, never user
-    /// text, so there's nothing that needs JSON string-escaping.
-    ///
-    /// `sender`, `sender_device`, `keys`, `recipient`, and `recipient_keys`
-    /// are all *required* by the Matrix spec in the plaintext of an
-    /// `m.olm.v1.curve25519-aes-sha2` to-device payload — found live
-    /// 2026-07-20, missing them was silently breaking every room-key
-    /// share. Element's decrypt path (matrix-js-sdk's
-    /// `OlmDecryption.decryptEvent`) checks
-    /// `payload.recipient`/`payload.recipient_keys.ed25519` before it will
-    /// even look at `content`, throwing `OLM_BAD_RECIPIENT`/
-    /// `OLM_BAD_RECIPIENT_KEY` otherwise — and to-device decrypt failures
-    /// are only logged internally by Element, never surfaced in its UI, so
-    /// the 200 OK `sendToDevice` gets back gives no hint anything is
-    /// wrong. Field order doesn't matter: this payload isn't itself
-    /// signature-checked (it rides inside the already-authenticated Olm
-    /// ciphertext), only field values are validated after decrypt.
+    /// Builds the plaintext Olm-encrypts into an `m.room_key` to-device event.
     fn buildRoomKeyPayload(allocator: std.mem.Allocator, p: RoomKeyPayloadParams) ![]u8 {
         return std.fmt.allocPrint(
             allocator,
@@ -1189,22 +982,8 @@ pub const State = struct {
 
     /// Establishes (or reuses) an Olm session with `device_id` and sends it
     /// `room_key_payload` (already the full `{"type":"m.room_key",...}`
-    /// plaintext) as an Olm-encrypted `m.room.encrypted` to-device event —
-    /// the mirror image of `handleToDeviceEventFallible`'s receive side.
-    ///
-    /// Found live: the very first real encrypt-path test reused a session
-    /// that had earlier been established the other direction (inbound, via
-    /// `handleToDeviceEventFallible`'s `createInbound`, from decrypt
-    /// testing) — Element accepted the send (200 OK) but silently failed to
-    /// process it ("The sender's device has not sent us the keys for this
-    /// message"), with no error visible on warden's side at all. Clearing
-    /// `crypto_sessions` (forcing a fresh PRE_KEY handshake instead of
-    /// reusing the drifted session) fixed it immediately. Bidirectional
-    /// reuse of one Olm session is normal, spec-legal behavior — the
-    /// takeaway isn't "reuse is wrong," it's that a stuck/desynced session
-    /// fails *silently* from the sender's side, so if room-key shares ever
-    /// stop landing again, suspect a stale `crypto_sessions` row before
-    /// anything else and clear it rather than debugging the JSON shape.
+    /// plaintext) as an Olm-encrypted `m.room.encrypted` to-device event — the
+    /// mirror image of `handleToDeviceEventFallible`'s receive side.
     fn shareRoomKeyWithDevice(self: *State, allocator: std.mem.Allocator, user_id: []const u8, device_id: []const u8, their_curve25519: []const u8, room_key_payload: []const u8) !void {
         var session: olm.Session = undefined;
         if (try store_crypto.loadSession(self.pool, allocator, their_curve25519)) |stored| {
@@ -1224,9 +1003,8 @@ pub const State = struct {
         defer allocator.free(ciphertext);
         const msg_type = try session.nextMessageType();
 
-        // Persist the session's advanced ratchet state before the network
-        // call, not after — same "don't lose track of what was actually
-        // sent" reasoning as everywhere else in this file.
+        // Persist the session's advanced ratchet state before the network call, not
+        // after.
         const session_id = try session.id(allocator);
         defer allocator.free(session_id);
         const pickled = try session.pickle(allocator, self.pickle_key);
@@ -1315,10 +1093,7 @@ test "uploadKeysPayload wraps whichever fields are non-null" {
     try testing.expectEqualStrings("{\"fallback_keys\":{\"c\":3}}", fallback_only);
 }
 
-// Regression test for the bug found live 2026-07-20: a payload missing any
-// of these fields decrypts fine at the Olm layer (libolm doesn't know or
-// care about them) but is silently rejected by every spec-compliant client
-// (matrix-js-sdk's `OlmDecryption.decryptEvent` checks `recipient`/
+// Regression test for the bug found live 2026-07-20.
 test "State.shouldRotateSession triggers at exactly the age threshold" {
     const now: i64 = 1_000_000;
     try testing.expect(!State.shouldRotateSession(now, now - (State.megolm_session_max_age_s - 1)));
@@ -1327,9 +1102,8 @@ test "State.shouldRotateSession triggers at exactly the age threshold" {
     try testing.expect(!State.shouldRotateSession(now, now)); // brand new
 }
 
-// `recipient_keys.ed25519` before it will even look at `content`) — with
-// no visible error anywhere, since Element only logs to-device decrypt
-// failures internally. This test would have caught that regression.
+// `recipient_keys.ed25519` before it will even look at `content`) — with no
+// visible error anywhere.
 test "State.buildRoomKeyPayload includes every field the Matrix spec requires" {
     const payload = try State.buildRoomKeyPayload(testing.allocator, .{
         .sender = "@alice:server",
@@ -1356,12 +1130,8 @@ test "State.buildRoomKeyPayload includes every field the Matrix spec requires" {
     try testing.expect(parsed.value == .object); // must still be well-formed JSON
 }
 
-// `handleRoomKeyRequestFallible`'s safety gating is the most
-// security-critical part of the whole responder — forwarding a room key
-// to the wrong recipient defeats the point of the room being encrypted at
-// all. Every case here must short-circuit before ever touching
-// `self.client` (a dummy pointed at an unreachable URL — any of these
-// cases reaching a real network call would hang/error this test).
+// `handleRoomKeyRequestFallible`'s safety gating is the most security-
+// critical part of the whole responder.
 test "State.handleRoomKeyRequest only ever answers this account's own other devices" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
@@ -1429,10 +1199,7 @@ test "State.handleRoomKeyRequest only ever answers this account's own other devi
         .requesting_device_id = "BOBOTHERDEVICE",
     });
 
-    // A genuinely valid request would proceed to `self.client.queryKeys`
-    // (untested here — no mock HTTP transport exists yet, see Phase E) —
-    // reaching that call at all, without erroring on any of the cases
-    // above, is what this test actually asserts.
+    // A genuinely valid request would proceed to `self.client.queryKeys`.
 }
 
 test "State.handleToDeviceEvent + State.decryptRoomEvent: full room-key-share and message round trip" {
@@ -1448,9 +1215,7 @@ test "State.handleToDeviceEvent + State.decryptRoomEvent: full room-key-share an
     defer testing.allocator.free(alice_keys.curve25519);
     defer testing.allocator.free(alice_keys.ed25519);
 
-    // Bob is "us" — the State under test. This test only exercises the
-    // decrypt side, which never dereferences `client` — a dummy pointed at
-    // an unreachable URL is enough.
+    // Bob is "us" — the State under test.
     var bob_client = raw.Client.init(testing.allocator, testing.io, "http://unused.invalid", "unused-token");
     defer bob_client.deinit();
     var bob_account = try olm.Account.create(testing.allocator, testing.io);
@@ -1469,9 +1234,6 @@ test "State.handleToDeviceEvent + State.decryptRoomEvent: full room-key-share an
     };
     defer bob_state.deinit();
 
-    // Alice claims one of bob's one-time keys and establishes an outbound
-    // Olm session with him (mirrors what /keys/claim + olm_create_outbound_
-    // session gets a real client to, minus the HTTP round trip).
     try bob_state.account.generateOneTimeKeys(testing.allocator, testing.io, 1);
     const bob_otks_json = try bob_state.account.oneTimeKeysJson(testing.allocator);
     defer testing.allocator.free(bob_otks_json);
@@ -1492,9 +1254,7 @@ test "State.handleToDeviceEvent + State.decryptRoomEvent: full room-key-share an
     const megolm_session_key = try alice_group_session.sessionKey(testing.allocator);
     defer testing.allocator.free(megolm_session_key);
 
-    // Built via the same helper `shareWithNewDevices` uses — a payload
-    // missing `sender`/`recipient`/`recipient_keys` is exactly the bug
-    // found live 2026-07-20 (see `buildRoomKeyPayload`'s doc comment).
+    // Built via the same helper `shareWithNewDevices` uses.
     const room_key_payload = try State.buildRoomKeyPayload(testing.allocator, .{
         .sender = "@alice:server",
         .sender_device = "ALICEDEVICE",
@@ -1542,12 +1302,8 @@ test "State.handleToDeviceEvent + State.decryptRoomEvent: full room-key-share an
     try testing.expectEqualStrings("hello from megolm", decrypted.value.content.body.?);
 }
 
-// Regression test for `handleToDeviceEventFallible`'s new envelope
-// validation — the receive-side counterpart of `buildRoomKeyPayload`'s
-// send-side fix. A room key addressed to someone else must be rejected,
-// not silently stored under our name (which would let a compromised or
-// buggy sender plant a session key we'd trust as if we'd been the
-// legitimate recipient).
+// Regression test for `handleToDeviceEventFallible`'s new envelope validation
+// — the receive-side counterpart of `buildRoomKeyPayload`'s send-side fix.
 test "State.handleToDeviceEvent rejects a room key addressed to a different recipient" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
@@ -1596,12 +1352,7 @@ test "State.handleToDeviceEvent rejects a room key addressed to a different reci
     const megolm_session_key = try alice_group_session.sessionKey(testing.allocator);
     defer testing.allocator.free(megolm_session_key);
 
-    // Addressed to Mallory, not Bob — Alice's own outbound session was
-    // still established against Bob's real identity/one-time keys (as if
-    // Bob's own client had a bug and built a wrong envelope, or a
-    // malicious relay tried to redirect a genuine share), so the Olm
-    // ratchet decrypt itself succeeds fine; only the envelope check should
-    // catch this.
+    // Addressed to Mallory, not Bob.
     const room_key_payload = try State.buildRoomKeyPayload(testing.allocator, .{
         .sender = "@alice:server",
         .sender_device = "ALICEDEVICE",
@@ -1664,14 +1415,8 @@ test "State.decryptRoomEvent returns null when no inbound session is on file" {
     try testing.expectEqual(@as(?json.Parsed(types.DecryptedRoomEventPayload), null), try bob_state.decryptRoomEvent(testing.allocator, "!room:server", content));
 }
 
-// Regression test for the bug found live 2026-07-20, the mirror image of
-// the missing-envelope-fields bug: `platform/matrix/connector.zig`'s
-// `sendEvent` omitted `room_id` from the plaintext it Megolm-encrypts, so
-// every decrypted event failed matrix-js-sdk's own anti-replay check ("the
-// room id of the room key doesn't match the room id of the decrypted event:
-// expected <room>, got None") even though the room-key delivery itself (the
-// earlier bug) had by then been fixed. `decryptRoomEvent` now enforces the
-// same check on the receive side.
+// Regression test for the bug found live 2026-07-20, the mirror image of the
+// missing-envelope-fields bug.
 test "State.decryptRoomEvent rejects a plaintext whose room_id doesn't match" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
@@ -1724,15 +1469,6 @@ test "State.decryptRoomEvent rejects a plaintext whose room_id doesn't match" {
     try testing.expectError(error.RoomIdMismatch, bob_state.decryptRoomEvent(testing.allocator, "!roomA:server", content));
 }
 
-// The full success path of a verification ceremony can't be tested without
-// a mock HTTP transport (every handler's success path ends in a real
-// `self.client.sendToDevice` call — same limitation noted throughout this
-// file's other tests). The rejection paths *are* testable, though: a
-// `cancelVerification` call's own `sendVerificationEvent` failure is
-// caught internally and doesn't block cleanup, so a dummy unreachable
-// client is enough to exercise "wrong commitment/MAC gets rejected and the
-// session is torn down" — exactly the security-critical behavior worth
-// regression-testing.
 fn testVerificationState(pool: *store_pool.PgPool, client: *raw.Client) !State {
     var account = try olm.Account.create(testing.allocator, testing.io);
     const keys = try extractOwnIdentityKeys(testing.allocator, &account);
@@ -1794,12 +1530,8 @@ test "State.handleVerificationMac rejects a mismatched MAC and tears down the se
 
     var sas = try olm.Sas.create(testing.allocator, testing.io);
     errdefer sas.deinit(testing.allocator);
-    // A real session never reaches `.mac_sent` without `setTheirKey`
-    // having already been called in `handleVerificationKeyFallible` —
-    // match that here (any valid peer pubkey does, a second throwaway
-    // `Sas`'s), or `calculateMac` below correctly errors
-    // `SAS_THEIR_KEY_NOT_SET` instead of exercising the rejection path
-    // this test is for.
+    // A real session never reaches `.mac_sent` without `setTheirKey` having
+    // already been called in `handleVerificationKeyFallible`.
     var peer_sas = try olm.Sas.create(testing.allocator, testing.io);
     defer peer_sas.deinit(testing.allocator);
     const peer_pubkey = try peer_sas.pubkey(testing.allocator);

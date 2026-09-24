@@ -8,12 +8,7 @@ const Args = struct {
 };
 
 /// The LLM-tool front end for `user_settings.monitor_all_default`
-/// (`0046_monitor_all_default.sql`) -- the owner's global monitoring
-/// default, applied to every personal-account chat that has no override of
-/// its own (`set_chat_monitoring`). Reading is low-risk (`get_bulletin`
-/// never sends anything, unlike replying, which stays opt-in per chat via
-/// `reply_autonomy`), so this is meant to be reachable for "monitor
-/// everything" in one call rather than requiring per-chat opt-in.
+/// (`0046_monitor_all_default.sql`).
 pub const tool: registry.ToolDef = .{
     .name = "set_default_chat_monitoring",
     .description = "Sets the owner's default monitoring level, applied to every personal-account chat that doesn't have its own override from set_chat_monitoring. \"off\" (the starting default) means only chats explicitly opted in via set_chat_monitoring are monitored. Setting this to low/normal/high monitors every chat at that level for get_bulletin -- individual chats can still be excluded (or raised/lowered) with set_chat_monitoring regardless of this default. Only call this when the owner has explicitly asked to change their default monitoring level.",

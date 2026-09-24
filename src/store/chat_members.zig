@@ -5,9 +5,7 @@ const Platform = @import("../platform/interface.zig").Platform;
 const ChatRef = @import("chats.zig").ChatRef;
 
 /// Ensures a `chat_members` row exists for (chat_id, identity_id) and bumps
-/// its `last_seen` — called once per inbound message, replacing the old
-/// per-chat `users` upsert. `tokens` is left untouched on conflict (defaults
-/// to 0 only on first insert), matching the old behavior.
+/// its `last_seen`.
 pub fn touch(pool: *PgPool, chat_id: i64, identity_id: i64, ts: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -24,10 +22,7 @@ pub fn touch(pool: *PgPool, chat_id: i64, identity_id: i64, ts: i64) !void {
     _ = try stmt.step();
 }
 
-/// `true` if this identity has a `chat_members` row for this chat — the
-/// API layer's stand-in for "is this person actually part of this chat",
-/// gating who may create reminders/alerts/watches on their own behalf
-/// (see `api/router.zig`'s Phase 5a handlers).
+/// `true` if this identity has a `chat_members` row for this chat.
 pub fn isMember(pool: *PgPool, chat_id: i64, identity_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);
@@ -39,14 +34,8 @@ pub fn isMember(pool: *PgPool, chat_id: i64, identity_id: i64) bool {
     return stmt.step() catch false;
 }
 
-/// Ensures a `chat_members` row exists for (chat_id, identity_id), but
-/// unlike `touch` never bumps `last_seen` — for identities Warden only
-/// learned about *passively* (a reply target, a text-mention, a join/leave
-/// event, an admin-list entry: see `iface.Message.observed_users` and
-/// `MemberDirectoryToolAdapter` in `main.zig`), not because they actually
-/// said something just now. Keeps `last_seen` meaning "last time this
-/// person spoke", while still registering them so `search` below can find
-/// them.
+/// Ensures a `chat_members` row exists for (chat_id, identity_id), but unlike
+/// `touch` never bumps `last_seen`.
 pub fn ensureKnown(pool: *PgPool, chat_id: i64, identity_id: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -62,10 +51,7 @@ pub fn ensureKnown(pool: *PgPool, chat_id: i64, identity_id: i64) !void {
     _ = try stmt.step();
 }
 
-/// Own shape rather than reusing `chats.ChatRef` — the warden-ui API's
-/// "My Groups" listing needs `title` too, and adding it to `ChatRef`
-/// itself would ripple into every other caller's cleanup code for a field
-/// only this one query actually needs.
+/// Own shape rather than reusing `chats.ChatRef`.
 pub const MemberChatRef = struct {
     id: i64,
     native_chat_id: []const u8,
@@ -73,15 +59,7 @@ pub const MemberChatRef = struct {
     title: ?[]const u8,
 };
 
-/// Every chat this identity has a `chat_members` row in — the candidate
-/// set for the warden-ui API's "My Groups" listing (`GET /api/v1/chats?
-/// mine=true`, Phase 4): cheaper than live-checking admin status against
-/// *every* chat in the system, and correct since a live platform admin of
-/// a chat is necessarily also a member of it.
-///
-/// Excludes chats the bot has left (`left_at` set — see
-/// `store/chats.zig`'s `markLeft`), same reasoning as
-/// `admin_directory.listChats`'s doc comment.
+/// Every chat this identity has a `chat_members` row in.
 pub fn listChatsForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64) ![]MemberChatRef {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -119,9 +97,8 @@ pub const Member = struct {
     last_seen: ?i64,
 };
 
-/// Every known member of a chat (not filtered by query, unlike `search`)
-/// — backs the warden-ui API's `GET /api/v1/chats/:id/members` (Phase 4).
-/// Bots excluded, same convention `search` already uses.
+/// Every known member of a chat (not filtered by query, unlike `search`) —
+/// Backs the warden-ui API's `GET /api/v1/chats/:id/members`.
 pub fn listMembers(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, limit: i64) ![]Member {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -150,9 +127,7 @@ pub fn listMembers(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, li
 }
 
 /// Escapes `%`, `_`, and `\` for safe embedding in a `LIKE ... ESCAPE '\'`
-/// pattern, then wraps `query` in `%...%` for a substring match — so a
-/// query containing those characters searches for them literally instead of
-/// being interpreted as wildcards.
+/// pattern, then wraps `query` in `%...%` for a substring match.
 fn likePattern(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     try buf.append(allocator, '%');
@@ -165,12 +140,7 @@ fn likePattern(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
 }
 
 /// Fuzzy (case-insensitive substring) lookup of this chat's known
-/// participants by display name or `@username` — the backing query for the
-/// `find_chat_member` LLM tool (see `tools/find_chat_member.zig`). Matches
-/// against everyone `chat_members` has a row for, not just recent senders —
-/// see `ensureKnown`'s doc comment for the other ways someone ends up with a
-/// row here. Most-recently-active matches first (nulls, i.e. purely
-/// passively-observed members, last).
+/// participants by display name or `@username`.
 pub fn search(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, query: []const u8, limit: i64) ![]Match {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -202,43 +172,12 @@ pub fn search(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, query: 
     return out.toOwnedSlice(allocator);
 }
 
-pub fn getTokens(pool: *PgPool, chat_id: i64, identity_id: i64, default: i64) i64 {
-    const db = pool.acquire() catch return default;
-    defer pool.release(db);
-
-    var stmt = db.prepare("SELECT tokens FROM chat_members WHERE chat_id = $1 AND identity_id = $2;") catch return default;
-    defer stmt.finalize();
-    stmt.bindInt64(1, chat_id);
-    stmt.bindInt64(2, identity_id);
-    const has_row = stmt.step() catch return default;
-    if (!has_row) return default;
-    return stmt.columnInt64(0);
-}
-
-/// Unlike the old SQLite `settings.setTokens` (a plain `UPDATE`, which
-/// silently affected zero rows for a user who'd never sent a message), this
-/// upserts — a `chat_members` row is guaranteed to exist afterward.
-pub fn setTokens(pool: *PgPool, chat_id: i64, identity_id: i64, value: i64) !void {
-    const db = try pool.acquire();
-    defer pool.release(db);
-
-    var stmt = try db.prepare(
-        \\INSERT INTO chat_members (chat_id, identity_id, tokens) VALUES ($1, $2, $3)
-        \\ON CONFLICT (chat_id, identity_id) DO UPDATE SET tokens = excluded.tokens;
-    );
-    defer stmt.finalize();
-    stmt.bindInt64(1, chat_id);
-    stmt.bindInt64(2, identity_id);
-    stmt.bindInt64(3, value);
-    _ = try stmt.step();
-}
-
 const testing = std.testing;
 const test_support = @import("test_support.zig");
 const identities = @import("identities.zig");
 const chats = @import("chats.zig");
 
-test "getTokens defaults when no row exists; setTokens upserts even for a never-seen user" {
+test "touch creates a chat_members row and updates last_seen" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -247,24 +186,11 @@ test "getTokens defaults when no row exists; setTokens upserts even for a never-
     const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
     const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
 
-    try testing.expectEqual(@as(i64, 0), getTokens(&pool, chat_id, identity_id, 0));
-
-    try setTokens(&pool, chat_id, identity_id, 5);
-    try testing.expectEqual(@as(i64, 5), getTokens(&pool, chat_id, identity_id, 0));
-}
-
-test "touch creates a chat_members row and updates last_seen without touching tokens" {
-    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
-    defer db.close();
-    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
-    defer pool.deinitTestWrap();
-
-    const chat_id = try chats.upsertChat(&pool, .telegram, "1", null, null);
-    const identity_id = try identities.getOrCreateMinimal(&pool, .telegram, "42", "alice", null, false, 1000);
-
-    try setTokens(&pool, chat_id, identity_id, 3);
+    try testing.expect(!isMember(&pool, chat_id, identity_id));
     try touch(&pool, chat_id, identity_id, 2000);
-    try testing.expectEqual(@as(i64, 3), getTokens(&pool, chat_id, identity_id, 0));
+    try testing.expect(isMember(&pool, chat_id, identity_id));
+    try touch(&pool, chat_id, identity_id, 3000);
+    try testing.expect(isMember(&pool, chat_id, identity_id));
 }
 
 test "ensureKnown registers a member without claiming they've ever actually spoken" {

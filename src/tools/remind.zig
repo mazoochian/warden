@@ -76,11 +76,6 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
     if (reminder_format.parseDuration(duration_str) != null) {
         return std.fmt.allocPrint(ctx.allocator, "Reminder #{d} set for {s} from now.", .{ id, duration_str });
     }
-    // A weekday name (unlike the bare-clock-time case just below) silently
-    // applies a default time-of-day when the caller didn't give one
-    // (`reminder_format.parseWeekdayWhen`'s doc comment) — echo the actual
-    // resolved date/time/weekday back rather than the raw input text so
-    // that default isn't a surprise.
     if (reminder_format.parseWeekdayWhen(duration_str, ctx.now) != null) {
         const local = civil_time.localFromUnix(due_at, 0);
         const date_str = civil_time.formatDate(ctx.allocator, local, .ymd);

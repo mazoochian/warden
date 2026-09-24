@@ -1,18 +1,10 @@
 //! A deliberately small, hand-rolled XML parser for the specific stanza
 //! shapes XMPP's client-server protocol needs — same "purpose-built, not
-//! general" philosophy as `../../features/feed_parse.zig`'s RSS/Atom parser: no
-//! namespace handling (`xmlns` is just another attribute), no DTD/comment/
+//! general" philosophy as `../../features/feed_parse.zig`'s RSS/Atom parser:
+//! no namespace handling (`xmlns` is just another attribute), no DTD/comment/
 //! CDATA support, and both attribute quote styles plus the five standard
-//! entities and numeric character references, since those genuinely appear
-//! in real servers' output.
-//!
-//! Operates on a complete in-memory buffer rather than a true streaming
-//! reader: `client.zig` accumulates bytes from the socket into a
-//! growing buffer and repeatedly calls `parseElement`, which returns
-//! `error.Incomplete` (not a real error) until the buffer holds one full
-//! top-level element — the caller reads more bytes and retries. This keeps
-//! the parser itself simple and independently testable against fixed
-//! strings.
+//! entities and numeric character references, since those genuinely appear in
+//! real servers' output.
 
 const std = @import("std");
 
@@ -36,9 +28,7 @@ pub const Element = struct {
         return null;
     }
 
-    /// First direct child element with this name, if any — doesn't look
-    /// inside grandchildren (every stanza shape this parser targets only
-    /// ever needs one level of nesting to inspect at a time).
+    /// First direct child element with this name, if any.
     pub fn child(self: Element, name: []const u8) ?Element {
         for (self.children) |node| switch (node) {
             .element => |e| if (std.mem.eql(u8, e.name, name)) return e,
@@ -61,9 +51,7 @@ pub const Element = struct {
 
 pub const ParseError = error{ Incomplete, Malformed } || std.mem.Allocator.Error;
 
-/// Owns the arena every allocation in `element` came from — mirrors
-/// `std.json.Parsed(T)`, the pattern `platform/matrix/types.zig` already uses
-/// for parsed results elsewhere in this codebase.
+/// Owns the arena every allocation in `element` came from.
 pub const ParsedElement = struct {
     arena: std.heap.ArenaAllocator,
     element: Element,
@@ -143,8 +131,7 @@ fn parseAttrs(allocator: std.mem.Allocator, buf: []const u8, pos: usize) ParseEr
 }
 
 /// Parses one element (its name, attributes, and — if not self-closing —
-/// children up to its matching end tag). `pos` must point just past the
-/// element's opening `<`.
+/// children up to its matching end tag).
 fn parseElementBody(allocator: std.mem.Allocator, buf: []const u8, pos: usize) ParseError!struct { element: Element, next: usize } {
     const name_res = try parseName(buf, pos);
     const name = try allocator.dupe(u8, name_res.name);
@@ -184,11 +171,8 @@ fn parseElementBody(allocator: std.mem.Allocator, buf: []const u8, pos: usize) P
     }
 }
 
-/// Parses one complete top-level element (e.g. `<message>...</message>`,
-/// `<iq .../>`) from the start of `buf`, skipping leading whitespace.
-/// `error.Incomplete` means `buf` doesn't yet hold a full element — the
-/// normal outcome mid-stream, not a real failure; the caller should read
-/// more bytes and retry with the same (or a longer) buffer.
+/// Parses one complete top-level element (e.g. `<message>...</message>`, `<iq
+/// .../>`) from the start of `buf`, skipping leading whitespace.
 pub fn parseElement(child_allocator: std.mem.Allocator, buf: []const u8) ParseError!ParsedElement {
     var arena = std.heap.ArenaAllocator.init(child_allocator);
     errdefer arena.deinit();
@@ -225,9 +209,7 @@ pub const ParsedOpenTag = struct {
 };
 
 /// Parses a start tag that is never expected to self-close or have its
-/// matching end tag show up in the same buffer — the XMPP stream root
-/// (`<stream:stream ...>`), which stays open for the connection's whole
-/// lifetime. Skips a leading `<?xml ... ?>` declaration if present.
+/// matching end tag show up in the same buffer.
 pub fn parseStreamOpenTag(child_allocator: std.mem.Allocator, buf: []const u8) ParseError!ParsedOpenTag {
     var arena = std.heap.ArenaAllocator.init(child_allocator);
     errdefer arena.deinit();
@@ -243,9 +225,8 @@ pub fn parseStreamOpenTag(child_allocator: std.mem.Allocator, buf: []const u8) P
     return .{ .arena = arena, .open = .{ .name = name, .attrs = attrs_res.attrs }, .consumed = attrs_res.next };
 }
 
-/// Unescapes the five standard XML entities plus numeric character
-/// references (`&#NN;`/`&#xNN;`) — generous on the inbound-decode side
-/// since we don't control what a real server sends.
+/// Unescapes the five standard XML entities plus numeric character references
+/// (`&#NN;`/`&#xNN;`).
 fn decodeEntities(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, raw, '&') == null) return allocator.dupe(u8, raw);
 

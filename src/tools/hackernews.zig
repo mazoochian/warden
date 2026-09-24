@@ -58,9 +58,7 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
     return formatHits(ctx.allocator, body);
 }
 
-/// Renders hits as numbered "title / link / stats" blocks. Ask-HN style
-/// stories have no external URL; the discussion link covers those. Split
-/// out for offline testing.
+/// Renders hits as numbered "title / link / stats" blocks.
 fn formatHits(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
     var parsed = try json.parseFromSlice(
         SearchResponse,

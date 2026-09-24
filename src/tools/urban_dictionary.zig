@@ -56,9 +56,7 @@ fn execute(ctx: registry.ToolContext, input_json: []const u8) anyerror![]const u
     return formatEntries(ctx.allocator, body, parsed.value.term);
 }
 
-/// Renders the top definitions. Urban Dictionary cross-links terms with
-/// [square brackets] inline; those are stripped for readability. Split out
-/// for offline testing.
+/// Renders the top definitions.
 fn formatEntries(allocator: std.mem.Allocator, body: []const u8, term: []const u8) ![]const u8 {
     var parsed = try json.parseFromSlice(
         UrbanResponse,

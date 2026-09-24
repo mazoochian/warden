@@ -7,27 +7,12 @@ const messages = @import("../store/messages.zig");
 const user_settings = @import("../store/user_settings.zig");
 
 /// Bound on how many rows one monitored chat can contribute to a single
-/// bulletin -- so one noisy chat can't drown out every other monitored
-/// chat's own activity. Same "belt-and-suspenders bound" reasoning as
-/// `chat_summary.zig`'s `max_unread_fetch`.
+/// bulletin.
 const per_chat_limit: i64 = 200;
 
 const default_lookback_hours: i64 = 24;
 
-/// `get_bulletin`'s implementation: gathers raw, id-tagged message text
-/// from every chat the owner has marked as monitored (`set_chat_monitoring`
-/// / `chat_settings.monitor_importance`), grouped by chat and ordered by
-/// importance, for the calling model to rank and turn into an actual
-/// bulletin itself -- no LLM call happens in here (same "just fetch, model
-/// summarizes" shape `tools/catch_me_up.zig` already establishes).
-///
-/// `hours = null` uses the owner's `last_bulletin_ts` cursor (or the last
-/// `default_lookback_hours` if a bulletin has never been generated before),
-/// and advances that cursor to `now` as a side effect -- same "the read has
-/// a side effect" precedent `chat_summary.fetchUnread`'s mark-as-read
-/// already sets. An explicit `hours` is a stateless ad-hoc probe: it never
-/// touches the cursor, so asking "what happened in the last 3 hours" can't
-/// disturb the next on-demand bulletin's own window.
+/// `get_bulletin`'s implementation.
 pub fn gather(pool: *PgPool, allocator: std.mem.Allocator, owner_identity_id: i64, hours: ?i64, now: i64) ![]const u8 {
     const monitored = try chat_settings.listMonitored(pool, allocator, .telegram_user, owner_identity_id);
     if (monitored.len == 0) {

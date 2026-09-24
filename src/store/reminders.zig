@@ -4,16 +4,7 @@ const PgPool = @import("pool.zig").PgPool;
 const Platform = @import("../platform/interface.zig").Platform;
 
 /// A reminder due for delivery, joined with `chats` for the native chat id
-/// `connector.sendMessage` needs — the delivery path never touches the
-/// internal `chats.id`. `platform` lets the caller pick the matching
-/// connector once more than one is active (see `chats.ChatRef`'s doc
-/// comment for the same reasoning). `due_at`/`recur_interval_seconds` let
-/// the caller (`checkAndSendDueReminders`) decide whether to mark this
-/// delivered for good or reschedule it (see `reschedule`).
-/// The internal `chat_id` rides along beside `native_chat_id` because the
-/// announcement path needs it to read this chat's `autopin_announcements`
-/// setting, which (like every other `chat_settings` row) is keyed by the
-/// internal id; sending itself still only ever uses `native_chat_id`.
+/// `connector.sendMessage` needs.
 pub const DueReminder = struct {
     id: i64,
     chat_id: i64,
@@ -25,24 +16,13 @@ pub const DueReminder = struct {
     kind: Kind,
 };
 
-/// What a row in this table *is*, as opposed to how it's scheduled — see
-/// the `0035_announcements.sql` migration comment. `.reminder` is the
-/// original, pre-Phase-16 behavior and the value every row predating the
-/// column was backfilled with; `.announcement` is a chat admin's scheduled
-/// broadcast (ROADMAP.md's Phase 16), which shares this table because the
-/// scheduling half — "post this text into this chat at this absolute time,
-/// optionally every N seconds" — is exactly the problem reminders already
-/// solved. The differences are entirely presentational: the delivery
-/// prefix, which list command shows it, and who's allowed to create one.
-/// That's why this is a column rather than a parallel subsystem.
+/// What a row in this table *is*, as opposed to how it's scheduled — see the
+/// `0035_announcements.sql` migration comment.
 pub const Kind = enum {
     reminder,
     announcement,
 
-    /// Parsed leniently: an unrecognized value degrades to `.reminder` (the
-    /// pre-existing behavior) rather than failing the read, the same
-    /// `stringToEnum(...) orelse` convention `DueReminder.platform` already
-    /// uses for `chats.platform`.
+    /// Parsed leniently: an unrecognized value degrades to `.reminder`.
     pub fn fromDb(text: []const u8) Kind {
         return std.meta.stringToEnum(Kind, text) orelse .reminder;
     }
@@ -53,12 +33,7 @@ pub const Kind = enum {
 };
 
 /// One row for `/reminders` — `due_at` is an absolute unix timestamp; the
-/// caller formats it relative to its own `now`. `recur_interval_seconds`
-/// set means this reminder repeats (see `reminder_format.formatInterval`
-/// for rendering it back to shorthand). `identity_id` is who set it — the
-/// caller uses it to render `due_at` in *that* person's own timezone/format
-/// (see `store/user_settings.zig`), since a chat's pending reminders can
-/// belong to several people.
+/// caller formats it relative to its own `now`.
 pub const PendingReminder = struct {
     id: i64,
     identity_id: i64,
@@ -68,9 +43,7 @@ pub const PendingReminder = struct {
     kind: Kind,
 };
 
-/// Enough to authorize a `/remind cancel` — the requester must be either
-/// this reminder's own creator (`identity_id`) or the bot owner, and it must
-/// belong to the chat the cancel command was issued in.
+/// Enough to authorize a `/remind cancel`.
 pub const Reminder = struct {
     id: i64,
     chat_id: i64,
@@ -79,19 +52,14 @@ pub const Reminder = struct {
     kind: Kind,
 };
 
-/// `recur_interval_seconds` null creates a normal one-off reminder; set,
-/// it creates a recurring one (see the `0003_reminders_recurrence.sql`
-/// migration comment). Kept as the `.reminder`-only front door so the
-/// dozen-odd existing call sites (the `/remind` command, the `set_reminder`
-/// LLM tool, the `/menu` wizard, the web API) don't all have to name a kind
-/// they'd never vary.
+/// `recur_interval_seconds` null creates a normal one-off reminder; set, it
+/// creates a recurring one.
 pub fn create(pool: *PgPool, chat_id: i64, identity_id: i64, message: []const u8, due_at: i64, recur_interval_seconds: ?i64) !i64 {
     return createOfKind(pool, chat_id, identity_id, message, due_at, recur_interval_seconds, .reminder);
 }
 
 /// `create` with an explicit `kind` — the announcement path's entry point
-/// (see `Kind`). Everything else about the row, and every query below, is
-/// identical between the two kinds by design.
+/// (see `Kind`).
 pub fn createOfKind(pool: *PgPool, chat_id: i64, identity_id: i64, message: []const u8, due_at: i64, recur_interval_seconds: ?i64, kind: Kind) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -113,8 +81,7 @@ pub fn createOfKind(pool: *PgPool, chat_id: i64, identity_id: i64, message: []co
 }
 
 /// Every undelivered reminder whose `due_at` has passed, across all chats —
-/// the poll loop calls this once per cycle (see `checkAndSendDueReminders`
-/// in `main.zig`).
+/// the poll loop calls this once per cycle.
 pub fn dueUndelivered(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]DueReminder {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -156,8 +123,7 @@ pub fn markDelivered(pool: *PgPool, id: i64, now: i64) !void {
 }
 
 /// Advances a recurring reminder's `due_at` to `new_due_at` (see
-/// `reminder_format.nextOccurrence`) instead of marking it delivered, so it
-/// stays pending and fires again next cycle.
+/// `reminder_format.nextOccurrence`) instead of marking it delivered.
 pub fn reschedule(pool: *PgPool, id: i64, new_due_at: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -169,10 +135,7 @@ pub fn reschedule(pool: *PgPool, id: i64, new_due_at: i64) !void {
     _ = try stmt.step();
 }
 
-/// One row for the web API's `GET /api/v1/reminders` — identity-scoped
-/// (not chat-scoped like `PendingReminder`/`listPending` above, which back
-/// the bot's own in-chat `/reminders`), so each row carries its own chat
-/// context for a "my reminders across every chat" view.
+/// One row for the web API's `GET /api/v1/reminders` — identity-scoped.
 pub const PendingReminderForIdentity = struct {
     id: i64,
     chat_id: i64,
@@ -182,27 +145,19 @@ pub const PendingReminderForIdentity = struct {
     recur_interval_seconds: ?i64,
 };
 
-/// Pending reminders for one identity, optionally narrowed to one chat —
-/// see `PendingReminderForIdentity`'s doc comment for why this is a
-/// separate query from `listPending` rather than a filter on top of it.
-/// Hard-filtered to `kind = 'reminder'` (not parameterized like
-/// `listPending`): this backs the web panel's personal "my reminders"
-/// view, and a scheduled announcement is a chat-level admin object that
-/// happens to share the table, not one of the caller's own reminders. The
-/// panel therefore has no announcement surface at all yet — a deliberate
-/// gap, noted in ROADMAP.md's Phase 16 rather than half-built here.
-pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]PendingReminderForIdentity {
+/// Pending reminders for one identity, optionally narrowed to one chat.
+pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]PendingReminderForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
         \\SELECT r.id, r.chat_id, c.title, r.message, EXTRACT(EPOCH FROM r.due_at)::bigint, r.recur_interval_seconds
         \\FROM reminders r JOIN chats c ON c.id = r.chat_id
-        \\WHERE r.delivered_at IS NULL AND r.kind = 'reminder' AND r.identity_id = $1 AND ($2::bigint IS NULL OR r.chat_id = $2)
+        \\WHERE r.delivered_at IS NULL AND r.kind = 'reminder' AND r.identity_id = ANY($1::bigint[]) AND ($2::bigint IS NULL OR r.chat_id = $2)
         \\ORDER BY r.due_at ASC;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
     if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
 
     var out: std.ArrayList(PendingReminderForIdentity) = .empty;
@@ -219,13 +174,7 @@ pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id:
     return out.toOwnedSlice(allocator);
 }
 
-/// Pending (undelivered) rows of one `kind` for one chat, soonest-due
-/// first. `kind` is a required argument rather than an optional filter on
-/// purpose: every caller (the `/reminders` list, the briefing, the `/menu`
-/// reminder picker, the `set_reminder` tool's own listing, `/announce
-/// list`) wants exactly one of the two and would be showing the wrong thing
-/// if it silently got both — so the type system makes each of them say
-/// which.
+/// Pending (undelivered) rows of one `kind` for one chat, soonest-due first.
 pub fn listPending(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, kind: Kind) ![]PendingReminder {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -255,10 +204,6 @@ pub fn listPending(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, ki
 
 /// `null` if no such pending (undelivered) row exists — used by `/remind
 /// cancel`/`/announce cancel` to check chat/creator/kind before deleting.
-/// Deliberately not filtered by kind here: the caller checks
-/// `Reminder.kind` itself so it can tell "no such id" apart from "that id
-/// is the other kind", which are different mistakes and deserve different
-/// replies.
 pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Reminder {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -379,7 +324,7 @@ test "a recurring reminder reschedules instead of being marked delivered" {
     try testing.expectEqual(@as(usize, 1), due_again.len);
 }
 
-test "listForIdentity scopes by identity across chats, optionally narrowed to one" {
+test "listForIdentities scopes by identity across chats, optionally narrowed to one" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -410,15 +355,15 @@ test "listForIdentity scopes by identity across chats, optionally narrowed to on
     _ = try create(&pool, chat2, alice, "alice in chat2", 3000, null);
     _ = try create(&pool, chat1, bob, "bob in chat1", 4000, null);
 
-    const alice_all = try listForIdentity(&pool, a, alice, null);
+    const alice_all = try listForIdentities(&pool, a, &.{alice}, null);
     try testing.expectEqual(@as(usize, 2), alice_all.len);
     try testing.expectEqualStrings("Chat One", alice_all[0].chat_title.?);
 
-    const alice_chat1 = try listForIdentity(&pool, a, alice, chat1);
+    const alice_chat1 = try listForIdentities(&pool, a, &.{alice}, chat1);
     try testing.expectEqual(@as(usize, 1), alice_chat1.len);
     try testing.expectEqualStrings("alice in chat1", alice_chat1[0].message);
 
-    const bob_all = try listForIdentity(&pool, a, bob, null);
+    const bob_all = try listForIdentities(&pool, a, &.{bob}, null);
     try testing.expectEqual(@as(usize, 1), bob_all.len);
 }
 
@@ -457,13 +402,12 @@ test "announcements share the table but never leak into a reminder listing (or v
     try testing.expectEqual(@as(?i64, 86400), anns[0].recur_interval_seconds);
 
     // `get` is deliberately kind-agnostic so the caller can tell "wrong
-    // kind" apart from "no such id" — see its doc comment.
+    // Kind" apart from "no such id".
     const fetched = (try get(&pool, a, ann_id)) orelse return error.TestExpectedValue;
     try testing.expectEqual(Kind.announcement, fetched.kind);
 
     // The delivery query returns both kinds (one loop delivers everything),
-    // tagged so the sender can pick the right framing, and carries the
-    // internal chat_id the auto-pin lookup needs.
+    // tagged so the sender can pick the right framing.
     const due = try dueUndelivered(&pool, a, 2000);
     try testing.expectEqual(@as(usize, 2), due.len);
     var saw_announcement = false;
@@ -474,7 +418,7 @@ test "announcements share the table but never leak into a reminder listing (or v
     try testing.expect(saw_announcement);
 
     // The web panel's identity-scoped view stays reminders-only.
-    const mine = try listForIdentity(&pool, a, identity_id, null);
+    const mine = try listForIdentities(&pool, a, &.{identity_id}, null);
     try testing.expectEqual(@as(usize, 1), mine.len);
     try testing.expectEqual(rem_id, mine[0].id);
 }

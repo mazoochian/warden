@@ -1,12 +1,7 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// One per-category monthly budget (ROADMAP.md's Phase 17) -- see the
-/// `0030_budgets.sql` migration comment for why "monthly" is fixed rather
-/// than a selectable period. Chat-wide, not per-identity: a shared budget
-/// a whole chat sees, same "policy" tier `chat_settings.system_prompt`
-/// already treats as owner-only to change (see `main.zig`'s
-/// `handleBudgetCommand`).
+/// One per-category monthly budget.
 pub const Budget = struct {
     id: i64,
     chat_id: i64,
@@ -16,8 +11,7 @@ pub const Budget = struct {
 };
 
 /// Upserts the budget for `(chat_id, category)` -- `/budget set` always
-/// replaces whatever was there before, same "one call does create-or-
-/// update" shape `chat_settings.setSystemPromptOverride` already uses.
+/// replaces whatever was there before.
 pub fn set(pool: *PgPool, chat_id: i64, category: []const u8, amount_cents: i64, currency: []const u8) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -60,13 +54,7 @@ pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![
     return out.toOwnedSlice(allocator);
 }
 
-/// `null` if no such budget exists. Exists for the web API's
-/// `DELETE /api/v1/budgets/:id`, which addresses a budget by its integer
-/// id rather than by category the way `/budget remove <category>` does --
-/// a category is free text that can contain spaces and `&`, and this
-/// file's own `remove` below would need it percent-decoded out of a URL
-/// path/query to match; an integer id sidesteps that encoding question
-/// entirely and matches every other `DELETE /api/v1/...:id` in the API.
+/// `null` if no such budget exists.
 pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Budget {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -84,7 +72,7 @@ pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Budget {
     };
 }
 
-/// Companion to `getById` above -- see its doc comment for why the web
+/// Companion to `getById` above
 /// API deletes by id while the bot's `/budget remove` deletes by category.
 pub fn removeById(pool: *PgPool, id: i64) !void {
     const db = try pool.acquire();
@@ -158,8 +146,7 @@ test "getById/removeById address a budget by integer id, independent of its cate
     defer arena.deinit();
     const a = arena.allocator();
 
-    // A category whose text would need percent-decoding to survive a URL --
-    // exactly the case `getById`'s doc comment exists for.
+    // A category whose text would need percent-decoding to survive a URL.
     const id = try set(&pool, chat1, "eating out & drinks", 25000, "USD");
 
     const fetched = (try getById(&pool, a, id)).?;

@@ -18,8 +18,7 @@ const system_prompt =
 const history_window = 300;
 
 /// Local (non-LLM) stats + an LLM-written summary of recent discussion,
-/// grounded in this chat's own logged history. If nothing's been said
-/// since the last digest, skips the LLM call entirely.
+/// grounded in this chat's own logged history.
 pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: registry.ToolContext, pool: *PgPool, chat_id: i64) ![]const u8 {
     const s = try stats.compute(pool, allocator, chat_id, 5);
 
@@ -40,24 +39,7 @@ pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: regis
     return buf.writer.buffered();
 }
 
-/// The one LLM round trip both `generate` and `summarizeWindow` make —
-/// factored out so the "group summary" surface (ROADMAP.md's Phase 16)
-/// really is the same summarizer with a different window, not a second,
-/// subtly-divergent prompt that drifts from this one over time. `pub`
-/// since `features/chat_summary.zig`'s `/tdsummary` reuses this exact
-/// same "who: text" -> prose call for the personal-account connector's
-/// unread-messages summary rather than growing its own near-duplicate
-/// prompt.
-///
-/// Not a live chat reply anyone's watching mid-generation (no ticker/
-/// Progress consumer is wired up here anyway — `.{}` below is a no-op
-/// Progress), so streaming would have zero visible effect either way.
-/// show_thinking=false regardless of any chat's own preference — a wall
-/// of chain-of-thought has no place in a summary. max_tokens
-/// matches ChatRequest's own pre-existing default (unset before this
-/// became an explicit `toolcall.run` parameter). Returns "" on failure
-/// (already logged) rather than propagating: a digest without its summary
-/// paragraph is still worth sending, and the caller decides what to say.
+/// The one LLM round trip both `generate` and `summarizeWindow` make.
 pub fn summarizeHistory(provider: llm.Provider, allocator: std.mem.Allocator, ctx: registry.ToolContext, history: []const u8) []const u8 {
     const prompt = std.fmt.allocPrint(
         allocator,
@@ -72,26 +54,10 @@ pub fn summarizeHistory(provider: llm.Provider, allocator: std.mem.Allocator, ct
 }
 
 /// Hard ceiling on how many messages a windowed summary pulls into the
-/// model's context — the same belt-and-suspenders bound
-/// `messages.recentSinceFormatted`'s own doc comment describes, so a very
-/// chatty chat over a long window can't produce an unbounded prompt.
+/// model's context.
 const window_message_limit = 500;
 
-/// The `/summary [hours]` surface (ROADMAP.md's Phase 16 "group
-/// summaries"): the same summarizer as `generate`, but over an explicit
-/// wall-clock window the caller names, and with no stats header and no
-/// "since the last digest" cursor involved.
-///
-/// Deliberately *not* folded into `generate`: `/digest` answers "what's
-/// happened since I last sent a digest" and moves that cursor as a side
-/// effect, so asking it for an ad-hoc "summarize the last 3 hours" would
-/// either lie about the window or quietly disturb the digest schedule.
-/// This one is read-only and stateless — ask for any window, as often as
-/// you like, without touching `chat_settings.last_digest_ts`.
-///
-/// Returns a "nothing to summarize" sentence (and skips the LLM call
-/// entirely) for an empty window, same short circuit `generate` makes for
-/// an empty chat.
+/// The `/summary [hours]` surface.
 pub fn summarizeWindow(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -150,16 +116,10 @@ test "generate skips the LLM call entirely when the chat has no messages" {
 const identities = @import("../store/identities.zig");
 const messages_store = @import("../store/messages.zig");
 
-/// Retries for this background summariser's own model call. A fixed
-/// default rather than the `WARDEN_LLM_MAX_RETRIES` dynamic value: this
-/// runs on a scheduler with no chat, no user waiting and no
-/// `LlmDynamicSettings` in scope, and a scheduled summary that quietly
-/// retries a congested endpoint is exactly the desired behaviour.
+/// Retries for this background summariser's own model call.
 const default_max_retries: u32 = @intCast(@import("../config.zig").Config.default_llm_max_retries);
 
-/// Records the prompt it was handed and answers with a fixed sentence, so a
-/// test can assert both "the model was asked at all" and "it was asked
-/// about the right messages".
+/// Records the prompt it was handed and answers with a fixed sentence.
 const StubProvider = struct {
     last_prompt: ?[]const u8 = null,
     answer: []const u8 = "They argued about tabs versus spaces.",

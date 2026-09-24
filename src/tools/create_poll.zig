@@ -9,12 +9,9 @@ const Args = struct {
     options: []const []const u8,
 };
 
-/// ROADMAP.md's Phase 16 (group/Telegram quality-of-life): lets the user
-/// ask for a poll in natural language ("make a poll asking pizza or
-/// sushi") and get a real native poll, not just a text listing --
-/// `/poll` (see `main.zig`) covers the explicit-command case, this covers
-/// the natural-language one, both landing on the same
-/// `Connector.sendPoll`.
+/// Of-life): lets the user ask for a poll in natural language ("make a poll
+/// asking pizza or sushi") and get a real native poll, not just a text
+/// listing.
 pub const tool: registry.ToolDef = .{
     .name = "create_poll",
     .description = "Creates and sends a native poll to this chat with a question and 2-10 answer options. Use this whenever the user asks for a poll, a vote, or to poll the group on something.",

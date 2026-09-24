@@ -1,12 +1,8 @@
-//! Minimal `multipart/form-data` request-body parser — Zig's `std.http`
-//! has no built-in support for this (only the outgoing multipart builder
+//! Minimal `multipart/form-data` request-body parser — Zig's `std.http` has
+//! no built-in support for this (only the outgoing multipart builder
 //! `http_util.zig`/`platform/telegram/client.zig` use, for uploading files
-//! *to* a platform), and Convert (Phase 5c) is the first endpoint that needs
-//! to *receive* a file upload. Deliberately hand-rolled and scoped to exactly
-//! what a browser's `FormData` + `fetch` actually produces (RFC 2046's
-//! general case — nested multipart, non-ASCII header folding, etc. — is
-//! never emitted by that path), matching this codebase's existing preference
-//! for a small purpose-built parser over a general-purpose dependency.
+//! *to* a platform), and the convert endpoint is the first that needs to
+//! *receive* a file upload.
 const std = @import("std");
 
 pub const Part = struct {
@@ -20,10 +16,7 @@ pub const ParseError = error{
     MalformedBody,
 };
 
-/// Extracts the `boundary=` parameter from a `Content-Type` header value
-/// (e.g. `multipart/form-data; boundary=----WebKitFormBoundaryXYZ`, quotes
-/// around the value optional). `null` if the header isn't multipart or has
-/// no boundary parameter.
+/// Extracts the `boundary=` parameter from a `Content-Type` header value.
 pub fn boundaryFromContentType(content_type: []const u8) ?[]const u8 {
     if (!std.ascii.startsWithIgnoreCase(content_type, "multipart/")) return null;
 
@@ -44,11 +37,8 @@ pub fn boundaryFromContentType(content_type: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Parses every part out of `body`, given the boundary already extracted
-/// from the request's `Content-Type` header. Every returned slice borrows
-/// from `body` directly — no copies, no allocator needed, matching
-/// `readJsonBodyLeaky`'s "borrow from the arena-owned raw body" convention
-/// elsewhere in this file.
+/// Parses every part out of `body`, given the boundary already extracted from
+/// the request's `Content-Type` header.
 pub fn parse(allocator: std.mem.Allocator, body: []const u8, boundary: []const u8) ![]Part {
     const delim = try std.fmt.allocPrint(allocator, "--{s}", .{boundary});
     defer allocator.free(delim);
@@ -94,8 +84,7 @@ pub fn parse(allocator: std.mem.Allocator, body: []const u8, boundary: []const u
 }
 
 /// Finds `key="value"` inside a `Content-Disposition` header value (e.g.
-/// `form-data; name="file"; filename="photo.png"`) — same quoted-parameter
-/// shape as `boundaryFromContentType`'s, just scanning for a specific key.
+/// `form-data; name="file"; filename="photo.png"`).
 fn dispositionParam(header_value: []const u8, key: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, header_value, ';');
     while (it.next()) |raw_param| {

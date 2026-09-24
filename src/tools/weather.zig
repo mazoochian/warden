@@ -70,11 +70,7 @@ pub const Reading = struct {
     weather_code: i64,
 };
 
-/// Geocodes `location` then fetches its current conditions — the
-/// fetch-and-parse core `execute` formats into prose, and
-/// `features/alerts.zig` reads `temperature_2m` from directly, skipping the
-/// tool-call loop for something this simple. Null (not an error) when the
-/// location doesn't geocode to anything.
+/// Geocodes `location` then fetches its current conditions.
 pub fn fetchWeather(allocator: std.mem.Allocator, io: std.Io, location: []const u8) !?Reading {
     var client: http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
@@ -132,8 +128,6 @@ pub fn fetchWeather(allocator: std.mem.Allocator, io: std.Io, location: []const 
 
 /// WMO weather codes (https://open-meteo.com/en/docs), condensed to the
 /// common cases.
-/// Also used by `main.zig`'s briefing weather line, so a briefing and the
-/// weather tool describe the same conditions identically.
 pub fn describeWeatherCode(code: i64) []const u8 {
     return switch (code) {
         0 => "clear sky",

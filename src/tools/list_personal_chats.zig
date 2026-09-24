@@ -8,13 +8,7 @@ const Args = struct {
 };
 
 /// Companion to `summarize_unread_chat`/`send_personal_message` for the
-/// personal-account (TDLib) connector: lets the owner ask "which chats do
-/// I have with X" or "what chats do you see" and get a real answer instead
-/// of having to type `/tdchats`/`/tdsearch` themselves -- also how the
-/// model finds a chat's exact id/title before calling
-/// `send_personal_message`, when the owner's phrasing alone doesn't
-/// resolve cleanly. Same "sink formats its own listing, no nested LLM
-/// call" shape as `catch_me_up`/`summarize_unread_chat`.
+/// personal-account (TDLib) connector.
 pub const tool: registry.ToolDef = .{
     .name = "list_personal_chats",
     .description = "Lists the personal Telegram account's known chats (id and title). Pass `query` to narrow it to chats whose title contains that text (case-insensitive); omit it to list everything. Use this to find a chat's exact id/title before calling send_personal_message or summarize_unread_chat, or when the owner just asks what chats exist.",

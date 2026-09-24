@@ -1,14 +1,7 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// One saved prompt (ROADMAP.md's Phase 19) -- `/template use <name>`
-/// resends `text` (plus any extra text the user typed) as a question
-/// through the normal Q&A pipeline, same `handleModeCommand` path
-/// `/eli5`/`/brainstorm` already use. Chat-scoped and shared, same
-/// "creator or the bot owner may remove" model `notes.zig`/
-/// `command_aliases.zig` already use -- see the latter's doc comment for
-/// the same "saving over an existing name reassigns ownership" tradeoff
-/// this makes too.
+/// One saved prompt.
 pub const PromptTemplate = struct {
     id: i64,
     chat_id: i64,

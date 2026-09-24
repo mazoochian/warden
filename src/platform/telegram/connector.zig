@@ -12,10 +12,8 @@ const log = @import("../../log.zig").scoped("telegram");
 pub const TelegramConnector = struct {
     client: raw.Client,
     offset: i64 = 0,
-    /// Own identity from `getMe`, fetched lazily on the first poll (and
-    /// retried each poll until it succeeds). Both live in the client's
-    /// long-lived allocator, not the per-poll arena, since messages keep
-    /// getting checked against them for the process lifetime.
+    /// Own identity from `getMe`, fetched lazily on the first poll (and retried
+    /// each poll until it succeeds).
     self_id: ?i64 = null,
     self_id_str: ?[]const u8 = null,
     self_username: ?[]const u8 = null,
@@ -46,13 +44,7 @@ pub const TelegramConnector = struct {
         log.notice("resolved self identity: id={d} username={?s}", .{ user.id, self.self_username });
     }
 
-    /// Builds just the ancestor `Identity` from a Bot API `User` — the
-    /// common core `profileFromUser` below extends with Telegram-specific
-    /// fields, and what's used directly for users Warden only glimpses in
-    /// passing (a reply target, a text-mention, a join/leave event, an
-    /// admin-list entry) where the fuller `TelegramProfile` extension isn't
-    /// worth building. Allocates out of `allocator` — same short-lived
-    /// poll-cycle arena `profileFromUser`'s callers use.
+    /// Builds just the ancestor `Identity` from a Bot API `User`.
     fn identityFromUser(allocator: std.mem.Allocator, user: types.User, now: i64) !Identity {
         const native_id = try std.fmt.allocPrint(allocator, "{d}", .{user.id});
         const display_name = if (user.last_name) |last|
@@ -71,13 +63,10 @@ pub const TelegramConnector = struct {
         };
     }
 
-    /// Builds the ancestor `Identity` plus Telegram-specific extension from
-    /// a fully-parsed Bot API `User` (Telegram sends the whole `User`
-    /// object on every message's `from` field, not just id/username, so
-    /// this is available per-message, not just from `getMe`/`getChatMember`).
-    /// Allocates out of `allocator` — same short-lived poll-cycle arena the
-    /// rest of `pollFn` uses; `iface.Message.dupe` deep-copies it into the
-    /// per-task arena along with everything else.
+    /// Builds the ancestor `Identity` plus Telegram-specific extension from a
+    /// fully-parsed Bot API `User` (Telegram sends the whole `User` object on
+    /// every message's `from` field, not just id/username, so this is available
+    /// per-message, not just from `getMe`/`getChatMember`).
     fn profileFromUser(allocator: std.mem.Allocator, user: types.User, now: i64) !TelegramProfile {
         return .{
             .identity = try identityFromUser(allocator, user, now),
@@ -93,11 +82,7 @@ pub const TelegramConnector = struct {
     }
 
     /// Translates a `my_chat_member` update into a synthetic `chat_left`
-    /// `iface.Message` — `null` if the status change isn't a departure
-    /// (e.g. the bot was just added, or promoted/demoted). Pulled out as
-    /// its own pure function (rather than inlined in `pollFn`) so it's
-    /// unit-testable without a live/mock HTTP client, matching
-    /// `attachmentFromMessage`/`observedUsersFromMessage`'s shape.
+    /// `iface.Message`.
     fn chatLeftMessageFromUpdate(allocator: std.mem.Allocator, cmu: types.ChatMemberUpdated, self_id_str: ?[]const u8) !?iface.Message {
         const is_left = std.mem.eql(u8, cmu.new_chat_member.status, "left") or
             std.mem.eql(u8, cmu.new_chat_member.status, "kicked");
@@ -110,16 +95,7 @@ pub const TelegramConnector = struct {
     }
 
     /// Translates a `my_chat_member` update into a synthetic chat-ingest-only
-    /// `iface.Message` — `null` unless the bot's new status is one that means
-    /// "present in this chat" (`member`/`administrator`/`creator`). This is
-    /// the only reliable ingestion signal for a channel: channels never
-    /// produce ordinary `message` updates (see `channel_post`'s branch in
-    /// `pollFn`), so without this, a channel the bot is added to as an admin
-    /// but that never gets posted in again would simply never become a
-    /// `chats` row. Idempotent to call on every such status change (not just
-    /// the very first) — `store/chats.zig`'s `upsertChat` is itself an
-    /// upsert, so re-ingesting on e.g. a promotion from member to
-    /// administrator is harmless.
+    /// `iface.Message`.
     fn chatJoinedMessageFromUpdate(allocator: std.mem.Allocator, cmu: types.ChatMemberUpdated) !?iface.Message {
         const status = cmu.new_chat_member.status;
         const is_present = std.mem.eql(u8, status, "member") or
@@ -135,12 +111,8 @@ pub const TelegramConnector = struct {
         };
     }
 
-    /// Translates a `channel_post`/`edited_channel_post` update into a
-    /// synthetic chat-ingest-only `iface.Message` — channel posts have no
-    /// `from` user (a channel post is anonymous-by-channel, not by a
-    /// member) and are never conversational content the LLM should answer,
-    /// so this deliberately only ever carries chat metadata. Same
-    /// testability reasoning as `chatLeftMessageFromUpdate`.
+    /// Translates a `channel_post`/`edited_channel_post` update into a synthetic
+    /// chat-ingest-only `iface.Message`.
     fn channelPostIngestMessage(allocator: std.mem.Allocator, cp: types.Message) !iface.Message {
         return .{
             .chat_id = try std.fmt.allocPrint(allocator, "{d}", .{cp.chat.id}),
@@ -151,11 +123,9 @@ pub const TelegramConnector = struct {
         };
     }
 
-    /// Translates a service message carrying `migrate_to_chat_id` (basic
-    /// group upgraded to a supergroup) into a synthetic
-    /// `migrated_to_native_chat_id` `iface.Message` — `null` for any
-    /// ordinary message. Same testability reasoning as
-    /// `chatLeftMessageFromUpdate`.
+    /// Translates a service message carrying `migrate_to_chat_id` (basic group
+    /// upgraded to a supergroup) into a synthetic `migrated_to_native_chat_id`
+    /// `iface.Message` — `null` for any ordinary message.
     fn migrationMessageFromMessage(allocator: std.mem.Allocator, msg: types.Message) !?iface.Message {
         const new_id = msg.migrate_to_chat_id orelse return null;
         return .{
@@ -165,12 +135,7 @@ pub const TelegramConnector = struct {
         };
     }
 
-    /// Collects every identity a message reveals *besides* its own sender —
-    /// see `iface.Message.observed_users`'s doc comment for why this exists.
-    /// Skips the bot's own account (it's not a "participant" worth
-    /// surfacing to `find_chat_member`) and de-dupes by native id within
-    /// this one message, since e.g. a reply target who's also
-    /// text-mentioned in the same message would otherwise appear twice.
+    /// Collects every identity a message reveals *besides* its own sender.
     fn observedUsersFromMessage(self: *TelegramConnector, allocator: std.mem.Allocator, msg: types.Message, now: i64) ![]Identity {
         var out: std.ArrayList(Identity) = .empty;
 
@@ -204,14 +169,7 @@ pub const TelegramConnector = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    /// Just this message's `new_chat_members`, if any -- see
-    /// `iface.Message.joined_users`'s doc comment for why this is a
-    /// separate signal from `observedUsersFromMessage` above (which
-    /// includes the same identities for roster-registration purposes, but
-    /// mixed in with replies/mentions/leaves). Skips the bot's own account
-    /// being added -- same "not a participant worth surfacing" reasoning
-    /// `observedUsersFromMessage` already uses, and specifically not a
-    /// "welcome a new member" event either.
+    /// Just this message's `new_chat_members`, if any.
     fn joinedUsersFromMessage(self: *TelegramConnector, allocator: std.mem.Allocator, msg: types.Message, now: i64) ![]Identity {
         const joined = msg.new_chat_members orelse return &.{};
         var out: std.ArrayList(Identity) = .empty;
@@ -223,10 +181,8 @@ pub const TelegramConnector = struct {
     }
 
     /// Telegram sends at most one of photo/document/voice/audio/video per
-    /// message; checked in this order since only `photo` is ever a list
-    /// (multiple resolutions) rather than a single object. Duped into
-    /// `allocator` — the same short-lived poll-cycle arena the rest of
-    /// `pollFn` uses.
+    /// message; checked in this order since only `photo` is ever a list (multiple
+    /// resolutions) rather than a single object.
     fn attachmentFromMessage(allocator: std.mem.Allocator, msg: types.Message) !?iface.Attachment {
         if (msg.document) |doc| {
             return .{
@@ -271,8 +227,7 @@ pub const TelegramConnector = struct {
     }
 
     /// Case-insensitive "@botusername" scan with a right-boundary check, so
-    /// "@warden_bot" matches but "@warden_bot2" (a different account) does
-    /// not. Telegram usernames are [A-Za-z0-9_], so ASCII handling suffices.
+    /// "@warden_bot" matches but "@warden_bot2" (a different account) does not.
     fn textMentions(text: []const u8, username: []const u8) bool {
         if (username.len == 0) return false;
         var start: usize = 0;
@@ -327,9 +282,7 @@ pub const TelegramConnector = struct {
         .setCommands = setCommandsFn,
     };
 
-    /// Telegram's documented hard cap on `sendMessage`'s `text` — see
-    /// `Connector.VTable.maxMessageLength`'s doc comment for how this feeds
-    /// into the cross-platform minimum.
+    /// Telegram's documented hard cap on `sendMessage`'s `text`.
     const max_message_length = 4096;
 
     fn maxMessageLengthFn(ptr: *anyopaque) usize {
@@ -357,9 +310,8 @@ pub const TelegramConnector = struct {
 
         self.ensureSelfInfo(allocator);
 
-        // 25s rather than 30: middleboxes commonly reap connections at a
-        // round 30s of idleness, which is exactly how long a quiet long
-        // poll holds the connection with zero bytes moving.
+        // 25s rather than 30: middleboxes commonly reap connections at a round 30s of
+        // idleness.
         var updates = try self.client.getUpdates(allocator, self.offset, 25);
         defer updates.deinit();
 
@@ -437,10 +389,8 @@ pub const TelegramConnector = struct {
                 (if (from.username) |u| try allocator.dupe(u8, u) else null)
             else
                 null;
-            // Telegram puts a caption typed alongside a photo/document/
-            // voice/audio/video in `caption`, never `text` — the two are
-            // mutually exclusive on any given message, so this always picks
-            // the one Telegram actually populated.
+            // Telegram puts a caption typed alongside a photo/document/ voice/audio/video
+            // in `caption`, never `text`.
             const text = if (msg.text) |t|
                 try allocator.dupe(u8, t)
             else if (msg.caption) |c|
@@ -520,11 +470,7 @@ pub const TelegramConnector = struct {
         return std.fmt.allocPrint(allocator, "{d}", .{sent_id});
     }
 
-    /// Shared by `sendChoicePromptFn`/`editChoicePromptFn` — translates
-    /// `iface.Choice`'s emoji+label+value into `raw.Client.Button`'s
-    /// text+callback_data ("{emoji} {label}" as the button text, matching
-    /// this platform's existing convention of putting the emoji directly on
-    /// the button rather than only in the message body).
+    /// Shared by `sendChoicePromptFn`/`editChoicePromptFn`.
     fn choicesToButtons(allocator: std.mem.Allocator, choices: []const iface.Choice) !std.ArrayList(raw.Client.Button) {
         var buttons: std.ArrayList(raw.Client.Button) = .empty;
         for (choices) |c| {
@@ -618,14 +564,8 @@ pub const TelegramConnector = struct {
         return self.client.demoteChatMember(allocator, try parseId(chat_id), try parseId(user_id));
     }
 
-    /// Decodes the `MemberPermission` bitmask into Telegram's
-    /// `ChatPermissions` fields — see `interface.zig`'s
-    /// `MemberPermission.telegram_enforceable` doc comment for which bits
-    /// have no Bot API field at all (`read`/`reactions`/`edit_tags`); those
-    /// are silently ignored here (stored in the bitmask, never enforced),
-    /// logged once per call so the gap stays visible without spamming the
-    /// chat itself — `main.zig`'s `/permission` reply is what tells the
-    /// admin who ran the command, this is just the operational trail.
+    /// Decodes the `MemberPermission` bitmask into Telegram's `ChatPermissions`
+    /// fields.
     fn restrictChatMemberPermissionsFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, permission_bits: u32, until_unix_time: i64) anyerror!void {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         const unenforceable = permission_bits & ~iface.MemberPermission.telegram_enforceable;
@@ -647,11 +587,10 @@ pub const TelegramConnector = struct {
         });
     }
 
-    /// `/tag` — see `raw.Client.setChatAdministratorCustomTitle`'s doc
-    /// comment for the "target must already be a chat administrator"
-    /// limitation; the resulting `error.TelegramApiError` propagates
-    /// as-is so `main.zig`'s `handleTagCommand` can surface a clear
-    /// platform-limitation message instead of a generic failure.
+    /// `/tag`. Telegram only allows a custom title on a chat administrator;
+    /// the resulting `error.TelegramApiError` propagates as-is.
+    /// `handleTagCommand` can surface a clear platform-limitation message instead
+    /// of a generic failure.
     fn setChatAdminTitleFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, title: []const u8) anyerror!void {
         const self: *TelegramConnector = @ptrCast(@alignCast(ptr));
         return self.client.setChatAdministratorCustomTitle(allocator, try parseId(chat_id), try parseId(user_id), title);

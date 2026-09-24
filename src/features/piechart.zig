@@ -5,10 +5,7 @@ const stats = @import("../store/stats.zig");
 pub const Slice = struct { label: []const u8, count: i64 };
 
 /// Builds the renderer's input straight from `stats.compute`'s existing
-/// ranked top-users query — no new DB query needed for the "top
-/// participants" pie chart. Falls back to the raw platform id as the label
-/// when a participant has no username set, same fallback `stats.zig`'s own
-/// text formatting already uses.
+/// ranked top-users query.
 pub fn slicesFromTopUsers(allocator: std.mem.Allocator, top_users: []const stats.TopUser) ![]Slice {
     const out = try allocator.alloc(Slice, top_users.len);
     for (top_users, 0..) |u, i| {
@@ -17,11 +14,8 @@ pub fn slicesFromTopUsers(allocator: std.mem.Allocator, top_users: []const stats
     return out;
 }
 
-/// Shells out to the bundled Node renderer (`tools/piechart/render.mjs`)
-/// and returns the resulting PNG bytes. Requires `node` on PATH — mirrors
-/// `wordcloud.zig`'s `render` pipeline exactly (JSON temp file -> node
-/// script using `@napi-rs/canvas` -> PNG bytes), just with a different
-/// script and payload shape.
+/// Shells out to the bundled Node renderer (`tools/piechart/render.mjs`) and
+/// returns the resulting PNG bytes.
 pub fn render(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, slices: []const Slice) ![]const u8 {
     if (slices.len == 0) return error.NoSlices;
 

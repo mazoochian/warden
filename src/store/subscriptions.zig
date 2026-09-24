@@ -1,13 +1,7 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// One recurring cost (ROADMAP.md's Phase 17) -- a read-only ledger of
-/// "what am I paying for and how much per month total," not a second
-/// reminder-firing scheduler; see the `0031_subscriptions.sql` migration
-/// comment for why "remind me when it's due" is deliberately left to the
-/// existing `/remind every <interval> <message>` instead of duplicated
-/// here. Chat-scoped and shared, same "creator or the bot owner may
-/// remove" model `notes.zig`/`expenses.zig` already use.
+/// One recurring cost.
 pub const Subscription = struct {
     id: i64,
     chat_id: i64,
@@ -70,12 +64,7 @@ pub fn listForChat(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![
     return out.toOwnedSlice(allocator);
 }
 
-/// One row for the web API's `GET /api/v1/subscriptions` -- identity-
-/// scoped (not chat-scoped like `Subscription`/`listForChat` above, which
-/// back the bot's own in-chat `/subscription list`), so each row carries
-/// its own chat context for a "everything I'm paying for, across every
-/// chat" view, same shape as `expenses.ExpenseForIdentity`/
-/// `notes.NoteForIdentity`.
+/// One row for the web API's `GET /api/v1/subscriptions` -- identity- scoped.
 pub const SubscriptionForIdentity = struct {
     id: i64,
     chat_id: i64,
@@ -87,11 +76,8 @@ pub const SubscriptionForIdentity = struct {
     created_at: i64,
 };
 
-/// Subscriptions added by one identity, optionally narrowed to one chat
-/// -- see `SubscriptionForIdentity`'s doc comment for why this is a
-/// separate query from `listForChat`. Oldest first, same ordering
-/// `listForChat` already uses.
-pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]SubscriptionForIdentity {
+/// Subscriptions added by one identity, optionally narrowed to one chat.
+pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]SubscriptionForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);
 
@@ -99,11 +85,11 @@ pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id:
         \\SELECT s.id, s.chat_id, c.title, s.name, s.amount_cents, s.currency, s.interval_days,
         \\       EXTRACT(EPOCH FROM s.created_at)::bigint
         \\FROM subscriptions s JOIN chats c ON c.id = s.chat_id
-        \\WHERE s.identity_id = $1 AND ($2::bigint IS NULL OR s.chat_id = $2)
+        \\WHERE s.identity_id = ANY($1::bigint[]) AND ($2::bigint IS NULL OR s.chat_id = $2)
         \\ORDER BY s.created_at ASC;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
     if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
 
     var out: std.ArrayList(SubscriptionForIdentity) = .empty;
@@ -122,9 +108,8 @@ pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id:
     return out.toOwnedSlice(allocator);
 }
 
-/// `null` if no such subscription exists -- used by `/subscription
-/// remove` to check chat/creator before deleting, same pattern as
-/// `notes.get`.
+/// `null` if no such subscription exists -- used by `/subscription remove` to
+/// check chat/creator before deleting, same pattern as `notes.get`.
 pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Subscription {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -156,10 +141,7 @@ pub fn remove(pool: *PgPool, id: i64) !void {
 }
 
 /// `amount_cents` expressed as a 30-day-month equivalent -- e.g. a $84/yr
-/// subscription is ~$7/mo. Approximate by construction (see this file's
-/// own doc comment on `interval_days` not being calendar-aware) but good
-/// enough to answer "what's my total monthly recurring spend," the
-/// actual point of tracking these at all.
+/// subscription is ~$7/mo.
 pub fn monthlyEquivalentCents(amount_cents: i64, interval_days: i64) i64 {
     return @divTrunc(amount_cents * 30, interval_days);
 }
@@ -207,7 +189,7 @@ test "monthlyEquivalentCents normalizes weekly/monthly/yearly intervals to a 30-
     try testing.expectEqual(@as(i64, 3000), monthlyEquivalentCents(700, 7)); // $7/wk -> $30/mo
 }
 
-test "listForIdentity scopes by identity across chats, optionally narrowed to one" {
+test "listForIdentities scopes by identity across chats, optionally narrowed to one" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -226,16 +208,16 @@ test "listForIdentity scopes by identity across chats, optionally narrowed to on
     _ = try create(&pool, chat2, alice, "Spotify", 999, "USD", 30, 2000);
     _ = try create(&pool, chat1, bob, "Hulu", 799, "USD", 30, 3000);
 
-    const alice_all = try listForIdentity(&pool, a, alice, null);
+    const alice_all = try listForIdentities(&pool, a, &.{alice}, null);
     try testing.expectEqual(@as(usize, 2), alice_all.len);
     try testing.expectEqualStrings("Netflix", alice_all[0].name); // oldest first
     try testing.expectEqualStrings("Chat One", alice_all[0].chat_title.?);
     try testing.expectEqual(@as(?[]const u8, null), alice_all[1].chat_title); // chat2 has no title
 
-    const alice_chat2 = try listForIdentity(&pool, a, alice, chat2);
+    const alice_chat2 = try listForIdentities(&pool, a, &.{alice}, chat2);
     try testing.expectEqual(@as(usize, 1), alice_chat2.len);
     try testing.expectEqualStrings("Spotify", alice_chat2[0].name);
 
-    const bob_all = try listForIdentity(&pool, a, bob, null);
+    const bob_all = try listForIdentities(&pool, a, &.{bob}, null);
     try testing.expectEqual(@as(usize, 1), bob_all.len); // never sees alice's
 }

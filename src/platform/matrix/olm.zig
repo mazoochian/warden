@@ -1,19 +1,8 @@
-//! Zig binding for libolm — the audited C library implementing the Olm
-//! (per-device Double Ratchet) and Megolm (group ratchet) protocols Matrix
-//! E2E encryption is built on. Deliberately bound via FFI rather than
-//! reimplemented, same load-bearing decision `ROADMAP.md`'s Phase 2b
-//! documents: hand-rolling a cryptographic ratchet from scratch carries
-//! real risk of subtly-wrong crypto with no way to catch it short of a
-//! security review and test vectors libolm has already been through.
-//!
-//! libolm's C API is a set of opaque object types the *caller* allocates
-//! raw memory for (queried via `olm_account_size()` etc.) and the library
-//! initializes in place — a good fit for a thin Zig wrapper: each type here
-//! owns its backing `[]u8` (allocated via a caller-supplied allocator) and
-//! is deinitialized by clearing (zeroing key material) then freeing it.
-//! `olm_error()` is the sentinel nearly every C function returns on
-//! failure; `check` below turns that into a Zig error, logging the
-//! object-specific `_last_error()` string libolm provides for diagnosis.
+//! Zig binding for libolm — the audited C library implementing the Olm (per-
+//! device Double Ratchet) and Megolm (group ratchet) protocols Matrix E2E
+//! encryption is built on. Deliberately bound via FFI rather than
+//! reimplemented, same load-bearing decision `ROADMAP.md`'s documents: hand-
+//! rolling a cryptographic ratchet from scratch carries real.
 
 const std = @import("std");
 
@@ -129,8 +118,7 @@ const c = struct {
 pub const OlmError = error{OlmOperationFailed};
 
 /// Fills `buf` with cryptographically secure random bytes via the runtime's
-/// own entropy source (`std.Io.random`) — libolm never generates its own
-/// randomness, every operation that needs it takes a caller-supplied buffer.
+/// own entropy source (`std.Io.random`).
 fn fillRandom(io: std.Io, allocator: std.mem.Allocator, len: usize) ![]u8 {
     const buf = try allocator.alloc(u8, len);
     io.random(buf);
@@ -138,8 +126,7 @@ fn fillRandom(io: std.Io, allocator: std.mem.Allocator, len: usize) ![]u8 {
 }
 
 /// Wraps an OlmAccount: this device's long-term Ed25519 identity key, its
-/// Curve25519 identity key, and its pool of one-time/fallback Curve25519
-/// keys published for other devices to establish Olm sessions with.
+/// Curve25519 identity key.
 pub const Account = struct {
     mem: []u8,
     ptr: *c.CAccount,
@@ -173,9 +160,7 @@ pub const Account = struct {
     }
 
     /// Encrypts and base64-encodes the account's full state (identity key,
-    /// private one-time keys, ...) under `key` — persist the result so a
-    /// restart doesn't lose the ability to decrypt already-shared room
-    /// keys.
+    /// private one-time keys, ...) under `key`.
     pub fn pickle(self: *Account, allocator: std.mem.Allocator, key: []const u8) ![]u8 {
         const len = c.olm_pickle_account_length(self.ptr);
         const out = try allocator.alloc(u8, len);
@@ -193,10 +178,8 @@ pub const Account = struct {
         return out;
     }
 
-    /// Base64-encoded Ed25519 signature over `message`, using this
-    /// account's identity signing key — every published one-time/fallback
-    /// key and every to-device room-key share is signed with this so the
-    /// receiving device can verify authenticity.
+    /// Base64-encoded Ed25519 signature over `message`, using this account's
+    /// identity signing key.
     pub fn sign(self: *Account, allocator: std.mem.Allocator, message: []const u8) ![]u8 {
         const len = c.olm_account_signature_length(self.ptr);
         const out = try allocator.alloc(u8, len);
@@ -213,9 +196,7 @@ pub const Account = struct {
         _ = try check(c.olm_account_generate_one_time_keys(self.ptr, count, random.ptr, random.len), errString(.account, self.ptr));
     }
 
-    /// JSON: `{"curve25519": {"<key id>": "<base64 key>", ...}}` — the
-    /// *unpublished* one-time keys only; call `markKeysAsPublished` after a
-    /// successful `/keys/upload` so they aren't offered again.
+    /// JSON: `{"curve25519": {"<key id>": "<base64 key>", ...}}`.
     pub fn oneTimeKeysJson(self: *Account, allocator: std.mem.Allocator) ![]u8 {
         const len = c.olm_account_one_time_keys_length(self.ptr);
         const out = try allocator.alloc(u8, len);
@@ -232,14 +213,8 @@ pub const Account = struct {
         return c.olm_account_max_number_of_one_time_keys(self.ptr);
     }
 
-    /// Only one fallback key is ever stored — a fresh call replaces
-    /// whatever fallback key was there before. A fallback key is the
-    /// one-time-key pool's backstop: if every real one-time key has been
-    /// claimed and this device has no fallback published, every future
-    /// `/keys/claim` against it fails outright (a documented failure mode
-    /// in mature Matrix clients too — see matrix-rust-sdk#281) rather than
-    /// the account's own `/keys/upload` traffic ever being able to
-    /// recover on its own.
+    /// Only one fallback key is ever stored — a fresh call replaces whatever
+    /// fallback key was there before.
     pub fn generateFallbackKey(self: *Account, allocator: std.mem.Allocator, io: std.Io) !void {
         const random = try fillRandom(io, allocator, c.olm_account_generate_fallback_key_random_length(self.ptr));
         defer allocator.free(random);
@@ -247,10 +222,7 @@ pub const Account = struct {
     }
 
     /// JSON: `{"curve25519": {"<key id>": "<base64 key>"}}` — same shape
-    /// `oneTimeKeysJson` returns, but for the (single) unpublished
-    /// fallback key. Uses `olm_account_unpublished_fallback_key`, not the
-    /// deprecated `olm_account_fallback_key` (per libolm's own header
-    /// comment).
+    /// `oneTimeKeysJson` returns, but for the (single) unpublished fallback key.
     pub fn fallbackKeyJson(self: *Account, allocator: std.mem.Allocator) ![]u8 {
         const len = c.olm_account_unpublished_fallback_key_length(self.ptr);
         const out = try allocator.alloc(u8, len);
@@ -259,19 +231,15 @@ pub const Account = struct {
         return out;
     }
 
-    /// Call once the *previous* fallback key is confirmed no longer
-    /// needed (a new one has been published and enough time has passed
-    /// that no in-flight `/keys/claim` could still be using the old one).
+    /// Call once the *previous* fallback key is confirmed no longer needed (a new
+    /// one has been published and enough time has passed that no in-flight
+    /// `/keys/claim` could still be using the old one).
     pub fn forgetOldFallbackKey(self: *Account) void {
         c.olm_account_forget_old_fallback_key(self.ptr);
     }
 };
 
-/// Wraps an OlmSession: a per-device Double Ratchet session, used to
-/// encrypt/decrypt the to-device `m.room.encrypted` (algorithm
-/// `m.olm.v1.curve25519-aes-sha2`) messages room keys are shared through —
-/// not room messages themselves (see `OutboundGroupSession`/
-/// `InboundGroupSession` for those).
+/// Wraps an OlmSession: a per-device Double Ratchet session.
 pub const Session = struct {
     mem: []u8,
     ptr: *c.CSession,
@@ -290,9 +258,8 @@ pub const Session = struct {
         return .{ .mem = mem, .ptr = ptr };
     }
 
-    /// Starts a new session from an incoming PRE_KEY message (the first
-    /// message on a session we didn't initiate) — `one_time_key_message`
-    /// is destroyed (overwritten) by libolm.
+    /// Starts a new session from an incoming PRE_KEY message (the first message
+    /// on a session we didn't initiate).
     pub fn createInbound(allocator: std.mem.Allocator, account: *Account, one_time_key_message: []u8) !Session {
         const mem = try allocator.alloc(u8, c.olm_session_size());
         errdefer allocator.free(mem);
@@ -331,9 +298,8 @@ pub const Session = struct {
         return out;
     }
 
-    /// 0 (PRE_KEY, includes the one-time-key handshake) or 1 (ordinary
-    /// ratcheted message) — matches Matrix's `m.olm.v1.curve25519-aes-sha2`
-    /// ciphertext `type` field.
+    /// 0 (PRE_KEY, includes the one-time-key handshake) or 1 (ordinary ratcheted
+    /// message).
     pub fn nextMessageType(self: *Session) !usize {
         return check(c.olm_encrypt_message_type(self.ptr), errString(.session, self.ptr));
     }
@@ -344,23 +310,12 @@ pub const Session = struct {
         const len = c.olm_encrypt_message_length(self.ptr, plaintext.len);
         const out = try allocator.alloc(u8, len);
         errdefer allocator.free(out);
-        // `len` is an upper bound, not necessarily the exact ciphertext
-        // size — returning the whole buffer unconditionally would pass a
-        // garbage-suffixed message to the receiving end's decrypt (found
-        // live: this was silently corrupting every round trip).
+        // `len` is an upper bound, not necessarily the exact ciphertext size.
         const actual_len = try check(c.olm_encrypt(self.ptr, plaintext.ptr, plaintext.len, random.ptr, random.len, out.ptr, out.len), errString(.session, self.ptr));
         return allocator.realloc(out, actual_len);
     }
 
     /// `message` is destroyed (overwritten) by libolm.
-    /// `message` is destroyed (overwritten) by libolm, per its own
-    /// contract — but so is `olm_decrypt_max_plaintext_length`'s input,
-    /// undocumented as a shared concern between the two calls: sizing the
-    /// output first via that call and then decrypting the *same* buffer
-    /// silently corrupts the second call's input (found live: decrypt
-    /// failed with BAD_MESSAGE_FORMAT even on a byte-for-byte-correct
-    /// ciphertext). A scratch copy absorbs the sizing call's destruction so
-    /// the real decrypt still gets pristine bytes.
     pub fn decrypt(self: *Session, allocator: std.mem.Allocator, message_type: usize, message: []u8) ![]u8 {
         const size_probe = try allocator.dupe(u8, message);
         defer allocator.free(size_probe);
@@ -373,10 +328,7 @@ pub const Session = struct {
     }
 };
 
-/// This device's outbound Megolm session for one room — encrypts every
-/// `m.room.message` sent to that room after the session's key has been
-/// shared (via Olm-encrypted to-device messages) with every other device
-/// in the room.
+/// This device's outbound Megolm session for one room.
 pub const OutboundGroupSession = struct {
     mem: []u8,
     ptr: *c.COutboundGroupSession,
@@ -432,9 +384,7 @@ pub const OutboundGroupSession = struct {
         return out;
     }
 
-    /// The base64 ratchet key shared with room members (via per-device Olm
-    /// sessions, as an `m.room_key` to-device event) so they can decrypt
-    /// this session's future messages.
+    /// The base64 ratchet key shared with room members.
     pub fn sessionKey(self: *OutboundGroupSession, allocator: std.mem.Allocator) ![]u8 {
         const len = c.olm_outbound_group_session_key_length(self.ptr);
         const out = try allocator.alloc(u8, len);
@@ -444,10 +394,8 @@ pub const OutboundGroupSession = struct {
     }
 };
 
-/// A received Megolm session for one room — decrypts `m.room.encrypted`
-/// room-timeline events. One per `(room, sender device, session id)`: a
-/// room with N actively-posting devices needs N inbound sessions to read
-/// everyone's messages.
+/// A received Megolm session for one room — decrypts `m.room.encrypted` room-
+/// timeline events.
 pub const InboundGroupSession = struct {
     mem: []u8,
     ptr: *c.CInboundGroupSession,
@@ -489,9 +437,7 @@ pub const InboundGroupSession = struct {
         message_index: u32,
     };
 
-    /// `message` is destroyed (overwritten) by libolm — see `Session.
-    /// decrypt`'s doc comment on why the sizing call also needs its own
-    /// scratch copy rather than reusing the same buffer twice.
+    /// `message` is destroyed (overwritten) by libolm.
     pub fn decrypt(self: *InboundGroupSession, allocator: std.mem.Allocator, message: []u8) !Decrypted {
         const size_probe = try allocator.dupe(u8, message);
         defer allocator.free(size_probe);
@@ -512,14 +458,7 @@ pub const InboundGroupSession = struct {
         return out;
     }
 
-    /// Re-exports this session's ratchet key at `message_index`, in the
-    /// format `olm_import_inbound_group_session`/(client-side)
-    /// `m.forwarded_room_key` expects — the mirror image of `create`,
-    /// which takes an `m.room_key`'s `session_key`. Used to answer an
-    /// `m.room_key_request`: forwarding a session we already hold to
-    /// another of the account's own devices that missed the original
-    /// share (to-device delivery is best-effort, not guaranteed — see
-    /// `State.handleRoomKeyRequest`'s doc comment).
+    /// Re-exports this session's ratchet key at `message_index`.
     pub fn exportAt(self: *InboundGroupSession, allocator: std.mem.Allocator, message_index: u32) ![]u8 {
         const len = c.olm_export_inbound_group_session_length(self.ptr);
         const out = try allocator.alloc(u8, len);
@@ -528,22 +467,15 @@ pub const InboundGroupSession = struct {
         return allocator.realloc(out, actual_len);
     }
 
-    /// The earliest message index this session can decrypt — export must
-    /// use this (or a later index), not a hardcoded 0: a session imported
-    /// partway through its lifetime (e.g. one this device only learned
-    /// about via a forwarded share) may never have known index 0 at all.
+    /// The earliest message index this session can decrypt — export must use this
+    /// (or a later index), not a hardcoded 0.
     pub fn firstKnownIndex(self: *InboundGroupSession) u32 {
         return c.olm_inbound_group_session_first_known_index(self.ptr);
     }
 };
 
-/// Ephemeral key-agreement object for one SAS (Short Authentication
-/// String, i.e. emoji/decimal) interactive device verification ceremony
-/// — see `verification.zig` for the Matrix-protocol layer built on
-/// top of this. Unlike every other type in this file, there's no
-/// `olm_pickle_sas`/`olm_unpickle_sas` — by design, a verification
-/// ceremony is a single ephemeral, process-lifetime-only object, never
-/// meant to survive a restart.
+/// Ephemeral key-agreement object for one SAS (Short Authentication String,
+/// i.e. emoji/decimal) interactive device verification ceremony.
 pub const Sas = struct {
     mem: []u8,
     ptr: *c.CSas,
@@ -576,26 +508,14 @@ pub const Sas = struct {
         return out;
     }
 
-    /// `their_key` is the other device's `m.key.verification.key`. Must be
-    /// called before `generateBytes`/`calculateMac` (libolm itself
-    /// enforces this, erroring `SAS_THEIR_KEY_NOT_SET` otherwise) —
-    /// scratch-copies its input defensively before the call, the same
-    /// "found live" caution `Session.decrypt`'s doc comment applies
-    /// elsewhere in this file: `sas.h` only documents `their_key` as
-    /// overwritten, not the MAC calls' `input`/`info`, but a pristine
-    /// caller-owned copy costs nothing and avoids relying on which calls
-    /// happen to be silent about a destructive contract.
+    /// `their_key` is the other device's `m.key.verification.key`.
     pub fn setTheirKey(self: *Sas, allocator: std.mem.Allocator, their_key: []const u8) !void {
         const their_key_mut = try allocator.dupe(u8, their_key);
         defer allocator.free(their_key_mut);
         _ = try check(c.olm_sas_set_their_key(self.ptr, their_key_mut.ptr, their_key_mut.len), errString(.sas, self.ptr));
     }
 
-    /// Derives `output_length` bytes from the shared secret via HKDF,
-    /// keyed by `info` (`verification.zig`'s `sasInfo` builds the
-    /// exact Matrix-spec info string) — the raw material the emoji/decimal
-    /// short authentication string is formatted from. `their_key` must
-    /// already be set.
+    /// Derives `output_length` bytes from the shared secret via HKDF.
     pub fn generateBytes(self: *Sas, allocator: std.mem.Allocator, info: []const u8, output_length: usize) ![]u8 {
         const out = try allocator.alloc(u8, output_length);
         errdefer allocator.free(out);
@@ -603,9 +523,7 @@ pub const Sas = struct {
         return out;
     }
 
-    /// `hkdf-hmac-sha256.v2` MAC (the modern, non-buggy variant — see
-    /// `verification.zig`'s module doc for why the older
-    /// `olm_sas_calculate_mac`/`_long_kdf` variants aren't bound at all).
+    /// `hkdf-hmac-sha256.v2` MAC.
     pub fn calculateMac(self: *Sas, allocator: std.mem.Allocator, input: []const u8, info: []const u8) ![]u8 {
         const len = c.olm_sas_mac_length(self.ptr);
         const out = try allocator.alloc(u8, len);
@@ -627,10 +545,7 @@ fn errString(kind: ObjKind, ptr: *anyopaque) [*:0]const u8 {
     };
 }
 
-/// Every libolm call funnels through here: `result == olm_error()` means
-/// failure, in which case the object-specific error string (already
-/// fetched by the caller via `errString`, since it has to happen while the
-/// object pointer's type is still known) is logged before returning.
+/// Every libolm call funnels through here.
 fn check(result: usize, last_error: [*:0]const u8) OlmError!usize {
     if (result == c.olm_error()) {
         std.log.err("olm operation failed: {s}", .{last_error});
@@ -671,9 +586,8 @@ test "Account one-time key generation produces the requested count" {
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, otks, ':');
     while (it.next()) |_| count += 1;
-    // 5 keys means 5 "key_id": "value" pairs, so at least 5 colons beyond
-    // the wrapping curve25519 object's own — a loose but simple sanity
-    // check that generation actually added keys, not an exact-count parse.
+    // 5 keys means 5 "key_id": "value" pairs, so at least 5 colons beyond the
+    // wrapping curve25519 object's own.
     try testing.expect(count > 5);
 }
 
@@ -767,9 +681,6 @@ test "Sas: both sides derive the same SAS bytes and the same MAC" {
     try alice.setTheirKey(testing.allocator, bob_pubkey);
     try bob.setTheirKey(testing.allocator, alice_pubkey);
 
-    // Same info string on both sides (in a real ceremony this is built
-    // identically by both parties from the agreed transaction — see
-    // `verification.zig`'s `sasInfo`), same derived bytes.
     const info = "test-sas-info-string";
     const alice_bytes = try alice.generateBytes(testing.allocator, info, 6);
     defer testing.allocator.free(alice_bytes);
@@ -786,11 +697,7 @@ test "Sas: both sides derive the same SAS bytes and the same MAC" {
 }
 
 // Test-only helpers for picking apart libolm's small hand-rolled-shape JSON
-// outputs (`{"curve25519": {"AAAAAA": "..."}}` / `{"curve25519": "..."}`) —
-// deliberately not a real JSON parser, mirroring `feed_parse.zig`'s
-// "good enough for what this needs" philosophy, since production code will
-// go through `std.json` against the actual Matrix API response shapes
-// instead of libolm's raw output.
+// outputs (`{"curve25519": {"AAAAAA": "..."}}` / `{"curve25519": "..."}`).
 fn extractJsonStringField(allocator: std.mem.Allocator, json: []const u8, field: []const u8) ![]u8 {
     var buf: [64]u8 = undefined;
     const needle = try std.fmt.bufPrint(&buf, "\"{s}\":\"", .{field});

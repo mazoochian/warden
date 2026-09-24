@@ -7,10 +7,7 @@ const Platform = @import("../platform/interface.zig").Platform;
 
 /// Typed replacement for the old stringly-typed per-chat `chat_settings` KV
 /// table (`digest_enabled`/`last_digest_ts`/`magic_word` used to be
-/// `key`/`value` string rows; now real columns). Also drops the old
-/// SQLite-era "empty string means unset" convention for `magic_word` — a
-/// real Postgres `NULL` now means unset, since `null`/`""` are no longer
-/// forced to collapse into the same thing the way SQLite's `columnText` did.
+/// `key`/`value` string rows; now real columns).
 pub fn getDigestEnabled(pool: *PgPool, chat_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);
@@ -63,10 +60,6 @@ pub fn setLastDigestTs(pool: *PgPool, chat_id: i64, ts: i64) !void {
     _ = try stmt.step();
 }
 
-/// Same shape as `getDigestEnabled`/`setDigestEnabled` above -- a separate
-/// pair rather than reusing the digest ones since a chat can opt into
-/// digests, briefings, both, or neither independently (see
-/// `0026_briefings.sql`).
 pub fn getBriefingEnabled(pool: *PgPool, chat_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);
@@ -147,11 +140,7 @@ pub fn setMagicWord(pool: *PgPool, chat_id: i64, word: ?[]const u8) !void {
     _ = try stmt.step();
 }
 
-/// This chat's explicit "reply on my behalf" override, or `null` if it just
-/// inherits the owner's global default (`user_settings.
-/// getEffectiveReplyAutonomyDefault`) — see `resolveReplyAutonomy` for the
-/// combined result callers actually want, and migration
-/// `0043_reply_autonomy.sql`'s doc comment for what each level means.
+/// This chat's explicit "reply on my behalf" override.
 pub fn getReplyAutonomy(pool: *PgPool, chat_id: i64) ?ReplyAutonomy {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -180,30 +169,17 @@ pub fn setReplyAutonomy(pool: *PgPool, chat_id: i64, value: ?ReplyAutonomy) !voi
 }
 
 /// The autonomy level a "reply on my behalf" draft for `chat_id` should
-/// actually use: this chat's override if it has one, else the owner's
-/// global default. The one function `features/`-layer code calling into
-/// this should use — `getReplyAutonomy`/`user_settings.
-/// getEffectiveReplyAutonomyDefault` individually are for the settings UI
-/// (which needs to show "unset, inheriting X" rather than just X) and for
-/// each other's tests.
+/// actually use.
 pub fn resolveReplyAutonomy(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, owner_identity_id: i64) ReplyAutonomy {
     if (getReplyAutonomy(pool, chat_id)) |override| return override;
     return user_settings.getEffectiveReplyAutonomyDefault(pool, allocator, owner_identity_id);
 }
 
 /// Owner-declared, static per-chat opt-in/override for the `get_bulletin`/
-/// `set_chat_monitoring`/`set_default_chat_monitoring` feature --
-/// deliberately NOT a classifier the bot computes by reading a chat's own
-/// content. See `0045_chat_monitoring.sql`/`0046_monitor_all_default.sql`.
-/// Same type as `user_settings.MonitorImportance` (aliased here so callers
-/// of this file don't need their own import of `user_settings.zig` just
-/// for the enum) -- see that type's doc comment for why `.off` is an
-/// explicit value rather than plain absence.
+/// `set_chat_monitoring`/`set_default_chat_monitoring` feature.
 pub const MonitorImportance = user_settings.MonitorImportance;
 
-/// This chat's own monitoring override, or `null` if it has none (falls
-/// back to the owner's global default -- see `resolveMonitorImportance`,
-/// the one callers outside this file/its tests should actually use).
+/// This chat's own monitoring override, or `null` if it has none.
 pub fn getMonitorImportance(pool: *PgPool, chat_id: i64) ?MonitorImportance {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -232,11 +208,7 @@ pub fn setMonitorImportance(pool: *PgPool, chat_id: i64, value: ?MonitorImportan
     _ = try stmt.step();
 }
 
-/// The monitoring level `chat_id` actually has: its own override if it has
-/// one, else the owner's global default (`user_settings.
-/// getEffectiveMonitorAllDefault`) -- same "override beats global default"
-/// combined result `resolveReplyAutonomy` already returns for reply
-/// autonomy.
+/// The monitoring level `chat_id` actually has.
 pub fn resolveMonitorImportance(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, owner_identity_id: i64) MonitorImportance {
     if (getMonitorImportance(pool, chat_id)) |override| return override;
     return user_settings.getEffectiveMonitorAllDefault(pool, allocator, owner_identity_id);
@@ -249,18 +221,7 @@ pub const MonitoredChat = struct {
     importance: MonitorImportance,
 };
 
-/// Every effectively-monitored chat on `platform` -- a chat's own override
-/// if it has one, else the owner's global default, excluding anything that
-/// resolves to `.off` either way (see `resolveMonitorImportance`) -- ordered
-/// highest importance first, then alphabetized by title within a tier.
-/// `get_bulletin`'s data source. A `LEFT JOIN` (not `chat_settings JOIN
-/// chats`) on purpose: once the global default can be non-`.off`, a chat
-/// that has never had a `chat_settings` row at all must still be able to
-/// surface here, resolved as "inherit the default" the same as an existing
-/// row whose `monitor_importance` is `NULL`. A chat with no `chats.title`
-/// yet (rare -- only before it's ever sent a message with fresh metadata)
-/// falls back to its native id so the bulletin always has something to
-/// label the chat with.
+/// Every effectively-monitored chat on `platform`.
 pub fn listMonitored(pool: *PgPool, allocator: std.mem.Allocator, platform: Platform, owner_identity_id: i64) ![]MonitoredChat {
     const default_effective = user_settings.getEffectiveMonitorAllDefault(pool, allocator, owner_identity_id);
 
@@ -292,18 +253,7 @@ pub fn listMonitored(pool: *PgPool, allocator: std.mem.Allocator, platform: Plat
 }
 
 /// Returns the per-chat system-prompt override duped into `allocator`, or
-/// `null` if unset (the caller falls back to `config.system_prompt`) — see
-/// the `0006_persona.sql` migration comment.
-/// `reply_autonomy`'s own per-chat system-prompt override — the
-/// ghostwriter voice used when drafting/auto-sending a reply *as the owner*
-/// through the personal-account connector.
-///
-/// Deliberately NOT `getSystemPromptOverride` (`/persona`), which the
-/// autonomy path used to read: `/persona` configures how Warden answers as
-/// *itself* in a chat, while this configures how it impersonates the owner,
-/// and the two want opposite things. Sharing one column meant that setting
-/// a persona anywhere silently made that chat's ghostwritten replies sound
-/// like a bot. `null` = use `main.zig`'s `default_reply_as_owner_prompt`.
+/// `null` if unset (the caller falls back to `config.system_prompt`).
 pub fn getReplyAutonomyPrompt(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ?[]const u8 {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -360,10 +310,7 @@ pub fn setSystemPromptOverride(pool: *PgPool, chat_id: i64, prompt: ?[]const u8)
 }
 
 /// Returns the per-chat welcome-message text duped into `allocator`, or
-/// `null` if unset (welcome messages are opt-in — see the
-/// `0028_welcome_message.sql` migration comment). May contain a literal
-/// `{name}` placeholder, substituted per new member by whichever caller
-/// sends it.
+/// `null` if unset.
 pub fn getWelcomeMessage(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ?[]const u8 {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -392,8 +339,7 @@ pub fn setWelcomeMessage(pool: *PgPool, chat_id: i64, text: ?[]const u8) !void {
 }
 
 /// Returns the per-chat show-thinking override, or `null` if unset (the
-/// caller falls back to `config.llm_show_thinking`) — see the
-/// `0007_show_thinking.sql` migration comment.
+/// caller falls back to `config.llm_show_thinking`).
 pub fn getShowThinkingOverride(pool: *PgPool, chat_id: i64) ?bool {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -666,9 +612,7 @@ test "show_thinking override round trips through true, false, and clears back to
 }
 
 /// Returns this chat's default location (the raw place name the user set,
-/// e.g. "Berlin") duped into `allocator`, or `null` if unset — see the
-/// `0034_default_location.sql` migration comment for why the text is stored
-/// rather than resolved coordinates.
+/// e.g. "Berlin") duped into `allocator`, or `null` if unset.
 pub fn getDefaultLocation(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ?[]const u8 {
     const db = pool.acquire() catch return null;
     defer pool.release(db);
@@ -696,16 +640,8 @@ pub fn setDefaultLocation(pool: *PgPool, chat_id: i64, location: ?[]const u8) !v
     _ = try stmt.step();
 }
 
-/// Whether this chat wants scheduled announcements pinned as they're
-/// posted (ROADMAP.md's Phase 16 auto-pin item) — false unless the chat
-/// explicitly opted in via `/autopin on`, same shape as
-/// `getDigestEnabled`/`getBriefingEnabled` and the same "off until asked"
-/// default as `welcome_message`.
-///
-/// The name is narrower than "auto-pin" on purpose: the only thing this
-/// ever pins is an announcement the bot itself posted, from a schedule a
-/// chat admin explicitly created. It is never a judgment about someone
-/// else's message — see `0036_autopin_announcements.sql`.
+/// Whether this chat wants scheduled announcements pinned as they're posted
+///.
 pub fn getAutopinAnnouncements(pool: *PgPool, chat_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);
@@ -732,11 +668,7 @@ pub fn setAutopinAnnouncements(pool: *PgPool, chat_id: i64, value: bool) !void {
     _ = try stmt.step();
 }
 
-/// Whether managerial commands (`/redact`, `/kick`, `/ban`, `/promote`,
-/// `/demote`, `/mute`, `/unmute`, `/photo`, `/title`, `/description`)
-/// default to `-s` (silent) in this chat without the flag being typed —
-/// ROADMAP.md's Phase 23. Off by default, same shape as
-/// `getAutopinAnnouncements`.
+/// Whether managerial commands.
 pub fn getSilentByDefault(pool: *PgPool, chat_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);
@@ -794,12 +726,7 @@ test "autopin_announcements is off until a chat opts in, and toggles back off" {
 }
 
 /// Whether this chat wants YouTube/Instagram/X video links auto-downloaded
-/// and reposted (ROADMAP.md's Phase 25) -- false unless a chat admin
-/// explicitly opted in via `/videodownload on`, same "off until asked"
-/// default as `getAutopinAnnouncements`/`welcome_message`. Off by default
-/// on purpose: unlike `keyword_alerts` (a word a user opts *themselves*
-/// into tracking), this changes what the bot does with a link *any*
-/// member posts -- see `0037_video_download.sql`.
+/// And reposted.
 pub fn getVideoDownloadEnabled(pool: *PgPool, chat_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);
@@ -826,13 +753,8 @@ pub fn setVideoDownloadEnabled(pool: *PgPool, chat_id: i64, value: bool) !void {
     _ = try stmt.step();
 }
 
-/// Whether video auto-download delivers a compressed native video (lossy,
-/// the default) or the original-quality file capped at 50MB (lossless, an
-/// opt-in) -- see `video_download.Quality` and `0042_video_download_lossy.sql`.
-/// Unlike `getVideoDownloadEnabled`, the no-row fallback here is `true`,
-/// not `false` -- this setting only matters once a chat has already opted
-/// into `video_download_enabled` itself, and among chats that have, lossy
-/// is the better default, matching the column's own `DEFAULT TRUE`.
+/// Whether video auto-download delivers a compressed native video (lossy, the
+/// default) or the original-quality file capped at 50MB.
 pub fn getVideoDownloadLossy(pool: *PgPool, chat_id: i64) bool {
     const db = pool.acquire() catch return true;
     defer pool.release(db);

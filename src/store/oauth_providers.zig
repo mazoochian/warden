@@ -2,12 +2,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
-/// Admin-configured generic-OIDC login providers (Google gets its own
-/// well-known env-based config, same as every other external integration
-/// — see config.zig; this table is only for "any other OIDC IdP" per
-/// /home/armin/claude/warden-ui/ARCHITECTURE.md §3.1/§4). `client_secret`
-/// must never be serialized back to an API response — `PublicProvider`
-/// below is the shape anything client-facing should actually return.
+/// Admin-configured generic-OIDC login providers.
 pub const Provider = struct {
     id: i64,
     name: []const u8,
@@ -18,9 +13,7 @@ pub const Provider = struct {
 };
 
 /// The subset safe to hand to a browser (the login-page provider list) —
-/// deliberately a distinct type from `Provider`, not just "the same struct
-/// minus a field the caller promises not to read," so a future call site
-/// can't accidentally serialize the wrong one.
+/// deliberately a distinct type from `Provider`.
 pub const PublicProvider = struct {
     id: i64,
     name: []const u8,
@@ -64,9 +57,7 @@ pub fn delete(pool: *PgPool, id: i64) !void {
     _ = try stmt.step();
 }
 
-/// `null` if `id` doesn't exist — used server-side only (the login
-/// callback handler needs the real `client_secret` to complete the code
-/// exchange), never returned directly to a client.
+/// `null` if `id` doesn't exist — used server-side only.
 pub fn get(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?Provider {
     const db = try pool.acquire();
     defer pool.release(db);

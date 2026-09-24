@@ -1,118 +1,36 @@
-//! ROADMAP.md's Phase 25: passive auto-download of YouTube/Instagram/X
-//! video links posted in a chat, delivered either as a native inline-
-//! playable video (lossy mode, the default -- compressed to fit Telegram's
-//! upload ceiling) or as a plain file (lossless mode, an opt-in -- original
-//! quality, capped at 50MB, unchanged from this feature's original shape).
-//! Three independent pieces live here, all deliberately free of any
-//! `Connector`/store dependency (same "pure function over bytes/paths"
-//! shape as `convert.zig`/`transcribe.zig` -- `main.zig`'s
-//! `checkVideoDownload`/`videoDownloadWorker` own the gating, threading,
-//! progress-ticker and connector calls):
-//!
-//!   - `findLink`: a plain substring scan over a message's text, no LLM
-//!     call, same "passive content observation" tier as
-//!     `main.zig`'s `checkKeywordAlerts`.
-//!   - `download`: shells out to `yt-dlp` (and, in lossy mode when the
-//!     source doesn't already fit, `ffmpeg`/`ffprobe` to compress it),
-//!     same argv/tmpdir/`defer deleteFile`/`readFileAlloc(.limited(...))`
-//!     idiom `convert.zig`/`transcribe.zig` already use for their own
-//!     external tools, plus a hard wall-clock timeout on every subprocess
-//!     call -- see `runWithTimeout`'s doc comment for why `yt-dlp`
-//!     specifically needs one and how it's enforced.
-//!   - `estimateSize`/`pollCurrentBytes`/`formatProgressText`: best-effort
-//!     progress reporting for `main.zig`'s progress ticker. Deliberately
-//!     filesystem-polling rather than streaming `yt-dlp`'s own stdout --
-//!     this codebase has no precedent anywhere for incrementally reading a
-//!     subprocess's output (every other shell-out blocks to completion),
-//!     and polling a growing file's size on disk gets a good-enough
-//!     percentage without introducing that new, riskier pattern.
-//!
-//! **Failure handling**: `download` never returns partial/garbage bytes --
-//! anything that isn't a clean success (age-restricted, private,
-//! geo-blocked, DRM'd, oversized even after compression, or otherwise
-//! undownloadable) is a plain returned error, this module doing no
-//! `Connector` calls itself. What `main.zig`'s caller does with that error
-//! is its own call, not this module's: today (`videoDownloadWorker`) it
-//! edits a short "couldn't download that" note into the placeholder it
-//! already showed, rather than either erroring loudly on every link or
-//! (the original design, changed after a real report of a placeholder
-//! silently vanishing with zero explanation) deleting it without a trace.
-//! That's a reasonable default specifically because a placeholder already
-//! went out for every trigger-pattern match, real video or not -- see
-//! `checkVideoDownload`'s own doc comment.
+//! Passive auto-download of YouTube/Instagram/X video links posted in a chat,
+//! delivered either as a native inline- playable video (lossy mode, the
+//! default -- compressed to fit Telegram's upload ceiling) or as a plain file
+//! (lossless mode, an opt-in -- original quality, capped at 50MB, unchanged
+//! from this feature's original shape). Three independent pieces live here.
 const std = @import("std");
 const Io = std.Io;
 
 const convert = @import("convert.zig");
 
-/// Telegram's cloud Bot API's real upload ceiling — this codebase talks
-/// directly to `api.telegram.org` with no local Bot API server (which would
-/// raise the limit to 2GB but needs its own separate service this project
-/// doesn't run — see ROADMAP.md's Phase 25 entry for why that's flagged as
-/// a possible future backlog item, not solved here). This is the hard
-/// budget both quality modes ultimately respect: lossless mode asks
-/// `yt-dlp` to never fetch more than this in the first place; lossy mode
-/// compresses down to fit it when the source doesn't already.
+/// Telegram's cloud Bot API's real upload ceiling.
 const max_bytes: usize = 50 * 1024 * 1024;
 
-/// Which delivery mode `download` should use — see this file's module doc
-/// comment. Chosen per-chat via `chat_settings.getVideoDownloadLossy`
-/// (`main.zig`), lossy being the default.
+/// Which delivery mode `download` should use.
 pub const Quality = enum { lossy, lossless };
 
-/// How long lossless `yt-dlp` gets before `download` gives up and kills it
-/// -- see `runWithTimeout`'s doc comment. `yt-dlp` is network-bound against
-/// an arbitrary remote server (unlike the local `ffmpeg`/`pandoc`/`convert`
-/// binaries `convert.zig` shells out to), so it can hang far longer than
-/// any of those ever would; 2 minutes comfortably covers a real short-clip
-/// download while still failing closed well within a human's patience for
-/// "did my link do anything." Lossy mode gets its own, longer budgets
-/// below -- it's doing more work (a same-or-larger fetch, potentially a
-/// compression pass too).
+/// How long lossless `yt-dlp` gets before `download` gives up and kills it.
 const lossless_timeout_seconds: i64 = 120;
 
-/// `yt-dlp` format selector both `downloadLossy` and `estimateSize` use --
-/// shared so the preflight size estimate actually corresponds to what gets
-/// fetched. Bounded to ~720p: a reasonable "shareable clip" resolution that
-/// keeps most short social clips at or near `max_bytes` already, so the
-/// `compressToFit` fallback below is the exception, not the common case.
-///
-/// The trailing `/bv*+ba/b` fallback is load-bearing, not decorative:
-/// `height` in a yt-dlp format spec is the *long* pixel dimension, not
-/// "vertical resolution" -- for a portrait clip (an Instagram Reel, a
-/// YouTube Short) that's the value that reads e.g. 1280 or 1920, so
-/// `height<=720` matches *zero* formats and yt-dlp hard-fails with
-/// "Requested format is not available" instead of just picking a smaller
-/// one. Confirmed live against a real Reel (`--list-formats` showed only
-/// 720x1280/1080x1920 DASH video streams, all excluded by the height cap).
-/// yt-dlp format specs have no portable "shorter side" filter to fix this
-/// properly, so the pragmatic fix is a fallback: try the 720p-capped
-/// selection first (the common, bandwidth-saving case for landscape
-/// video), and if that matches nothing, fall through to the fully
-/// unconstrained `bv*+ba/b` (still bounded by `--max-filesize` below, and
-/// by `compressToFit` after download) rather than failing outright.
+/// `yt-dlp` format selector both `downloadLossy` and `estimateSize` use.
 const lossy_format_selector = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b";
 
-/// Longer than `lossless_timeout_seconds`: even bounded to ~720p, a lossy
-/// fetch can be pulling a larger/longer source than the lossless path ever
-/// would (which fails closed immediately if no under-50MB format exists).
-/// Raised from 180s alongside dropping the source `--max-filesize` cap
-/// below (storage_sense.zig) -- a longer clip with nothing capping its
-/// source size now legitimately needs more time to fetch.
+/// Longer than `lossless_timeout_seconds`.
 const lossy_download_timeout_seconds: i64 = 600;
 
-/// Bounds the best-effort `estimateSize` preflight call -- must stay short
-/// since it runs before the placeholder message and progress ticker even
-/// start; a slow preflight would itself look like "nothing is happening."
+/// Bounds the best-effort `estimateSize` preflight call.
 const preflight_timeout_seconds: i64 = 15;
 
 /// `ffprobe` is local and CPU-only (no network) -- should return almost
 /// instantly; generous slack, not a real expected duration.
 const ffprobe_timeout_seconds: i64 = 15;
 
-/// Bounds the `ffmpeg` compression pass. Raised from 120s alongside
-/// `lossy_download_timeout_seconds` -- a larger uncapped source can need
-/// more compression time too.
+/// Bounds the `ffmpeg` compression pass.
 const compress_timeout_seconds: i64 = 300;
 
 /// Audio bitrate `compressToFit` reserves out of the size budget before
@@ -120,35 +38,17 @@ const compress_timeout_seconds: i64 = 300;
 const target_audio_bitrate_kbps: u32 = 128;
 
 /// Floor below which a computed video bitrate would produce an unwatchably
-/// bad encode -- `computeVideoBitrateKbps` returns `null` rather than that,
-/// which `compressToFit`/`downloadLossy` treat as "this clip is too long to
-/// fit lossy mode's budget at all," failing closed the same as an
-/// oversized lossless link does today.
+/// bad encode -- `computeVideoBitrateKbps` returns `null` rather than that.
 const min_video_bitrate_kbps: u32 = 150;
 
-/// `compressToFit` targets this fraction of `max_bytes`, not all of it --
-/// headroom for container overhead and single-pass `libx264` rate control
-/// occasionally overshooting its target under high-motion content. A first
-/// guess, not a derived constant; worth revisiting once real videos have
-/// run through it.
+/// `compressToFit` targets this fraction of `max_bytes`, not all of it.
 const size_safety_margin: f64 = 0.92;
 
 /// Serializes every `ffmpeg` compression call in the process (see
-/// `compressToFit`) -- deliberately NOT serializing `yt-dlp` fetches, which
-/// are I/O-bound and fine running concurrently. `Io.Mutex`, not
-/// `std.Thread.Mutex` -- same primitive `main.zig`'s `TickerState` already
-/// uses for its own cross-thread state, locked/unlocked through the `Io`
-/// each caller already has on hand.
+/// `compressToFit`) -- deliberately NOT serializing `yt-dlp` fetches.
 var compression_mutex: Io.Mutex = .init;
 
-/// Substrings identifying a link this module will attempt to download —
-/// deliberately conservative and literal (no real regex engine in `std`),
-/// equivalent to the plan's own
-/// `(youtube\.com/watch|youtube\.com/shorts/|youtu\.be/|instagram\.com/(reel|p)/|x\.com/|twitter\.com/)`.
-/// Case-sensitive on purpose: real URLs use lowercase domains, and a
-/// hand-rolled case-insensitive substring search isn't worth the extra
-/// code for a fail-closed feature where a missed match just means no
-/// download, not a functional gap.
+/// Substrings identifying a link this module will attempt to download.
 const trigger_patterns = [_][]const u8{
     "youtube.com/watch",
     "youtube.com/shorts/",
@@ -159,16 +59,8 @@ const trigger_patterns = [_][]const u8{
     "twitter.com/",
 };
 
-/// Scans `text` token by token (splitting on ASCII whitespace) for the
-/// first token containing one of `trigger_patterns`, returning that token
-/// trimmed of common trailing punctuation a sentence might wrap it in
-/// (`"check this out: https://youtu.be/abc123."` yields
-/// `"https://youtu.be/abc123"`, not `"https://youtu.be/abc123."`). Doesn't
-/// otherwise validate the token is a well-formed URL — `yt-dlp` itself is
-/// the source of truth for "is this actually downloadable" (see this
-/// module's own doc comment on fail-closed handling), so a token that
-/// merely *contains* a trigger substring but isn't really a link just
-/// fails the download attempt harmlessly.
+/// Scans `text` token by token (splitting on ASCII whitespace) for the first
+/// token containing one of `trigger_patterns`.
 pub fn findLink(text: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
     while (it.next()) |token| {
@@ -186,18 +78,11 @@ pub const DownloadResult = struct {
     file_name: []const u8,
 };
 
-/// Named for callers that want to log/branch on which failure mode this
-/// was — `download` itself returns a plain inferred error set (same shape
-/// as `convert.zig`'s `convert()`), so these names are documentation more
-/// than a binding contract.
+/// Named for callers that want to log/branch on which failure mode this was.
 pub const DownloadError = error{ DownloadFailed, DownloadTimedOut, CompressionFailed, DownloadTooLarge };
 
-/// Downloads `url` at `quality`, returning file bytes (capped at
-/// `max_bytes`) plus a suggested filename. `ts` is the nanosecond
-/// uniqueness key for this attempt's tmp files -- generated by the caller
-/// (`main.zig`'s `checkVideoDownload`), not here, so a concurrent progress
-/// ticker (`pollCurrentBytes`) can watch the same `tmp_dir/video_download_
-/// {ts}*` prefix while this runs on the worker thread.
+/// Downloads `url` at `quality`, returning file bytes (capped at `max_bytes`)
+/// plus a suggested filename.
 pub fn download(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, url: []const u8, quality: Quality, ts: i96) !DownloadResult {
     try Io.Dir.cwd().createDirPath(io, tmp_dir);
     return switch (quality) {
@@ -207,18 +92,7 @@ pub fn download(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, url: 
 }
 
 /// Original, unchanged-since-launch behavior: `yt-dlp --max-filesize 50M`,
-/// fail closed if no under-`max_bytes` format exists. Delivered as a file
-/// (`sendDocument`), original quality -- see this file's module doc
-/// comment for the lossy/lossless split.
-///
-/// `--no-playlist` is the one argv addition beyond the plan's literal
-/// `yt-dlp -o ... --max-filesize 50M <url>`: without it, a
-/// `youtube.com/watch?v=...&list=...` link (a video that's also part of a
-/// playlist — common in practice) would have `yt-dlp` fetch the *entire*
-/// playlist into `tmp_dir`, breaking `findDownloadedFile`'s single-file
-/// assumption below and turning one chat link into an unbounded, far-past-
-/// timeout download. Restricting to the one linked video is what "someone
-/// posted a video link" means here, not "someone posted a playlist link."
+/// fail closed if no under-`max_bytes` format exists.
 fn downloadLossless(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, url: []const u8, ts: i96) !DownloadResult {
     const output_template = try std.fmt.allocPrint(allocator, "{s}/video_download_{d}.%(ext)s", .{ tmp_dir, ts });
     defer allocator.free(output_template);
@@ -256,11 +130,7 @@ fn downloadLossless(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, u
     return .{ .bytes = bytes, .file_name = file_name };
 }
 
-/// Fetches a bounded/reasonable-resolution source (~720p, no source-size
-/// cap -- see `lossy_download_timeout_seconds`), then delivers it as-is if
-/// it already fits `max_bytes` (the common case for short clips), or
-/// compresses it down to fit via `compressToFit` otherwise. Delivered as a
-/// native video (`sendVideo`) -- see this file's module doc comment.
+/// Fetches a bounded/reasonable-resolution source.
 fn downloadLossy(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, url: []const u8, ts: i96) !DownloadResult {
     const output_template = try std.fmt.allocPrint(allocator, "{s}/video_download_{d}.%(ext)s", .{ tmp_dir, ts });
     defer allocator.free(output_template);
@@ -322,13 +192,8 @@ fn downloadLossy(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, url:
     return .{ .bytes = bytes, .file_name = try allocator.dupe(u8, "video.mp4") };
 }
 
-/// Pure sizing math, no IO -- given a clip's `duration_seconds` and a
-/// total `budget_bytes`, reserves `audio_kbps` worth of audio out of the
-/// budget and returns the video bitrate (in kbps) that spends the rest
-/// over the clip's full length. Returns `null` if that would fall below
-/// `min_video_bitrate_kbps` -- the clip is too long to fit this budget at
-/// any watchable quality, which `compressToFit`/`downloadLossy` treat as a
-/// fail-closed signal, same class as an oversized lossless link today.
+/// Pure sizing math, no IO -- given a clip's `duration_seconds` and a total
+/// `budget_bytes`.
 pub fn computeVideoBitrateKbps(duration_seconds: f64, budget_bytes: u64, audio_kbps: u32) ?u32 {
     if (duration_seconds <= 0) return null;
     const budget_kbits = @as(f64, @floatFromInt(budget_bytes)) * 8.0 / 1000.0;
@@ -338,10 +203,8 @@ pub fn computeVideoBitrateKbps(duration_seconds: f64, budget_bytes: u64, audio_k
     return @intFromFloat(video_kbps);
 }
 
-/// `ffprobe -show_entries format=duration`, parsed as a plain float
-/// (seconds, may have a fractional part) -- fails closed (`error.
-/// CompressionFailed`) on a nonzero exit or unparseable output rather than
-/// letting a bogus duration feed bogus bitrate math.
+/// `ffprobe -show_entries format=duration`, parsed as a plain float (seconds,
+/// may have a fractional part).
 fn probeDurationSeconds(allocator: std.mem.Allocator, io: Io, path: []const u8) !f64 {
     const result = runWithTimeout(allocator, io, &.{
         "ffprobe",
@@ -372,16 +235,7 @@ fn probeDurationSeconds(allocator: std.mem.Allocator, io: Io, path: []const u8) 
 }
 
 /// Probes `input_path`'s duration, sizes a bitrate that fits `budget_bytes`
-/// via `computeVideoBitrateKbps`, then re-encodes with `ffmpeg` into
-/// `output_path`. Single-pass CBR-ish encoding (`-b:v`/`-maxrate`/
-/// `-bufsize`), not 2-pass -- 2-pass roughly doubles encode time for no
-/// benefit here, since the goal is "fits under budget," not "best quality
-/// at a fixed size." No retry on overshoot -- `downloadLossy` fails closed
-/// instead, keeping worst-case time bounded and predictable.
-///
-/// Only the `ffmpeg` call itself is held under `compression_mutex` (see its
-/// own doc comment) -- `probeDurationSeconds` above it is cheap and doesn't
-/// need to serialize.
+/// via `computeVideoBitrateKbps`.
 fn compressToFit(allocator: std.mem.Allocator, io: Io, input_path: []const u8, output_path: []const u8, budget_bytes: u64) !void {
     const duration = try probeDurationSeconds(allocator, io, input_path);
     const video_kbps = computeVideoBitrateKbps(duration, budget_bytes, target_audio_bitrate_kbps) orelse {
@@ -439,13 +293,8 @@ fn compressToFit(allocator: std.mem.Allocator, io: Io, input_path: []const u8, o
 }
 
 /// Best-effort preflight size estimate, using the same format selector
-/// `downloadLossy` fetches with so the estimate actually corresponds to
-/// what will be downloaded. Many extractors (most YouTube videos; commonly
-/// NOT Instagram/X) report an approximate filesize without downloading
-/// anything. Swallows every failure mode (nonzero exit, timeout,
-/// unparseable/`NA` output) and returns `null` rather than propagating --
-/// this only ever feeds a progress percentage; when it's unavailable,
-/// `main.zig`'s ticker falls back to an elapsed-time display instead.
+/// `downloadLossy` fetches with so the estimate actually corresponds to what
+/// will be downloaded.
 pub fn estimateSize(allocator: std.mem.Allocator, io: Io, url: []const u8) ?u64 {
     const result = runWithTimeout(allocator, io, &.{
         "yt-dlp",
@@ -467,14 +316,7 @@ pub fn estimateSize(allocator: std.mem.Allocator, io: Io, url: []const u8) ?u64 
 }
 
 /// Best-effort progress-ticker helper (`main.zig`'s
-/// `videoProgressTickerLoop`): scans `tmp_dir` for every entry whose name
-/// starts with `video_download_{ts}` and returns the largest size found --
-/// covers `yt-dlp`'s in-progress `.part`/`.ytdl` temp files, the merged
-/// source file, and (in lossy mode, once compression starts) the
-/// compressed output, across both phases, without needing to know which
-/// phase is currently active. Returns `null` if nothing matches yet or on
-/// any stat error -- this only ever feeds a progress display, never
-/// propagates.
+/// `videoProgressTickerLoop`).
 pub fn pollCurrentBytes(io: Io, tmp_dir: []const u8, ts: i96) ?u64 {
     var buf: [64]u8 = undefined;
     const prefix = std.fmt.bufPrint(&buf, "video_download_{d}", .{ts}) catch return null;
@@ -493,12 +335,7 @@ pub fn pollCurrentBytes(io: Io, tmp_dir: []const u8, ts: i96) ?u64 {
     return largest;
 }
 
-/// Pure formatting for `main.zig`'s progress ticker -- a percent-based bar
-/// when both a current size and a preflight estimate are known (clamped to
-/// 99% so it never visually claims completion before the real "done"
-/// message replaces it), otherwise a plain elapsed-time line (the common
-/// case for Instagram/X, where `estimateSize` usually can't report a
-/// total, and for lossless mode, which doesn't call `estimateSize` at all).
+/// Pure formatting for `main.zig`'s progress ticker.
 pub fn formatProgressText(allocator: std.mem.Allocator, elapsed_seconds: i64, current_bytes: ?u64, estimated_total_bytes: ?u64) ![]const u8 {
     if (current_bytes) |current| {
         if (estimated_total_bytes) |total| {
@@ -511,16 +348,8 @@ pub fn formatProgressText(allocator: std.mem.Allocator, elapsed_seconds: i64, cu
     return std.fmt.allocPrint(allocator, "⬇️ Downloading… ({d}s)", .{elapsed_seconds});
 }
 
-/// `yt-dlp` resolves `%(ext)s` itself (mp4/webm/mkv/... depending on what
-/// it actually fetched), so the real output filename isn't knowable ahead
-/// of time the way `convert.zig`'s fixed-extension output path is — this
-/// scans `tmp_dir` for whichever file starts with this run's unique
-/// `video_download_{ts}.` prefix (the same nanosecond-timestamp-as-
-/// uniqueness-key idiom `convert.zig`/`transcribe.zig` use for their own
-/// tmp paths) instead. Exactly one match is expected on a clean success —
-/// `--no-playlist` above is what keeps that true. The trailing `.` in the
-/// prefix keeps this from ever matching a `compressToFit` output
-/// (`video_download_{ts}_compressed.mp4`, no `.` right after the number).
+/// `yt-dlp` resolves `%(ext)s` itself (mp4/webm/mkv/... depending on what it
+/// actually fetched).
 fn findDownloadedFile(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, ts: i96) ![]const u8 {
     const prefix = try std.fmt.allocPrint(allocator, "video_download_{d}.", .{ts});
     defer allocator.free(prefix);
@@ -538,55 +367,14 @@ fn findDownloadedFile(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8,
     return error.FileNotFound;
 }
 
-/// Runs `argv` with a hard wall-clock deadline `timeout_seconds_arg` from
-/// now — the "new infrastructure" ROADMAP.md's Phase 25 entry calls out:
-/// neither `convert.zig` nor `transcribe.zig` bounds its `std.process.run`
-/// call at all, safe for them only because both shell out to a local
-/// binary operating on a local file, never a caller-supplied remote URL.
-///
-/// This uses `std.process.run`'s own `timeout: Io.Timeout` option — a real
-/// option this Zig version already exposes, not new plumbing built from
-/// scratch. `run()`'s implementation (`lib/std/process.zig`) always
-/// `defer child.kill(io)`s before returning, on every path including a
-/// timeout error, so a fired timeout doesn't just abandon the subprocess:
-/// it synchronously sends it `SIGTERM` and waits for it to be reaped
-/// before this function returns, so no zombie is left behind.
-///
-/// **Must be a `.deadline`, not a `.duration`.** `run()` internally polls
-/// the child's stdout/stderr in a loop and passes the same `Io.Timeout`
-/// value to every poll; `yt-dlp` writes progress output steadily while a
-/// download is in flight. A `.duration` timeout is recomputed as "now + N"
-/// on every single poll (see `Io.Timeout.toTimestamp`), so as long as
-/// *some* output keeps arriving it would never actually elapse — an idle
-/// timeout in practice, not the firm execution cap this needs. Computing
-/// one fixed `.deadline` up front, before the first poll, makes it a true
-/// total-runtime cap regardless of how much output `yt-dlp` produces.
-///
-/// **Known limitation, not solved here**: `Child.kill` on this Zig version
-/// only signals the direct child pid (`SIGTERM`, POSIX), not its process
-/// group — there is no process-group-kill primitive exposed by `std.Io`/
-/// `std.process` to reach for instead. If `yt-dlp` has already forked a
-/// helper (commonly `ffmpeg`, to merge separately-fetched audio/video
-/// streams) at the exact moment the deadline fires, that grandchild isn't
-/// guaranteed to die with its parent and can briefly survive as an orphan
-/// reparented to PID 1. Accepted as a real but minor gap: it only matters
-/// during the narrow mid-merge window, the orphan is single-purpose and
-/// self-terminating (ffmpeg exits on its own once done or once its input
-/// pipe closes), and it is strictly better than the alternative this
-/// function actually prevents — the `yt-dlp` process itself hanging
-/// forever, unkilled, unreaped.
+/// Runs `argv` with a hard wall-clock deadline `timeout_seconds_arg` from now
+/// — the "new infrastructure" ROADMAP.md's entry calls out.
 fn runWithTimeout(allocator: std.mem.Allocator, io: Io, argv: []const []const u8, timeout_seconds_arg: i64) std.process.RunError!std.process.RunResult {
     const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = .fromSeconds(timeout_seconds_arg), .clock = .awake });
     return std.process.run(allocator, io, .{ .argv = argv, .timeout = .{ .deadline = deadline } });
 }
 
-/// `pub` for the same reason `convert.zig`'s own `binaryAvailable` is —
-/// callers outside this file (tests, and eventually `main.zig` if it ever
-/// wants to warn rather than silently fail-closed on a missing binary) can
-/// skip on the same terms rather than hard-failing wherever `yt-dlp` isn't
-/// installed. Deliberately just re-exports `convert.binaryAvailable`
-/// rather than duplicating its body — the check itself ("does running this
-/// argv produce a normal exit") has nothing video-specific about it.
+/// `pub` for the same reason `convert.zig`'s own `binaryAvailable` is.
 pub const binaryAvailable = convert.binaryAvailable;
 
 const testing = std.testing;
@@ -646,10 +434,7 @@ test "runWithTimeout kills a subprocess that outlives its deadline, rather than 
     const a = testing.allocator;
     const io = testing.io;
 
-    // Guard, same shape as convert.zig's own binary-presence checks: skip
-    // rather than hard-fail if this environment somehow lacks `sleep`
-    // (present via busybox/coreutils on essentially every POSIX box this
-    // project runs or tests on).
+    // Guard, same shape as convert.zig's own binary-presence checks.
     if (std.process.run(a, io, .{ .argv = &.{ "sleep", "0" } })) |r| {
         a.free(r.stdout);
         a.free(r.stderr);
@@ -660,9 +445,6 @@ test "runWithTimeout kills a subprocess that outlives its deadline, rather than 
     const result = runWithTimeout(a, io, &.{ "sleep", "5" }, 1);
     const elapsed_ms = @divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - started.toNanoseconds(), std.time.ns_per_ms);
 
-    // The bound here (well under the 5s `sleep` would take if the timeout
-    // didn't fire) is what actually proves the kill happened rather than
-    // this test just passing by coincidentally waiting out the sleep.
     try testing.expect(elapsed_ms < 4000);
     if (result) |r| {
         a.free(r.stdout);
@@ -683,10 +465,8 @@ test "download fails closed rather than crashing when yt-dlp itself is unavailab
     if (!binaryAvailable(a, io, &.{ "yt-dlp", "--version" })) return error.SkipZigTest;
 
     try Io.Dir.cwd().createDirPath(io, "data/tmp");
-    // Not a real video -- exercises the "yt-dlp ran, exited nonzero"
-    // failure path without depending on any specific network condition
-    // succeeding, only on it not silently fabricating a video from thin
-    // air. Covers both quality modes through the same bogus URL.
+    // Not a real video -- exercises the "yt-dlp ran, exited nonzero" failure path
+    // without depending on any specific network condition succeeding.
     inline for (.{ Quality.lossless, Quality.lossy }) |quality| {
         const ts = Io.Timestamp.now(io, .real).toNanoseconds();
         const result = download(a, io, "data/tmp", "https://x.com/this_is_not_a_real_status_url_warden_test/status/1", quality, ts);
@@ -706,9 +486,8 @@ test "computeVideoBitrateKbps sizes a normal clip and fails closed on one too lo
     const normal = computeVideoBitrateKbps(10.0, 5 * 1024 * 1024, 128) orelse return error.TestExpectedValue;
     try testing.expect(normal >= min_video_bitrate_kbps);
 
-    // A 2-hour clip squeezed into the same 5MB budget can't fit a
-    // watchable bitrate -- this is the "too long for lossy mode" signal
-    // `compressToFit`/`downloadLossy` fail closed on.
+    // A 2-hour clip squeezed into the same 5MB budget can't fit a watchable
+    // bitrate.
     try testing.expectEqual(@as(?u32, null), computeVideoBitrateKbps(7200.0, 5 * 1024 * 1024, 128));
 }
 

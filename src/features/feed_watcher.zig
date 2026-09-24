@@ -11,11 +11,7 @@ const llm = @import("../llm/provider.zig");
 const toolcall = @import("../llm/toolcall.zig");
 const registry = @import("../tools/registry.zig");
 
-/// Retries for this background summariser's own model call. A fixed
-/// default rather than the `WARDEN_LLM_MAX_RETRIES` dynamic value: this
-/// runs on a scheduler with no chat, no user waiting and no
-/// `LlmDynamicSettings` in scope, and a scheduled summary that quietly
-/// retries a congested endpoint is exactly the desired behaviour.
+/// Retries for this background summariser's own model call.
 const default_max_retries: u32 = @intCast(@import("../config.zig").Config.default_llm_max_retries);
 
 const system_prompt =
@@ -26,17 +22,11 @@ const system_prompt =
 ;
 
 /// Upper bound on how many item guids get persisted as the "seen" set per
-/// watch — bounds the `seen_guids_json` column's size regardless of how
-/// large a feed's own item window is (one real feed encountered live had
-/// 777 `<item>`s). Which specific items get kept doesn't affect *this*
-/// check's correctness (dedup is a pure set-membership test now, not
-/// order-dependent) — it only bounds how much inter-check publishing
-/// volume the *next* check can still recognize as "already seen".
+/// watch.
 const max_tracked_guids: usize = 150;
 
 /// Finds the connector whose platform matches `platform` — duplicated from
-/// `main.zig`'s `findConnector`, same reasoning as `features/alerts.zig`'s
-/// own copy (keeps this file's only dependency on `main.zig` at zero).
+/// `main.zig`'s `findConnector`.
 fn findConnector(connectors: []const iface.Connector, platform: iface.Platform) ?iface.Connector {
     for (connectors) |c| {
         if (c.platform() == platform) return c;
@@ -51,22 +41,16 @@ fn fetchFeed(allocator: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
 }
 
 /// What happened when checking one watch — returned so both the scheduled
-/// batch loop and the manual `/watchcheck` command can react appropriately
-/// (the batch loop mostly just logs; the manual command reports this
-/// directly to the chat, which is the whole point of that command existing
-/// — answering "is my feed actually broken" without needing log access).
+/// batch loop and the manual `/watchcheck` command can react appropriately.
 pub const CheckOutcome = union(enum) {
-    /// First-ever check: baseline recorded, nothing announced (see
-    /// `checkOne`'s doc comment for why).
+    /// First-ever check: baseline recorded, nothing announced.
     baseline_recorded: usize,
     /// Fetched and parsed fine, nothing new since last time.
     no_new_items,
     /// Notified the chat with this many new items.
     notified: usize,
     /// Fetched fine, but not recognizable as RSS/Atom (0 `<item>`/`<entry>`
-    /// blocks found) — `feed_parse.parseFeedItems` treats this as "empty",
-    /// not an error, so this is the closest signal available that
-    /// something about the feed's shape might be wrong.
+    /// blocks found) — `feed_parse.parseFeedItems` treats this as "empty".
     unrecognized_feed_shape,
     fetch_failed: anyerror,
     parse_failed: anyerror,
@@ -74,15 +58,7 @@ pub const CheckOutcome = union(enum) {
 };
 
 /// Checks every feed watch whose interval has elapsed, and for any with
-/// genuinely new items (not the first check ever — see below), posts an
-/// LLM-written one-or-two-sentence blurb rather than a raw item dump.
-///
-/// The very first check of a newly-added feed only records a baseline
-/// (the current items' guids) without announcing anything — same
-/// "don't replay history" reasoning as `MatrixConnector.pollFn`'s discarded
-/// first `/sync`, since a feed can easily have dozens of old items and
-/// nobody wants those all replayed into the chat the moment they add a
-/// watch.
+/// genuinely new items.
 pub fn checkAndNotifyFeeds(connectors: []const iface.Connector, gpa: std.mem.Allocator, io: Io, pool: *store_pool.PgPool, llm_provider: llm.Provider, now: i64) void {
     const due = feed_watches.dueForCheck(pool, gpa, now) catch |err| {
         std.log.err("feed_watcher: failed to query due feed watches: {t}", .{err});
@@ -111,9 +87,8 @@ pub fn checkAndNotifyFeeds(connectors: []const iface.Connector, gpa: std.mem.All
     }
 }
 
-/// Forces an immediate check of one specific watch, regardless of whether
-/// its interval has elapsed — the `/watchcheck <url>` command's entry
-/// point. `null` means this chat isn't watching that URL at all.
+/// Forces an immediate check of one specific watch, regardless of whether its
+/// interval has elapsed — the `/watchcheck <url>` command's entry point.
 pub fn checkNow(connectors: []const iface.Connector, gpa: std.mem.Allocator, io: Io, pool: *store_pool.PgPool, llm_provider: llm.Provider, chat_id: i64, feed_url: []const u8, now: i64) !?CheckOutcome {
     const fw = try feed_watches.getOne(pool, gpa, chat_id, feed_url) orelse return null;
     defer {
@@ -127,19 +102,8 @@ pub fn checkNow(connectors: []const iface.Connector, gpa: std.mem.Allocator, io:
     return checkOne(connectors, gpa, io, pool, llm_provider, fw, now);
 }
 
-/// The actual fetch → parse → dedupe → notify → mark-checked pipeline for
-/// one watch, shared by the scheduled batch loop and the manual
-/// `/watchcheck` command so they can never drift apart.
-///
-/// Dedup is a set-membership test against `fw.seen_guids` (the snapshot of
-/// item guids from the *previous* check), not a positional scan — found
-/// live 2026-07-20: a real feed (iranwire.com's) keeps a featured/pinned
-/// story at `<item>` position 0 regardless of publish date, so the old
-/// "scan from the top, stop at the first guid matching the watermark"
-/// approach got permanently stuck the moment that pinned story became the
-/// watermark, silently reporting "0 new items" forever while hundreds of
-/// genuinely new items accumulated underneath it. Set membership doesn't
-/// care what order items come in.
+/// The actual fetch → parse → dedupe → notify → mark-checked pipeline for one
+/// watch.
 fn checkOne(connectors: []const iface.Connector, gpa: std.mem.Allocator, io: Io, pool: *store_pool.PgPool, llm_provider: llm.Provider, fw: feed_watches.DueFeedWatch, now: i64) CheckOutcome {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -158,10 +122,7 @@ fn checkOne(connectors: []const iface.Connector, gpa: std.mem.Allocator, io: Io,
         return .{ .parse_failed = err };
     };
     if (items.len == 0) {
-        // Not necessarily an error (a feed can genuinely be empty, or this
-        // fetch just didn't look like RSS/Atom at all — parseFeedItems
-        // doesn't distinguish the two) — still bump last_checked_at so
-        // this doesn't get re-fetched every poll cycle.
+        // Not necessarily an error.
         feed_watches.markChecked(pool, gpa, fw.id, now, &.{}) catch |err| {
             std.log.err("feed_watcher: failed to mark {d} checked: {t}", .{ fw.id, err });
         };
@@ -193,10 +154,8 @@ fn checkOne(connectors: []const iface.Connector, gpa: std.mem.Allocator, io: Io,
     const prompt = std.fmt.allocPrint(a, "New items from {s}:\n{s}\nWrite the update now.", .{ fw.feed_url, titles_buf.writer.buffered() }) catch return .no_new_items;
 
     const tool_ctx = registry.ToolContext{ .allocator = a, .io = io };
-    // Background job, no live chat message being edited — streaming
-    // would have zero visible effect (same reasoning as digest.zig).
-    // show_thinking=false and max_tokens=1024 for the same reasons
-    // documented in digest.zig's own toolcall.run call.
+    // Background job, no live chat message being edited — streaming would have
+    // zero visible effect (same reasoning as digest.zig).
     const blurb = toolcall.run(llm_provider, a, tool_ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, 1024, default_max_retries) catch |err| blk: {
         std.log.err("feed_watcher: llm summary failed for {s}: {t}", .{ fw.feed_url, err });
         break :blk "";
@@ -221,13 +180,8 @@ fn collectGuids(allocator: std.mem.Allocator, items: []const feed_parse.Item) []
     return out;
 }
 
-/// Every item in `items` whose guid isn't in `seen_guids` — a pure
-/// set-membership test, deliberately independent of item order. This is
-/// the fix for the bug found live 2026-07-20: the old logic scanned
-/// `items` from the top and stopped at the first one matching a single
-/// watermark guid, which broke permanently the moment a feed put a
-/// pinned/featured item (older than genuinely new ones) at position 0 —
-/// see this file's module-level and `checkOne`'s doc comments.
+/// Every item in `items` whose guid isn't in `seen_guids` — a pure set-
+/// membership test, deliberately independent of item order.
 fn newItemsSince(allocator: std.mem.Allocator, items: []const feed_parse.Item, seen_guids: []const []const u8) std.ArrayList(feed_parse.Item) {
     var seen_set: std.StringHashMapUnmanaged(void) = .empty;
     defer seen_set.deinit(allocator);

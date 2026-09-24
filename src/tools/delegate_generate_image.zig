@@ -17,10 +17,8 @@ const ImageDatum = struct {
     /// Set by backends that default to inline image bytes (e.g. OpenAI's
     /// gpt-image-1).
     b64_json: ?[]const u8 = null,
-    /// Set by backends that default to a fetch-it-yourself URL instead
-    /// (e.g. OpenAI's dall-e-2/dall-e-3) — fetched with a plain GET, no
-    /// auth header, matching how these URLs are meant to be used (they're
-    /// short-lived, pre-signed, and not the API host itself).
+    /// Set by backends that default to a fetch-it-yourself URL instead (e.g.
+    /// OpenAI's dall-e-2/dall-e-3) — fetched with a plain GET, no auth header.
     url: ?[]const u8 = null,
 };
 

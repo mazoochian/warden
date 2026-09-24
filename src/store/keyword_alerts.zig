@@ -1,13 +1,8 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// One tracked word for a chat (ROADMAP.md's Phase 16) -- whenever any
-/// chat member's message contains it (whole-word, case-insensitive, same
-/// matching `main.zig`'s magic-word check already uses via
-/// `containsWordIgnoreCase`), the bot flags it right in the chat. Chat-
-/// scoped and visible to the whole chat, same "shared, but only the
-/// creator or the bot owner may delete" model `notes.zig`/`reminders.zig`
-/// already use.
+/// One tracked word for a chat -- whenever any chat
+/// member's message contains it.
 pub const KeywordAlert = struct {
     id: i64,
     chat_id: i64,
@@ -18,10 +13,8 @@ pub const KeywordAlert = struct {
 
 pub const AddResult = union(enum) {
     added: i64,
-    /// A keyword already tracked in this chat (case-insensitively) --
-    /// `keyword` is normalized to lowercase before the uniqueness check, so
-    /// "Urgent" and "urgent" collide rather than creating two functionally
-    /// identical rows.
+    /// A keyword already tracked in this chat (case-insensitively) -- `keyword`
+    /// is normalized to lowercase before the uniqueness check.
     already_tracked,
 };
 

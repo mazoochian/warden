@@ -12,69 +12,25 @@ const MatrixProfile = @import("../../domain/matrix_profile.zig").MatrixProfile;
 const log = @import("../../log.zig").scoped("matrix");
 const llm = @import("../../llm/provider.zig");
 
-/// Matrix implementation of `platform.Connector`, backed by `/sync`
-/// long-polling — same shape as `../telegram/connector.zig`'s `TelegramConnector`, just
-/// against Matrix's Client-Server API instead of the Bot API.
-///
-/// Two deliberate simplifications versus Telegram parity, both documented
-/// where they bite:
-///   - E2E-encrypted rooms are supported for text messages (see
-///     `sendEvent`/`crypto.zig`) but not media — `sendPhotoFn`/
-///     `sendDocumentFn` always send unencrypted `m.image`/`m.file`
-///     (encrypted media needs its own AES-CTR-over-the-file-bytes scheme
-///     per the Matrix spec, separate from Olm/Megolm; not built yet).
-///     Choice-prompt reactions are sent encrypted but can't be *received*
-///     back as picks in an encrypted room yet (see `sendChoicePromptFn`'s
-///     doc comment).
-///   - Every room is treated as a group for `is_group` purposes (see
-///     `pollFn`) since distinguishing a real 1:1 room from a small group
-///     needs an extra `m.direct` account-data lookup this doesn't do yet;
-///     worst case the owner has to mention the bot in a Matrix DM the same
-///     way they would in a group, rather than it engaging on every message
-///     the way a Telegram DM does.
+/// Matrix implementation of `platform.Connector`, backed by `/sync` long-
+/// polling.
 pub const MatrixConnector = struct {
     client: raw.Client,
     /// `/sync`'s `next_batch` token — Matrix's equivalent of Telegram's
     /// integer `offset`, just an opaque string instead.
     since: ?[]const u8 = null,
-    /// The very first `/sync` (since = null) returns each joined room's
-    /// recent history, not just what's new — discarded rather than
-    /// processed (see `pollFn`) so a restart doesn't re-answer old
-    /// messages. Sync calls after this one only ever contain genuinely new
-    /// events.
+    /// The very first `/sync` (since = null) returns each joined room's recent
+    /// history, not just what's new — discarded rather than processed.
     initial_sync_done: bool = false,
     self_user_id: ?[]const u8 = null,
-    /// Null when `WARDEN_MATRIX_PICKLE_KEY` isn't set — encryption stays
-    /// inert (an `m.room.encrypted` event just can't be read, same as
-    /// before this field existed). Set via `enableCrypto` once the DB pool
-    /// is available (later than `init`, see `main.zig`'s startup sequence).
+    /// Null when `WARDEN_MATRIX_PICKLE_KEY` isn't set — encryption stays inert.
     crypto: ?matrix_crypto.State = null,
-    /// Rooms confirmed E2E-encrypted, cached once and never evicted — a
-    /// room can only ever turn encryption *on*, never back off, so a
-    /// positive result never goes stale. Found live: without this,
-    /// `sendEvent` called `client.isRoomEncrypted` fresh on every single
-    /// send, and on this desktop's occasionally-flaky networking, that
-    /// GET sometimes timed out — and the fallback for "couldn't check"
-    /// was to send plaintext, silently downgrading a message into an
-    /// *already-confirmed-encrypted* room the moment one HTTP call was
-    /// slow. Caching a positive result means a transient blip after the
-    /// first successful check can never cause that again for the same
-    /// room. Guarded by `encrypted_rooms_mutex` since sends run
-    /// concurrently across per-message tasks.
+    /// Rooms confirmed E2E-encrypted, cached once and never evicted — a room can
+    /// only ever turn encryption *on*, never back off.
     encrypted_rooms: std.StringHashMapUnmanaged(void) = .empty,
     encrypted_rooms_mutex: Io.Mutex = .init,
-    /// room id -> `m.room.name`, so a room can be shown by name instead of
-    /// its raw `!abc:server` id. Before this, the Matrix connector never
-    /// set `chat_title` at all, so every Matrix room reached
-    /// `chats.upsertChat` with a null title and was displayed by id
-    /// everywhere.
-    ///
-    /// Cached because reading it is a real HTTP round trip and this is
-    /// consulted per message. A room with no name caches the *absence*
-    /// (`null`) too, so an unnamed DM doesn't re-ask on every message.
-    /// Never evicted: a rename is rare enough that picking it up on the
-    /// next restart is an acceptable trade for not re-fetching forever.
-    /// Same mutex reasoning as `encrypted_rooms`.
+    /// Room id -> `m.room.name`, so a room can be shown by name instead of its
+    /// raw `!abc:server` id.
     room_names: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     room_names_mutex: Io.Mutex = .init,
 
@@ -83,8 +39,7 @@ pub const MatrixConnector = struct {
     }
 
     /// Loads (or creates+uploads) this device's Olm account and turns on
-    /// decrypt/encrypt for `m.room.encrypted` events from here on. Called
-    /// once at startup, after the DB pool exists — see `main.zig`.
+    /// decrypt/encrypt for `m.room.encrypted` events from here on.
     pub fn enableCrypto(self: *MatrixConnector, allocator: std.mem.Allocator, io: Io, pool: *store_pool.PgPool, pickle_key: []const u8) !void {
         self.crypto = try matrix_crypto.State.load(allocator, io, pool, pickle_key, &self.client);
     }
@@ -144,10 +99,7 @@ pub const MatrixConnector = struct {
         log.notice("resolved self identity: {?s}", .{self.self_user_id});
     }
 
-    /// Content-based mention check, preferred over a plain-text scan: modern
-    /// clients (Element and others) set this explicitly per MSC3952 rather
-    /// than relying on the message body actually containing the mentioned
-    /// user's id.
+    /// Content-based mention check, preferred over a plain-text scan.
     fn mentionsViaContent(content: types.MessageContent, self_user_id: []const u8) bool {
         const mentions = content.@"m.mentions" orelse return false;
         for (mentions.user_ids) |id| {
@@ -156,23 +108,15 @@ pub const MatrixConnector = struct {
         return false;
     }
 
-    /// Fallback for clients that don't send `m.mentions`: a plain substring
-    /// scan for the bot's own full user id ("@bot:server"). Less precise
-    /// than Telegram's word-boundary `textMentions` (a false positive would
-    /// need one user id to literally contain another's, which Matrix's
-    /// `@localpart:server` shape makes very unlikely in practice), but
-    /// simple and good enough absent a real client-side pill-rendering
-    /// concept to parse.
+    /// Fallback for clients that don't send `m.mentions`: a plain substring scan
+    /// for the bot's own full user id ("@bot:server").
     fn mentionsViaText(text: []const u8, self_user_id: []const u8) bool {
         if (self_user_id.len == 0) return false;
         return std.mem.indexOf(u8, text, self_user_id) != null;
     }
 
     /// True when `content` carries an `m.replace` relation — an edit of a
-    /// previously-sent event, not a new message. Skipped entirely by
-    /// `pollFn` so re-editing (e.g. another bot's live-updating message)
-    /// never gets treated as fresh input, matching how `telegram.zig` never
-    /// looks at `Update.edited_message` either.
+    /// previously-sent event, not a new message.
     fn isEdit(content: types.MessageContent) bool {
         const rel = content.@"m.relates_to" orelse return false;
         return rel.rel_type != null and std.mem.eql(u8, rel.rel_type.?, "m.replace");
@@ -200,9 +144,7 @@ pub const MatrixConnector = struct {
         };
     }
 
-    /// Best-effort display name absent a room-member/profile lookup: the
-    /// localpart of "@localpart:server" ("localpart"), falling back to the
-    /// full id if it's not shaped as expected.
+    /// Best-effort display name absent a room-member/profile lookup.
     fn displayNameFromUserId(user_id: []const u8) []const u8 {
         const without_sigil = if (std.mem.startsWith(u8, user_id, "@")) user_id[1..] else user_id;
         const colon = std.mem.indexOfScalar(u8, without_sigil, ':') orelse return user_id;
@@ -240,13 +182,8 @@ pub const MatrixConnector = struct {
         .deleteMessage = deleteMessageFn,
         .isGroupAdmin = isGroupAdminFn,
         .selfId = selfIdFn,
-        // `maxMessageLength` deliberately left null: Matrix caps total
-        // event size (tens of KB including markup), not a small character
-        // count — see `iface.Connector.VTable.maxMessageLength`'s doc
-        // comment on why that means Matrix just doesn't contribute a floor
-        // to the cross-platform minimum.
-        // `selfUsername` left null: Matrix has no separate "username"
-        // distinct from the user id the way Telegram does.
+        // `maxMessageLength` deliberately left null: Matrix caps total event size
+        // (tens of KB including markup), not a small character count.
     };
 
     fn platformFn(ptr: *anyopaque) iface.Platform {
@@ -270,11 +207,7 @@ pub const MatrixConnector = struct {
         if (self.since) |old| self.client.allocator.free(old);
         self.since = next_batch;
 
-        // Auto-accept invites unconditionally, including on the discarded
-        // first sync — a Matrix bot has to explicitly join a room it's
-        // invited to (unlike Telegram, where being added to a group needs
-        // no bot-side action), and there's no reason to make that wait for
-        // a second sync cycle.
+        // Auto-accept invites unconditionally, including on the discarded first sync.
         var invite_it = synced.value.rooms.invite.map.iterator();
         while (invite_it.next()) |entry| {
             self.client.joinRoom(allocator, entry.key_ptr.*) catch |err| {
@@ -282,13 +215,8 @@ pub const MatrixConnector = struct {
             };
         }
 
-        // Departures (left, kicked, or banned -- `/sync` doesn't
-        // distinguish, see `types.LeftRoom`'s doc comment) are recorded
-        // even on the discarded first sync, same reasoning as invites
-        // above: a room already left before this process started should
-        // still get marked promptly rather than waiting for a second
-        // cycle that may never show it again (`rooms.leave` only reports
-        // a room while it's a *recent* change, not indefinitely).
+        // Departures (left, kicked, or banned -- `/sync` doesn't distinguish)
+        // are recorded even on the discarded first sync.
         var out: std.ArrayList(iface.Message) = .empty;
         var leave_it = synced.value.rooms.leave.map.iterator();
         while (leave_it.next()) |entry| {
@@ -299,11 +227,8 @@ pub const MatrixConnector = struct {
             });
         }
 
-        // To-device events (room-key shares, etc.) are consumed by the
-        // server the moment `/sync` returns them — unlike room timeline
-        // history, there's no backlog to discard, so these are processed
-        // every cycle, including the one whose *room* events get thrown
-        // away below.
+        // To-device events (room-key shares, etc.) are consumed by the server the
+        // moment `/sync` returns them.
         if (self.crypto) |*crypto| {
             for (synced.value.to_device.events) |ev| {
                 if (std.mem.eql(u8, ev.type, "m.room.encrypted")) {
@@ -451,10 +376,8 @@ pub const MatrixConnector = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    /// Builds and appends the `iface.Message` for one `m.room.message`-
-    /// shaped event — shared by the plaintext `m.room.message` and
-    /// decrypted `m.room.encrypted` (Megolm) branches in `pollFn`, which
-    /// differ only in *how* they arrived at `content`.
+    /// Builds and appends the `iface.Message` for one `m.room.message`- shaped
+    /// event.
     fn appendMessageEvent(self: *MatrixConnector, allocator: std.mem.Allocator, out: *std.ArrayList(iface.Message), room_id: []const u8, event: types.RoomEvent, content: types.MessageContent) !void {
         const chat_id = try allocator.dupe(u8, room_id);
         const message_id = try allocator.dupe(u8, event.event_id);
@@ -472,12 +395,8 @@ pub const MatrixConnector = struct {
                     var reply_ev = parsed_reply;
                     defer reply_ev.deinit();
                     reply_to_user_id = try allocator.dupe(u8, reply_ev.value.sender);
-                    // The reply target could itself be `m.room.encrypted`
-                    // (an encrypted room's own replies point at other
-                    // encrypted events) — decrypting a *reply target* for
-                    // quoted-context purposes isn't built tonight, so this
-                    // just degrades to no quoted text rather than erroring,
-                    // same as any other content-shape mismatch here.
+                    // The reply target could itself be `m.room.encrypted` (an encrypted room's
+                    // own replies point at other encrypted events).
                     if (json.parseFromValue(types.MessageContent, allocator, reply_ev.value.content, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })) |parsed_content| {
                         var pc = parsed_content;
                         defer pc.deinit();
@@ -506,8 +425,7 @@ pub const MatrixConnector = struct {
             .first_seen = event.origin_server_ts,
             .last_seen = event.origin_server_ts,
         };
-        // `avatar_url` stays null — see `MatrixProfile`'s doc comment on
-        // why (no profile lookup implemented yet).
+        // `avatar_url` stays null.
         const matrix_profile = MatrixProfile{
             .identity = identity,
             .homeserver = try allocator.dupe(u8, self.client.homeserver_url),
@@ -521,8 +439,7 @@ pub const MatrixConnector = struct {
             .reply_to_message_id = reply_to_message_id,
             .reply_to_user_id = reply_to_user_id,
             .reply_to_text = reply_to_text,
-            // Every Matrix room is treated as a group — see this struct's
-            // doc comment.
+            // Every Matrix room is treated as a group.
             .is_group = true,
             .chat_type = "room",
             .chat_title = self.roomTitle(allocator, self.client.io, chat_id),
@@ -535,10 +452,7 @@ pub const MatrixConnector = struct {
     }
 
     /// Serializes `value` via `std.json.Stringify` into a freshly-allocated
-    /// buffer — the safe way to build event content JSON (handles string
-    /// escaping for user text), as opposed to hand-formatting with
-    /// `std.fmt.allocPrint` the way `crypto.zig` does for its own
-    /// library/server-generated (never user-controlled) tokens.
+    /// buffer.
     fn buildJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
         var w: Io.Writer.Allocating = .init(allocator);
         defer w.deinit();
@@ -552,28 +466,13 @@ pub const MatrixConnector = struct {
         ciphertext: []const u8,
         session_id: []const u8,
         device_id: []const u8,
-        /// Duplicated from the encrypted content when present, not just
-        /// left inside it — found live 2026-07-20 (why the bot's edits
-        /// were rendering as brand-new messages instead of replacing the
-        /// placeholder): matrix-js-sdk's `MatrixEvent.isRelation`/
-        /// `getRelation` read `m.relates_to` from `getWireContent()` —
-        /// the event's *clear*, unencrypted top level — never from the
-        /// decrypted payload, so a client can recognize an edit/reply/
-        /// reaction without decrypting first (also what lets the server
-        /// compute bundled aggregations for encrypted rooms at all).
-        /// Their own comment: "Relation info is lifted out of the
-        /// encrypted content when sent to encrypted rooms." Still present
-        /// inside the encrypted content too, unchanged — this is a
-        /// duplicate, not a replacement.
+        /// Duplicated from the encrypted content when present, not just left inside
+        /// it.
         @"m.relates_to": ?json.Value = null,
     };
 
     /// Checks (and caches, on a positive result) whether `room_id` is
-    /// E2E-encrypted. A network failure while checking is treated as "not
-    /// encrypted" **only for this one call** — it's deliberately never
-    /// cached as a negative, so the very next send retries the real check
-    /// instead of a single blip permanently disabling encryption for the
-    /// room (see `encrypted_rooms`'s doc comment for the bug this fixes).
+    /// E2E-encrypted.
     fn isRoomEncryptedCached(self: *MatrixConnector, allocator: std.mem.Allocator, room_id: []const u8) bool {
         self.encrypted_rooms_mutex.lockUncancelable(self.client.io);
         const cached = self.encrypted_rooms.contains(room_id);
@@ -594,31 +493,15 @@ pub const MatrixConnector = struct {
         return encrypted;
     }
 
-    /// Sends `content_json` (an already-serialized `m.room.message`/
-    /// `m.reaction` content object) to `room_id`, transparently
-    /// Megolm-encrypting it first when the room is E2E-encrypted and crypto
-    /// is enabled. This is what fixes the "reply sent but not visible" bug:
-    /// previously every send went out as a plaintext `m.room.message`
-    /// regardless of the room's own encryption state, which the server
-    /// accepted but compliant clients (Element included) won't render.
-    /// Falls back to plaintext (logged) if the encryption state check or
-    /// the encrypt itself fails — better a visible-but-unencrypted message
-    /// than a silently dropped one, matching the room's plaintext behavior
-    /// from before this existed.
+    /// Sends `content_json` (an already-serialized `m.room.message`/ `m.reaction`
+    /// content object) to `room_id`.
     fn sendEvent(self: *MatrixConnector, allocator: std.mem.Allocator, room_id: []const u8, event_type: []const u8, content_json: []const u8) ![]const u8 {
         const crypto = if (self.crypto) |*c| c else return self.client.putRoomEvent(allocator, room_id, event_type, content_json);
 
         if (!self.isRoomEncryptedCached(allocator, room_id)) return self.client.putRoomEvent(allocator, room_id, event_type, content_json);
 
-        // `room_id` is required in a Megolm-encrypted event's *plaintext*,
-        // not just its outer envelope — an anti-replay check (found live
-        // 2026-07-20): without it, matrix-js-sdk's decrypt rejects with
-        // "the room id of the room key doesn't match the room id of the
-        // decrypted event: expected <room>, got None", since a session key
-        // could otherwise be replayed to forge a message into a different
-        // room. `types.DecryptedRoomEventPayload` already parses this
-        // field on the receive side; this was the one place that never
-        // wrote it.
+        // `room_id` is required in a Megolm-encrypted event's *plaintext*, not just
+        // its outer envelope — an anti-replay check (found live 2026-07-20).
         const inner_event = try std.fmt.allocPrint(allocator, "{{\"type\":\"{s}\",\"content\":{s},\"room_id\":\"{s}\"}}", .{ event_type, content_json, room_id });
         defer allocator.free(inner_event);
 
@@ -629,9 +512,8 @@ pub const MatrixConnector = struct {
         defer allocator.free(enc.ciphertext);
         defer allocator.free(enc.session_id);
 
-        // See `EncryptedEventContent.m.relates_to`'s doc comment — clients
-        // need this outside the encrypted blob to recognize edits/replies/
-        // reactions at all.
+        // `m.relates_to` must sit outside the encrypted blob: clients need it
+        // in the clear to recognize edits/replies/reactions at all.
         var parsed_content = try json.parseFromSlice(json.Value, allocator, content_json, .{});
         defer parsed_content.deinit();
         const relates_to: ?json.Value = if (parsed_content.value == .object) parsed_content.value.object.get("m.relates_to") else null;
@@ -658,10 +540,8 @@ pub const MatrixConnector = struct {
 
     fn sendMessageReturningIdFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, reply_to_message_id: ?[]const u8) anyerror![]const u8 {
         const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
-        // Matrix has no expandable-blockquote equivalent to Telegram's, but
-        // chain-of-thought markers are control bytes and must not go out
-        // raw — render them as a 💭 paragraph instead. See
-        // `llm.renderThinkingPlain`.
+        // Matrix has no expandable-blockquote equivalent to Telegram's, but chain-of-
+        // thought markers are control bytes and must not go out raw.
         const body = llm.renderThinkingPlain(allocator, text) catch text;
         const payload = try buildJson(allocator, raw.Client.MessagePayload{ .body = body, .@"m.relates_to" = raw.Client.replyRelation(reply_to_message_id) });
         defer allocator.free(payload);
@@ -687,18 +567,7 @@ pub const MatrixConnector = struct {
         allocator.free(id);
     }
 
-    /// Sends the prompt text (choices spelled out as "{emoji} — {label}",
-    /// since a Matrix reaction alone carries no label) then self-reacts
-    /// once per choice to seed tappable pills — Matrix's nearest equivalent
-    /// of Telegram's inline-keyboard buttons. A single failed seed reaction
-    /// is logged and skipped rather than aborting the whole prompt.
-    ///
-    /// Both the prompt and the seed reactions go through `sendEvent`, so
-    /// they're visible in encrypted rooms like any other outgoing message —
-    /// but a user's own tap-to-pick reaction arriving back as an encrypted
-    /// `m.reaction` isn't decrypted by `pollFn` yet (its `m.room.encrypted`
-    /// branch only unwraps to `m.room.message`), so choice prompts aren't
-    /// pickable in encrypted rooms yet. Known gap, not fixed tonight.
+    /// Sends the prompt text.
     fn sendChoicePromptFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8, choices: []const iface.Choice, reply_to_message_id: ?[]const u8) anyerror!?[]const u8 {
         const self: *MatrixConnector = @ptrCast(@alignCast(ptr));
 
@@ -772,14 +641,7 @@ pub const MatrixConnector = struct {
         return self.client.demoteUser(allocator, chat_id, user_id);
     }
 
-    /// Matrix has no granular permission object — best-effort maps only the
-    /// `write` bit onto the same power-level mechanism `muteUser`/
-    /// `unmuteUser` already use (a member with `write` cleared is set to
-    /// the same "muted" power level `muteUser` uses; otherwise ordinary).
-    /// Every other bit (`p`/`v`/`f`/`m`/`o`/`d`/`s`/`l`/`e`/`i`/`r`/`a`/`t`)
-    /// stays stored-but-unenforced here, same as Telegram's `r`/`a`/`t`.
-    /// `until_unix_time` is ignored — Matrix power levels have no expiry,
-    /// same note as `muteUserFn` above.
+    /// Matrix has no granular permission object.
     fn restrictChatMemberPermissionsFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, permission_bits: u32, until_unix_time: i64) anyerror!void {
         _ = until_unix_time;
         const self: *MatrixConnector = @ptrCast(@alignCast(ptr));

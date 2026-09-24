@@ -1,19 +1,12 @@
-//! Rate-limit / ban-avoidance pacing for the Instagram connector's poll
-//! loop -- jittered intervals and a hard pause-and-alert on anything
-//! shaped like a checkpoint/feedback-block response, per the connector
-//! plan's "Rate-limit / ban-avoidance policy" section. Deliberately simple
-//! (no exponential-backoff state machine beyond the pause/resume flip):
-//! this connector's own poll loop already retries on its own schedule, and
-//! the actual risk-reduction lever that matters most is "stop entirely and
-//! make a human look at it", not a cleverer retry curve.
+//! Rate-limit / ban-avoidance pacing for the Instagram connector's poll loop
+//! -- jittered intervals and a hard pause-and-alert on anything shaped like a
+//! checkpoint/feedback-block response, per the connector plan's "Rate-limit /
+//! ban-avoidance policy" section.
 const std = @import("std");
 const Io = std.Io;
 
 /// Jittered delay before the next poll cycle -- `base_ms` plus up to 50%
-/// extra, so this connector's request cadence doesn't look like a metronome
-/// (a real Android app's own background sync timing varies too). Uses
-/// `io.random` for the jitter draw, same entropy source as
-/// `transport.zig`'s device-id generation.
+/// extra.
 pub fn nextPollDelayMs(io: Io, base_ms: u32) u32 {
     var buf: [4]u8 = undefined;
     io.random(&buf);
@@ -25,11 +18,7 @@ pub fn nextPollDelayMs(io: Io, base_ms: u32) u32 {
 }
 
 /// Whether an HTTP status/body combination looks like Instagram's
-/// checkpoint/feedback-block family of responses -- deliberately broad
-/// (a 400/403 with any of these substrings) since correctly recognizing
-/// every exact shape isn't as important as never missing one: a false
-/// pause just costs a manual `/iglogin status`-driven resume, a missed one
-/// risks hammering an already-flagged account.
+/// checkpoint/feedback-block family of responses.
 pub fn looksLikeChallengeOrBlock(status_class_is_error: bool, body: []const u8) bool {
     if (!status_class_is_error) return false;
     const markers = [_][]const u8{
@@ -46,10 +35,7 @@ pub fn looksLikeChallengeOrBlock(status_class_is_error: bool, body: []const u8) 
 }
 
 /// Tracks whether polling is currently paused after a challenge/block was
-/// detected -- the connector checks `isPaused()` before every poll cycle
-/// and skips it (returning no messages) while paused, resuming only once
-/// `resume_()` is called (driven by `/iglogin status` after the owner has
-/// dealt with whatever tripped it, e.g. re-logging in).
+/// detected.
 pub const Breaker = struct {
     paused: std.atomic.Value(bool) = .init(false),
     /// Set once, the first time `trip()` fires -- surfaced by `/iglogin
@@ -69,9 +55,8 @@ pub const Breaker = struct {
         return self.paused.load(.acquire);
     }
 
-    /// Idempotent -- a second trip while already paused just leaves the
-    /// original reason in place (the first cause is almost always the
-    /// actually-informative one).
+    /// Idempotent -- a second trip while already paused just leaves the original
+    /// reason in place.
     pub fn trip(self: *Breaker, reason: []const u8) void {
         if (self.paused.swap(true, .acq_rel)) return;
         self.reason = self.allocator.dupe(u8, reason) catch null;

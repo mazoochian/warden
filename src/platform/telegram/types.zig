@@ -4,10 +4,7 @@
 
 const std = @import("std");
 
-/// Full Telegram Bot API `User` object (fields Warden can plausibly use for
-/// identity — deprecated/inline-menu-only fields are omitted since
-/// `ignore_unknown_fields = true` means nothing breaks if Telegram sends
-/// them anyway).
+/// Full Telegram Bot API `User` object.
 pub const User = struct {
     id: i64,
     is_bot: bool = false,
@@ -27,11 +24,7 @@ pub const User = struct {
 pub const Chat = struct {
     id: i64,
     type: []const u8 = "",
-    /// Groups, supergroups and channels only. A *private* chat never has
-    /// one — Telegram identifies the other party by name instead, via the
-    /// two fields below. Reading this alone (as everything used to) meant
-    /// every 1:1 chat ended up with no title at all and got displayed by
-    /// raw numeric id. See `displayTitle`.
+    /// Groups, supergroups and channels only.
     title: ?[]const u8 = null,
     /// Private chats only: the other party's name.
     first_name: ?[]const u8 = null,
@@ -40,14 +33,7 @@ pub const Chat = struct {
     /// don't unless they have a public invite link.
     username: ?[]const u8 = null,
 
-    /// The best human-readable name for this chat, whatever its type:
-    /// `title` for groups/supergroups/channels, the other party's name for
-    /// a private chat, falling back to `@username` when a private chat has
-    /// no name at all. `null` only when Telegram gave us nothing to go on,
-    /// which is the one case a caller should fall back to the raw id.
-    ///
-    /// Allocates only when it has to join a first and last name; every
-    /// other case borrows from `self`.
+    /// The best human-readable name for this chat, whatever its type.
     pub fn displayTitle(self: Chat, allocator: std.mem.Allocator) !?[]const u8 {
         if (self.title) |t| if (t.len > 0) return t;
         if (self.first_name) |first| if (first.len > 0) {
@@ -94,18 +80,16 @@ test "Chat.displayTitle falls back to @username, then to nothing" {
     try std.testing.expectEqual(@as(?[]const u8, null), try bare.displayTitle(a));
 }
 
-/// Deliberately flat (no nested `reply_to_message` of its own) rather than
-/// a recursive `Message` — Telegram does allow reply chains, but Warden
-/// only ever needs to know who/what a direct reply targets.
+/// Deliberately flat (no nested `reply_to_message` of its own) rather than a
+/// recursive `Message`.
 pub const ReplyToMessage = struct {
     message_id: i64,
     from: ?User = null,
     text: ?[]const u8 = null,
 };
 
-/// One size variant of an inbound photo — Telegram sends several
-/// resolutions per photo; the largest (by pixel area) is what Warden
-/// downloads.
+/// One size variant of an inbound photo — Telegram sends several resolutions
+/// per photo; the largest (by pixel area) is what Warden downloads.
 pub const PhotoSize = struct {
     file_id: []const u8,
     width: i64 = 0,
@@ -135,12 +119,7 @@ pub const Video = struct {
     mime_type: ?[]const u8 = null,
 };
 
-/// One parsed span of `Message.text` — Warden only cares about
-/// `text_mention`, the one entity kind that carries a full `User` object
-/// (used when a client mentions someone by name without an `@username`,
-/// e.g. tapping a name out of the member list on a person with no handle).
-/// Plain `"mention"` entities (`@username`) carry no `user` and need no
-/// special parsing — the raw `@handle` is already in `text`.
+/// One parsed span of `Message.text`.
 pub const MessageEntity = struct {
     type: []const u8 = "",
     offset: i64 = 0,
@@ -155,15 +134,10 @@ pub const Message = struct {
     chat: Chat,
     date: i64 = 0,
     text: ?[]const u8 = null,
-    /// Telegram never sends `text` on a photo/document/voice/audio/video
-    /// message — any caption the user typed alongside the attachment
-    /// arrives here instead. `attachmentFromMessage`'s caller folds this
-    /// into `iface.Message.text` so callers don't need to know which field
-    /// a given message actually populated.
+    /// Telegram never sends `text` on a photo/document/voice/audio/video message.
     caption: ?[]const u8 = null,
-    /// Parsed spans of `text` (mentions, links, bold, ...) — Warden only
-    /// reads `text_mention` entries out of this (see `MessageEntity`'s doc
-    /// comment) to learn about a chat member who has no `@username`.
+    /// Parsed spans of `text` (mentions, links, bold, ...) — Warden only reads
+    /// `text_mention` entries out of this.
     entities: ?[]MessageEntity = null,
     reply_to_message: ?ReplyToMessage = null,
     /// Multiple resolutions when present; adapters pick the largest.
@@ -178,11 +152,8 @@ pub const Message = struct {
     /// Present on the service message Telegram sends when a single user
     /// leaves/is removed from a group.
     left_chat_member: ?User = null,
-    /// Present on the service message Telegram sends to the OLD chat id
-    /// when a basic group is upgraded to a supergroup — Telegram mints a
-    /// brand-new chat id for the same real-world group. See
-    /// `platform/telegram/connector.zig`'s `pollFn` for how this becomes a
-    /// `migrated_to_native_chat_id` signal instead of a normal message.
+    /// Present on the service message Telegram sends to the OLD chat id when a
+    /// basic group is upgraded to a supergroup.
     migrate_to_chat_id: ?i64 = null,
 };
 
@@ -193,9 +164,8 @@ pub const FileResponse = struct {
     description: ?[]const u8 = null,
 };
 
-/// A button press on a message's inline keyboard (see
-/// `client.zig`'s `sendChoicePrompt`). Telegram never sets `message`
-/// alongside `update.message` — a callback query is its own update kind.
+/// A button press on a message's inline keyboard (see `client.zig`'s
+/// `sendChoicePrompt`).
 pub const CallbackQuery = struct {
     id: []const u8,
     from: ?User = null,
@@ -205,16 +175,8 @@ pub const CallbackQuery = struct {
     data: ?[]const u8 = null,
 };
 
-/// Sent whenever the bot's OWN membership status in a chat changes
-/// (added, promoted/demoted, left, kicked/banned) — Telegram's `my_chat_
-/// member` update, distinct from `chat_member` (other members' status
-/// changes, not requested/parsed here) and from `left_chat_member`
-/// (a *service message* visible in the chat's own timeline, which isn't
-/// reliably delivered depending on the chat's visibility settings and
-/// says nothing about the bot itself unless the bot happens to be who
-/// left). `new_chat_member.status` of `"left"`/`"kicked"` is the
-/// authoritative "the bot's no longer in this chat" signal — see
-/// `platform/telegram/connector.zig`'s `pollFn`.
+/// Sent whenever the bot's OWN membership status in a chat changes (added,
+/// promoted/demoted, left, kicked/banned).
 pub const ChatMemberUpdated = struct {
     chat: Chat,
     new_chat_member: ChatMember,
@@ -226,11 +188,7 @@ pub const Update = struct {
     edited_message: ?Message = null,
     callback_query: ?CallbackQuery = null,
     my_chat_member: ?ChatMemberUpdated = null,
-    /// A post in a channel the bot is in — channels have no `from` user
-    /// (posts are anonymous-by-channel, not by a member) and never produce
-    /// ordinary `message` updates, only these. See
-    /// `platform/telegram/connector.zig`'s `pollFn` for how this becomes a
-    /// chat-ingest-only `iface.Message`.
+    /// A post in a channel the bot is in — channels have no `from` user.
     channel_post: ?Message = null,
     edited_channel_post: ?Message = null,
 };
@@ -252,13 +210,7 @@ pub const MeResponse = struct {
     description: ?[]const u8 = null,
 };
 
-/// Telegram's ChatMember object. The real Bot API models this as a union
-/// discriminated by `status` (ChatMemberOwner/Administrator/Member/
-/// Restricted/Left/Banned each with their own field set) — flattened here
-/// into one struct with every variant's fields optional, matching this
-/// file's existing style (see `Message`'s doc comment) rather than
-/// introducing a JSON-tagged-union decode. `status` is one of "creator",
-/// "administrator", "member", "restricted", "left", "kicked".
+/// Telegram's ChatMember object.
 pub const ChatMember = struct {
     status: []const u8 = "",
     user: ?User = null,
@@ -291,10 +243,7 @@ pub const ChatMemberResponse = struct {
     description: ?[]const u8 = null,
 };
 
-/// Response shape of `getChatAdministrators` — every owner/administrator of
-/// a chat, the one Telegram Bot API call that surfaces more than a single
-/// member at a time (see `Client.getChatAdministrators`'s doc comment for
-/// why this is the closest thing to a member "roster" bots get).
+/// Response shape of `getChatAdministrators`.
 pub const ChatAdministratorsResponse = struct {
     ok: bool,
     result: []ChatMember = &.{},

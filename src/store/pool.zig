@@ -3,30 +3,11 @@ const Io = std.Io;
 const Db = @import("db.zig").Db;
 const log = @import("../log.zig").scoped("postgres");
 
-/// How often `acquire` re-checks the free list while waiting for a
-/// connection — same idiom/value as `http_util.zig`'s `fetchWithTimeout`
-/// poll loop.
+/// How often `acquire` re-checks the free list while waiting for a connection
+/// — same idiom/value as `http_util.zig`'s `fetchWithTimeout` poll loop.
 const poll_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
-/// A fixed-size pool of Postgres connections. Replaces `ChatStore`'s
-/// `std.StringHashMap(*Db)` (one SQLite connection per chat, free isolation
-/// via separate files) — a single shared Postgres database has no such free
-/// isolation, so every concurrently-running per-message task now borrows a
-/// connection from here for the duration of its queries instead of owning
-/// one outright.
-///
-/// `acquire` used to block forever on an `Io.Semaphore` when the pool was
-/// exhausted — no timeout, no way out. Confirmed live (2026-07-22) as the
-/// likely cause of a production hang: with per-message concurrency degraded
-/// to fully serial-per-platform on a low-core host (see `main.zig`'s
-/// `WorkerPool`), a single connection wedged for any reason (network blip to
-/// Postgres, a slow query) would silently shrink the pool's usable capacity
-/// by one forever, eventually starving every future acquire with nothing to
-/// show for it in the logs — the exact same "looks alive, answers nothing"
-/// failure mode `8dcbcd8` fixed for HTTP. `acquire` now polls the free list
-/// with a bounded wait instead of blocking on a semaphore, returning
-/// `error.PoolExhausted` after `acquire_timeout_ns` so a starved pool is a
-/// normal, loggable error instead of a silent forever-hang.
+/// A fixed-size pool of Postgres connections.
 pub const PgPool = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -76,10 +57,7 @@ pub const PgPool = struct {
 
     pub fn deinit(self: *PgPool) void {
         // A poisoned slot's `conn` may still be touched by an abandoned
-        // `runWithDeadline` thread at any point in the future (see
-        // `Db.poisoned`) — closing it here would race that thread, so it's
-        // left leaked, same trade-off `http_util.zig` accepts for a
-        // detached-on-timeout HTTP request.
+        // `runWithDeadline` thread at any point in the future (see `Db.poisoned`).
         for (self.conns) |*conn| {
             if (!conn.poisoned) conn.close();
         }
@@ -89,16 +67,13 @@ pub const PgPool = struct {
     }
 
     /// Waits up to `acquire_timeout_ns` for a free connection, polling every
-    /// `poll_interval_ns` — see this struct's doc comment for why this isn't
-    /// an unbounded wait anymore. Returns `error.PoolExhausted` on timeout.
+    /// `poll_interval_ns`.
     pub fn acquire(self: *PgPool) !*Db {
         var waited_ns: u64 = 0;
         while (true) {
             if (try self.tryAcquire()) |db| {
-                // Only logged once actual waiting happened (not on the
-                // common instant-acquire path) — this is the leading
-                // indicator that the pool is under real pressure, well
-                // before it actually exhausts.
+                // Only logged once actual waiting happened (not on the common instant-acquire
+                // path).
                 if (waited_ns > 0) {
                     log.debug("acquired after waiting {d}ms", .{@divTrunc(waited_ns, std.time.ns_per_ms)});
                 }
@@ -132,15 +107,7 @@ pub const PgPool = struct {
         self.mutex.unlock(self.io);
     }
 
-    /// A query on this slot blew its deadline (see `Db.runWithDeadline`) —
-    /// the old connection is left exactly as-is (leaked; an abandoned
-    /// thread may still be touching it) and a fresh one takes its place so
-    /// the pool's usable capacity doesn't shrink permanently every time a
-    /// connection dies. If the reopen itself fails (Postgres genuinely
-    /// unreachable right now), the slot is simply not returned to the free
-    /// list — capacity degrades by one instead of looping or panicking; a
-    /// pool that runs out entirely surfaces as an ordinary, loggable
-    /// `error.PoolExhausted` from `acquire` rather than another silent hang.
+    /// A query on this slot blew its deadline (see `Db.runWithDeadline`).
     fn reopenPoisoned(self: *PgPool, idx: usize) void {
         log.warn("connection slot {d} poisoned (query blew its deadline), reopening", .{idx});
         const fresh = Db.open(self.allocator, self.io, self.dsn, self.statement_timeout_seconds) catch |err| {
@@ -154,12 +121,8 @@ pub const PgPool = struct {
         log.notice("connection slot {d} reopened and back in the pool", .{idx});
     }
 
-    /// Test-only: wraps a single already-open connection the caller still
-    /// owns (e.g. `test_support.openTestDb`'s handle), so store-module tests
-    /// can exercise pool-based APIs without opening a second real
-    /// connection. Must be torn down with `deinitTestWrap`, not `deinit` —
-    /// this pool doesn't own `db` or the one-element `conns` slice, so
-    /// `deinit`'s `close()`/`free()` would misbehave.
+    /// Test-only: wraps a single already-open connection the caller still owns
+    /// (e.g. `test_support.openTestDb`'s handle).
     pub fn wrapForTest(allocator: std.mem.Allocator, io: Io, db: *Db) !PgPool {
         var free_idx: std.ArrayList(usize) = .empty;
         try free_idx.append(allocator, 0);
@@ -200,13 +163,7 @@ test "acquire/release round-trips a connection through the pool" {
 test "acquire returns error.PoolExhausted instead of hanging forever when nothing is free" {
     const io = testing.io;
 
-    // Deliberately not `PgPool.init` — no real Postgres needed to exercise
-    // this: `acquire`/`tryAcquire` never dereference `conns[idx]` itself,
-    // only `free_idx`, so a single placeholder `Db` (never touched) is
-    // enough to test the timeout path in isolation. Regression for the
-    // production hang this replaces: `acquire` used to block on an
-    // `Io.Semaphore` with no way out at all when every connection was
-    // checked out and never returned.
+    // Deliberately not `PgPool.init` — no real Postgres needed to exercise this.
     var conns = [_]Db{.{ .conn = undefined, .allocator = testing.allocator, .io = io, .query_timeout_ns = 30 * std.time.ns_per_s }};
     var pool: PgPool = .{
         .allocator = testing.allocator,

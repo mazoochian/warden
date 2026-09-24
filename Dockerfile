@@ -47,8 +47,14 @@ RUN --mount=type=cache,target=/root/.cache/zig \
 # the distro Chromium instead.
 # ---------------------------------------------------------------------------
 FROM node:22-alpine AS node-deps
+# npm's default 15 parallel connections get reset (ECONNRESET) partway
+# through `npm ci` on networks that rate-limit concurrent conns; a few
+# sockets plus retries is slower but actually finishes.
 ENV PUPPETEER_SKIP_DOWNLOAD=true \
-    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    NPM_CONFIG_MAXSOCKETS=3 \
+    NPM_CONFIG_FETCH_RETRIES=5 \
+    NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=2000
 WORKDIR /deps
 COPY tools/diagram/package.json tools/diagram/package-lock.json ./diagram/
 RUN cd diagram && npm ci --omit=dev

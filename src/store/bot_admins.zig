@@ -3,17 +3,7 @@ const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
 /// Bot-admin role: a DB-backed permission tier distinct from any platform's
-/// own group-admin flag — see `auth.checkGroupAdminAccess`'s doc comment for
-/// how it plugs into the permission ladder. Keyed purely on `identity_id`
-/// (not platform+native_id): every call site already has an internal id in
-/// hand by the time it needs to check this (the message sender's
-/// `identity_id` is a `handleMessage` parameter already; command targets are
-/// always resolved through `identities.getOrCreateMinimal`/`findByUsername`
-/// first).
-///
-/// `isBotAdmin` fails closed (returns `false`) on any pool/query error,
-/// matching `chat_members.getTokens`'s and `auth.isAuthorizedForGroupAdmin`'s
-/// existing "an unreachable check means not authorized" convention.
+/// own group-admin flag.
 pub fn isBotAdmin(pool: *PgPool, identity_id: i64) bool {
     const db = pool.acquire() catch return false;
     defer pool.release(db);

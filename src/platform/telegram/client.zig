@@ -8,9 +8,7 @@ const http_util = @import("../../http_util.zig");
 const markdown_html = @import("markdown_html.zig");
 const llm = @import("../../llm/provider.zig");
 
-/// Thin wrapper around the Telegram Bot API. Uses long polling (`getUpdates`)
-/// rather than webhooks, since Warden runs local/dev without a public HTTPS
-/// endpoint.
+/// Thin wrapper around the Telegram Bot API.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -30,9 +28,7 @@ pub const Client = struct {
         self.http_client.deinit();
     }
 
-    /// Long-polls for new updates starting after `offset`. Blocks for up to
-    /// `timeout_secs` seconds if there are none yet. Caller owns the returned
-    /// `Parsed` value and must call `.deinit()` on it.
+    /// Long-polls for new updates starting after `offset`.
     pub fn getUpdates(
         self: *Client,
         allocator: std.mem.Allocator,
@@ -49,9 +45,8 @@ pub const Client = struct {
         const body = try http_util.get(&self.http_client, allocator, url);
         defer allocator.free(body);
 
-        // `alloc_always` forces all strings to be duplicated into the
-        // Parsed value's own arena instead of borrowing from `body`, which
-        // we free right after this call returns.
+        // `alloc_always` forces all strings to be duplicated into the Parsed value's
+        // own arena instead of borrowing from `body`.
         return json.parseFromSlice(
             types.UpdatesResponse,
             allocator,
@@ -80,8 +75,6 @@ pub const Client = struct {
     /// Sends a plain text message, threaded as a reply to `reply_to_message_id`
     /// when set (`allow_sending_without_reply` so a reply target that's since
     /// been deleted degrades to a plain message instead of failing outright).
-    /// Fire-and-forget: logs failures rather than propagating them, since a
-    /// failed reply shouldn't crash the poll loop.
     pub fn sendMessage(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, reply_to_message_id: ?i64) void {
         self.sendMessageErr(allocator, chat_id, text, reply_to_message_id) catch |err| {
             std.log.err("sendMessage failed: {t}", .{err});
@@ -93,18 +86,10 @@ pub const Client = struct {
         allow_sending_without_reply: bool = true,
     };
 
-    /// POSTs `sendMessage` once, either with `parse_mode=HTML` (converting
-    /// `text` first via `markdown_html.toHtml`) or as plain text — the
-    /// shared body every text-sending method's "try HTML, fall back to
-    /// plain on failure" retry (see e.g. `sendMessageErr` below) drives.
-    /// Caller owns the returned body.
+    /// POSTs `sendMessage` once, either with `parse_mode=HTML` (converting `text`
+    /// first via `markdown_html.toHtml`) or as plain text.
     fn postSendMessage(self: *Client, allocator: std.mem.Allocator, url: []const u8, chat_id: i64, text: []const u8, reply_parameters: ?ReplyParameters, html: bool) ![]u8 {
-        // The plain branch is a fallback, not a "no formatting needed"
-        // path: it is taken when Telegram rejected the HTML attempt, and
-        // the text may still carry chain-of-thought markers. Those are
-        // control bytes, so passing them through unrendered is what made a
-        // rejected message show its thinking as ordinary prose with the 💭
-        // missing (see `llm.renderThinkingPlain`).
+        // The plain branch is a fallback, not a "no formatting needed" path.
         const send_text = if (html)
             markdown_html.toHtml(allocator, text) catch text
         else
@@ -113,14 +98,7 @@ pub const Client = struct {
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
-        // `emit_null_optional_fields = false`: Telegram's API rejects an
-        // explicitly-present `"reply_parameters":null` ("Bad Request:
-        // object expected as reply parameters") rather than treating it
-        // like the field was never sent — Zig's default stringify options
-        // emit null optional fields as literal `null` rather than omitting
-        // the key, which silently broke every unprompted message (a
-        // reminder/alert/feed-watcher notification, anything not sent as a
-        // reply) until this was caught. Same reasoning covers `parse_mode`.
+        // `emit_null_optional_fields = false`.
         try json.Stringify.value(
             .{ .chat_id = chat_id, .text = send_text, .reply_parameters = reply_parameters, .parse_mode = parse_mode },
             .{ .emit_null_optional_fields = false },
@@ -140,19 +118,8 @@ pub const Client = struct {
 
         const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
 
-        // Try HTML-formatted first; only retry as plain text when Telegram
-        // itself rejected the request (`error.HttpRequestFailed` — most
-        // plausibly an entity `markdown_html.toHtml`'s necessarily-
-        // incomplete grammar got wrong, occasionally a genuinely benign
-        // rejection like "message is not modified" that'll just fail the
-        // same way again either way). A transient network failure
-        // (timeout, connection reset) isn't a formatting problem — retrying
-        // would just repeat the same failure while silently discarding
-        // formatting that would have worked fine; propagate those as-is
-        // instead. Confirmed live: an editMessage that failed this way
-        // dropped an otherwise-valid expandable blockquote down to plain
-        // text for no reason before this distinction existed. See
-        // `markdown_html.zig`'s module doc comment.
+        // Try HTML-formatted first; only retry as plain text when Telegram itself
+        // rejected the request.
         if (self.postSendMessage(allocator, url, chat_id, text, reply_parameters, true)) |body| {
             allocator.free(body);
             return;
@@ -198,11 +165,8 @@ pub const Client = struct {
 
         const reply_parameters: ?ReplyParameters = if (reply_to_message_id) |id| .{ .message_id = id } else null;
 
-        // Same HTML-then-plain-text fallback as `sendMessageErr` — only
-        // retry as plain on an actual Telegram rejection, not a transient
-        // network failure. Reaching `parseSendMessageResponse` at all means
-        // the HTTP call itself already succeeded (2xx), so any error it
-        // raises is cheap to retry regardless of cause.
+        // Same HTML-then-plain-text fallback as `sendMessageErr` — only retry as
+        // plain on an actual Telegram rejection, not a transient network failure.
         if (self.postSendMessage(allocator, url, chat_id, text, reply_parameters, true)) |body| {
             defer allocator.free(body);
             if (parseSendMessageResponse(allocator, body)) |id| return id else |_| {
@@ -218,10 +182,8 @@ pub const Client = struct {
         return parseSendMessageResponse(allocator, body);
     }
 
-    /// One button on an inline keyboard, in this client's own local shape
-    /// rather than `iface.Choice` — this file stays free of any dependency
-    /// on `platform/interface.zig` (the raw-API layer never imports the
-    /// adapter layer); `platform/telegram/connector.zig` translates.
+    /// One button on an inline keyboard, in this client's own local shape rather
+    /// than `iface.Choice`.
     pub const Button = struct {
         text: []const u8,
         callback_data: []const u8,
@@ -235,12 +197,9 @@ pub const Client = struct {
         inline_keyboard: []const []const InlineKeyboardButton,
     };
 
-    /// Arranges `buttons` 2 per row (a single long row renders badly once
-    /// there are more than a handful of choices) as the nested-slice shape
-    /// `InlineKeyboardMarkup` needs. Caller owns and must free both the
-    /// returned outer slice and each row slice it contains — shared by
-    /// `sendChoicePrompt` and `editMessageTextWithKeyboard` so both build
-    /// the exact same keyboard shape from the same button list.
+    /// Arranges `buttons` 2 per row (a single long row renders badly once there
+    /// are more than a handful of choices) as the nested-slice shape
+    /// `InlineKeyboardMarkup` needs.
     fn buildInlineKeyboardRows(allocator: std.mem.Allocator, buttons: []const Button) ![]const []const InlineKeyboardButton {
         const buttons_per_row = 2;
         var rows: std.ArrayList([]const InlineKeyboardButton) = .empty;
@@ -260,9 +219,6 @@ pub const Client = struct {
     }
 
     /// Sends a message with an inline keyboard built from `buttons`.
-    /// Returns the sent message's id, like `sendMessageReturningId` —
-    /// needed so a later button press can be matched back to this specific
-    /// prompt.
     pub fn sendChoicePrompt(self: *Client, allocator: std.mem.Allocator, chat_id: i64, text: []const u8, buttons: []const Button, reply_to_message_id: ?i64) !i64 {
         const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{self.bot_token});
         defer allocator.free(url);
@@ -277,8 +233,6 @@ pub const Client = struct {
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
-        // See `sendMessageErr`'s doc comment on why this needs
-        // `emit_null_optional_fields = false`.
         try json.Stringify.value(
             .{ .chat_id = chat_id, .text = text, .reply_parameters = reply_parameters, .reply_markup = InlineKeyboardMarkup{ .inline_keyboard = rows } },
             .{ .emit_null_optional_fields = false },
@@ -305,12 +259,7 @@ pub const Client = struct {
     }
 
     /// Replaces a message's text AND inline keyboard together in one call
-    /// (Telegram's `editMessageText` accepts `reply_markup` directly) — how
-    /// `features/menu.zig` navigates a multi-level menu by editing one
-    /// living message instead of sending a new one per level. Deliberately
-    /// plain text, no HTML/markdown conversion (menu content doesn't need
-    /// it, and keeping this separate from `editMessage`'s HTML-fallback
-    /// path keeps that one simple for its own callers).
+    /// (Telegram's `editMessageText` accepts `reply_markup` directly).
     pub fn editMessageTextWithKeyboard(self: *Client, allocator: std.mem.Allocator, chat_id: i64, message_id: i64, text: []const u8, buttons: []const Button) !void {
         const rows = try buildInlineKeyboardRows(allocator, buttons);
         defer {
@@ -325,41 +274,23 @@ pub const Client = struct {
         });
     }
 
-    /// Dismisses the client-side loading spinner Telegram shows on a
-    /// pressed button until this is called. Fire-and-forget like
-    /// `sendMessage` — a failure here doesn't affect the button press
-    /// itself, which has already been delivered as an update either way.
+    /// Dismisses the client-side loading spinner Telegram shows on a pressed
+    /// button until this is called.
     pub fn answerCallbackQuery(self: *Client, allocator: std.mem.Allocator, callback_query_id: []const u8) void {
         self.callMethod(allocator, "answerCallbackQuery", .{ .callback_query_id = callback_query_id }) catch |err| {
             std.log.err("answerCallbackQuery failed: {t}", .{err});
         };
     }
 
-    /// Replaces the text of a previously-sent message (the "thinking"
-    /// placeholder / progressive-answer editing flow — see main.zig's
-    /// `replyWithAnswer`). Telegram rejects an edit whose text is
-    /// byte-for-byte identical to the message's current content ("message
-    /// is not modified", HTTP 400) — `http_util`'s non-2xx handling
-    /// discards the response body, so that specific case can't be told
-    /// apart from a real failure here; callers must avoid sending an
-    /// identical edit in the first place (main.zig's ticker tracks the
-    /// last text it actually sent and skips a no-op edit). Same
-    /// HTML-then-plain-text fallback as `sendMessageErr` — the "not
-    /// modified" case above will still just fail after both attempts
-    /// (unrelated to formatting, nothing new to do about it here), same as
-    /// it already did before this fallback existed.
+    /// Replaces the text of a previously-sent message (the "thinking" placeholder
+    /// / progressive-answer editing flow — see main.zig's `replyWithAnswer`).
     pub fn editMessage(self: *Client, allocator: std.mem.Allocator, chat_id: i64, message_id: i64, text: []const u8) !void {
         const html_text = markdown_html.toHtml(allocator, text) catch text;
         const parse_mode: ?[]const u8 = "HTML";
         if (self.callMethod(allocator, "editMessageText", .{ .chat_id = chat_id, .message_id = message_id, .text = html_text, .parse_mode = parse_mode })) |_| {
             return;
         } else |err| {
-            // Only an actual Telegram rejection is worth retrying as plain
-            // text — see `sendMessageErr`'s doc comment for why a
-            // transient network failure isn't. Includes the benign "not
-            // modified" case (also a 400 = `error.HttpRequestFailed`);
-            // that retry will just fail the same way again either way, no
-            // worse off than before this fallback existed.
+            // Only an actual Telegram rejection is worth retrying as plain text.
             if (err != error.HttpRequestFailed) return err;
             std.log.warn("editMessage: HTML edit rejected for chat {d} message {d}, retrying as plain text", .{ chat_id, message_id });
         }
@@ -419,12 +350,7 @@ pub const Client = struct {
         }
     }
 
-    /// Sends a native Telegram poll (ROADMAP.md's Phase 16). Fire-and-
-    /// forget like `sendMessage`/`sendPhoto` -- a failed poll (bad
-    /// question/options, bot lacking permission, etc.) is logged, not
-    /// propagated, so a caller's own reply flow never has to special-case
-    /// it. `options` up to Bot API 7's `InputPollOption` shape (an object
-    /// with a `text` field, not a bare string).
+    /// Sends a native Telegram poll.
     pub fn sendPoll(self: *Client, allocator: std.mem.Allocator, chat_id: i64, question: []const u8, options: []const []const u8, reply_to_message_id: ?i64) void {
         self.sendPollErr(allocator, chat_id, question, options, reply_to_message_id) catch |err| {
             std.log.err("sendPoll failed: {t}", .{err});
@@ -448,8 +374,7 @@ pub const Client = struct {
     }
 
     /// Sends an arbitrary file as a document (e.g. a converted file from
-    /// `convert_file`, or the text-too-long fallback). Fire-and-forget like
-    /// `sendMessage`/`sendPhoto`.
+    /// `convert_file`, or the text-too-long fallback).
     pub fn sendDocument(self: *Client, allocator: std.mem.Allocator, chat_id: i64, file_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void {
         self.sendDocumentErr(allocator, chat_id, file_bytes, file_name, caption) catch |err| {
             std.log.err("sendDocument failed: {t}", .{err});
@@ -502,18 +427,7 @@ pub const Client = struct {
     }
 
     /// Sends a native, inline-playable video message (`video_download.zig`'s
-    /// lossy delivery path) -- same multipart shape as `sendDocumentErr`,
-    /// just the `video` field/endpoint instead of `document`. Fire-and-
-    /// forget like `sendMessage`/`sendPhoto`/`sendDocument`.
-    ///
-    /// `Content-Type` is hardcoded to `video/mp4` rather than derived from
-    /// `file_name` -- same precedent `sendPhotoErr` already sets by
-    /// hardcoding `image/png` regardless of the actual bytes, and safe here
-    /// because the only producer (`video_download.zig`) always emits
-    /// `.mp4`. Telegram's real `sendVideo` also accepts optional
-    /// `duration`/`width`/`height`/`thumbnail` fields -- deliberately
-    /// omitted (Telegram infers them from the file itself); a possible
-    /// future enhancement if that inference proves poor, not required now.
+    /// lossy delivery path).
     pub fn sendVideo(self: *Client, allocator: std.mem.Allocator, chat_id: i64, video_bytes: []const u8, file_name: []const u8, caption: ?[]const u8) void {
         self.sendVideoErr(allocator, chat_id, video_bytes, file_name, caption) catch |err| {
             std.log.err("sendVideo failed: {t}", .{err});
@@ -565,11 +479,8 @@ pub const Client = struct {
         }
     }
 
-    /// Resolves a `file_id` (from an inbound photo/document/voice/audio/
-    /// video) to downloadable bytes — Telegram's two-step process: look up
-    /// the file's `file_path` via `getFile`, then GET it from the separate
-    /// file-serving host. Bot API file downloads cap at 20MB; `.limited`
-    /// below matches that so a pathological response can't exhaust memory.
+    /// Resolves a `file_id` (from an inbound photo/document/voice/audio/ video)
+    /// to downloadable bytes — Telegram's two-step process.
     pub fn downloadFile(self: *Client, allocator: std.mem.Allocator, file_id: []const u8) ![]u8 {
         const encoded_id = try http_util.encodeQueryComponent(allocator, file_id);
         defer allocator.free(encoded_id);
@@ -612,9 +523,7 @@ pub const Client = struct {
         return self.callMethod(allocator, "banChatMember", .{ .chat_id = chat_id, .user_id = user_id });
     }
 
-    /// Ban immediately followed by unban — Telegram's standard idiom for a
-    /// "kick" (removes them now, but they're free to rejoin), as opposed to
-    /// `banChatMember` alone which is permanent.
+    /// Ban immediately followed by unban.
     pub fn kickChatMember(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64) !void {
         try self.callMethod(allocator, "banChatMember", .{ .chat_id = chat_id, .user_id = user_id });
         try self.callMethod(allocator, "unbanChatMember", .{ .chat_id = chat_id, .user_id = user_id, .only_if_banned = true });
@@ -667,14 +576,7 @@ pub const Client = struct {
     }
 
     /// The subset of Telegram's `ChatPermissions` object the granular
-    /// `/permission` model (ROADMAP.md's Phase 24) actually has bits for —
-    /// unlike `restrictChatMember`/`unrestrictChatMember` above (which only
-    /// ever set every field to the same bool), each field here is set
-    /// independently. See `platform/telegram/connector.zig`'s
-    /// `restrictChatMemberPermissionsFn` for the bitmask -> field mapping,
-    /// and `interface.zig`'s `MemberPermission.telegram_enforceable` doc
-    /// comment for which grammar letters have no field here at all
-    /// (`r`/`a`/`t` — no Bot API equivalent exists).
+    /// `/permission` model actually has bits for.
     pub const ChatPermissionOverrides = struct {
         can_send_messages: bool,
         can_send_audios: bool,
@@ -700,13 +602,7 @@ pub const Client = struct {
         });
     }
 
-    /// Sets `user_id`'s custom admin title in `chat_id` (`/tag`) — Telegram
-    /// rejects this outright (a `TelegramApiError`, per `callMethod`'s doc
-    /// comment) unless the target is already a chat administrator; there is
-    /// no Bot API concept of a custom title for an ordinary member. An
-    /// empty `custom_title` clears a previously-set one. 0-16 characters,
-    /// emoji not allowed per Telegram's docs — not validated here, Telegram
-    /// itself will reject an invalid one via the same error path.
+    /// Sets `user_id`'s custom admin title in `chat_id` (`/tag`).
     pub fn setChatAdministratorCustomTitle(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64, custom_title: []const u8) !void {
         return self.callMethod(allocator, "setChatAdministratorCustomTitle", .{
             .chat_id = chat_id,
@@ -715,17 +611,13 @@ pub const Client = struct {
         });
     }
 
-    /// `/title` (ROADMAP.md's Phase 22) — Bot API `setChatTitle`, 1-128
-    /// characters, not validated here (Telegram rejects an invalid one via
-    /// the same `TelegramApiError` path `callMethod` already gives every
-    /// other method).
+    /// `/title` — Bot API `setChatTitle`, 1-128
+    /// characters.
     pub fn setChatTitle(self: *Client, allocator: std.mem.Allocator, chat_id: i64, title: []const u8) !void {
         return self.callMethod(allocator, "setChatTitle", .{ .chat_id = chat_id, .title = title });
     }
 
-    /// `/description` — Bot API `setChatDescription`. An empty string
-    /// clears it (Telegram treats a missing/empty `description` field as
-    /// "remove the description").
+    /// `/description` — Bot API `setChatDescription`.
     pub fn setChatDescription(self: *Client, allocator: std.mem.Allocator, chat_id: i64, description: []const u8) !void {
         return self.callMethod(allocator, "setChatDescription", .{ .chat_id = chat_id, .description = description });
     }
@@ -735,9 +627,7 @@ pub const Client = struct {
         return self.callMethod(allocator, "deleteChatPhoto", .{ .chat_id = chat_id });
     }
 
-    /// `/photo` — same multipart shape as `sendPhotoErr` (the "photo" field
-    /// name and PNG content-type are Telegram convention, not a real format
-    /// requirement; Telegram re-encodes whatever image format is posted).
+    /// `/photo` — same multipart shape as `sendPhotoErr`.
     pub fn setChatPhoto(self: *Client, allocator: std.mem.Allocator, chat_id: i64, photo_bytes: []const u8) !void {
         const boundary = "----WardenBoundary7f3a9c2e";
 
@@ -776,12 +666,7 @@ pub const Client = struct {
         }
     }
 
-    /// A moderate permission set — deliberately omits `can_promote_members`
-    /// so a bot-promoted admin can't themselves mint further admins
-    /// through the bot (`/promote` is owner-gated; a promoted admin
-    /// bypassing that gate for anyone else would defeat the point).
-    /// Everything else here matches what a group owner would typically
-    /// hand a trusted moderator.
+    /// A moderate permission set.
     pub fn promoteChatMember(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64) !void {
         return self.callMethod(allocator, "promoteChatMember", .{
             .chat_id = chat_id,
@@ -837,9 +722,7 @@ pub const Client = struct {
     }
 
     /// True if `user_id` is currently the creator or an administrator of
-    /// `chat_id` — the live source of truth for group-management gating
-    /// (see `group_admin.zig`), queried fresh each time rather than cached
-    /// since admin status can change at any moment.
+    /// `chat_id` — the live source of truth for group-management gating.
     pub fn isChatAdmin(self: *Client, allocator: std.mem.Allocator, chat_id: i64, user_id: i64) !bool {
         const url = try std.fmt.allocPrint(
             allocator,
@@ -866,32 +749,20 @@ pub const Client = struct {
         return std.mem.eql(u8, member.status, "administrator") or std.mem.eql(u8, member.status, "creator");
     }
 
-    /// One entry in the bot's command menu, in this client's own local
-    /// shape — same "no dependency on the adapter layer" reasoning as
-    /// `Button`. `command` is Telegram's bare command name with no leading
-    /// slash (lowercase letters/digits/underscores, 1-32 chars).
+    /// One entry in the bot's command menu, in this client's own local shape —
+    /// same "no dependency on the adapter layer" reasoning as `Button`.
     pub const BotCommand = struct {
         command: []const u8,
         description: []const u8,
     };
 
-    /// Publishes the bot-wide command menu Telegram clients show in the
-    /// "/" autocomplete / attachment-icon menu — without this call the bot
-    /// works identically, it's purely a discoverability aid. Global default
-    /// scope (every chat, every language); replaces whatever was set
-    /// before. Best-effort from the caller's point of view: `main.zig` logs
-    /// a failure here rather than treating it as fatal to startup.
+    /// Publishes the bot-wide command menu Telegram clients show in the "/"
+    /// autocomplete / attachment-icon menu.
     pub fn setMyCommands(self: *Client, allocator: std.mem.Allocator, commands: []const BotCommand) !void {
         return self.callMethod(allocator, "setMyCommands", .{ .commands = commands });
     }
 
     /// Every owner/administrator of `chat_id`, full `User` objects included.
-    /// This is the *only* Bot API call that hands back more than one
-    /// member at a time — Telegram deliberately gives bots no way to
-    /// enumerate a group's regular (non-admin) membership, so this is used
-    /// to seed the local roster with at least the admin subset rather than
-    /// relying purely on who happens to message/get mentioned/get replied
-    /// to. Caller owns the returned `Parsed` value.
     pub fn getChatAdministrators(self: *Client, allocator: std.mem.Allocator, chat_id: i64) !json.Parsed(types.ChatAdministratorsResponse) {
         const url = try std.fmt.allocPrint(
             allocator,
@@ -912,23 +783,11 @@ pub const Client = struct {
     }
 
     /// Whether the bot itself is still a member of a chat, from a
-    /// `checkMembership` call. `.gone` covers both "the chat/bot's own
-    /// membership row explicitly says left/kicked" and "Telegram won't
-    /// even let us look, because we're not there anymore" (400 "chat not
-    /// found" / 403 "bot was kicked"/"bot is not a member") — both mean
-    /// the same thing for cleanup purposes. `.unknown` is anything else
-    /// (rate-limited, a real server error, a malformed response) — NOT
-    /// safe to treat as "gone" since it says nothing definite either way;
-    /// see `cleanup_left_chats.zig`, the only caller.
+    /// `checkMembership` call.
     pub const Membership = enum { member, gone, unknown };
 
-    /// Checks whether the bot (`self_id`) is still a member of `chat_id`,
-    /// via `getChatMember` — the one Bot API call that reports the bot's
-    /// own current status in a chat explicitly, rather than inferring it
-    /// from whether other calls happen to succeed. Uses
-    /// `http_util.getAllowingAnyStatus` instead of the usual `get` because
-    /// the *meaning* of a non-2xx response here is exactly the signal
-    /// being checked for, not an error to propagate.
+    /// Checks whether the bot (`self_id`) is still a member of `chat_id`, via
+    /// `getChatMember`.
     pub fn checkMembership(self: *Client, allocator: std.mem.Allocator, chat_id: i64, self_id: i64) !Membership {
         const url = try std.fmt.allocPrint(
             allocator,
@@ -975,21 +834,14 @@ pub const Client = struct {
     };
 
     /// Calls a Telegram Bot API method that returns a simple `{ok, result}`
-    /// (result ignored) and turns `ok: false` into a real error, unlike
-    /// `sendMessage` which is deliberately fire-and-forget — admin actions
-    /// need their caller to know whether they actually happened (e.g. the
-    /// bot not being an admin in the group) so it can report back to the
-    /// owner instead of silently doing nothing.
+    /// (result ignored) and turns.
     fn callMethod(self: *Client, allocator: std.mem.Allocator, method: []const u8, payload_value: anytype) !void {
         const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/{s}", .{ self.bot_token, method });
         defer allocator.free(url);
 
         var payload_writer: Io.Writer.Allocating = .init(allocator);
         defer payload_writer.deinit();
-        // `emit_null_optional_fields = false` defensively — see
-        // `sendMessageErr`'s doc comment; `callMethod`'s callers today
-        // don't pass a null optional field, but this is a generic helper
-        // and should be safe by default for whichever one eventually does.
+        // `emit_null_optional_fields = false` defensively.
         try json.Stringify.value(payload_value, .{ .emit_null_optional_fields = false }, &payload_writer.writer);
         const payload = payload_writer.writer.buffered();
 

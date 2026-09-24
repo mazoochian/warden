@@ -1,15 +1,7 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// One custom command shortcut (ROADMAP.md's Phase 19) -- typing `/name`
-/// re-dispatches `expansion` (plus any trailing text the user typed after
-/// the alias) exactly as if it had been typed directly, see `main.zig`'s
-/// alias-expansion step right after `/sudo` unwrapping. Chat-scoped and
-/// shared, same "creator or the bot owner may remove" model
-/// `notes.zig`/`expenses.zig` already use. `name` is always stored
-/// lowercase, without its leading slash (see `main.zig`'s
-/// `handleAliasCommand`, which also rejects any name colliding with a
-/// real built-in command before this is ever called).
+/// One custom command shortcut.
 pub const CommandAlias = struct {
     id: i64,
     chat_id: i64,
@@ -19,11 +11,7 @@ pub const CommandAlias = struct {
     created_at: i64,
 };
 
-/// Upserts `(chat_id, name)` -- saving over an existing alias name
-/// replaces its expansion (and reassigns "who added it" to whoever just
-/// saved it, a deliberate simplification: the alternative, rejecting a
-/// re-save from someone other than the original creator, adds real
-/// friction to a shared-chat power tool for little benefit).
+/// Upserts `(chat_id, name)`.
 pub fn set(pool: *PgPool, chat_id: i64, identity_id: i64, name: []const u8, expansion: []const u8, created_at: i64) !i64 {
     const db = try pool.acquire();
     defer pool.release(db);

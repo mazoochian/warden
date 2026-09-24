@@ -2,9 +2,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const PgPool = @import("pool.zig").PgPool;
 
-/// Persistence for the bot's one process-wide Olm account (see
-/// `src/platform/matrix/olm.zig`'s doc comment on why there's only ever one row,
-/// keyed by the fixed id `'self'`).
+/// Persistence for the bot's one process-wide Olm account.
 pub const StoredAccount = struct {
     device_id: []const u8,
     pickled_account: []const u8,
@@ -41,11 +39,7 @@ pub fn saveAccount(pool: *PgPool, device_id: []const u8, pickled_account: []cons
 }
 
 /// Persistence for a per-device Olm session (see `platform/matrix/olm.zig`'s
-/// `Session`). Deliberately one session per sender identity key, not a
-/// multi-session-per-sender model real clients eventually need (trying
-/// every known session until one decrypts) — a reasonable simplification
-/// for a fresh device whose very first message from any given sender is
-/// always a PRE_KEY (session-establishing) message anyway.
+/// `Session`).
 pub const StoredSession = struct {
     session_id: []const u8,
     pickled_session: []const u8,
@@ -129,12 +123,7 @@ pub fn saveInboundGroupSession(pool: *PgPool, room_id: []const u8, sender_key: [
 pub const StoredOutboundSession = struct {
     pickled_session: []const u8,
     shared_with_json: []const u8,
-    /// Unix seconds — when this *session* (not this row) was first
-    /// created. The upsert in `saveOutboundGroupSession` never touches
-    /// this column, only `pickled_session`/`shared_with_json`, so it
-    /// stays fixed across every message sent with the session and only
-    /// moves forward when the session itself rotates. Drives
-    /// `crypto.zig`'s `State.encryptForRoom` rotation check.
+    /// Unix seconds — when this *session* (not this row) was first created.
     created_at_unix: i64,
 };
 

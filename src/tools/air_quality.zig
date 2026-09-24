@@ -75,10 +75,7 @@ pub const Reading = struct {
     pm10: ?f64,
 };
 
-/// Geocodes `location` then fetches its current air quality — same
-/// fetch-and-parse-core-extracted-from-execute shape as
-/// `weather.fetchWeather`, for the same reason (`features/alerts.zig` reads
-/// `us_aqi` directly). Null when the location doesn't geocode to anything.
+/// Geocodes `location` then fetches its current air quality.
 pub fn fetchAirQuality(allocator: std.mem.Allocator, io: std.Io, location: []const u8) !?Reading {
     var client: http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();

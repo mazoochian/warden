@@ -12,15 +12,8 @@ const Args = struct {
     hours: ?i64 = null,
 };
 
-/// ROADMAP.md's Phase 14 ("messaging assistance modes") -- lets the user
-/// ask "catch me up" / "what did I miss" and get an answer grounded in this
-/// chat's own logged history, without waiting for a scheduled `/digest`.
-/// Deliberately returns raw "who: text" lines for the model to summarize
-/// itself, the same "we just fetch, the model summarizes" shape
-/// `fetch_url`'s own doc comment already established -- there's no nested
-/// LLM call here (unlike `features/digest.zig`'s `generate`, which does its
-/// own summarization internally), so this is one plain request/response
-/// tool call, not a second model round trip hidden inside a tool.
+/// Lets the user ask "catch me up" / "what did I miss" and get an answer
+/// grounded in this chat's own logged history.
 pub const tool: registry.ToolDef = .{
     .name = "catch_me_up",
     .description = "Fetches this chat's raw message history from the last N hours (default 24, max 336) so you can summarize it yourself when the user asks to catch up, asks what they missed, or wants a recap of recent discussion. Returns raw \"who: text\" lines, not a summary -- write the summary yourself in your reply. Different from a scheduled /digest: this is an on-demand, user-controlled time window.",

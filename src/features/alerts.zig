@@ -8,14 +8,7 @@ const crypto_price = @import("../tools/crypto_price.zig");
 const weather = @import("../tools/weather.zig");
 const air_quality = @import("../tools/air_quality.zig");
 
-/// Fetches the single numeric value an alert's condition is compared
-/// against — the plain, non-LLM-tool-call path each source tool exposes
-/// (`crypto_price.fetchPrice`, `weather.fetchWeather`, `air_quality.fetchAirQuality`)
-/// so checking an alert doesn't need a model round trip. Null (not an
-/// error) when the subject doesn't resolve to anything (e.g. a
-/// weather/aqi city that stopped geocoding) — treated the same as "not
-/// triggered" by the caller rather than a hard failure, since a transient
-/// geocoding hiccup shouldn't spam error logs every check cycle.
+/// Fetches the single numeric value an alert's condition is compared against.
 fn fetchValue(allocator: std.mem.Allocator, io: Io, kind: alerts.Kind, subject: []const u8, currency: ?[]const u8) !?f64 {
     return switch (kind) {
         .crypto => try crypto_price.fetchPrice(allocator, io, subject, currency orelse "usd"),
@@ -39,10 +32,7 @@ fn unitFor(kind: alerts.Kind, currency: ?[]const u8) []const u8 {
     };
 }
 
-/// Finds the connector whose platform matches `platform` — duplicated from
-/// `main.zig`'s own `findConnector` rather than exported, to keep this
-/// feature file's only dependency on `main.zig` at zero (matches how
-/// `digest.zig`/`scheduler.zig` don't reach back into `main.zig` either).
+/// Finds the connector whose platform matches `platform`.
 fn findConnector(connectors: []const iface.Connector, platform: iface.Platform) ?iface.Connector {
     for (connectors) |c| {
         if (c.platform() == platform) return c;

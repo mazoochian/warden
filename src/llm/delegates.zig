@@ -2,33 +2,21 @@ const std = @import("std");
 const llm = @import("provider.zig");
 
 /// One configured "ask another model" target, built once at startup (see
-/// `main.zig`'s delegate construction) from a `config.DelegateConfig` — kept
-/// as its own type here rather than reusing `config.DelegateConfig` directly
-/// since this one carries a real, callable `llm.Provider`, not just the raw
-/// credentials that produced it. Plain data, not another ptr+vtable `Sink`
-/// like `tools/registry.zig`'s `ReminderSink`/etc: the only "backend" a
-/// delegate needs is already the vtable-based `llm.Provider` from this same
-/// package, so there's no store-layer dependency to hide behind an extra
-/// indirection.
+/// `main.zig`'s delegate construction) from a `config.DelegateConfig`.
 pub const Delegate = struct {
     /// Matched case-insensitively against the `delegate` tool argument —
     /// see `find` below.
     name: []const u8,
-    /// Shown to the delegating model alongside `name` so it can pick the
-    /// right target for a given task, e.g. "OpenAI's GPT-4o — strong at
-    /// code and general reasoning." May be empty.
+    /// Shown to the delegating model alongside `name` so it can pick the right
+    /// target for a given task, e.g. "OpenAI's GPT-4o.
     description: []const u8,
     provider: llm.Provider,
     /// Non-null only when this delegate should also be offered for
-    /// `tools/delegate_generate_image.zig` — see `ImageConfig`'s own doc
-    /// comment.
+    /// `tools/delegate_generate_image.zig`.
     image: ?ImageConfig = null,
 
     /// What `delegate_generate_image` needs to call an OpenAI-compatible
-    /// `/images/generations` endpoint directly — separate from `provider`
-    /// since that's a `chat/completions` client and image generation is a
-    /// different endpoint entirely, not something `llm.Provider`'s
-    /// chat-shaped interface can express.
+    /// `/images/generations` endpoint directly.
     pub const ImageConfig = struct {
         /// No trailing slash — `{base_url}/images/generations` is appended
         /// directly.
@@ -47,10 +35,7 @@ pub fn find(delegates: []const Delegate, name: []const u8) ?Delegate {
     return null;
 }
 
-/// Renders every configured delegate as a "name (description), ..." list —
-/// used by `ask_delegate`'s "no such delegate" tool result so the calling
-/// model can see what's actually available and retry with a valid name,
-/// instead of just failing.
+/// Renders every configured delegate as a "name (description), ...
 pub fn describeAll(allocator: std.mem.Allocator, delegates: []const Delegate) ![]const u8 {
     if (delegates.len == 0) return allocator.dupe(u8, "none configured");
 
@@ -68,9 +53,6 @@ pub fn describeAll(allocator: std.mem.Allocator, delegates: []const Delegate) ![
     return allocator.dupe(u8, buf.writer.buffered());
 }
 
-/// Same shape as `describeAll`, but only the delegates with `image` set —
-/// used by `delegate_generate_image`'s "no such image-capable delegate"
-/// tool result.
 pub fn describeImageCapable(allocator: std.mem.Allocator, delegates: []const Delegate) ![]const u8 {
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();

@@ -1,22 +1,5 @@
-//! Fixed-window rate limiting for warden-ui's API (Phase 7 hardening,
-//! /home/armin/claude/warden-ui/ROADMAP.md's "Rate limiting on the API
-//! layer, especially auth endpoints and Bot View's send endpoint").
-//!
-//! Deliberately a plain fixed-window counter per key, not a sliding-window
-//! or token-bucket algorithm -- allows some burstiness right at a window
-//! boundary, which is an accepted tradeoff for "stop naive flooding," not
-//! "precise quota enforcement." One process-lifetime `Limiter` per
-//! endpoint class (see `router.zig`'s call sites), same "owned by
-//! `main.zig`, handed into `ServerContext`" shape as `bot_view.Broadcaster`.
-//!
-//! Keys are caller-supplied strings: an account id (as text) for
-//! authenticated endpoints like Bot View's send, or a fixed constant for
-//! endpoints with no per-caller identity yet to key on (anonymous
-//! auth-flow endpoints) -- see each call site's own doc comment for which.
-//! True per-client-IP limiting would need the peer address plumbed from
-//! `server.zig`'s accept loop through every handler signature, which
-//! isn't done yet; flagged as follow-up in `ROADMAP.md`, not silently
-//! skipped.
+//! Fixed-window rate limiting for the web API's auth endpoints and Bot
+//! View's send endpoint.
 const std = @import("std");
 const Io = std.Io;
 
@@ -43,9 +26,9 @@ pub const Limiter = struct {
         self.buckets.deinit(self.allocator);
     }
 
-    /// `true` if `key` is still under its limit for the window containing
-    /// `now` (and counts this call toward it); `false` if the window's
-    /// budget is already spent.
+    /// `true` if `key` is still under its limit for the window containing `now`
+    /// (and counts this call toward it); `false` if the window's budget is
+    /// already spent.
     pub fn allow(self: *Limiter, key: []const u8, now: i64) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

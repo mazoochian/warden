@@ -11,10 +11,7 @@ const Args = struct {
     system: ?[]const u8 = null,
 };
 
-/// Generous headroom for a delegated task's answer — not tied to any
-/// messaging platform's length cap (unlike `qa.zig`'s `answerMaxTokens`)
-/// since a delegate's reply gets folded back into Warden's own answer as
-/// tool-result text, never sent as its own chat message.
+/// Generous headroom for a delegated task's answer.
 const delegate_max_tokens: u32 = 2048;
 
 pub const tool: registry.ToolDef = .{
@@ -68,10 +65,7 @@ test "tool schema is valid JSON" {
 
 test "execute reports unknown delegates by name, listing what's available" {
     // Arena, not testing.allocator directly: `execute` builds the "no such
-    // delegate" text out of two separate allocations (the list from
-    // `describeAll`, then the wrapping message) and only the final one is
-    // handed back to the caller — same "assume an arena" convention every
-    // other tool's `execute` relies on (see e.g. `web_search.zig`).
+    // delegate" text out of two separate allocations.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 

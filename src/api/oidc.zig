@@ -1,19 +1,5 @@
-//! Generic OIDC login (Authorization Code + PKCE, ES256-signed ID tokens)
-//! — backs `oauth_providers` rows. Telegram's own OIDC provider
-//! (https://core.telegram.org/bots/telegram-login) is the one production
-//! use of this today; it replaced the old HMAC-signed Telegram Login
-//! Widget outright (removed 2026-07-28), which Telegram itself now
-//! describes as legacy/archived in favor of this.
-//!
-//! Only ES256 (ECDSA P-256 + SHA-256) is supported, not the RS256 most
-//! OIDC providers default to -- Zig's standard library has no RSA
-//! implementation at all (by design: safe constant-time RSA is a large
-//! attack surface this stdlib has never taken on), while
-//! `std.crypto.sign.ecdsa.EcdsaP256Sha256` covers ES256 directly. Every
-//! provider using this module must have its signing algorithm switched to
-//! ES256 (Telegram: BotFather's Web Login settings) -- there is
-//! deliberately no fallback to "trust the token unverified" for an
-//! unsupported algorithm.
+//! Generic OIDC login (Authorization Code + PKCE, ES256-signed ID tokens) —
+//! backs `oauth_providers` rows.
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
@@ -21,9 +7,7 @@ const http_util = @import("../http_util.zig");
 
 pub const Discovery = struct {
     /// The document's own declared `issuer` -- used as `verifyIdToken`'s
-    /// `expected_issuer` (spec-correct: what matters is that the token's
-    /// `iss` matches what the provider itself claims here, not that it
-    /// happens to match whatever exact string we stored/requested).
+    /// `expected_issuer`.
     issuer: []const u8,
     authorization_endpoint: []const u8,
     token_endpoint: []const u8,
@@ -31,8 +15,6 @@ pub const Discovery = struct {
 };
 
 /// Fetches and parses `{issuer_url}/.well-known/openid-configuration`.
-/// `allocator` should be an arena -- every field borrows from the parsed
-/// JSON's own backing allocation.
 pub fn discover(allocator: std.mem.Allocator, io: Io, issuer_url: []const u8) !Discovery {
     const url = try std.fmt.allocPrint(allocator, "{s}/.well-known/openid-configuration", .{issuer_url});
     var client: http.Client = .{ .allocator = allocator, .io = io };
@@ -55,15 +37,12 @@ pub fn discover(allocator: std.mem.Allocator, io: Io, issuer_url: []const u8) !D
 
 pub const JwkKey = struct {
     kid: []const u8,
-    /// Raw SEC-1 uncompressed public key bytes (`0x04 || x || y`, 65 bytes
-    /// for P-256) -- decoded once at fetch time so `verifyIdToken` doesn't
-    /// redo base64 decoding per candidate key.
+    /// Raw SEC-1 uncompressed public key bytes (`0x04 || x || y`, 65 bytes for
+    /// P-256).
     sec1: [65]u8,
 };
 
-/// Fetches `jwks_uri` and decodes every EC/P-256 key in the set (any other
-/// `kty`/`crv` is silently skipped -- this module only ever verifies
-/// ES256, so a key it could never use isn't an error, just irrelevant).
+/// Fetches `jwks_uri` and decodes every EC/P-256 key in the set.
 pub fn fetchJwks(allocator: std.mem.Allocator, io: Io, jwks_uri: []const u8) ![]JwkKey {
     var client: http.Client = .{ .allocator = allocator, .io = io };
     const body = try http_util.get(&client, allocator, jwks_uri);
@@ -100,9 +79,7 @@ pub fn fetchJwks(allocator: std.mem.Allocator, io: Io, jwks_uri: []const u8) ![]
 }
 
 pub const IdTokenClaims = struct {
-    /// The provider's own user id (Telegram: `id`, the numeric Telegram
-    /// user id -- also mirrored into the standard `sub` claim, but `id`
-    /// is used directly since it's documented as the stable identifier).
+    /// The provider's own user id.
     id: []const u8,
     preferred_username: ?[]const u8 = null,
     name: ?[]const u8 = null,
@@ -120,11 +97,7 @@ pub const VerifyError = error{
     NotYetValid,
 };
 
-/// Verifies a compact JWT (`header.payload.signature`, all base64url) --
-/// ES256 signature against one of `jwks`'s keys (matched by `kid`), plus
-/// `iss`/`aud`/`exp`/`iat` per the OIDC core spec. `allocator` should be
-/// an arena. `clock_skew_seconds` gives `exp`/`iat` a little slack for
-/// clock drift between this host and the provider.
+/// Verifies a compact JWT (`header.payload.signature`, all base64url).
 pub fn verifyIdToken(
     allocator: std.mem.Allocator,
     id_token: []const u8,
@@ -269,9 +242,8 @@ fn b64UrlNoPad(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     return b64Encode(a, bytes);
 }
 
-/// Builds a real ES256-signed JWT for test purposes -- mirrors exactly
-/// what a real OIDC provider produces, so `verifyIdToken`'s tests exercise
-/// the real decode/verify path, not a mocked shortcut.
+/// Builds a real ES256-signed JWT for test purposes -- mirrors exactly what a
+/// real OIDC provider produces.
 fn makeTestToken(
     a: std.mem.Allocator,
     key_pair: std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
@@ -348,15 +320,8 @@ test "verifyIdToken rejects a tampered payload even with a valid-looking signatu
     const now: i64 = 1_800_000_000;
     const token = try makeTestToken(a, key_pair, "key1", "ES256", "https://oauth.telegram.org", "client-123", 555, now - 10, now + 3600);
 
-    // Flip one base64url character in the payload segment without
-    // re-signing -- the classic "attacker edits the JWT and hopes nobody
-    // checks" attempt. Editing the *encoded* token (not the pre-encoding
-    // JSON) matters: base64 doesn't preserve substrings byte-for-byte
-    // across the 3-bytes-in/4-chars-out grouping, so searching the token
-    // for literal decoded text like "555" would usually find nothing to
-    // replace and silently test an unmodified (still validly-signed)
-    // token instead -- confirmed the hard way, this test passed for the
-    // wrong reason before this fix.
+    // Flip one base64url character in the payload segment without re-signing --
+    // the classic "attacker edits the JWT and hopes nobody checks" attempt.
     const tampered = try a.dupe(u8, token);
     const first_dot = std.mem.indexOfScalar(u8, tampered, '.').?;
     const second_dot = std.mem.indexOfScalarPos(u8, tampered, first_dot + 1, '.').?;

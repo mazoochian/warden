@@ -4,10 +4,7 @@ const PgPool = @import("../store/pool.zig").PgPool;
 
 pub const WordCount = struct { word: []const u8, count: u32 };
 
-/// How many of the chat's most recent logged messages to tokenize. Bounded
-/// so a very active chat doesn't make this scan unboundedly large — matches
-/// the "recently discussed" framing used elsewhere (qa.zig's history
-/// window, retention pruning).
+/// How many of the chat's most recent logged messages to tokenize.
 const message_window = 5000;
 const min_word_len = 3;
 const max_word_len = 30;
@@ -75,10 +72,7 @@ fn rankTop(allocator: std.mem.Allocator, counts: std.StringHashMap(u32), top_n: 
 }
 
 /// Tokenizes recent message text into lowercased word counts, filtered of
-/// stopwords/digits/very short or long tokens. Not `.deinit()`'d
-/// internally — callers are expected to run this against an arena (same
-/// pattern as `chat_store`/`toolcall`), so the hash map's storage rides
-/// along and gets reclaimed for free.
+/// stopwords/digits/very short or long tokens.
 pub fn topWords(allocator: std.mem.Allocator, pool: *PgPool, chat_id: i64, top_n: usize) ![]WordCount {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -97,9 +91,7 @@ pub fn topWords(allocator: std.mem.Allocator, pool: *PgPool, chat_id: i64, top_n
 }
 
 /// Same tokenizing/ranking as `topWords`, but over caller-supplied text
-/// instead of a chat's logged history — used by the `word_cloud` tool so
-/// the model can build a cloud from an article, a scrape result, or
-/// anything else it has in hand, not just this group's own chat log.
+/// instead of a chat's logged history.
 pub fn topWordsFromText(allocator: std.mem.Allocator, text: []const u8, top_n: usize) ![]WordCount {
     var counts = std.StringHashMap(u32).init(allocator);
     try tokenizeInto(&counts, allocator, text);
@@ -145,7 +137,7 @@ pub fn render(allocator: std.mem.Allocator, io: Io, tmp_dir: []const u8, words: 
         return error.RenderFailed;
     }
 
-    // std.debug.print("{s}\n", .{result.stderr});
+    // Std.debug.print("{s}\n", .{result.stderr}).
     return result.stdout;
 }
 

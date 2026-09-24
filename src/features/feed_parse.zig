@@ -1,28 +1,17 @@
 //! A deliberately small, hand-rolled RSS 2.0 / Atom parser — just enough to
-//! pull each entry's title and a stable identifier out of a feed, in
-//! document order (both formats list newest-first by convention). Not a
-//! real XML parser: no namespace handling, no DTD/entity expansion beyond
-//! the five standard XML entities, and a malformed or unusual feed shape
-//! degrades to "found nothing" rather than an error — good enough for
-//! diffing "what's new" against `last_seen_guid`, not a general feed
-//! reader.
+//! pull each entry's title and a stable identifier out of a feed, in document
+//! order (both formats list newest-first by convention).
 
 const std = @import("std");
 
 pub const Item = struct {
     title: []const u8,
-    /// RSS: `<guid>`, falling back to `<link>`. Atom: `<id>`. Falling back
-    /// to the title itself (in the rare case neither is present) is better
-    /// than skipping the item outright, at the cost of re-notifying if the
-    /// title ever changes — an acceptable tradeoff for something this
-    /// simple.
+    /// RSS: `<guid>`, falling back to `<link>`.
     guid: []const u8,
 };
 
 /// Extracts every `<item>...</item>` (RSS) or `<entry>...</entry>` (Atom)
-/// block's title + identifier, in the order they appear in `xml`. Returns
-/// an empty slice (not an error) for anything that doesn't look like
-/// either shape.
+/// block's title + identifier, in the order they appear in `xml`.
 pub fn parseFeedItems(allocator: std.mem.Allocator, xml: []const u8) ![]Item {
     const blocks = try extractBlocks(allocator, xml, "item");
     defer allocator.free(blocks);
@@ -46,8 +35,7 @@ fn itemsFromBlocks(allocator: std.mem.Allocator, blocks: []const []const u8, id_
 }
 
 /// Finds every substring between a `<tag` start (allowing attributes before
-/// the closing `>`) and its matching `</tag>`, non-overlapping and
-/// non-nested (RSS/Atom entries are never nested in valid feeds).
+/// the closing `>`) and its matching `</tag>`.
 fn extractBlocks(allocator: std.mem.Allocator, xml: []const u8, tag: []const u8) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     const open = try std.fmt.allocPrint(allocator, "<{s}", .{tag});
@@ -57,9 +45,6 @@ fn extractBlocks(allocator: std.mem.Allocator, xml: []const u8, tag: []const u8)
 
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, xml, pos, open)) |start| {
-        // Reject a longer tag name that merely starts with `tag` (e.g. an
-        // "itemization" element while looking for "item") by requiring the
-        // next byte to end the tag name.
         const after = start + open.len;
         if (after < xml.len and (std.ascii.isAlphanumeric(xml[after]) or xml[after] == '-' or xml[after] == '_')) {
             pos = after;
@@ -74,8 +59,7 @@ fn extractBlocks(allocator: std.mem.Allocator, xml: []const u8, tag: []const u8)
 }
 
 /// Finds `<tag>...</tag>` or `<tag ...>...</tag>` inside `block` and returns
-/// its text content, CDATA-unwrapped and XML-entity-decoded. Null if the
-/// tag isn't present.
+/// its text content, CDATA-unwrapped and XML-entity-decoded.
 fn extractTagText(allocator: std.mem.Allocator, block: []const u8, tag: []const u8) ?[]const u8 {
     const open = std.fmt.allocPrint(allocator, "<{s}", .{tag}) catch return null;
     defer allocator.free(open);
@@ -101,9 +85,7 @@ fn extractTagText(allocator: std.mem.Allocator, block: []const u8, tag: []const 
 }
 
 /// Strips a `<![CDATA[...]]>` wrapper if present, then unescapes the five
-/// standard XML entities. Numeric character references (`&#NN;`) are left
-/// as-is — a rare enough case in feed titles not to be worth the extra
-/// complexity here.
+/// standard XML entities.
 fn decode(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     const cdata_prefix = "<![CDATA[";
     const cdata_suffix = "]]>";

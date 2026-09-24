@@ -9,16 +9,7 @@ const Args = struct {
     text: []const u8,
 };
 
-/// Threaded-reply counterpart to `send_personal_message`: replies to one
-/// specific message in a personal-account chat rather than just posting
-/// into the chat generally, so the recipient sees which message it's
-/// answering. `message_id` is expected to be a `native_message_id` the
-/// model already saw in a bracketed `[id]` line from `get_bulletin` or
-/// `summarize_unread_chat` -- this tool doesn't validate the id against
-/// anything itself (the underlying `sendMessage` call simply fails
-/// silently server-side on a stale/invalid one, same as any other
-/// `reply_to_message_id` the connector layer accepts), so the model must
-/// only ever pass one it actually read, never invent one.
+/// Threaded-reply counterpart to `send_personal_message`.
 pub const tool: registry.ToolDef = .{
     .name = "reply_to_message",
     .description = "Replies to one specific message in a personal-account chat, threaded so the recipient sees which message it's answering. `chat` is a TDLib chat id or any substring of the chat's title. `message_id` must be one of the bracketed ids returned by get_bulletin or summarize_unread_chat -- never guess or invent one. Only call this when the owner has explicitly asked you to reply to that specific message.",

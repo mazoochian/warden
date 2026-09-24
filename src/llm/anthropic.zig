@@ -72,11 +72,7 @@ pub const AnthropicProvider = struct {
         defer allocator.free(body);
         log.debug("chat: {s} returned in {d}ms", .{ self.model, elapsedMs(self.http_client.io, started) });
 
-        // Deliberately never `.deinit()`'d: `ToolUse.input` below borrows
-        // from this parse's arena, and callers are expected to run
-        // requests through an arena allocator themselves (main.zig's poll
-        // loop resets one per cycle), so this rides along for free. See the
-        // note on `llm.ChatResponse`.
+        // Deliberately never `.deinit()`'d.
         const parsed = try json.parseFromSlice(
             RawResponse,
             allocator,
@@ -131,13 +127,7 @@ fn elapsedMs(io: Io, started: Io.Timestamp) i64 {
 }
 
 /// Shared request-body builder for both `chatFn` and `chatStreamFn` — the
-/// only difference between the two is `"stream":true`. Duped into a fresh
-/// allocation before returning (rather than handing back
-/// `payload_writer.buffered()` directly) since `payload_writer` is a local
-/// that goes out of scope here; the non-streaming call site used to build
-/// this inline specifically to keep the writer's buffer alive across the
-/// HTTP call within one function body — factoring it out means that trick
-/// no longer applies.
+/// only difference between the two is `"stream":true`.
 fn buildPayload(allocator: std.mem.Allocator, self: *const AnthropicProvider, request: llm.ChatRequest, stream: bool) ![]const u8 {
     var payload_writer: Io.Writer.Allocating = .init(allocator);
     defer payload_writer.deinit();
@@ -146,9 +136,7 @@ fn buildPayload(allocator: std.mem.Allocator, self: *const AnthropicProvider, re
     try w.writeAll("{\"model\":");
     try json.Stringify.value(self.model, .{}, w);
     try w.print(",\"max_tokens\":{d}", .{request.max_tokens});
-    // `system: null` is rejected by the API ("should be a valid string"),
-    // so the field is omitted entirely rather than sent as JSON null when
-    // there isn't one.
+    // `system: null` is rejected by the API ("should be a valid string").
     if (request.system) |system| {
         try w.writeAll(",\"system\":");
         try json.Stringify.value(system, .{}, w);
@@ -167,6 +155,7 @@ fn buildPayload(allocator: std.mem.Allocator, self: *const AnthropicProvider, re
 fn parseStopReason(raw: []const u8) llm.StopReason {
     if (std.mem.eql(u8, raw, "tool_use")) return .tool_use;
     if (std.mem.eql(u8, raw, "end_turn")) return .end_turn;
+    if (std.mem.eql(u8, raw, "max_tokens")) return .max_tokens;
     return .other;
 }
 
@@ -185,9 +174,15 @@ fn writeMessages(w: *Io.Writer, messages: []const llm.ChatMessage) !void {
 
 fn writeContentBlocks(w: *Io.Writer, content: []const llm.ContentBlock) !void {
     try w.writeByte('[');
-    for (content, 0..) |block, idx| {
-        if (idx != 0) try w.writeByte(',');
+    var first = true;
+    for (content) |block| {
+        // This adapter never enables extended thinking, so it never gets a (signed)
+        // thinking block back and can't send one.
+        if (block == .thinking) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
         switch (block) {
+            .thinking => unreachable,
             .text => |t| {
                 try w.writeAll("{\"type\":\"text\",\"text\":");
                 try json.Stringify.value(t, .{}, w);
@@ -200,12 +195,8 @@ fn writeContentBlocks(w: *Io.Writer, content: []const llm.ContentBlock) !void {
                 try json.Stringify.value(img.base64_data, .{}, w);
                 try w.writeAll("}}");
             },
-            // Same `source`-wrapped shape as `.image` above, differing only
-            // in the block type -- Anthropic's native PDF support, which
-            // reads the document's real layout/pages rather than treating
-            // it as text extracted elsewhere. Needs no beta header. The
-            // generic OpenAI-compatible surface has no equivalent; see
-            // `openai_compat.zig`'s `writeMessages`.
+            // Same `source`-wrapped shape as `.image` above, differing only in the block
+            // type -- Anthropic's native PDF support.
             .document => |doc| {
                 try w.writeAll("{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":");
                 try json.Stringify.value(doc.media_type, .{}, w);
@@ -239,10 +230,7 @@ fn writeTools(allocator: std.mem.Allocator, w: *Io.Writer, tools: []const llm.To
     try w.writeByte('[');
     for (tools, 0..) |t, idx| {
         if (idx != 0) try w.writeByte(',');
-        // Parsed fresh per tool into a throwaway arena-backed value: the
-        // schema needs to be embedded as a real JSON object (not a quoted
-        // string), and `json.Value` is the type `Stringify` knows how to
-        // splice in as-is.
+        // Parsed fresh per tool into a throwaway arena-backed value.
         var schema = try json.parseFromSlice(json.Value, allocator, t.input_schema_json, .{});
         defer schema.deinit();
 
@@ -285,14 +273,7 @@ fn jsonStr(obj: json.ObjectMap, key: []const u8) []const u8 {
 }
 
 /// Incrementally assembles a `llm.ChatResponse` from Anthropic's streaming
-/// SSE events (https://docs.anthropic.com/en/api/messages-streaming),
-/// content-block by content-block. Anthropic's stream is a single ordered
-/// sequence — at most one content block is ever "open" at a time (a
-/// `content_block_stop` always precedes the next `content_block_start`) —
-/// so tracking just the *current* block's state (reset on each start,
-/// finalized on each stop) is enough; no need to key state by `index` the
-/// way `openai_compat.zig`'s parser has to (OpenAI-style tool_call deltas
-/// don't come with the same "one thing open at a time" guarantee).
+/// SSE events (https://docs.anthropic.com/en/api/messages-streaming).
 const StreamState = struct {
     const CurrentBlock = union(enum) {
         none,
@@ -300,10 +281,8 @@ const StreamState = struct {
         tool_use: struct {
             id: []const u8,
             name: []const u8,
-            /// Raw JSON string accumulated from `input_json_delta`
-            /// fragments — parsed into a real `json.Value` only once the
-            /// block closes, matching how the non-streaming path parses
-            /// `input` whole (see `parseContentBlocks`).
+            /// Raw JSON string accumulated from `input_json_delta` fragments — parsed
+            /// into a real `json.Value` only once the block closes.
             json_buf: std.ArrayList(u8),
         },
     };
@@ -311,12 +290,8 @@ const StreamState = struct {
     allocator: std.mem.Allocator,
     stream_sink: llm.StreamSink,
     blocks: std.ArrayList(llm.ContentBlock) = .empty,
-    /// Cumulative visible text across the *whole turn* so far (all closed
-    /// text blocks plus whatever's been streamed of the current one) —
-    /// reported to `stream_sink` on every delta. Separate from any single
-    /// content block's own text (see `CurrentBlock.text` below), which
-    /// only needs to span one block for `blocks` to come out correctly
-    /// ordered/split.
+    /// Cumulative visible text across the *whole turn* so far (all closed text
+    /// blocks plus whatever's been streamed of the current one).
     visible_text: std.ArrayList(u8) = .empty,
     stop_reason: llm.StopReason = .other,
     err: ?ApiError = null,
@@ -332,11 +307,8 @@ const StreamState = struct {
         const data = std.mem.trim(u8, line["data:".len..], " ");
         if (data.len == 0) return;
 
-        // `.alloc_always` so nothing in `parsed.value` aliases `data`,
-        // which itself aliases the SSE reader's transfer buffer — about to
-        // be overwritten by the next line read, so anything from this
-        // parse that needs to outlive this one call must be copied out via
-        // `self.allocator` before returning (see the `dupe` calls below).
+        // `.alloc_always` so nothing in `parsed.value` aliases `data`, which itself
+        // aliases the SSE reader's transfer buffer.
         var parsed = json.parseFromSlice(json.Value, self.allocator, data, .{ .allocate = .alloc_always }) catch |err| {
             log.warn("stream: unparseable SSE data line ({t}): {s}", .{ err, data[0..@min(data.len, 200)] });
             return;
@@ -422,11 +394,7 @@ const StreamState = struct {
 
 const testing = std.testing;
 
-// These parse canned response bodies rather than hitting the real API:
-// deterministic and offline, unlike a live call (which was used once by
-// hand to confirm the wire format/headers/error-path against the real
-// Anthropic API with an invalid key — got back and correctly parsed a real
-// `401 {"type":"error","error":{"type":"authentication_error",...}}`).
+// These parse canned response bodies rather than hitting the real API.
 
 test "parses a plain text response" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -535,9 +503,7 @@ test "writeContentBlocks: a document block writes Anthropic's native PDF documen
 }
 
 // `StreamState.onLine` is fed canned SSE lines directly (one `sink.onLine`
-// call per line, matching what `postJsonSSE` would do) — deterministic and
-// offline, same philosophy as the response-body tests above, just at the
-// SSE-event granularity instead of one whole JSON body.
+// call per line, matching what `postJsonSSE` would do).
 
 const Recorder = struct {
     reports: std.ArrayList([]const u8) = .empty,

@@ -11,55 +11,22 @@ const log = @import("../../log.zig").scoped("xmpp");
 const llm = @import("../../llm/provider.zig");
 
 /// How long a single `pollFn` cycle waits for a stanza before returning an
-/// empty slice — bounds the blocking socket read so the round-robin poll
-/// loop in `main.zig` (which polls every connector, one after another)
-/// stays responsive to Telegram/Matrix even when nothing's happening on
-/// XMPP. Shorter than Telegram/Matrix's ~25s HTTP long-poll timeout since
-/// XMPP's read has no server-side "nothing happened yet" signal the way
-/// long-poll does — it just blocks until bytes arrive. Unlike that read
-/// itself, though, this timeout does NOT tear the connection down when it
-/// fires — see `pollFn`'s doc comment.
+/// empty slice.
 const poll_timeout_ns: u64 = 8 * std.time.ns_per_s;
 
 /// Cooldown after a failed `ensureConnected` before `pollFn` returns —
-/// discovered live while adding logging (2026-07-25): a failed connect
-/// returns an empty slice, not an error, so `main.zig`'s outer
-/// `connectorPollLoop` sees an ordinary successful-but-empty poll and loops
-/// straight back into `poll()` with zero delay. Without this, an
-/// unreachable/misconfigured XMPP server turns into a genuine busy-retry
-/// loop — hundreds of connect attempts and log lines per second, burning a
-/// full core for nothing, on every host this connector is enabled on.
+/// discovered live while adding logging (2026-07-25).
 const reconnect_cooldown_ns: u64 = 5 * std.time.ns_per_s;
 const poll_check_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
-/// How long the connection can sit with no stanza read, keepalive sent, or
-/// fresh connect before `pollFn` sends a whitespace ping (`Client.
-/// sendKeepalive`) — the simplest way to keep a NAT/reverse-proxy/load
-/// balancer from silently reclaiming an idle-looking TCP connection.
-/// Arbitrary but conservative: most such idle timeouts are measured in
-/// minutes, not seconds.
+/// How long the connection can sit with no stanza read, keepalive sent.
 const keepalive_idle_seconds: i64 = 60;
 
 /// How `platform/xmpp/client.zig`'s `startTls` verifies the server's
-/// certificate — mirrors `config.zig`'s `XmppTlsMode` one-for-one; kept as
-/// this connector's own type (rather than importing `config.zig`) for the
-/// same reason `host`/`port`/`domain`/... below are passed as plain values
-/// instead of a whole `XmppConfig`: this layer stays decoupled from config,
-/// `main.zig` does the unpacking.
+/// certificate.
 pub const TlsMode = enum { self_signed, bundle, insecure };
 
-/// XMPP implementation of `platform.Connector` — 1:1 chat + MUC group chat
-/// (with real kick/ban/mute/promote/demote admin actions, XEP-0045 §9),
-/// SASL SCRAM-SHA-256/-SHA-1/PLAIN, and configurable TLS verification. See
-/// README's "XMPP" section for what's still out of scope (OMEMO, file
-/// transfer, roster UI, `/permission`'s granular bitmask, `/tag`) — same
-/// spirit as `../matrix/connector.zig`'s doc comment on its own scope cuts.
-///
-/// Unlike Telegram/Matrix's stateless HTTP long-poll, XMPP is a persistent
-/// socket: `ensureConnected` drives the full connect/STARTTLS/SASL/bind/
-/// MUC-join sequence lazily on first `poll()` and again after any
-/// connection loss, since a dropped socket needs a real reconnect, not
-/// just a retried request.
+/// XMPP implementation of `platform.Connector`.
 pub const XmppConnector = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -76,41 +43,26 @@ pub const XmppConnector = struct {
     /// Bare room JIDs currently joined — `sendMessageFn` checks membership
     /// here to pick `type='groupchat'` vs `type='chat'`.
     joined_rooms: std.ArrayList([]const u8) = .empty,
-    /// The one outstanding background stanza read, kept alive ACROSS
-    /// `pollFn` calls rather than respawned every cycle — see `pollFn`'s
-    /// doc comment for the reconnect-storm bug this replaces.
+    /// The one outstanding background stanza read, kept alive ACROSS `pollFn`
+    /// calls rather than respawned every cycle.
     read_thread: ?std.Thread = null,
     read_shared: ?*ReadShared = null,
-    /// Wall-clock seconds of the last stanza received, keepalive sent, or
-    /// fresh connect — `pollFn` compares against this to decide whether an
-    /// idle connection needs a keepalive.
+    /// Wall-clock seconds of the last stanza received, keepalive sent, or fresh
+    /// connect.
     last_activity_unix: i64 = 0,
     /// Loaded lazily, once, only when `tls_mode == .bundle` — see
-    /// `ensureConnected`. `std.crypto.tls.Client.Options.ca`'s `.bundle`
-    /// variant requires a lock even though this connector only ever drives
-    /// one TLS handshake at a time; `ca_bundle_lock` exists to satisfy that
-    /// shape, not because real concurrent access happens here.
+    /// `ensureConnected`.
     ca_bundle: std.crypto.Certificate.Bundle = .empty,
     ca_bundle_loaded: bool = false,
     ca_bundle_lock: Io.RwLock = .init,
-    /// Occupants of every currently-joined MUC room, keyed by their full
-    /// occupant JID (`room@server/nick` — exactly `Message.user_id` for a
-    /// MUC sender, see `messagesFromElement`). Populated from every
-    /// presence stanza a joined room sends (`handlePresence` ->
-    /// `updateOccupant`), since that's the only channel MUC exposes
-    /// affiliation/role/real-JID information on. Backs `isGroupAdminFn`
-    /// and resolves the real JID `setAffiliation` (ban/promote/demote)
-    /// needs.
+    /// Occupants of every currently-joined MUC room, keyed by their full occupant
+    /// JID.
     occupants: std.StringHashMap(Occupant),
 
     const Occupant = struct {
         /// Owned copies of XEP-0045's affiliation ("owner"/"admin"/
         /// "member"/"outcast"/"none") and role ("moderator"/"participant"/
-        /// "visitor"/"none") strings, and the occupant's real bare JID —
-        /// present only if the room discloses it to this bot (moderators
-        /// always see it; a non-anonymous room discloses it to everyone;
-        /// a semi-anonymous room with the bot as an ordinary participant
-        /// never does).
+        /// "visitor"/"none") strings.
         affiliation: []const u8,
         role: []const u8,
         real_jid: ?[]const u8,
@@ -144,12 +96,7 @@ pub const XmppConnector = struct {
 
     pub fn deinit(self: *XmppConnector) void {
         if (self.read_shared != null) {
-            // A background read may still be blocked on `self.client`'s
-            // socket — closing/freeing it here would race a thread that
-            // might still be touching that memory. Same "abandon rather
-            // than risk a use-after-free" tradeoff `pollFn`'s timeout path
-            // used to make every ~8s of idle time before this fix; here it
-            // only applies once, at process shutdown.
+            // A background read may still be blocked on `self.client`'s socket.
             self.read_thread.?.detach();
         } else if (self.client) |c| {
             c.close();
@@ -190,12 +137,7 @@ pub const XmppConnector = struct {
         .promoteUser = promoteUserFn,
         .demoteUser = demoteUserFn,
         .isGroupAdmin = isGroupAdminFn,
-        // Every other moderation/media/room-metadata slot (restrictChat-
-        // MemberPermissions, setChatAdminTitle, setChatTitle/Description/
-        // Photo, pin/unpin, delete, sendDocument, ...) has no XMPP MUC
-        // primitive to map onto and stays unset -> `error.Unsupported`,
-        // matching the pre-existing stub's behavior for anything it didn't
-        // implement either. See README's "XMPP" section.
+        // Every other moderation/media/room-metadata slot.
     };
 
     fn platformFn(ptr: *anyopaque) iface.Platform {
@@ -222,13 +164,8 @@ pub const XmppConnector = struct {
             for (features2.mechanisms) |m| allocator.free(m);
             allocator.free(features2.mechanisms);
         }
-        // Prefer SCRAM whenever the server offers it — PLAIN is the
-        // fallback, not the default, since a bare-metal password exchange
-        // (even TLS-wrapped) is weaker than SCRAM's salted-challenge
-        // exchange. Deliberately doesn't consider "-PLUS" variants: this
-        // connector never offers channel binding (see `Client.authScram`'s
-        // doc comment), and `hasMechanism`'s exact-string match already
-        // excludes them.
+        // Prefer SCRAM whenever the server offers it — PLAIN is the fallback, not the
+        // default.
         if (features2.hasMechanism("SCRAM-SHA-256")) {
             try client.authScramSha256(allocator, self.jid_user, self.password);
         } else if (features2.hasMechanism("SCRAM-SHA-1")) {
@@ -266,11 +203,7 @@ pub const XmppConnector = struct {
     }
 
     /// Builds this connect attempt's `Client.TlsVerification` from
-    /// `self.tls_mode` — lazily loads the system CA trust store on first
-    /// use of `.bundle` (rescanning on every reconnect would be wasteful
-    /// and, per `Certificate.Bundle.rescan`'s own contract, isn't needed:
-    /// the store doesn't change during one process's lifetime in any way
-    /// this connector needs to react to).
+    /// `self.tls_mode`.
     fn tlsVerification(self: *XmppConnector) !raw.Client.TlsVerification {
         return switch (self.tls_mode) {
             .insecure => .insecure,
@@ -307,35 +240,7 @@ pub const XmppConnector = struct {
     }
 
     /// Blocks up to `poll_timeout_ns` for one stanza, on a real detachable
-    /// `std.Thread` rather than `Io.concurrent` + `Future.cancel` — mirrors
-    /// `http_util.zig`'s `fetchWithTimeout` fix (see its module doc for the
-    /// full story): the underlying socket read (`Client.readElement` /
-    /// `fillMore`) is a plain blocking call with no `Io`-native
-    /// cancellation point, so `cancel()` could never actually interrupt it.
-    ///
-    /// Unlike that HTTP fix, though, a timeout here does NOT abandon the
-    /// read or the connection — `self.read_shared`/`self.read_thread` stay
-    /// set, and the *same* background read keeps being checked across
-    /// however many `pollFn` calls it takes to actually complete. This
-    /// replaces an earlier version of this function that spawned a fresh
-    /// thread every call and abandoned it (leaking both the thread and the
-    /// still-open socket) on every timeout — harmless-looking for a chat
-    /// that's constantly active, but on any XMPP deployment idle for more
-    /// than `poll_timeout_ns` at a stretch (i.e. nearly all of them), that
-    /// meant a full reconnect/re-authenticate storm and an unbounded
-    /// thread+socket leak every ~8 idle seconds, forever. Since a stanza
-    /// read is only ever issued from this one persistent thread per
-    /// connection now, there's also no risk of two reads racing the same
-    /// socket the way abandoning-and-respawning could.
-    ///
-    /// `readElement`'s allocations go through `self.allocator` (long-lived,
-    /// owned by this connector) rather than the caller's per-poll-cycle
-    /// arena — required so an abandoned thread that eventually does finish
-    /// writing into `shared` never touches memory the caller may have
-    /// already freed (same reasoning as `http_util.zig`'s `FetchShared`).
-    /// That case is now rare (only a genuinely wedged socket, e.g. a
-    /// black-holed connection the OS never reports as dead) rather than
-    /// the common one, but the same safety margin still applies.
+    /// `std.Thread` rather than `Io.concurrent` + `Future.cancel`.
     fn pollFn(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]iface.Message {
         const self: *XmppConnector = @ptrCast(@alignCast(ptr));
 
@@ -366,14 +271,8 @@ pub const XmppConnector = struct {
         }
 
         if (!shared.done.load(.acquire)) {
-            // Still nothing this cycle — leave the same read outstanding
-            // for the next `pollFn` call, and consider sending a
-            // keepalive. Writing here while the background thread is
-            // still reading is the same "write from one thread, read from
-            // another, on the same socket" pattern `sendMessageFn` already
-            // relies on (a reply can be sent while a poll is blocked
-            // waiting on the next inbound stanza) — not new concurrency
-            // this connector didn't already depend on.
+            // Still nothing this cycle — leave the same read outstanding for the next
+            // `pollFn` call, and consider sending a keepalive.
             self.maybeSendKeepalive();
             return &.{};
         }
@@ -429,18 +328,8 @@ pub const XmppConnector = struct {
         self.last_activity_unix = now;
     }
 
-    /// Replies to a server-initiated `<iq type='get'/'set'>` — RFC 6120
-    /// §8.2.3 requires every one get *some* reply. XEP-0199 ping gets a
-    /// real result (proving liveness is basically free); everything else
-    /// (disco#info/#items, vCard fetches, ...) gets a spec-compliant
-    /// `feature-not-implemented` error, which XEP-0199 §4 notes is just as
-    /// good as a real result for proving the connection is alive, without
-    /// this connector needing to implement every namespace a peer might
-    /// probe. `type='result'/'error'` IQs (answers to requests *we* sent,
-    /// e.g. `setMucRole`/`setMucAffiliation`) are deliberately not replied
-    /// to here — those are terminal per RFC 6120, and this connector
-    /// doesn't correlate its own outgoing IQ ids to read their results
-    /// anyway (see `Client.setMucRole`'s doc comment).
+    /// Replies to a server-initiated `<iq type='get'/'set'>` — RFC 6120 §8.2.3
+    /// requires every one get *some* reply.
     fn handleIq(self: *XmppConnector, allocator: std.mem.Allocator, el: xml.Element) !void {
         const iq_type = el.attr("type") orelse return;
         if (!std.mem.eql(u8, iq_type, "get") and !std.mem.eql(u8, iq_type, "set")) return;
@@ -455,17 +344,7 @@ pub const XmppConnector = struct {
         try client.replyIqUnsupported(allocator, from, id);
     }
 
-    /// Auto-accepts subscription requests (see this file's module doc
-    /// comment on why that's this connector's whole roster story for now),
-    /// tracks MUC occupant affiliation/role/real-JID from every presence a
-    /// joined room sends (`updateOccupant` — backs `isGroupAdminFn`/
-    /// `setAffiliation`), and detects the bot's own departure from a
-    /// joined MUC room — `type="unavailable"` self-presence (the standard
-    /// MUC status code 110 marker, inside an `<x xmlns='...muc#user'>`
-    /// child) covers leaving voluntarily, being kicked, being banned, or
-    /// the room being destroyed alike; XMPP doesn't distinguish these in
-    /// the stanza either. Returns a synthetic `chat_left` message in that
-    /// case, `null` otherwise.
+    /// Auto-accepts subscription requests.
     fn handlePresence(self: *XmppConnector, allocator: std.mem.Allocator, el: xml.Element) !?iface.Message {
         const from = el.attr("from") orelse return null;
         const kind = el.attr("type"); // null (no `type` attribute) means "available".
@@ -501,13 +380,8 @@ pub const XmppConnector = struct {
         return null;
     }
 
-    /// Finds the `<x xmlns='http://jabber.org/protocol/muc#user'>` child
-    /// among `el`'s children — namespace-checked (unlike most lookups in
-    /// this connector, see `xml.zig`'s module doc on treating `xmlns` as
-    /// an ordinary attribute) because a presence stanza can carry more
-    /// than one `<x>` extension (e.g. some servers also add `vcard-temp:
-    /// x:update` for avatar hashes), and `Element.child` only ever returns
-    /// the first match by tag name alone.
+    /// Finds the `<x xmlns='http://jabber.org/protocol/muc#user'>` child among
+    /// `el`'s children.
     fn mucUserExtension(el: xml.Element) ?xml.Element {
         for (el.children) |node| switch (node) {
             .element => |e| if (std.mem.eql(u8, e.name, "x") and
@@ -517,11 +391,8 @@ pub const XmppConnector = struct {
         return null;
     }
 
-    /// Updates (or, on `type="unavailable"`, removes) `self.occupants`'
-    /// entry for `from` (a full occupant JID). A departure clears tracked
-    /// state even when the room didn't include a muc#user extension on the
-    /// `unavailable` presence — the occupant is gone either way, and stale
-    /// affiliation/role data is worse than none.
+    /// Updates (or, on `type="unavailable"`, removes) `self.occupants`' entry for
+    /// `from` (a full occupant JID).
     fn updateOccupant(self: *XmppConnector, from: []const u8, kind: ?[]const u8, muc_x: ?xml.Element) !void {
         if (kind) |k| {
             if (std.mem.eql(u8, k, "unavailable")) {
@@ -560,19 +431,15 @@ pub const XmppConnector = struct {
         if (body.len == 0) return &.{};
 
         const is_group = std.mem.eql(u8, stanza.type, "groupchat");
-        // MUC's `from` is `room@server/nick` — `bareJid` of that is exactly
-        // the room's own JID, so this one derivation gives the right
-        // `chat_id` for both shapes: the room for MUC, the sender for 1:1.
+        // MUC's `from` is `room@server/nick` — `bareJid` of that is exactly the
+        // room's own JID, so this one derivation gives the right `chat_id` for both
+        // shapes.
         const chat_id = bareJid(stanza.from);
-        // 1:1 uses the bare JID (stable across a user's devices, matching
-        // Matrix's `@user:server`); MUC has no stabler identity to offer
-        // than `room@server/nick` (semi-anonymous by default), so its
-        // `user_id` stays resource-qualified.
+        // 1:1 uses the bare JID.
         const user_id = if (is_group) stanza.from else chat_id;
         const display_name = if (is_group) (resourcePart(stanza.from) orelse chat_id) else chat_id;
         // XMPP MUC has no wire-level "@mention" concept (unlike Telegram's
-        // entities/Matrix's `m.mentions`) — the closest equivalent is
-        // scanning for the bot's own in-room nickname, IRC-style.
+        // entities/Matrix's `m.mentions`).
         const mentions_me = is_group and mucMentionsMe(body, self.resource);
 
         const now = Io.Timestamp.now(self.io, .real).toSeconds();
@@ -613,12 +480,8 @@ pub const XmppConnector = struct {
         return full[slash + 1 ..];
     }
 
-    /// Word-boundary-aware, case-insensitive scan for the bot's own MUC
-    /// nickname anywhere in `body` — the closest XMPP equivalent to
-    /// Telegram's `@username` mention/Matrix's `m.mentions`, neither of
-    /// which XMPP has a wire-level concept of. Matches a bare nick as well
-    /// as an `@`-prefixed one ("warden, ..." and "@warden ..." both count)
-    /// since MUC clients don't agree on a convention.
+    /// Word-boundary-aware, case-insensitive scan for the bot's own MUC nickname
+    /// anywhere in `body`.
     fn mucMentionsMe(body: []const u8, nick: []const u8) bool {
         if (nick.len == 0) return false;
         var i: usize = 0;
@@ -644,31 +507,24 @@ pub const XmppConnector = struct {
             return;
         };
         const kind = if (self.isJoinedRoom(chat_id)) "groupchat" else "chat";
-        // Same reasoning as the Matrix connector: no rich equivalent here,
-        // but the chain-of-thought markers are control bytes and must not
-        // reach a client raw. See `llm.renderThinkingPlain`.
+        // Same reasoning as the Matrix connector: no rich equivalent here, but the
+        // chain-of-thought markers are control bytes and must not reach a client raw.
         const body = llm.renderThinkingPlain(allocator, text) catch text;
         client.sendMessage(allocator, chat_id, kind, body) catch |err| {
             log.warn("failed to send message to {s}: {t}", .{ chat_id, err });
         };
     }
 
-    /// Shared body for `muteUserFn`/`unmuteUserFn`/`kickUserFn` — all
-    /// three are XEP-0045 role changes, addressed by nickname (see
-    /// `Client.setMucRole`'s doc comment on why role, unlike affiliation,
-    /// never needs a real JID).
+    /// Shared body for `muteUserFn`/`unmuteUserFn`/`kickUserFn` — all three are
+    /// XEP-0045 role changes, addressed by nickname.
     fn setRole(self: *XmppConnector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, role: []const u8) !void {
         const client = self.client orelse return error.NotConnected;
         const nick = resourcePart(user_id) orelse return error.NotMucOccupant;
         try client.setMucRole(allocator, chat_id, nick, role);
     }
 
-    /// Shared body for `banUserFn`/`promoteUserFn`/`demoteUserFn` — all
-    /// three are XEP-0045 affiliation changes, addressed by the occupant's
-    /// real bare JID. That JID has to already be tracked in `self.
-    /// occupants` (populated from presence — see `updateOccupant`); if
-    /// this bot has never seen it disclosed (a semi-anonymous room and the
-    /// bot isn't a moderator), this fails rather than guessing.
+    /// Shared body for `banUserFn`/`promoteUserFn`/`demoteUserFn` — all three are
+    /// XEP-0045 affiliation changes, addressed by the occupant's real bare JID.
     fn setAffiliation(self: *XmppConnector, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8, affiliation: []const u8) !void {
         const client = self.client orelse return error.NotConnected;
         const occupant = self.occupants.get(user_id) orelse return error.UnknownOccupant;
@@ -707,12 +563,7 @@ pub const XmppConnector = struct {
         return self.setAffiliation(allocator, chat_id, user_id, "member");
     }
 
-    /// Reads `self.occupants` — no I/O, so unlike `setRole`/`setAffiliation`
-    /// this never fails; an occupant this bot hasn't seen presence for
-    /// yet defaults to "not an admin" rather than erroring, matching how
-    /// callers already treat a failed `isGroupAdmin` (see `auth.zig`'s
-    /// `checkGroupAdminAccess` and `group_admin.zig`'s promote/demote,
-    /// both of which `catch` it into a plain bool anyway).
+    /// Reads `self.occupants` — no I/O.
     fn isGroupAdminFn(ptr: *anyopaque, allocator: std.mem.Allocator, chat_id: []const u8, user_id: []const u8) anyerror!bool {
         _ = allocator;
         _ = chat_id;
@@ -814,10 +665,8 @@ test "banUser fails with RealJidUnknown for a tracked occupant whose real JID wa
 
 /// Each branch is one self-contained inline literal tree (rather than
 /// building attrs up imperatively in a local `var`) so the whole `Element`
-/// tree's storage rides `return`'s result-location semantics all the way
-/// out to the caller — same shape as `statusCode110Presence` below. A
-/// local `var` slice pointing at this function's own stack frame would
-/// dangle the moment it returned.
+/// tree's storage rides `return`'s result-location semantics all the way out
+/// to the caller — same shape as `statusCode110Presence` below.
 fn availableMucPresence(from: []const u8, affiliation: []const u8, role: []const u8, real_jid: ?[]const u8) xml.Element {
     if (real_jid) |j| return .{
         .name = "presence",
@@ -932,16 +781,8 @@ test "handlePresence ignores unavailable presence for a room we never joined" {
     try testing.expectEqual(@as(?iface.Message, null), try conn.handlePresence(testing.allocator, el));
 }
 
-// Full connect -> TLS `self_signed` verification -> MUC join -> real
-// server presence round trip — gated on `WARDEN_TEST_XMPP_HOST` (same
-// convention as `client.zig`'s "Client stages 1-4" test). Confirms two
-// things the hand-built fixtures above can't: that `.self_signed` TLS
-// verification (this connector's new default, replacing the old
-// `.no_verification`) actually completes a handshake against a real
-// server's self-signed cert, and that `updateOccupant` correctly parses a
-// *real* server's muc#user presence extension shape, not just the tests'
-// own fixtures. Point it at the `prosody` compose service, same as
-// `client.zig`'s test.
+// Full connect -> TLS `self_signed` verification -> MUC join -> real server
+// presence round trip.
 test "XmppConnector.ensureConnected connects with self_signed TLS, joins a MUC room, and tracks its own occupant presence" {
     const host_z = std.c.getenv("WARDEN_TEST_XMPP_HOST") orelse return error.SkipZigTest;
     const port: u16 = if (std.c.getenv("WARDEN_TEST_XMPP_PORT")) |p| try std.fmt.parseInt(u16, std.mem.span(p), 10) else 5222;
@@ -975,19 +816,12 @@ test "XmppConnector.ensureConnected connects with self_signed TLS, joins a MUC r
     try testing.expect(found_self_presence);
 
     // A freshly (or previously, MAM-persisted) self-created room makes its
-    // creator the owner -- confirms real affiliation/role attributes made
-    // it through parsing, not just that *an* item element was present.
+    // creator the owner.
     const occupant = conn.occupants.get(self_occupant_jid).?;
     try testing.expect(std.mem.eql(u8, occupant.affiliation, "owner") or std.mem.eql(u8, occupant.affiliation, "admin"));
 }
 
-// Regression test for the exact bug `pollFn`'s doc comment describes:
-// before this fix, every `poll_timeout_ns` (8s) of silence tore the whole
-// connection down and reconnected from scratch, leaking a thread+socket
-// each time. Two full idle cycles (>16s) here is well past that old
-// trigger point; a pointer-identity check on `conn.client` is a direct,
-// unambiguous way to prove no reconnect happened (a reconnect would
-// `create` a new `Client` at a different address).
+// Regression: an idle poll used to tear the connection down every cycle.
 test "XmppConnector.poll keeps the same connection alive across multiple idle poll_timeout cycles" {
     const host_z = std.c.getenv("WARDEN_TEST_XMPP_HOST") orelse return error.SkipZigTest;
     const port: u16 = if (std.c.getenv("WARDEN_TEST_XMPP_PORT")) |p| try std.fmt.parseInt(u16, std.mem.span(p), 10) else 5222;
@@ -995,13 +829,7 @@ test "XmppConnector.poll keeps the same connection alive across multiple idle po
     const user = if (std.c.getenv("WARDEN_TEST_XMPP_USER")) |u| std.mem.span(u) else "test";
     const password = if (std.c.getenv("WARDEN_TEST_XMPP_PASSWORD")) |p| std.mem.span(p) else "testpass123";
 
-    // `page_allocator`, not `testing.allocator`, for the connector itself:
-    // this test's very last `poll()` deliberately ends with a background
-    // read still outstanding (nothing ever arrives to complete it), so
-    // `conn.deinit()` takes the documented "abandon rather than risk a
-    // use-after-free" path and never frees the `Client`'s buffers — a real,
-    // intentional leak in this one abandoned-on-shutdown case (see
-    // `pollFn`'s doc comment), not a bug this test should fail on.
+    // `page_allocator`, not `testing.allocator`, for the connector itself.
     var conn = XmppConnector.init(std.heap.page_allocator, testing.io, std.mem.span(host_z), port, domain, user, password, &.{}, .self_signed);
     defer conn.deinit();
     const c = conn.connector();

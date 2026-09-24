@@ -1,8 +1,8 @@
 //! Instagram Direct Messages: inbox/thread polling, per-thread watermark
 //! dedup, and text send. Polling-based by design, not Instagram's MQTT
 //! "Realtime" push -- see the connector plan's "Why polling, not MQTT"
-//! section. Endpoint paths/response shapes are this implementation's
-//! best-effort current knowledge (same caveat as `auth.zig`'s doc comment).
+//! section. Endpoint paths/response shapes are this implementation's best-
+//! effort current knowledge.
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
@@ -19,10 +19,8 @@ pub const DirectMessage = struct {
     user_id: []const u8,
     text: []const u8,
     timestamp_us: i64,
-    /// True when this thread has no other participant besides the
-    /// authenticated account itself -- Instagram's "message yourself"
-    /// thread, the owner-command channel per the connector plan's "Owner
-    /// command routing: self-DM thread" section.
+    /// True when this thread has no other participant besides the authenticated
+    /// account itself.
     is_self_thread: bool,
 
     pub fn dupe(self: DirectMessage, allocator: std.mem.Allocator) !DirectMessage {
@@ -53,11 +51,8 @@ fn valueToI64(v: json.Value) ?i64 {
     };
 }
 
-/// Parses one `inbox.threads[]` entry's `items[]` into `DirectMessage`s
-/// newer than `since_ts_us`, appending to `out`. Skips any item this pass
-/// doesn't recognize (non-text content, or missing required fields) --
-/// same "skip, don't crash the poll loop" posture every other connector's
-/// message conversion already takes.
+/// Parses one `inbox.threads[]` entry's `items[]` into `DirectMessage`s newer
+/// than `since_ts_us`, appending to `out`.
 fn collectThreadMessages(allocator: std.mem.Allocator, thread: json.ObjectMap, since_ts_us: i64, out: *std.ArrayList(DirectMessage)) !void {
     const thread_id = switch (thread.get("thread_id") orelse return) {
         .string => |s| s,
@@ -114,9 +109,6 @@ fn collectThreadMessages(allocator: std.mem.Allocator, thread: json.ObjectMap, s
 
 /// One poll cycle: fetches the inbox, returns every text message newer than
 /// its thread's watermark (via `watermark_lookup`), across every thread.
-/// `watermark_lookup` is a caller-supplied callback (rather than this module
-/// reaching into `store/` directly) so it stays testable against synthetic
-/// JSON fixtures with no Postgres involved.
 pub fn pollInbox(
     io: Io,
     allocator: std.mem.Allocator,

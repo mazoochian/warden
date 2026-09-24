@@ -1,47 +1,18 @@
-//! Phase 20 (ROADMAP.md): every managerial action against a chat that has a
-//! bound management room (see `store/management_rooms.zig`, 1:1 as of this
-//! phase) posts a structured log entry there — actor, action, before/after
-//! state, and (for the subset of actions with a clean, already-existing
-//! inverse primitive) an "Undo" button. The persistent DB row
-//! (`store/audit_log.zig`) is written unconditionally, whether or not a
-//! room is bound; the room post is a convenience notification on top of it.
-//!
-//! **Undo scope, deliberately narrow.** Only `mute`, `promote`, `demote`,
-//! `token_grant` and `credit_grant` are undoable this phase — each has a
-//! real, already-existing inverse the connector or store already supports
-//! (`unmuteUser`, `demoteUser`/`promoteUser`, restoring a previous
-//! balance). `kick`/`ban` are logged but not undoable: there is no
-//! `unbanUser` vtable method anywhere in this codebase yet (adding one is
-//! its own scope, not bundled in here), and un-kicking would mean
-//! re-inviting someone, which isn't a bot capability either. `unmute` isn't
-//! undoable either — reversing it cleanly would need to know the exact
-//! prior mute-until value, and nothing reads that back from the platform
-//! today. These are documented gaps, not silently pretended-away, matching
-//! this project's standing convention for platform/feature limits.
-//!
-//! **No second "are you sure" confirmation before Undo executes.** The
-//! original plan for this phase called for one, but on implementation it
-//! would need its own second round of pending-state (a confirm-prompt
-//! nested inside the undo-prompt) for no real safety gain over the single
-//! deliberate button press every other choice-prompt flow in this codebase
-//! already treats as sufficient (`features/convert_flow.zig`'s format
-//! picker, `features/menu.zig`'s navigation) — simplified away rather than
-//! built as originally scoped.
+//! Every managerial action against a chat that has a bound management room
+//! posts a structured log entry there — actor, action, before/after state,
+//! and, for actions with a clean inverse, an "Undo" button. The persistent
+//! `audit_log` row is written whether or not a room is bound.
 const std = @import("std");
 const Io = std.Io;
 const iface = @import("../platform/interface.zig");
 const store_pool = @import("../store/pool.zig");
 const management_rooms = @import("../store/management_rooms.zig");
 const audit_log = @import("../store/audit_log.zig");
-const chat_members = @import("../store/chat_members.zig");
 const identities = @import("../store/identities.zig");
 
 const log = std.log.scoped(.audit_notify);
 
-/// The value carried on the "Undo" button's `Choice` — checked by
-/// `handleUndoPicked` so a stray/unrelated `ChoicePicked` (e.g. a
-/// `/convert` format pick landing in the same chat) is never mistaken for
-/// an undo.
+/// The value carried on the "Undo" button's `Choice`.
 const undo_choice_value = "audit_undo";
 
 pub const AuditAction = union(enum) {
@@ -51,15 +22,8 @@ pub const AuditAction = union(enum) {
     demote: struct { target_user_id: []const u8, target_label: []const u8, was_admin_before: bool },
     kick: struct { target_user_id: []const u8, target_label: []const u8 },
     ban: struct { target_user_id: []const u8, target_label: []const u8 },
-    token_grant: struct { target_identity_id: i64, target_label: []const u8, prev_balance: i64, new_balance: i64 },
-    credit_grant: struct { target_identity_id: i64, target_label: []const u8, prev_balance: i64, new_balance: i64 },
-    /// Phase 22 — none of these three act on a *member*, so there's no
-    /// `target_user_id`; `new_*`/`removed` doubles as the audit-log
-    /// "target" text. No "before" value captured (Telegram has no
-    /// `getChat`-style read wired up yet, and there's no way to read a
-    /// chat's current photo back at all) — logged as a plain change, same
-    /// documented simplification as everything else in this module that
-    /// isn't undoable.
+    /// None of these three act on a *member*, so there's no `target_user_id`;
+    /// `new_*`/`removed` doubles as the audit-log "target" text.
     title_change: struct { new_title: []const u8 },
     description_change: struct { new_description: []const u8 },
     photo_change: struct { removed: bool },
@@ -72,8 +36,6 @@ pub const AuditAction = union(enum) {
             .demote => "chat.action.demote",
             .kick => "chat.action.kick",
             .ban => "chat.action.ban",
-            .token_grant => "chat.action.token",
-            .credit_grant => "chat.action.credit",
             .title_change => "chat.action.title",
             .description_change => "chat.action.description",
             .photo_change => "chat.action.photo",
@@ -88,8 +50,6 @@ pub const AuditAction = union(enum) {
             .demote => "Demoted",
             .kick => "Kicked",
             .ban => "Banned",
-            .token_grant => "Tokens changed",
-            .credit_grant => "Credits changed",
             .title_change => "Title changed",
             .description_change => "Description changed",
             .photo_change => |p| if (p.removed) "Photo removed" else "Photo changed",
@@ -104,8 +64,6 @@ pub const AuditAction = union(enum) {
             .demote => |x| x.target_label,
             .kick => |x| x.target_label,
             .ban => |x| x.target_label,
-            .token_grant => |x| x.target_label,
-            .credit_grant => |x| x.target_label,
             .title_change => |x| x.new_title,
             .description_change => |x| x.new_description,
             .photo_change => |x| if (x.removed) "removed" else "changed",
@@ -114,7 +72,7 @@ pub const AuditAction = union(enum) {
 
     fn undoable(self: AuditAction) bool {
         return switch (self) {
-            .mute, .token_grant, .credit_grant => true,
+            .mute => true,
             .promote => |p| !p.was_admin_before,
             .demote => |d| d.was_admin_before,
             .unmute, .kick, .ban, .title_change, .description_change, .photo_change => false,
@@ -130,8 +88,6 @@ fn dupeAction(a: std.mem.Allocator, action: AuditAction) !AuditAction {
         .demote => |m| .{ .demote = .{ .target_user_id = try a.dupe(u8, m.target_user_id), .target_label = try a.dupe(u8, m.target_label), .was_admin_before = m.was_admin_before } },
         .kick => |m| .{ .kick = .{ .target_user_id = try a.dupe(u8, m.target_user_id), .target_label = try a.dupe(u8, m.target_label) } },
         .ban => |m| .{ .ban = .{ .target_user_id = try a.dupe(u8, m.target_user_id), .target_label = try a.dupe(u8, m.target_label) } },
-        .token_grant => |m| .{ .token_grant = .{ .target_identity_id = m.target_identity_id, .target_label = try a.dupe(u8, m.target_label), .prev_balance = m.prev_balance, .new_balance = m.new_balance } },
-        .credit_grant => |m| .{ .credit_grant = .{ .target_identity_id = m.target_identity_id, .target_label = try a.dupe(u8, m.target_label), .prev_balance = m.prev_balance, .new_balance = m.new_balance } },
         .title_change => |m| .{ .title_change = .{ .new_title = try a.dupe(u8, m.new_title) } },
         .description_change => |m| .{ .description_change = .{ .new_description = try a.dupe(u8, m.new_description) } },
         .photo_change => |m| .{ .photo_change = .{ .removed = m.removed } },
@@ -164,18 +120,14 @@ fn freeAction(a: std.mem.Allocator, action: AuditAction) void {
             a.free(m.target_user_id);
             a.free(m.target_label);
         },
-        .token_grant => |m| a.free(m.target_label),
-        .credit_grant => |m| a.free(m.target_label),
         .title_change => |m| a.free(m.new_title),
         .description_change => |m| a.free(m.new_description),
         .photo_change => {},
     }
 }
 
-/// Builds the message text posted into the bound room — actor, action
-/// title, and whatever before/after detail that `AuditAction` variant
-/// carries. Uses the same `Io.Writer.Allocating` idiom `main.zig`'s
-/// `/chatinfo`/`/manage list` already use for multi-line replies.
+/// Builds the message text posted into the bound room — actor, action title,
+/// and whatever before/after detail that `AuditAction` variant carries.
 fn formatLogText(a: std.mem.Allocator, actor_label: []const u8, action: AuditAction) []const u8 {
     var buf: std.Io.Writer.Allocating = .init(a);
     buf.writer.print("🛡️ {s}\nBy: {s}\n", .{ action.titleText(), actor_label }) catch {};
@@ -186,8 +138,6 @@ fn formatLogText(a: std.mem.Allocator, actor_label: []const u8, action: AuditAct
         .demote => |m| buf.writer.print("Target: {s}\nWas admin before: {s}", .{ m.target_label, if (m.was_admin_before) "yes" else "no" }) catch {},
         .kick => |m| buf.writer.print("Target: {s}", .{m.target_label}) catch {},
         .ban => |m| buf.writer.print("Target: {s}", .{m.target_label}) catch {},
-        .token_grant => |m| buf.writer.print("Target: {s}\nTokens: {d} \xe2\x86\x92 {d}", .{ m.target_label, m.prev_balance, m.new_balance }) catch {},
-        .credit_grant => |m| buf.writer.print("Target: {s}\nCredits: {d} \xe2\x86\x92 {d}", .{ m.target_label, m.prev_balance, m.new_balance }) catch {},
         .title_change => |m| buf.writer.print("New title: {s}", .{m.new_title}) catch {},
         .description_change => |m| buf.writer.print("New description: {s}", .{m.new_description}) catch {},
         .photo_change => {},
@@ -204,13 +154,7 @@ const UndoEntry = struct {
     expires_at: i64,
 };
 
-/// In-memory, one entry per (control room, prompt message) — several audit
-/// events can have live "Undo" buttons in the same room at once, unlike
-/// `group_admin.PendingConfirmations`' one-per-chat model, so the key must
-/// include the prompt's own message id. 24h timeout: unlike a ban/kick
-/// confirmation (seconds matter, the operator is actively mid-flow), an
-/// audit-log undo is something someone might reasonably want to reach for
-/// well after the fact.
+/// In-memory, one entry per (control room, prompt message).
 pub const PendingUndos = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -280,9 +224,8 @@ pub const PendingUndos = struct {
         try self.map.put(map_key, entry);
     }
 
-    /// Removes and returns the pending undo for this (room, prompt) pair,
-    /// if one exists and hasn't expired — one-shot, same as
-    /// `PendingConfirmations.take`.
+    /// Removes and returns the pending undo for this (room, prompt) pair, if one
+    /// exists and hasn't expired — one-shot, same as `PendingConfirmations.take`.
     pub fn take(self: *PendingUndos, now: i64, control_native_chat_id: []const u8, prompt_message_id: []const u8) ?UndoEntry {
         const map_key = makeKey(self.allocator, control_native_chat_id, prompt_message_id) catch return null;
         defer self.allocator.free(map_key);
@@ -305,14 +248,8 @@ pub const PendingUndos = struct {
     }
 };
 
-/// Writes the permanent `audit_log` row (always, regardless of whether a
-/// room is bound) and, if `target_chat_id` has a bound management room
-/// (`store/management_rooms.zig`, 1:1 as of this phase), posts a formatted
-/// log entry there — with an "Undo" button for the subset of actions
-/// `AuditAction.undoable` admits. `actor_label` is normally the acting
-/// user's `msg.username orelse msg.user_id` — cheap, no extra DB read, and
-/// good enough for a log line (callers wanting a resolved display name can
-/// pass one instead).
+/// Writes the permanent `audit_log` row (always, regardless of whether a room
+/// is bound) and.
 pub fn recordAndNotify(
     connector: iface.Connector,
     a: std.mem.Allocator,
@@ -346,17 +283,15 @@ pub fn recordAndNotify(
                 log.err("failed to remember undo state for room #{d}: {t}", .{ room.id, err });
             };
         }
-        // `prompt_id == null` means the platform has no choice-prompt
-        // support (e.g. XMPP) — `Connector.sendChoicePrompt` already sent a
-        // plain-text fallback listing the choices, with no working button;
-        // nothing more to do.
+        // `prompt_id == null` means the platform has no choice-prompt support (e.g.
+        // XMPP).
         return;
     }
 
     connector.sendMessage(a, room.native_chat_id, text, null);
 }
 
-fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool.PgPool, entry: UndoEntry) !void {
+fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, entry: UndoEntry) !void {
     switch (entry.action) {
         .mute => |m| try connector.unmuteUser(a, entry.target_native_chat_id, m.target_user_id),
         .promote => |p| {
@@ -367,22 +302,15 @@ fn applyUndo(connector: iface.Connector, a: std.mem.Allocator, pool: *store_pool
             if (!d.was_admin_before) return error.NothingToUndo;
             try connector.promoteUser(a, entry.target_native_chat_id, d.target_user_id);
         },
-        .token_grant => |t| try chat_members.setTokens(pool, entry.target_chat_id, t.target_identity_id, t.prev_balance),
-        .credit_grant => |c| try identities.setCredits(pool, c.target_identity_id, c.prev_balance),
         .unmute, .kick, .ban, .title_change, .description_change, .photo_change => return error.NotUndoable,
     }
 }
 
-/// Consumes a `ChoicePicked` arriving in a bound room, if (and only if) it
-/// is a pick of this module's own "Undo" button on a still-live prompt —
-/// returns `false` for anything else (a stray pick, an expired/already-used
-/// prompt, or a pick from a chat/prompt this module never registered) so
-/// `main.zig`'s `handleMessage` can fall through to its other
-/// `choice_picked` consumers (`convert_flow`, `menu`) unchanged.
+/// Consumes a `ChoicePicked` arriving in a bound room, if (and only if) it is
+/// a pick of this module's own "Undo" button on a still-live prompt.
 pub fn handleUndoPicked(
     connector: iface.Connector,
     a: std.mem.Allocator,
-    pool: *store_pool.PgPool,
     pending_undos: *PendingUndos,
     now: i64,
     msg: iface.Message,
@@ -396,7 +324,7 @@ pub fn handleUndoPicked(
         freeAction(a, entry.action);
     }
 
-    applyUndo(connector, a, pool, entry) catch |err| {
+    applyUndo(connector, a, entry) catch |err| {
         log.err("undo failed: {t}", .{err});
         connector.sendMessage(a, msg.chat_id, "Couldn't undo that — it may need to be reverted manually.", msg.message_id);
         return true;
@@ -405,10 +333,6 @@ pub fn handleUndoPicked(
     connector.sendMessage(a, msg.chat_id, "Undone.", msg.message_id);
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const test_support = @import("../store/test_support.zig");
@@ -462,22 +386,10 @@ test "AuditAction.undoable reflects the documented scope" {
     try testing.expect(!(AuditAction{ .promote = .{ .target_user_id = "1", .target_label = "x", .was_admin_before = true } }).undoable());
     try testing.expect((AuditAction{ .demote = .{ .target_user_id = "1", .target_label = "x", .was_admin_before = true } }).undoable());
     try testing.expect(!(AuditAction{ .demote = .{ .target_user_id = "1", .target_label = "x", .was_admin_before = false } }).undoable());
-    try testing.expect((AuditAction{ .token_grant = .{ .target_identity_id = 1, .target_label = "x", .prev_balance = 0, .new_balance = 5 } }).undoable());
-    try testing.expect((AuditAction{ .credit_grant = .{ .target_identity_id = 1, .target_label = "x", .prev_balance = 0, .new_balance = 5 } }).undoable());
 }
 
 /// Minimal fake connector for `recordAndNotify`/`handleUndoPicked` tests —
-/// records calls and hands back a fixed prompt id from `sendChoicePrompt`,
-/// same spirit as `platform/reply_redirect.zig`'s own `RecordingConnector`
-/// but local to this file's narrower needs.
-///
-/// `record` dupes every string into its own arena rather than storing the
-/// caller's slice as-is: `recordAndNotify` frees its own temporary buffers
-/// (`room.native_chat_id`, the formatted text) via `defer` before it
-/// returns, same as production's real connectors only ever need the bytes
-/// for the duration of the synchronous call — a test that inspects
-/// `calls` *after* `recordAndNotify` returns would otherwise be reading
-/// already-freed memory.
+/// records calls and hands back a fixed prompt id from `sendChoicePrompt`.
 const FakeConnector = struct {
     const Call = struct { kind: []const u8, chat_id: []const u8, arg: []const u8 };
 
@@ -562,14 +474,8 @@ test "recordAndNotify writes an audit_log row unconditionally, and posts+registe
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
     defer pool.deinitTestWrap();
-    // `recordAndNotify` frees its own temporary buffers (the resolved
-    // room, the formatted text) via `defer` before returning -- matching
-    // production, where callers always pass the per-message task arena, so
-    // nothing outlives one message's handling. An arena here is the
-    // correct stand-in, not a leak-suppression hack: `testing.allocator`
-    // directly would flag those as leaked, since nothing frees them
-    // individually by design (same convention `main.zig`'s own
-    // `Io.Writer.Allocating`-built replies already follow).
+    // `recordAndNotify` frees its own temporary buffers (the resolved room, the
+    // formatted text) via `defer` before returning.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -610,10 +516,6 @@ test "recordAndNotify writes an audit_log row unconditionally, and posts+registe
 }
 
 test "handleUndoPicked applies the inverse action and consumes the pending entry" {
-    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
-    defer db.close();
-    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
-    defer pool.deinitTestWrap();
     const a = testing.allocator;
 
     var pending = PendingUndos.init(a, testing.io, 60);
@@ -626,7 +528,7 @@ test "handleUndoPicked applies the inverse action and consumes the pending entry
     const msg = iface.Message{ .chat_id = "control-native", .user_id = "1", .message_id = "op-msg" };
     const picked = iface.ChoicePicked{ .prompt_message_id = "prompt-1", .value = undo_choice_value };
 
-    try testing.expect(handleUndoPicked(fake.connector(), a, &pool, &pending, 1010, msg, picked));
+    try testing.expect(handleUndoPicked(fake.connector(), a, &pending, 1010, msg, picked));
 
     try testing.expectEqual(@as(usize, 2), fake.calls.items.len);
     try testing.expectEqualStrings("unmuteUser", fake.calls.items[0].kind);
@@ -635,7 +537,7 @@ test "handleUndoPicked applies the inverse action and consumes the pending entry
     try testing.expectEqualStrings("sendMessage", fake.calls.items[1].kind);
 
     // One-shot: the pending entry was consumed, so a second pick is a no-op.
-    try testing.expect(!handleUndoPicked(fake.connector(), a, &pool, &pending, 1010, msg, picked));
+    try testing.expect(!handleUndoPicked(fake.connector(), a, &pending, 1010, msg, picked));
 }
 
 test "handleUndoPicked returns false for a pick that isn't this module's own undo button" {
@@ -643,11 +545,10 @@ test "handleUndoPicked returns false for a pick that isn't this module's own und
     defer pending.deinit();
     var fake = FakeConnector.init(testing.allocator);
     defer fake.deinit();
-    var pool: store_pool.PgPool = undefined;
 
     const msg = iface.Message{ .chat_id = "chat", .user_id = "1" };
     const picked = iface.ChoicePicked{ .prompt_message_id = "prompt-1", .value = "some_other_flow" };
-    try testing.expect(!handleUndoPicked(fake.connector(), testing.allocator, &pool, &pending, 1000, msg, picked));
+    try testing.expect(!handleUndoPicked(fake.connector(), testing.allocator, &pending, 1000, msg, picked));
 }
 
 const PgPool = store_pool.PgPool;

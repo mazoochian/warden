@@ -1,53 +1,25 @@
 //! Matrix interactive (SAS/emoji) device verification, `m.key.verification.*`
 //! — the protocol logic layered on top of `olm.zig`'s `Sas` binding.
-//! Deliberately narrow in scope: this bot only ever *responds* to an
-//! incoming `m.key.verification.request` from its own account (never
-//! initiates one, never verifies a different user's device) — see
-//! `crypto.zig`'s `State.handleVerificationRequest` and friends for
-//! the stateful handlers that use these pure helpers, and `ROADMAP.md` for
-//! why this exists (clearing Element's "unverified device" shield without
-//! ever giving the bot the account's password or any cross-signing private
-//! key — Element signs the bot's device automatically on a successful
-//! self-verification, using its own locally-held key).
-//!
-//! Only the modern, non-deprecated method set is implemented:
-//! `curve25519-hkdf-sha256` key agreement, `hkdf-hmac-sha256.v2` MAC
-//! (the older `hkdf-hmac-sha256` has a known libolm base64 encoding bug —
-//! `olm.zig`'s `Sas.calculateMac` only binds the `_fixed_base64` libolm
-//! entry point that corrects it), and `sha256` commitment hashing. Real
-//! clients (Element) always support this set; there's no reason to carry
-//! the deprecated fallbacks for a bot verifying only its own devices.
 
 const std = @import("std");
 const olm = @import("olm.zig");
 
 /// One in-flight verification ceremony, keyed by `transaction_id` on
-/// `crypto.zig`'s `State.verifications` map. No persistence: `olm.Sas` has
-/// no pickle/unpickle (a verification ceremony is meant to be a single
-/// ephemeral, human-paced exchange, never resumed across a restart) —
-/// abandoned by a restart, it simply times out on the other side.
+/// `crypto.zig`'s `State.verifications` map.
 pub const VerificationSession = struct {
     their_user_id: []const u8,
     their_device_id: []const u8,
-    /// Pinned once, at `.request` time, from a fresh `/keys/query` — never
-    /// re-resolved mid-ceremony. This is the lesson from CVE-2022-39250
-    /// (matrix-js-sdk): re-looking-up "the current key for this device
-    /// ID" between the verify and sign/trust steps let a malicious
-    /// homeserver substitute a different key in between. Every MAC check
-    /// below verifies against this pinned copy, not a fresh lookup.
+    /// Pinned once, at `.request` time, from a fresh `/keys/query` — never re-
+    /// resolved mid-ceremony.
     their_ed25519: []const u8,
-    /// Literal bytes of the `m.key.verification.start` content this
-    /// device sent — needed verbatim (not re-serialized) for the later
-    /// commitment check, since the bot always plays the "sent start"
-    /// role (see this file's module doc).
+    /// Literal bytes of the `m.key.verification.start` content this device sent —
+    /// needed verbatim (not re-serialized) for the later commitment check.
     sent_start_json: []const u8,
     our_pubkey: []const u8,
     sas: olm.Sas,
     created_at_unix: i64,
     state: enum { ready_sent, accept_received, key_sent, mac_sent },
     /// Set once `m.key.verification.accept` arrives — `null` until then.
-    /// `their_commitment` is verified against `sent_start_json` once their
-    /// ephemeral key arrives in `m.key.verification.key`.
     their_commitment: ?[]const u8 = null,
     /// Whether `accept` negotiated emoji display (vs. falling back to
     /// decimal-only, if the other side didn't offer emoji).
@@ -66,19 +38,11 @@ pub const VerificationSession = struct {
 };
 
 /// A verification ceremony older than this is abandoned — swept lazily by
-/// `crypto.zig`'s handlers on each new verification event, not by a
-/// background timer. Matches the spec's own recommended timeout.
+/// `crypto.zig`'s handlers on each new verification event.
 pub const session_max_age_s: i64 = 10 * std.time.s_per_min;
 
-/// `base64_unpadded(SHA256(their_ephemeral_key_b64 || start_content_json))`
-/// — the `m.key.verification.accept` `commitment` field. Computed by
-/// whoever *accepts* (here, always the other side, since this bot always
-/// sends `start` — see module doc); this device *verifies* it once it
-/// receives their ephemeral key in `m.key.verification.key`, by
-/// recomputing the same formula over the `start` content it itself sent
-/// (`VerificationSession.sent_start_json`, kept verbatim for exactly this
-/// reason — no canonical-JSON serializer needed since it's always our own
-/// literal bytes, never a re-serialization of something received).
+/// `base64_unpadded(SHA256(their_ephemeral_key_b64 || start_content_json))` —
+/// the `m.key.verification.accept` `commitment` field.
 pub fn commitment(allocator: std.mem.Allocator, their_key_b64: []const u8, start_json: []const u8) ![]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(their_key_b64);
@@ -92,10 +56,7 @@ pub fn commitment(allocator: std.mem.Allocator, their_key_b64: []const u8, start
 }
 
 /// The exact `MATRIX_KEY_VERIFICATION_SAS|...` HKDF info string the spec
-/// defines, pipe-delimited — fields anchored to "whoever sent `start`" vs
-/// "whoever sent `accept`", not a fixed "us/them" — since this bot always
-/// sends `start` (module doc), callers always pass the bot's own identity
-/// as `starter_*`.
+/// defines, pipe-delimited.
 pub fn sasInfo(
     allocator: std.mem.Allocator,
     starter_user: []const u8,
@@ -113,13 +74,7 @@ pub fn sasInfo(
     );
 }
 
-/// The exact `MATRIX_KEY_VERIFICATION_MAC...` HKDF info string — straight
-/// concatenation, deliberately *no* delimiters (unlike `sasInfo`'s
-/// pipe-separated form; confirmed against matrix-rust-sdk's
-/// `verification/sas/helpers.rs`, the actual crate Element's crypto now
-/// runs on). `key_id_or_key_ids` is either a specific `"{algorithm}:{id}"`
-/// (when MAC'ing one key) or the literal string `"KEY_IDS"` (when MAC'ing
-/// the sorted key-ID list itself).
+/// The exact `MATRIX_KEY_VERIFICATION_MAC...` HKDF info string.
 pub fn macInfo(
     allocator: std.mem.Allocator,
     mac_sender_user: []const u8,
@@ -138,9 +93,8 @@ pub fn macInfo(
 
 pub const EmojiEntry = struct { emoji: []const u8, description: []const u8 };
 
-/// The official 64-entry SAS emoji table, in index order (0-63) —
-/// `data-definitions/sas-emoji.json` at spec.matrix.org. 7 six-bit indices
-/// (see `formatSas`) each pick one entry.
+/// The official 64-entry SAS emoji table, in index order (0-63) — `data-
+/// definitions/sas-emoji.json` at spec.matrix.org.
 pub const emoji_table = [64]EmojiEntry{
     .{ .emoji = "🐶", .description = "Dog" },
     .{ .emoji = "🐱", .description = "Cat" },
@@ -208,13 +162,7 @@ pub const emoji_table = [64]EmojiEntry{
     .{ .emoji = "📌", .description = "Pin" },
 };
 
-/// Splits 6 bytes (48 bits) into 7 six-bit indices (the top 42 bits — the
-/// bottom 6 bits of the last byte are unused, per spec) into
-/// `emoji_table`, formatted as a human-readable log line. The bot has no
-/// screen: this is what a human reads (via `docker logs`) to compare
-/// against what Element displays for the same ceremony — both sides
-/// derive identical bytes from the shared ECDH secret assuming no MITM,
-/// so a mismatch here means someone in the middle, not a bug.
+/// Splits 6 bytes (48 bits) into 7 six-bit indices.
 pub fn formatSas(allocator: std.mem.Allocator, bytes: [6]u8) ![]u8 {
     const indices = [7]u8{
         bytes[0] >> 2,

@@ -5,55 +5,26 @@ const registry = @import("../tools/registry.zig");
 const attachment_content = @import("attachment_content.zig");
 
 /// Hard cap on model<->tool round trips per question, so a confused model
-/// can't loop forever burning tokens. Hitting it doesn't fail the request:
-/// the model gets one final wrap-up turn (see end of `run`).
+/// can't loop forever burning tokens.
 const max_iterations = 6;
 
-/// Lets a caller observe what a `run` call is doing while it's in flight —
-/// e.g. main.zig uses this to keep an animated "thinking"/"using X" chat
-/// message up to date instead of the user staring at silence until the
-/// whole tool-calling loop finishes. `ptr`/`onEvent` null (the default) is
-/// a no-op, so existing callers don't need to change.
+/// Lets a caller observe what a `run` call is doing while it's in flight.
 pub const Progress = struct {
     ptr: *anyopaque = undefined,
     onEvent: ?*const fn (ptr: *anyopaque, event: Event) void = null,
-    /// Set by callers that support cooperative cancellation (main.zig's
-    /// "🛑 Cancel" button on the thinking placeholder — see
-    /// `features/cancel_request.zig`) — `run` below checks this at each
-    /// loop-iteration boundary (before a new model call, before each tool
-    /// execution) and bails out with `error.Cancelled` as soon as it sees
-    /// it set. Deliberately *not* checked mid-flight inside a `chat`/
-    /// `chatStream` call already underway: there's nothing here to abort
-    /// that with (see `http_util.zig`'s own timeout-not-true-cancellation
-    /// tradeoff for why) — a cancel pressed while a request is in flight
-    /// takes effect only once that call returns. `null` (the default)
-    /// means "not cancellable", same as `onEvent = null` meaning "no
-    /// progress reporting".
+    /// Set by callers that support cooperative cancellation.
     cancelled: ?*const std.atomic.Value(bool) = null,
 
     pub const Event = union(enum) {
         /// About to send a request to the model (first turn or a follow-up
         /// after tool results).
         thinking,
-        /// About to execute a tool the model asked for. `input_digest`
-        /// fingerprints the arguments (see `hashToolInput`) so a caller
-        /// rendering these can tell a genuinely different call apart from
-        /// the same one being reported again — the model re-issuing an
-        /// identical call shouldn't look like new activity.
+        /// About to execute a tool the model asked for.
         tool_use: struct { name: []const u8, input_digest: u64 },
-        /// Cumulative visible answer text generated so far *this turn* (not
-        /// a delta) — reported repeatedly as a streaming provider produces
-        /// more of it; the last report for a given turn equals that turn's
-        /// full text. Resets to a fresh, independent accumulation on the
-        /// next turn (e.g. after a tool call), same as `tool_use` simply
-        /// replacing whatever status was shown before it.
+        /// Cumulative visible answer text generated so far *this turn* (not a delta).
         text: []const u8,
-        /// A model call failed with something worth retrying and another
-        /// attempt is about to be made after a backoff — reported so the
-        /// caller can say so instead of leaving the user watching an
-        /// unexplained pause (see `callProviderWithRetry`). `attempt` is
-        /// 1-based and counts retries, not total calls, so the first one
-        /// reads "1/3".
+        /// A model call failed with something worth retrying and another attempt is
+        /// about to be made after a backoff.
         retry: struct { attempt: u32, max: u32, err: anyerror },
     };
 
@@ -68,15 +39,7 @@ pub const Progress = struct {
 };
 
 /// Order-stable fingerprint of a tool call's arguments, for telling "the
-/// model called web_search again, for something else" apart from "the model
-/// re-issued the same web_search". Serialised rather than hashed field by
-/// field so nested objects/arrays are covered without walking them here;
-/// `std.json.Stringify` preserves object key order as parsed, which is
-/// stable for a given provider response, and a hash collision would only
-/// ever cost a duplicate line in a progress display.
-///
-/// Falls back to a random-ish constant on serialisation failure, so a
-/// failure never makes two different calls *look* identical.
+/// model called web_search again.
 fn hashToolInput(allocator: std.mem.Allocator, input: std.json.Value) u64 {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -84,20 +47,11 @@ fn hashToolInput(allocator: std.mem.Allocator, input: std.json.Value) u64 {
     return std.hash.Wyhash.hash(0, out.writer.buffered());
 }
 
-/// Base backoff before the first retry; doubles each further attempt (1s,
-/// 2s, 4s with the default of 3). Short enough that a transient blip
-/// resolves well inside a chat message's useful lifetime, long enough to
-/// actually let a congested endpoint recover rather than hammering it.
+/// Base backoff before the first retry; doubles each further attempt (1s, 2s,
+/// 4s with the default of 3).
 const retry_backoff_base_ms: u64 = 1000;
 
-/// Whether a failed model call is worth trying again. Deliberately a small
-/// allowlist rather than "anything that isn't cancellation": these are the
-/// transport- and API-level failures that congestion produces (timeouts,
-/// dropped connections, 429/5xx collapsed into one provider error, an empty
-/// response body), and retrying anything else — a malformed request, a bad
-/// key — just burns the same failure three more times.
-///
-/// `error.Cancelled` is never retryable: the user pressed the button.
+/// Whether a failed model call is worth trying again.
 fn isRetryable(err: anyerror) bool {
     return switch (err) {
         error.HttpRequestFailed,
@@ -110,18 +64,8 @@ fn isRetryable(err: anyerror) bool {
     };
 }
 
-/// One model call, retried up to `max_retries` times on a transient
-/// failure with exponential backoff.
-///
-/// Before this, a single failed call ended the whole request with "Sorry, I
-/// couldn't reach the model just now" — which during a provider's busy
-/// hours meant routine, self-correcting blips surfaced as hard failures.
-///
-/// Retrying here (per model call) rather than around the whole of `run` is
-/// what makes it safe: `run`'s conversation may be several turns deep with
-/// tools already executed, and restarting that would re-run those tools —
-/// re-sending a message, re-charging an expense. Only the failed HTTP call
-/// is repeated; the conversation state is untouched.
+/// One model call, retried up to `max_retries` times on a transient failure
+/// with exponential backoff.
 fn callProviderWithRetry(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -153,25 +97,35 @@ fn callProviderWithRetry(
     }
 }
 
-/// Drives one provider-agnostic conversation: sends `user_message`, and as
-/// long as the model keeps asking for tools, executes them against
-/// `tool_defs` and feeds the results back, until it produces a final text
-/// answer (or the iteration cap is hit). `stream` selects `chatStream`
-/// (progressively reports `.text` events as the model generates, see
-/// `ProgressStreamBridge`) vs. one blocking `chat` call per turn.
-/// `show_thinking`/`max_tokens` are forwarded straight into every
-/// `ChatRequest` — see `provider.zig`'s `ChatRequest.show_thinking` doc
-/// comment and `qa.zig`'s `answerMaxTokens` for how callers compute them.
-/// `vision_enabled`/`documents_enabled` gate whether `ctx`'s attachment
-/// gets attached as real bytes to the first turn below — the former for
-/// images, the latter for PDFs (see `llm/attachment_content.zig`). Neither
-/// `imageBlockForAttachment` nor `documentBlockForAttachment` knows about
-/// this config; callers are expected to check it first, same division of
-/// responsibility as everywhere else config-gating happens above this
-/// layer rather than inside it. They're separate flags because they're
-/// separate capabilities: a model can support vision and still have no way
-/// to read a PDF, which is exactly the case for the OpenAI-compatible
-/// surface (see `llm/openai_compat.zig`'s `writeMessages`).
+/// One executed tool call, as `RunResult.tool_calls` reports it.
+pub const ToolCallRecord = struct {
+    name: []const u8,
+    /// The arguments, JSON-serialised.
+    input_json: []const u8,
+    /// What the tool returned (or the `tool error: ...` text fed back to
+    /// the model when it failed).
+    result: []const u8,
+    is_error: bool,
+};
+
+pub const RunResult = struct {
+    /// The visible answer (thinking rendered in when `show_thinking`).
+    text: []const u8,
+    /// Every tool executed this run, in order.
+    tool_calls: []const ToolCallRecord,
+    /// The final model turn's stop reason.
+    stop_reason: llm.StopReason,
+};
+
+/// How many times an empty final turn is answered with a nudge before the run
+/// gives up and returns the empty text for the caller to handle.
+const max_empty_nudges = 1;
+
+/// Sent as a user turn when the model's final turn carried no visible text.
+const empty_turn_nudge = "Your last turn had no visible reply text -- the user saw nothing. Reply now, in plain text, with your answer (or a one-line summary of what you just did with tools). Do not call any more tools.";
+const empty_truncated_nudge = "Your last turn was cut off by the length limit before any visible reply text -- the user saw nothing. Reply now with a short, direct answer; keep any reasoning brief. Do not call any more tools.";
+
+/// `run` for callers that only want the text -- see `runDetailed`.
 pub fn run(
     provider: llm.Provider,
     allocator: std.mem.Allocator,
@@ -185,18 +139,36 @@ pub fn run(
     vision_enabled: bool,
     documents_enabled: bool,
     max_tokens: u32,
-    /// How many times a *transient* model-call failure is retried before
-    /// the request gives up (see `callProviderWithRetry`). 0 restores the
-    /// old single-attempt behaviour.
     max_retries: u32,
 ) ![]const u8 {
+    const result = try runDetailed(provider, allocator, ctx, system, user_message, tool_defs, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens, max_retries);
+    return result.text;
+}
+
+/// Drives one provider-agnostic conversation.
+pub fn runDetailed(
+    provider: llm.Provider,
+    allocator: std.mem.Allocator,
+    ctx: registry.ToolContext,
+    system: ?[]const u8,
+    user_message: []const u8,
+    tool_defs: []const registry.ToolDef,
+    progress: Progress,
+    stream: bool,
+    show_thinking: bool,
+    vision_enabled: bool,
+    documents_enabled: bool,
+    max_tokens: u32,
+    /// How many times a *transient* model-call failure is retried before the
+    /// request gives up (see `callProviderWithRetry`).
+    max_retries: u32,
+) !RunResult {
     const llm_tools = try toLlmTools(allocator, tool_defs);
+    var trace: std.ArrayList(ToolCallRecord) = .empty;
+    var empty_nudges: u32 = 0;
 
     var messages: std.ArrayList(llm.ChatMessage) = .empty;
-    // At most one attachment block: a given message carries a single
-    // attachment, and the two builders are mutually exclusive by
-    // construction (an image's media type is never `application/pdf`).
-    // Image is tried first only because it's the cheaper check.
+    // At most one attachment block.
     const attachment_block: ?llm.ContentBlock = blk: {
         if (vision_enabled) {
             if (attachment_content.imageBlockForAttachment(ctx)) |img| break :blk img;
@@ -215,10 +187,7 @@ pub fn run(
     });
 
     // Bridges the provider-layer `llm.StreamSink` into this loop's own
-    // `Progress` — kept as one instance reused across every turn since it's
-    // stateless (just forwards whatever `text_so_far` it's given); each
-    // turn's own accumulation lives in the provider's `chatStream` call,
-    // not here. Only actually used when `stream` is true.
+    // `Progress`.
     var stream_bridge = ProgressStreamBridge{ .progress = progress };
 
     var i: u32 = 0;
@@ -233,39 +202,54 @@ pub fn run(
             .max_tokens = max_tokens,
         }, stream, stream_bridge.sink(), progress, max_retries);
 
-        try messages.append(allocator, .{ .role = .assistant, .content = response.content });
-
         var tool_uses: std.ArrayList(llm.ToolUse) = .empty;
         for (response.content) |block| {
             switch (block) {
                 .tool_use => |tu| try tool_uses.append(allocator, tu),
-                .text, .image, .document, .tool_result => {},
+                .text, .thinking, .image, .document, .tool_result => {},
             }
         }
 
         if (tool_uses.items.len == 0) {
-            return llm.textOf(allocator, response.content);
+            const text = try renderText(allocator, response.content, show_thinking);
+            if (std.mem.trim(u8, text, " \t\r\n").len > 0 or empty_nudges >= max_empty_nudges) {
+                return .{ .text = text, .tool_calls = try trace.toOwnedSlice(allocator), .stop_reason = response.stop_reason };
+            }
+            // Nothing visible came back.
+            empty_nudges += 1;
+            std.log.warn("model turn had no visible text (stop={t}, thinking={d} bytes, tools so far={d}); nudging once", .{
+                response.stop_reason, llm.thinkingLenOf(response.content), trace.items.len,
+            });
+            const nudge = if (response.stop_reason == .max_tokens) empty_truncated_nudge else empty_turn_nudge;
+            try messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = nudge }}) });
+            continue;
         }
+
+        try messages.append(allocator, .{ .role = .assistant, .content = response.content });
 
         var results: std.ArrayList(llm.ContentBlock) = .empty;
         for (tool_uses.items) |tu| {
             if (progress.isCancelled()) return error.Cancelled;
             progress.report(.{ .tool_use = .{ .name = tu.name, .input_digest = hashToolInput(allocator, tu.input) } });
+            var is_error = false;
             const result_text = executeTool(ctx, tool_defs, tu) catch |err| blk: {
                 std.log.err("tool '{s}' failed: {t}", .{ tu.name, err });
+                is_error = true;
                 break :blk try std.fmt.allocPrint(allocator, "tool error: {t}", .{err});
             };
             const safe_text = try sanitizeUtf8(allocator, result_text);
             try results.append(allocator, .{ .tool_result = .{ .tool_use_id = tu.id, .content = safe_text } });
+            try trace.append(allocator, .{
+                .name = tu.name,
+                .input_json = std.json.Stringify.valueAlloc(allocator, tu.input, .{}) catch "{}",
+                .result = safe_text,
+                .is_error = is_error,
+            });
         }
         try messages.append(allocator, .{ .role = .user, .content = try results.toOwnedSlice(allocator) });
     }
 
-    // Cap hit (usually a model flailing at tools that keep erroring). One
-    // last call, told to wrap up, salvages whatever it has learned so far —
-    // a partial answer beats surfacing an error after all that work. Tools
-    // stay in the request (providers reject conversations containing
-    // tool_use blocks without them) but any further calls are ignored.
+    // Cap hit (usually a model flailing at tools that keep erroring).
     try messages.append(allocator, .{ .role = .user, .content = try allocator.dupe(llm.ContentBlock, &.{
         .{ .text = "You have reached the tool-call limit. Do not call any more tools — give your final answer now using what you already have, and say plainly what you couldn't complete." },
     }) });
@@ -276,14 +260,67 @@ pub fn run(
         .show_thinking = show_thinking,
         .max_tokens = max_tokens,
     }, stream, stream_bridge.sink(), progress, max_retries);
-    const text = try llm.textOf(allocator, response.content);
-    if (text.len > 0) return text;
+    const text = try renderText(allocator, response.content, show_thinking);
+    if (std.mem.trim(u8, text, " \t\r\n").len > 0) {
+        return .{ .text = text, .tool_calls = try trace.toOwnedSlice(allocator), .stop_reason = response.stop_reason };
+    }
     return error.ToolCallLoopExceeded;
 }
 
+/// Per-call caps for `formatTrace` -- the trace is grounding for the model's
+/// next turn, not a transcript.
+const trace_args_max = 80;
+const trace_result_max = 160;
+const trace_total_max = 700;
+
+/// Renders a run's tool calls as one compact line -- `name(args) -> result`
+/// per call, `; `-separated, newlines flattened, each part capped.
+pub fn formatTrace(allocator: std.mem.Allocator, tool_calls: []const ToolCallRecord) !?[]const u8 {
+    if (tool_calls.len == 0) return null;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (tool_calls, 0..) |tc, idx| {
+        if (idx != 0) try buf.appendSlice(allocator, "; ");
+        if (buf.items.len >= trace_total_max) {
+            try buf.print(allocator, "+{d} more", .{tool_calls.len - idx});
+            break;
+        }
+        try buf.appendSlice(allocator, tc.name);
+        try buf.append(allocator, '(');
+        try appendFlattened(&buf, allocator, tc.input_json, trace_args_max);
+        try buf.appendSlice(allocator, if (tc.is_error) ") -> ERROR " else ") -> ");
+        try appendFlattened(&buf, allocator, tc.result, trace_result_max);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Appends `text` with runs of whitespace collapsed to one space, cut to
+/// `max` bytes on a UTF-8 boundary with a trailing ellipsis when cut.
+fn appendFlattened(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, max: usize) !void {
+    const start = buf.items.len;
+    var last_space = false;
+    for (text) |c| {
+        const is_space = std.ascii.isWhitespace(c);
+        if (is_space and last_space) continue;
+        last_space = is_space;
+        try buf.append(allocator, if (is_space) ' ' else c);
+        if (buf.items.len - start > max) break;
+    }
+    if (buf.items.len - start > max) {
+        var end = start + max;
+        while (end > start and (buf.items[end] & 0xC0) == 0x80) end -= 1;
+        buf.shrinkRetainingCapacity(end);
+        try buf.appendSlice(allocator, "\u{2026}");
+    }
+}
+
+/// The answer as the caller should see it.
+fn renderText(allocator: std.mem.Allocator, content: []const llm.ContentBlock, show_thinking: bool) ![]const u8 {
+    return if (show_thinking) llm.textWithThinkingOf(allocator, content) else llm.textOf(allocator, content);
+}
+
 /// Forwards `llm.StreamSink` reports into this loop's own `Progress` as
-/// `.text` events — kept separate from `llm.StreamSink` itself since this
-/// module (unlike `llm/provider.zig`) is allowed to depend on `Progress`.
+/// `.text` events.
 const ProgressStreamBridge = struct {
     progress: Progress,
 
@@ -297,16 +334,7 @@ const ProgressStreamBridge = struct {
     }
 };
 
-/// Tool results can carry arbitrary bytes from external sources — a
-/// scraped page served in an unexpected encoding, a botched HTML-entity
-/// decode — that aren't valid UTF-8. Zig's `json.Stringify` only emits a
-/// `[]const u8` as a JSON string when it validates as UTF-8 (see
-/// `std.json.Stringify.write`); otherwise it silently falls back to a raw
-/// array of byte integers, which Anthropic's API then rejects outright
-/// ("Input should be an object") — surfacing as a confusing 400 on the
-/// *next* turn, far from whichever tool actually produced the bad bytes.
-/// Replacing anything that doesn't decode cleanly with U+FFFD guarantees
-/// every tool result is valid UTF-8 by the time it reaches the wire.
+/// Tool results can carry arbitrary bytes from external sources.
 fn sanitizeUtf8(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (std.unicode.utf8ValidateSlice(text)) return text;
 
@@ -352,10 +380,7 @@ fn toLlmTools(allocator: std.mem.Allocator, defs: []const registry.ToolDef) ![]c
 const testing = std.testing;
 const calculator = @import("../tools/calculator.zig");
 
-/// Stands in for a real provider: first turn asks for the calculator tool,
-/// second turn checks the tool's result actually made it back into the
-/// conversation before returning a final answer. Exercises the loop's
-/// dispatch/threading logic with no network involved.
+/// Stands in for a real provider.
 const FakeProvider = struct {
     call_count: u32 = 0,
 
@@ -424,10 +449,7 @@ test "run bails out with error.Cancelled instead of calling the model when alrea
     try testing.expectEqual(@as(u32, 0), fake.call_count);
 }
 
-/// Implements `chatStream`, not just `chat` — used to confirm `run(...,
-/// true)` actually calls the streaming path (and reports `.text` progress
-/// events for the visible answer, not the tool-calling turn) rather than
-/// silently falling back to `chat`.
+/// Implements `chatStream`, not just `chat`.
 const FakeStreamingProvider = struct {
     call_count: u32 = 0,
 
@@ -732,9 +754,8 @@ const RetryRecorder = struct {
 };
 
 test "run: a transient model failure is retried and reported, not surfaced as an error" {
-    // The reported bug: one failed call ended the whole request with
-    // "Sorry, I couldn't reach the model just now", which during a
-    // provider's busy hours turned routine blips into hard failures.
+    // The reported bug: one failed call ended the whole request with "Sorry, I
+    // couldn't reach the model just now".
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -779,4 +800,137 @@ test "run: a non-transient failure is not retried at all" {
 
     try testing.expectError(error.SomethingUnretryable, run(flaky.provider(), a, ctx, null, "hi", &.{}, .{}, false, false, false, false, 1024, 3));
     try testing.expectEqual(@as(u32, 1), flaky.call_count);
+}
+
+/// Scripts a sequence of canned responses, one per model call, and records
+/// every request it was given -- for the empty-turn recovery tests below.
+const ScriptedProvider = struct {
+    script: []const llm.ChatResponse,
+    call_count: usize = 0,
+    requests: std.ArrayList([]const llm.ChatMessage) = .empty,
+
+    fn provider(self: *ScriptedProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn };
+
+    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        const self: *ScriptedProvider = @ptrCast(@alignCast(ptr));
+        try self.requests.append(allocator, try allocator.dupe(llm.ChatMessage, request.messages));
+        defer self.call_count += 1;
+        return self.script[self.call_count];
+    }
+};
+
+test "runDetailed: an empty final turn after a tool call is nudged once, and the nudge is what recovers the answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const input = try std.json.parseFromSlice(std.json.Value, a, "{\"expression\":\"2+2\"}", .{});
+    var scripted = ScriptedProvider{
+        .script = &.{
+            .{ .content = &.{.{ .tool_use = .{ .id = "call_1", .name = "calculator", .input = input.value } }}, .stop_reason = .tool_use },
+            // The MiniMax shape: thought about it, said nothing.
+            .{ .content = &.{.{ .thinking = .{ .text = "the tool said 4", .field = .reasoning_content } }}, .stop_reason = .end_turn },
+            .{ .content = &.{.{ .text = "It's 4." }}, .stop_reason = .end_turn },
+        },
+    };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    const result = try runDetailed(scripted.provider(), a, ctx, "system", "what is 2+2?", &.{calculator.tool}, .{}, false, false, false, false, 1024, 0);
+    try testing.expectEqualStrings("It's 4.", result.text);
+    try testing.expectEqual(@as(usize, 3), scripted.call_count);
+    try testing.expectEqual(llm.StopReason.end_turn, result.stop_reason);
+
+    // The trace reports the one tool that ran, with its arguments and result.
+    try testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try testing.expectEqualStrings("calculator", result.tool_calls[0].name);
+    try testing.expectEqualStrings("{\"expression\":\"2+2\"}", result.tool_calls[0].input_json);
+    try testing.expectEqualStrings("4", result.tool_calls[0].result);
+    try testing.expect(!result.tool_calls[0].is_error);
+
+    // The third request ends with the nudge as a user turn, and the empty
+    // assistant turn itself was not kept.
+    const third = scripted.requests.items[2];
+    const last = third[third.len - 1];
+    try testing.expectEqual(llm.Role.user, last.role);
+    try testing.expectEqualStrings(empty_turn_nudge, last.content[0].text);
+    for (third) |m| {
+        if (m.role == .assistant) try testing.expect(m.content[0] != .thinking);
+    }
+}
+
+test "runDetailed: a turn cut off by max_tokens with no text gets the truncation nudge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var scripted = ScriptedProvider{ .script = &.{
+        .{ .content = &.{}, .stop_reason = .max_tokens },
+        .{ .content = &.{.{ .text = "short answer" }}, .stop_reason = .end_turn },
+    } };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    const result = try runDetailed(scripted.provider(), a, ctx, null, "q", &.{}, .{}, false, false, false, false, 64, 0);
+    try testing.expectEqualStrings("short answer", result.text);
+    const second = scripted.requests.items[1];
+    try testing.expectEqualStrings(empty_truncated_nudge, second[second.len - 1].content[0].text);
+}
+
+test "runDetailed: a second empty turn is returned as empty text, not nudged forever" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var scripted = ScriptedProvider{
+        .script = &.{
+            .{ .content = &.{.{ .text = "   \n" }}, .stop_reason = .end_turn },
+            .{ .content = &.{}, .stop_reason = .end_turn },
+            // Never reached.
+            .{ .content = &.{.{ .text = "unexpected" }}, .stop_reason = .end_turn },
+        },
+    };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    const result = try runDetailed(scripted.provider(), a, ctx, null, "q", &.{}, .{}, false, false, false, false, 64, 0);
+    try testing.expectEqual(@as(usize, 0), std.mem.trim(u8, result.text, " \t\r\n").len);
+    try testing.expectEqual(@as(usize, 2), scripted.call_count);
+    try testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+}
+
+test "runDetailed renders thinking into the text only when show_thinking is on" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const script = [_]llm.ChatResponse{
+        .{ .content = &.{ .{ .thinking = .{ .text = "hmm", .field = .reasoning } }, .{ .text = "four" } }, .stop_reason = .end_turn },
+    };
+    const ctx = registry.ToolContext{ .allocator = a, .io = testing.io };
+
+    var hidden = ScriptedProvider{ .script = &script };
+    try testing.expectEqualStrings("four", (try runDetailed(hidden.provider(), a, ctx, null, "q", &.{}, .{}, false, false, false, false, 64, 0)).text);
+
+    var shown = ScriptedProvider{ .script = &script };
+    try testing.expectEqualStrings(llm.thinking_start ++ "hmm" ++ llm.thinking_end ++ "\n\nfour", (try runDetailed(shown.provider(), a, ctx, null, "q", &.{}, .{}, false, true, false, false, 64, 0)).text);
+}
+
+test "formatTrace renders one compact entry per call, flattens whitespace, caps long parts, and is null with no calls" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expect((try formatTrace(a, &.{})) == null);
+
+    const long_result = "x" ** 300;
+    const trace = (try formatTrace(a, &.{
+        .{ .name = "weather", .input_json = "{\"location\":\"Berlin\"}", .result = "Berlin:\n  12°C,\twind 3 m/s", .is_error = false },
+        .{ .name = "fetch_url", .input_json = "{}", .result = long_result, .is_error = true },
+    })).?;
+    try testing.expect(std.mem.startsWith(u8, trace, "weather({\"location\":\"Berlin\"}) -> Berlin: 12°C, wind 3 m/s; fetch_url({}) -> ERROR xxx"));
+    try testing.expect(std.mem.endsWith(u8, trace, "\u{2026}"));
+    try testing.expect(trace.len < 300);
+    try testing.expect(std.unicode.utf8ValidateSlice(trace));
 }

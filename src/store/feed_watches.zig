@@ -6,18 +6,8 @@ const Platform = @import("../platform/interface.zig").Platform;
 pub const default_check_interval_seconds: i64 = 900;
 
 /// A watch due to be re-checked, joined with `chats` for the native chat id
-/// and platform `checkAndNotifyFeeds` needs to pick the right connector
-/// (same reasoning as `reminders.DueReminder`/`alerts.AlertToCheck`).
-/// `seen_guids` null means this feed has never been checked before —
-/// distinct from an empty (but non-null) slice, which means it *was*
-/// checked and genuinely had nothing.
-///
-/// A set, not a single watermark — found live 2026-07-20: a feed whose
-/// `<item>`s aren't reliably newest-first (a pinned/featured story sitting
-/// at position 0 regardless of publish date) broke the old
-/// scan-from-the-top-stop-at-the-watermark dedup permanently, since the
-/// stale pinned item never moved off position 0. Set membership doesn't
-/// care about item order at all.
+/// and platform `checkAndNotifyFeeds` needs to pick the right connector (same
+/// reasoning as `reminders.DueReminder`/`alerts.AlertToCheck`).
 pub const DueFeedWatch = struct {
     id: i64,
     native_chat_id: []const u8,
@@ -32,9 +22,8 @@ pub const FeedWatchRow = struct {
     feed_url: []const u8,
 };
 
-/// Adds a watch, or does nothing if this chat is already watching this
-/// exact URL — returns whether a new row was actually created (a caller
-/// can tell "just started watching" from "already watching this one").
+/// Adds a watch, or does nothing if this chat is already watching this exact
+/// URL.
 pub fn create(pool: *PgPool, chat_id: i64, identity_id: i64, feed_url: []const u8) !bool {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -54,7 +43,6 @@ pub fn create(pool: *PgPool, chat_id: i64, identity_id: i64, feed_url: []const u
 
 /// Removes a watch by its natural key (chat + URL) — open to anyone in the
 /// chat, same as `/digest on|off`, not restricted to whoever added it.
-/// Returns whether a row actually existed to remove.
 pub fn remove(pool: *PgPool, chat_id: i64, feed_url: []const u8) !bool {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -67,10 +55,7 @@ pub fn remove(pool: *PgPool, chat_id: i64, feed_url: []const u8) !bool {
 }
 
 /// One row for the web API's `GET /api/v1/watches` — identity-scoped
-/// ("watches I've added"), with its own chat context, same reasoning as
-/// `reminders.PendingReminderForIdentity`. Deleting a watch is still open
-/// to anyone in the chat (see `remove`/`removeById` below), not just
-/// whoever's listed here as the adder.
+/// ("watches I've added"), with its own chat context.
 pub const FeedWatchRowForIdentity = struct {
     id: i64,
     chat_id: i64,
@@ -78,21 +63,19 @@ pub const FeedWatchRowForIdentity = struct {
     feed_url: []const u8,
 };
 
-/// Watches added by one identity, optionally narrowed to one chat — see
-/// `reminders.listForIdentity`'s doc comment for why this is separate
-/// from `listPending`.
-pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id: i64, chat_id: ?i64) ![]FeedWatchRowForIdentity {
+/// Watches added by one identity, optionally narrowed to one chat.
+pub fn listForIdentities(pool: *PgPool, allocator: std.mem.Allocator, identity_ids: []const i64, chat_id: ?i64) ![]FeedWatchRowForIdentity {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
         \\SELECT f.id, f.chat_id, c.title, f.feed_url
         \\FROM feed_watches f JOIN chats c ON c.id = f.chat_id
-        \\WHERE f.identity_id = $1 AND ($2::bigint IS NULL OR f.chat_id = $2)
+        \\WHERE f.identity_id = ANY($1::bigint[]) AND ($2::bigint IS NULL OR f.chat_id = $2)
         \\ORDER BY f.id ASC;
     );
     defer stmt.finalize();
-    stmt.bindInt64(1, identity_id);
+    stmt.bindInt64Array(1, identity_ids);
     if (chat_id) |c| stmt.bindInt64(2, c) else stmt.bindNull(2);
 
     var out: std.ArrayList(FeedWatchRowForIdentity) = .empty;
@@ -108,10 +91,7 @@ pub fn listForIdentity(pool: *PgPool, allocator: std.mem.Allocator, identity_id:
 }
 
 /// Enough to authorize+locate a web API delete-by-id (the web API exposes
-/// `DELETE /api/v1/watches/:id`, unlike `/unwatch`'s natural-key lookup) —
-/// same shape/reasoning as `reminders.Reminder`/`alerts.Alert`, minus an
-/// `identity_id` since watch removal was never creator-restricted (see
-/// `remove`'s doc comment).
+/// `DELETE /api/v1/watches/:id`, unlike `/unwatch`'s natural-key lookup).
 pub const WatchRef = struct {
     id: i64,
     chat_id: i64,
@@ -133,9 +113,7 @@ pub fn getById(pool: *PgPool, allocator: std.mem.Allocator, id: i64) !?WatchRef 
     };
 }
 
-/// Removes a watch by its own id — the web API's delete path (see
-/// `getById`'s doc comment for why this exists alongside the natural-key
-/// `remove` the bot's own `/unwatch` uses).
+/// Removes a watch by its own id — the web API's delete path.
 pub fn removeById(pool: *PgPool, id: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -165,9 +143,8 @@ pub fn listPending(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64) ![
     return out.toOwnedSlice(allocator);
 }
 
-/// Every watch whose check interval has elapsed (or has never been
-/// checked), across all chats — same shape/reasoning as
-/// `alerts.dueForCheck`.
+/// Every watch whose check interval has elapsed (or has never been checked),
+/// across all chats — same shape/reasoning as `alerts.dueForCheck`.
 pub fn dueForCheck(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]DueFeedWatch {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -194,12 +171,8 @@ pub fn dueForCheck(pool: *PgPool, allocator: std.mem.Allocator, now: i64) ![]Due
     return out.toOwnedSlice(allocator);
 }
 
-/// Looks up exactly one watch by its natural key, regardless of whether
-/// it's actually due for a check yet — the manual `/watchcheck <url>` path
-/// uses this instead of `dueForCheck`, since forcing an immediate check is
-/// the whole point (see `features/feed_watcher.zig`'s `checkOne`, shared
-/// by both the scheduled batch loop and the manual command so they can
-/// never drift apart).
+/// Looks up exactly one watch by its natural key, regardless of whether it's
+/// actually due for a check yet.
 pub fn getOne(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, feed_url: []const u8) !?DueFeedWatch {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -223,12 +196,8 @@ pub fn getOne(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, feed_ur
     };
 }
 
-/// Records that this feed was just checked and which item guids it
-/// currently has (so the next check can diff against this set) — called
-/// regardless of whether any new items were actually found or announced.
-/// Caller should cap `guids` to a reasonable window (see
-/// `feed_watcher.zig`'s `max_tracked_guids`) — this just persists whatever
-/// it's given.
+/// Records that this feed was just checked and which item guids it currently
+/// has (so the next check can diff against this set).
 pub fn markChecked(pool: *PgPool, allocator: std.mem.Allocator, id: i64, now: i64, guids: []const []const u8) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -246,15 +215,6 @@ pub fn markChecked(pool: *PgPool, allocator: std.mem.Allocator, id: i64, now: i6
 
 /// Bumps `last_checked_at` only, leaving `seen_guids_json` untouched
 /// (including left `NULL` if the watch was never successfully baselined).
-/// For a fetch/parse failure — `markChecked` can't be reused here since it
-/// unconditionally overwrites `seen_guids_json`, which would either wipe an
-/// existing dedup baseline or (worse) turn a `NULL` baseline into an empty
-/// one, making the next successful check treat every current item as "new"
-/// instead of recording a proper baseline. Without this, `dueForCheck`'s
-/// `last_checked_at IS NULL OR ...` picks a failing watch again on every
-/// ~30s poll tick forever — found live 2026-07-21: three watches with
-/// garbage `feed_url`s (typo'd `/watch` input meant as `/unwatch`) fetch-failed
-/// continuously for 16+ hours, one retry storm per poll tick.
 pub fn bumpLastChecked(pool: *PgPool, id: i64, now: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -337,7 +297,7 @@ test "create/dueForCheck/markChecked/listPending/remove" {
     try testing.expect(!(try remove(&pool, chat_id, "https://example.com/feed.xml")));
 }
 
-test "listForIdentity/getById/removeById" {
+test "listForIdentities/getById/removeById" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
     var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
@@ -360,11 +320,11 @@ test "listForIdentity/getById/removeById" {
     try testing.expect(try create(&pool, chat1, alice, "https://example.com/a.xml"));
     try testing.expect(try create(&pool, chat2, alice, "https://example.com/b.xml"));
 
-    const all = try listForIdentity(&pool, a, alice, null);
+    const all = try listForIdentities(&pool, a, &.{alice}, null);
     try testing.expectEqual(@as(usize, 2), all.len);
     try testing.expectEqualStrings("Chat One", all[0].chat_title.?);
 
-    const narrowed = try listForIdentity(&pool, a, alice, chat1);
+    const narrowed = try listForIdentities(&pool, a, &.{alice}, chat1);
     try testing.expectEqual(@as(usize, 1), narrowed.len);
 
     const ref = (try getById(&pool, a, narrowed[0].id)) orelse return error.TestExpectedValue;

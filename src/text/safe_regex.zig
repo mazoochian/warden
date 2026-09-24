@@ -1,38 +1,7 @@
 //! A hand-rolled regex engine for `/redact regex`, deliberately built as a
 //! Thompson-construction NFA simulated via Pike's VM — never backtracking —
-//! so it's immune to catastrophic backtracking (ReDoS) *by construction*,
-//! not by blacklisting dangerous-looking patterns. Matching a compiled
-//! pattern against N bytes of text always costs O(states × N), regardless
-//! of how the pattern is shaped: classic backtracking-engine worst cases
-//! like `(a+)+$` against a long non-matching run compile to a handful of
-//! states here and match/reject in linear time (see this file's own
-//! non-hang regression test).
-//!
-//! Three defenses, all enforced at `compile()` time, not just documented:
-//!   - `max_pattern_len`: the raw pattern string itself can't be absurdly
-//!     long.
-//!   - `max_repetition_bound`: a single `{n,m}` can't specify an absurd
-//!     bound.
-//!   - `max_nfa_states`: the *compiled* state count is checked as states
-//!     are allocated, which is what actually catches compounding blow-ups
-//!     (e.g. nested repetition) that no single `{n,m}` bound-check alone
-//!     would — `compile()` fails with `error.TooManyStates` the instant the
-//!     ceiling would be crossed, mid-compilation.
-//!
-//! Deliberate v1 scope, not full PCRE: literals, `.`, `[abc]`/`[^abc]`/
-//! ranges, `*`/`+`/`?`/`{n,m}`/`{n,}`, alternation `|`, non-capturing
-//! `(...)` grouping (precedence only — no backreferences, which are
-//! exactly what forces real regex engines into backtracking), anchors
-//! `^`/`$`. No capture groups (nothing here needs submatches, only a yes/
-//! no `isMatch`). Matching is byte-wise (raw UTF-8 bytes), not Unicode-
-//! codepoint-wise — `.` and classes operate on single bytes, and there's no
-//! `\d`/`\w`/`\s` shorthand. Acceptable for a moderation tool where
-//! patterns are overwhelmingly ASCII; both are addable later without
-//! touching the matching core. `isMatch` is an unanchored *search* (matches
-//! anywhere in the text) unless the pattern itself uses `^`/`$` — same
-//! default as grep/most regex engines, appropriate for "does this message
-//! contain a match" rather than "does this message consist entirely of a
-//! match".
+//! so it's immune to catastrophic backtracking (ReDoS) *by construction*, not
+//! by blacklisting dangerous-looking patterns.
 
 const std = @import("std");
 
@@ -57,9 +26,7 @@ const ClassSpec = struct {
     negate: bool,
 };
 
-/// Parse-time tree, allocated in a short-lived arena — see `compile`'s doc
-/// comment on why `Compiler` copies anything from here that needs to
-/// outlive it (the arena is freed before `compile` returns).
+/// Parse-time tree, allocated in a short-lived arena.
 const Ast = union(enum) {
     literal: u8,
     any_byte,
@@ -160,10 +127,9 @@ const Parser = struct {
         return std.fmt.parseInt(usize, self.pattern[start..self.pos], 10) catch null;
     }
 
-    /// Always treats `{` as the start of a bounded-repeat expression rather
-    /// than trying to guess whether malformed content means a literal `{`
-    /// was intended — rejecting ambiguous input outright is the safer
-    /// default for a security-focused engine.
+    /// Always treats `{` as the start of a bounded-repeat expression rather than
+    /// trying to guess whether malformed content means a literal `{` was
+    /// intended.
     fn parseBoundedRepeat(self: *Parser, atom: *const Ast) CompileError!*const Ast {
         self.pos += 1; // consume '{'
         const min = self.parseNumber() orelse return error.UnsupportedSyntax;
@@ -195,8 +161,8 @@ const Parser = struct {
             '[' => self.parseClass(),
             '*', '+', '?' => error.UnsupportedSyntax, // quantifier with nothing to quantify
             '\\' => blk: {
-                // Escapes any char to its literal (`\.`, `\\`, `\(`, ...) —
-                // no `\d`/`\w`/`\s` shorthand, see this file's module doc.
+                // Escapes any char to its literal (`\.`, `\\`, `\(`, ...) — no `\d`/`\w`/`\s`
+                // shorthand.
                 const esc = self.advance() orelse return error.UnsupportedSyntax;
                 break :blk self.dupe(.{ .literal = esc });
             },
@@ -204,10 +170,8 @@ const Parser = struct {
         };
     }
 
-    /// A leading `]` is always the closing bracket here (no POSIX "`]`
-    /// right after `[`/`[^` is a literal member" special case) — an
-    /// explicit `\]` is required to include a literal bracket, which is
-    /// simpler and less surprising than that convention.
+    /// A leading `]` is always the closing bracket here (no POSIX "`]` right
+    /// after `[`/`[^` is a literal member" special case).
     fn parseClass(self: *Parser) CompileError!*const Ast {
         var negate = false;
         if (self.eat('^')) negate = true;
@@ -240,12 +204,7 @@ const Parser = struct {
 
 const ClassState = struct { ranges: []const Range, negate: bool, out: usize };
 
-/// One compiled NFA state. `out`/`out1`/`out2` are indices into
-/// `Regex.states`. Built via Thompson construction with a continuation-
-/// passing compiler (`Compiler.compileNode` takes the state to transition
-/// to on success as an explicit `next` parameter) rather than the classic
-/// "patch list of dangling pointers" formulation — equivalent NFA shape,
-/// simpler to implement correctly in Zig.
+/// One compiled NFA state.
 const State = union(enum) {
     byte: struct { value: u8, out: usize },
     any_byte: struct { out: usize },
@@ -266,9 +225,7 @@ const Compiler = struct {
         return self.states.items.len - 1;
     }
 
-    /// Reserves a slot to be filled in later — needed for `*`/`+`, whose
-    /// loop-back split must exist (so its index is known) before the body
-    /// it loops into is compiled.
+    /// Reserves a slot to be filled in later.
     fn addPlaceholder(self: *Compiler) CompileError!usize {
         return self.addState(undefined);
     }
@@ -281,8 +238,7 @@ const Compiler = struct {
     }
 
     /// Builds `count` nested optional copies of `node`, each one skippable
-    /// straight through to `next` — backs the "up to `max - min` extra
-    /// optional copies" half of a bounded `{min,max}` repeat.
+    /// straight through to `next`.
     fn compileOptionalTail(self: *Compiler, node: *const Ast, count: usize, next: usize) CompileError!usize {
         if (count == 0) return next;
         const inner = try self.compileOptionalTail(node, count - 1, next);
@@ -304,11 +260,8 @@ const Compiler = struct {
         return switch (node.*) {
             .literal => |b| self.addState(.{ .byte = .{ .value = b, .out = next } }),
             .any_byte => self.addState(.{ .any_byte = .{ .out = next } }),
-            // Ranges are copied into the long-lived allocator here — `c`
-            // itself (and its `ranges` slice) lives in the parser's arena,
-            // which is freed once `compile()` returns; the compiled `State`
-            // must not keep pointing into it. `Regex.deinit` frees this
-            // copy (see its own doc comment).
+            // Ranges are copied into the long-lived allocator here — `c` itself (and its
+            // `ranges` slice) lives in the parser's arena.
             .class => |c| self.addState(.{ .class = .{ .ranges = try self.allocator.dupe(Range, c.ranges), .negate = c.negate, .out = next } }),
             .assert_start => self.addState(.{ .assert_start = .{ .out = next } }),
             .assert_end => self.addState(.{ .assert_end = .{ .out = next } }),
@@ -334,10 +287,8 @@ const Compiler = struct {
             },
             .star => |child| self.compileStar(child, next),
             .plus => |child| blk: {
-                // One mandatory pass through `child`, then optionally loop
-                // — same split-based loop as `compileStar`, but the entry
-                // point is the body (not the split), so it always runs at
-                // least once.
+                // One mandatory pass through `child`, then optionally loop — same split-based
+                // loop as `compileStar`, but the entry point is the body (not the split).
                 const split_id = try self.addPlaceholder();
                 const body_id = try self.compileNode(child, split_id);
                 self.states.items[split_id] = .{ .split = .{ .out1 = body_id, .out2 = next } };
@@ -367,17 +318,10 @@ pub const Regex = struct {
     allocator: std.mem.Allocator,
     states: []const State,
     start: usize,
-    /// Per-state "last-seen generation" — reused across `isMatch` calls
-    /// (cleared implicitly by bumping `generation` rather than by zeroing
-    /// the whole array each time) to dedupe the epsilon closure without
-    /// which a `*`/`+`-induced cycle in the state graph would recurse
-    /// forever.
+    /// Per-state "last-seen generation".
     gen_marks: []usize,
     generation: usize = 0,
-    /// Scratch state-id lists, reused (not reallocated) across `isMatch`
-    /// calls — this engine is meant to run against many candidate messages
-    /// per `/redact regex` invocation (see `store/messages.zig`'s
-    /// `recentForScan`), so avoiding a fresh allocation per call matters.
+    /// Scratch state-id lists, reused (not reallocated) across `isMatch` calls.
     clist: std.ArrayList(usize) = .empty,
     nlist: std.ArrayList(usize) = .empty,
 
@@ -392,8 +336,7 @@ pub const Regex = struct {
     }
 
     /// Unanchored substring search (matches anywhere in `text`) unless the
-    /// pattern itself anchors with `^`/`$` — see this file's module doc.
-    /// Pointer receiver: matching mutates the reused scratch buffers above.
+    /// pattern itself anchors with `^`/`$`.
     pub fn isMatch(self: *Regex, text: []const u8) bool {
         self.clist.clearRetainingCapacity();
         self.generation += 1;
@@ -417,11 +360,7 @@ pub const Regex = struct {
                     else => {},
                 }
             }
-            // Unanchored search: also start a fresh match attempt at the
-            // next position. Naturally a no-op for a `^`-anchored pattern
-            // — `assert_start` below only lets the closure through at
-            // pos == 0, so re-injecting `start` at pos+1 > 0 dead-ends
-            // immediately without adding anything new.
+            // Unanchored search: also start a fresh match attempt at the next position.
             self.addThread(&self.nlist, self.start, pos + 1, text.len, self.generation);
 
             std.mem.swap(std.ArrayList(usize), &self.clist, &self.nlist);
@@ -430,13 +369,8 @@ pub const Regex = struct {
         return false;
     }
 
-    /// Follows epsilon transitions (`split`/`assert_start`/`assert_end`)
-    /// from `state_id`, adding every byte-consuming state (and `match`) it
-    /// can reach at `pos` to `list`. `gen_marks`-based dedup is what keeps
-    /// this from recursing forever around a `*`/`+` loop, and is also
-    /// exactly what bounds total work per position to O(states) — each
-    /// state is visited at most once per position, regardless of how many
-    /// different paths reach it.
+    /// Follows epsilon transitions (`split`/`assert_start`/`assert_end`) from
+    /// `state_id`.
     fn addThread(self: *Regex, list: *std.ArrayList(usize), state_id: usize, pos: usize, text_len: usize, gen: usize) void {
         if (self.gen_marks[state_id] == gen) return;
         self.gen_marks[state_id] = gen;
@@ -452,11 +386,7 @@ pub const Regex = struct {
     }
 };
 
-/// Compiles `pattern` into a `Regex`. `allocator` owns the returned
-/// `Regex`'s memory for its whole lifetime (freed by `Regex.deinit`) — a
-/// separate, short-lived arena backs parsing only (the AST never needs to
-/// outlive this function; `Compiler.compileNode` copies anything that does,
-/// e.g. character-class ranges, into `allocator`).
+/// Compiles `pattern` into a `Regex`.
 pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) CompileError!Regex {
     if (pattern.len == 0) return error.UnsupportedSyntax;
     if (pattern.len > max_pattern_len) return error.PatternTooLong;
@@ -466,9 +396,9 @@ pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) CompileError!R
 
     var parser = Parser{ .pattern = pattern, .pos = 0, .allocator = arena.allocator() };
     const ast = try parser.parseAlt();
-    // Leftover input after a full parse means something didn't balance,
-    // e.g. a stray ')' with no matching '(' (parseConcat stops at ')'
-    // without consuming it, so an unmatched one is left dangling here).
+    // Leftover input after a full parse means something didn't balance, e.g. a
+    // stray ')' with no matching '(' (parseConcat stops at ')' without consuming
+    // it.
     if (parser.pos != pattern.len) return error.UnbalancedGroup;
 
     var compiler = Compiler{ .allocator = allocator };
@@ -618,11 +548,8 @@ test "compile rejects a {n,m} bound over max_repetition_bound" {
 }
 
 test "compile rejects a pattern whose compiled NFA would exceed max_nfa_states" {
-    // Nested large repetition: (a{999}){999} would compile to ~999*999
-    // states if each outer copy fully re-expanded the inner one — exactly
-    // the compounding blow-up max_nfa_states exists to catch (a single
-    // {n,m} bound-check alone wouldn't, since neither 999 alone exceeds
-    // max_repetition_bound).
+    // Nested large repetition: (a{999}){999} would compile to ~999*999 states if
+    // each outer copy fully re-expanded the inner one.
     try testing.expectError(error.TooManyStates, compile(testing.allocator, "(a{999}){999}"));
 }
 
@@ -641,11 +568,7 @@ test "regression: a classically-catastrophic-for-backtracking-engines pattern co
     defer re.deinit();
 
     const allocator = testing.allocator;
-    // Long run of 'a's followed by a non-matching character — the exact
-    // shape that makes a backtracking engine explode trying every way to
-    // partition the 'a's among the nested quantifiers before giving up.
-    // This engine compiles (a+)+ to a handful of states regardless of
-    // nesting depth, so this either matches or rejects in microseconds.
+    // Long run of 'a's followed by a non-matching character.
     const n = 5000;
     var text = try allocator.alloc(u8, n + 1);
     defer allocator.free(text);
@@ -653,9 +576,7 @@ test "regression: a classically-catastrophic-for-backtracking-engines pattern co
     text[n] = '!';
 
     try testing.expect(!re.isMatch(text));
-    // A prefix that actually does satisfy "one or more runs of one or more
-    // a's, anchored at the end" should still match, confirming this isn't
-    // just "everything returns false" — a's ending exactly at the string's
-    // end.
+    // A prefix that actually does satisfy "one or more runs of one or more a's,
+    // anchored at the end" should still match.
     try testing.expect(re.isMatch(text[0..n]));
 }

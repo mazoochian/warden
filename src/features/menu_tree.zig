@@ -1,11 +1,7 @@
 const std = @import("std");
 
-/// Every navigable node in the `/menu` tree — the single source of truth
-/// for both real navigation (`menu.zig`) and the read-only Help browser,
-/// which renders this exact same tree in a different mode rather than
-/// maintaining its own parallel list (see `NodeKind` and `MenuSession.mode`
-/// in `menu.zig`). Deliberately flat (not nested structs) so a comptime
-/// table indexed by `@intFromEnum` can look any node up in O(1).
+/// Every navigable node in the `/menu` tree — the single source of truth for
+/// both real navigation (`menu.zig`) and the read-only Help browser.
 pub const NodeId = enum {
     root,
 
@@ -48,10 +44,10 @@ pub const NodeId = enum {
     settings_global,
     settings_global_addadmin,
     settings_global_removeadmin,
-    settings_global_adduser,
-    settings_global_removeuser,
-    settings_global_allowchat,
-    settings_global_disallowchat,
+    settings_global_blockuser,
+    settings_global_unblockuser,
+    settings_global_blockchat,
+    settings_global_unblockchat,
     settings_global_whois,
     settings_global_scraper,
     settings_chat,
@@ -79,8 +75,7 @@ pub const NodeId = enum {
 
 /// One button shown for a `.branch`/`.dynamic_list` node's child, or for a
 /// terminal node's own "confirm this" affordance (e.g. the digest on/off
-/// pair). `emoji` doubles as the Matrix reaction key, matching
-/// `iface.Choice`.
+/// pair).
 pub const ChildRef = struct {
     id: NodeId,
     emoji: []const u8,
@@ -94,46 +89,24 @@ pub const NodeKind = enum {
     /// Performs `ActionRunner.perform(id, ...)` immediately on selection,
     /// then re-renders the parent (or whatever the runner returns).
     action,
-    /// Prompts with `prompt`, puts the session into `awaiting_input`, and
-    /// hands the next message from the same (chat, user) to
-    /// `ActionRunner.resumeAwaitingInput(id, ...)`.
+    /// Prompts with `prompt`, puts the session into `awaiting_input`, and hands
+    /// the next message from the same.
     awaiting_input,
-    /// Like `.branch`, but its buttons are produced live by
-    /// `ActionRunner.dynamicChoices(id, ...)` (e.g. the actual list of
-    /// pending alerts/watches in this chat) instead of from `children`.
     dynamic_list,
-    /// Enters the multi-step reminder-creation stepper (see `menu.zig`'s
-    /// `Session.stage`'s `.wizard` variant) instead of performing a single
-    /// immediate action or a single text prompt.
+    /// Enters the multi-step reminder-creation stepper.
     wizard,
 };
 
 /// The trust tier a presser must hold before a node is offered to them, let
-/// alone run. Enforced by `menu.zig` through `ActionRunner.authorize` (whose
-/// only implementation is `main.zig`'s `menuAuthorize`) in two places: when
-/// building a branch's buttons, and again immediately before dispatching a
-/// pick — Telegram lets a client send arbitrary `callback_data` for any bot
-/// message, so a node being absent from the rendered keyboard is not on its
-/// own a gate.
-///
-/// Ordered least → most trusted; the comptime guard below requires every
-/// child to be at least as strict as its parent, so hiding a branch really
-/// does hide everything underneath it.
-///
-/// `.chat_admin` is deliberately stricter than the slash-command ladder in
-/// `auth.checkGroupAdminAccess`: owner or a live platform admin only. There's
-/// no `/sudo` prefix to type on a button, and silently spending one of the
-/// presser's per-chat tokens (that ladder's tier 4) on a tap would be a
-/// surprising way to lose a token.
+/// alone run.
 pub const MinRole = enum { anyone, chat_admin, bot_admin, owner };
 
 pub const MenuNode = struct {
     id: NodeId,
     parent: ?NodeId,
     title: []const u8,
-    /// Shown as the message body under `title` when this node is rendered
-    /// as a branch/root — ignored for `.action`/`.awaiting_input` leaves,
-    /// which use `prompt`/their own runner-produced text instead.
+    /// Shown as the message body under `title` when this node is rendered as a
+    /// branch/root — ignored for `.action`/`.awaiting_input` leaves.
     body: []const u8 = "",
     kind: NodeKind,
     /// Who may see and run this node — see `MinRole`. Defaults to `.anyone`;
@@ -142,10 +115,8 @@ pub const MenuNode = struct {
     children: []const ChildRef = &.{},
     /// Only used when `kind == .awaiting_input`.
     prompt: []const u8 = "",
-    /// Longer descriptions used only by the Help browser (`help` node and
-    /// its descendants in help mode) — never shown during normal use, so
-    /// these can be as verbose as actually useful without bloating every
-    /// real interaction.
+    /// Longer descriptions used only by the Help browser (`help` node and its
+    /// descendants in help mode) — never shown during normal use.
     help_body: []const u8 = "",
     help_example: []const u8 = "",
 };
@@ -170,7 +141,7 @@ const table = [_]MenuNode{
         .help_body = "The root menu. Every module below is also its own slash command if you'd rather type than tap.",
     },
 
-    // ---- Alerts ----
+    // ---- Alerts.
     .{
         .id = .alerts,
         .parent = .root,
@@ -202,7 +173,7 @@ const table = [_]MenuNode{
         .help_example = "/alert weather Tehran above 35",
     },
 
-    // ---- Reminders ----
+    // ---- Reminders.
     .{
         .id = .reminders,
         .parent = .root,
@@ -232,7 +203,7 @@ const table = [_]MenuNode{
         .help_body = "Walks you through picking a date and time with +/- stepper buttons (or just reply with a time/date to jump straight to it), then the message to send.",
     },
 
-    // ---- Watches ----
+    // ---- Watches.
     .{
         .id = .watches,
         .parent = .root,
@@ -263,7 +234,7 @@ const table = [_]MenuNode{
         .help_example = "/watch https://example.com/feed.xml",
     },
 
-    // ---- Statistics ----
+    // ---- Statistics.
     .{
         .id = .stats,
         .parent = .root,
@@ -299,7 +270,7 @@ const table = [_]MenuNode{
         .help_body = "A pie chart of who's sent the most messages in this chat recently.",
     },
 
-    // ---- Convert ----
+    // ---- Convert.
     .{
         .id = .convert,
         .parent = .root,
@@ -309,7 +280,7 @@ const table = [_]MenuNode{
         .help_example = "/convert",
     },
 
-    // ---- Group Administration ----
+    // ---- Group Administration.
     .{
         .id = .group_admin,
         .parent = .root,
@@ -451,7 +422,7 @@ const table = [_]MenuNode{
         .prompt = "Send the regex pattern to match and delete. Bot admin/owner only, even if you got here as a live chat admin.",
     },
 
-    // ---- Settings ----
+    // ---- Settings.
     .{
         .id = .settings,
         .parent = .root,
@@ -474,14 +445,14 @@ const table = [_]MenuNode{
         .children = &.{
             .{ .id = .settings_global_addadmin, .emoji = "➕", .label = "Add bot admin" },
             .{ .id = .settings_global_removeadmin, .emoji = "➖", .label = "Remove bot admin" },
-            .{ .id = .settings_global_adduser, .emoji = "✅", .label = "Allow a user" },
-            .{ .id = .settings_global_removeuser, .emoji = "🚫", .label = "Remove a user" },
-            .{ .id = .settings_global_allowchat, .emoji = "🟢", .label = "Allow this chat" },
-            .{ .id = .settings_global_disallowchat, .emoji = "🔴", .label = "Disallow this chat" },
+            .{ .id = .settings_global_blockuser, .emoji = "🚫", .label = "Block a user" },
+            .{ .id = .settings_global_unblockuser, .emoji = "✅", .label = "Unblock a user" },
+            .{ .id = .settings_global_blockchat, .emoji = "🔴", .label = "Block this chat" },
+            .{ .id = .settings_global_unblockchat, .emoji = "🟢", .label = "Unblock this chat" },
             .{ .id = .settings_global_whois, .emoji = "🔎", .label = "Look up a user (/whois)" },
             .{ .id = .settings_global_scraper, .emoji = "🕷", .label = "Scraper config" },
         },
-        .help_body = "The owner is always treated as a bot admin here too, everywhere one is checked — no need to add yourself.",
+        .help_body = "Everyone can talk to the bot unless blocked. The owner is always treated as a bot admin here too, everywhere one is checked — no need to add yourself.",
     },
     .{
         .id = .settings_global_addadmin,
@@ -500,32 +471,32 @@ const table = [_]MenuNode{
         .prompt = "Reply to the user, or send @username or their user id, to remove them as a bot admin.",
     },
     .{
-        .id = .settings_global_adduser,
+        .id = .settings_global_blockuser,
         .parent = .settings_global,
-        .title = "✅ Allow a user",
+        .title = "🚫 Block a user",
         .kind = .awaiting_input,
         .min_role = .bot_admin,
-        .prompt = "Reply to the user, or send @username or their user id, to let them use this bot.",
+        .prompt = "Reply to the user, or send @username or their user id, to stop the bot responding to them anywhere.",
     },
     .{
-        .id = .settings_global_removeuser,
+        .id = .settings_global_unblockuser,
         .parent = .settings_global,
-        .title = "🚫 Remove a user",
+        .title = "✅ Unblock a user",
         .kind = .awaiting_input,
         .min_role = .bot_admin,
-        .prompt = "Reply to the user, or send @username or their user id, to remove them.",
+        .prompt = "Reply to the user, or send @username or their user id, to unblock them.",
     },
     .{
-        .id = .settings_global_allowchat,
+        .id = .settings_global_blockchat,
         .parent = .settings_global,
-        .title = "🟢 Allow this chat",
+        .title = "🔴 Block this chat",
         .kind = .action,
         .min_role = .bot_admin,
     },
     .{
-        .id = .settings_global_disallowchat,
+        .id = .settings_global_unblockchat,
         .parent = .settings_global,
-        .title = "🔴 Disallow this chat",
+        .title = "🟢 Unblock this chat",
         .kind = .action,
         .min_role = .bot_admin,
     },
@@ -653,7 +624,7 @@ const table = [_]MenuNode{
     .{ .id = .settings_personal_timeformat_24h, .parent = .settings_personal_timeformat, .title = "🕐 Time format: 24h", .kind = .action },
     .{ .id = .settings_personal_timeformat_12h, .parent = .settings_personal_timeformat, .title = "🕐 Time format: 12h (AM/PM)", .kind = .action },
 
-    // ---- Help ----
+    // ---- Help.
     .{
         .id = .help,
         .parent = .root,
@@ -673,9 +644,8 @@ const table = [_]MenuNode{
 };
 
 comptime {
-    // Guards against a copy/paste typo leaving a node out of `table` (or
-    // doubling one up) as the tree grows — every `NodeId` must appear
-    // exactly once.
+    // Guards against a copy/paste typo leaving a node out of `table` (or doubling
+    // one up) as the tree grows — every `NodeId` must appear exactly once.
     var seen = std.EnumArray(NodeId, bool).initFill(false);
     for (table) |n| {
         if (seen.get(n.id)) @compileError("menu_tree: duplicate node " ++ @tagName(n.id));
@@ -686,12 +656,7 @@ comptime {
     }
 
     // `min_role` must never get laxer on the way down: `menu.zig` filters a
-    // branch's buttons by `authorize`, so a child looser than its parent
-    // would be unreachable through the UI while still being a legitimate
-    // target for a forged `callback_data` pick that only the per-pick check
-    // stops. Keeping the tree monotone means both layers agree. Compared by
-    // `children`, not `parent`, so the Help browser's second set of links
-    // into the real tree is checked too.
+    // branch's buttons by `authorize`.
     var role_of = std.EnumArray(NodeId, MinRole).initFill(.anyone);
     for (table) |n| role_of.set(n.id, n.min_role);
     for (table) |n| {
@@ -733,9 +698,8 @@ test "every node's parent is reachable from root, and root has no parent" {
 test "every branch/dynamic_list child's parent field points back at its declaring node" {
     for (table) |n| {
         for (n.children) |c| {
-            // `help`'s children intentionally repeat root's real modules
-            // (read-only browsing), so their `.parent` legitimately points
-            // at `.root`, not `.help` — skip that one node's own check.
+            // `help`'s children intentionally repeat root's real modules (read-only
+            // browsing), so their `.parent` legitimately points at `.root`, not `.help`.
             if (n.id == .help) continue;
             try testing.expectEqual(n.id, node(c.id).parent.?);
         }

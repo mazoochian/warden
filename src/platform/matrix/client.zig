@@ -7,12 +7,7 @@ const types = @import("types.zig");
 const http_util = @import("../../http_util.zig");
 
 /// Thin wrapper around the Matrix Client-Server API, authenticated with a
-/// pre-provisioned access token (see `config.MatrixConfig`'s doc comment).
-/// Uses `/sync` long-polling rather than push/webhooks, same reasoning as
-/// `../telegram/client.zig`'s choice of long polling over webhooks.
-///
-/// Deliberately out of scope: end-to-end encryption (Olm/Megolm) — this
-/// client only sends/receives in plaintext rooms. See README for details.
+/// pre-provisioned access token.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -20,18 +15,7 @@ pub const Client = struct {
     homeserver_url: []const u8,
     access_token: []const u8,
     /// Unique per PUT (send/state) call, so retried/duplicate requests are
-    /// idempotent from the homeserver's point of view — incremented
-    /// atomically since moderation/reply calls can run concurrently across
-    /// per-message tasks (see `PgPool`'s doc comment for why that's normal
-    /// in this codebase).
-    ///
-    /// Seeded from wall-clock time in `init`, not left at 0: Synapse
-    /// remembers recently-used txn ids per access token across different
-    /// endpoints (e.g. `sendToDevice` vs `send/m.room.encrypted`) and
-    /// rejects a reused id with `M_INVALID_PARAM` even across process
-    /// restarts. A dev container that restarts often would otherwise
-    /// reissue low ids like `warden3` that collide with the same id from
-    /// a previous run — confirmed live 2026-07-20.
+    /// idempotent from the homeserver's point of view.
     txn_counter: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, io: Io, homeserver_url: []const u8, access_token: []const u8) Client {
@@ -58,9 +42,7 @@ pub const Client = struct {
         return std.fmt.allocPrint(allocator, "warden{d}", .{n});
     }
 
-    /// Percent-encodes a path segment (room id, event id, user id — all of
-    /// which contain characters like `!`, `$`, `@`, `:` that must not be
-    /// interpreted as URL structure).
+    /// Percent-encodes a path segment.
     fn encodeSegment(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         return http_util.encodeQueryComponent(allocator, s);
     }
@@ -79,11 +61,7 @@ pub const Client = struct {
         return json.parseFromSlice(types.WhoamiResponse, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
     }
 
-    /// Uploads this device's signed identity/one-time keys (see
-    /// `crypto.zig`'s `deviceKeysJson`/`signedOneTimeKeysJson`/
-    /// `uploadKeysPayload` for how `payload` is built) — returns the raw
-    /// response body (just `{"one_time_key_counts": {...}}`) rather than a
-    /// typed struct, since nothing needs to act on it yet beyond logging.
+    /// Uploads this device's signed identity/one-time keys.
     pub fn uploadKeys(self: *Client, allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
         const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/keys/upload", .{self.homeserver_url});
         defer allocator.free(url);
@@ -93,10 +71,7 @@ pub const Client = struct {
         return http_util.postJson(&self.http_client, allocator, url, &.{auth}, payload);
     }
 
-    /// Long-polls for new events since `since` (null on the very first call
-    /// — see `MatrixConnector.pollFn`'s doc comment on why that first
-    /// response's events are discarded rather than processed). 25s not 30s,
-    /// same middlebox-idle-reap reasoning as `telegram.zig`'s `pollFn`.
+    /// Long-polls for new events since `since`.
     pub fn sync(self: *Client, allocator: std.mem.Allocator, since: ?[]const u8) !json.Parsed(types.SyncResponse) {
         const url = if (since) |s|
             try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/sync?timeout=25000&since={s}", .{ self.homeserver_url, try encodeSegment(allocator, s) })
@@ -112,9 +87,8 @@ pub const Client = struct {
         return json.parseFromSlice(types.SyncResponse, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
     }
 
-    /// Accepts a pending invite — warden auto-joins any room it's invited
-    /// to (see `pollFn`), matching how a Telegram bot is simply added to a
-    /// group with no separate accept step.
+    /// Accepts a pending invite — warden auto-joins any room it's invited to (see
+    /// `pollFn`).
     pub fn joinRoom(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) !void {
         const encoded = try encodeSegment(allocator, room_id);
         defer allocator.free(encoded);
@@ -149,14 +123,8 @@ pub const Client = struct {
         @"m.relates_to": types.RelatesTo,
     };
 
-    /// `PUT .../rooms/{roomId}/send/{eventType}/{txn}` with an
-    /// already-JSON-stringified `payload` — the one generic primitive every
-    /// room-timeline send goes through, whether that's a plaintext
-    /// `m.room.message`/`m.reaction` or (see `platform/matrix/connector.zig`'s
-    /// `MatrixConnector.sendEvent`) an `m.room.encrypted` event wrapping one
-    /// of those. Kept generic rather than one method per event type so the
-    /// encryption decision has a single place to plug into, instead of
-    /// needing its own copy inside every `sendX` method.
+    /// `PUT .../rooms/{roomId}/send/{eventType}/{txn}` with an already-JSON-
+    /// stringified `payload`.
     pub fn putRoomEvent(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_type: []const u8, payload: []const u8) ![]const u8 {
         const encoded_room = try encodeSegment(allocator, room_id);
         defer allocator.free(encoded_room);
@@ -178,8 +146,7 @@ pub const Client = struct {
     }
 
     /// Uploads bytes and returns their `mxc://` content URI — the two-step
-    /// process every image/document send needs: upload first, then send an
-    /// `m.room.message` event pointing at the resulting URI.
+    /// process every image/document send needs.
     pub fn uploadMedia(self: *Client, allocator: std.mem.Allocator, bytes: []const u8, content_type: []const u8, filename: []const u8) ![]const u8 {
         const encoded_name = try encodeSegment(allocator, filename);
         defer allocator.free(encoded_name);
@@ -203,9 +170,7 @@ pub const Client = struct {
         filename: ?[]const u8 = null,
     };
 
-    /// Uploads `bytes` then sends an `m.room.message` pointing at it —
-    /// shared by `sendPhoto`/`sendDocument` (only `msgtype` and whether
-    /// `filename` is sent differ between an image and an arbitrary file).
+    /// Uploads `bytes` then sends an `m.room.message` pointing at it.
     fn sendMedia(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, bytes: []const u8, content_type: []const u8, msgtype: []const u8, filename: []const u8, caption: ?[]const u8) !void {
         const uri = try self.uploadMedia(allocator, bytes, content_type, filename);
         defer allocator.free(uri);
@@ -247,10 +212,7 @@ pub const Client = struct {
         };
     }
 
-    /// Resolves an inbound attachment's `mxc://server/media_id` URI to
-    /// bytes — Matrix's equivalent of Telegram's two-step `getFile` +
-    /// download, but a single request since the media id is already fully
-    /// resolved (no separate lookup step).
+    /// Resolves an inbound attachment's `mxc://server/media_id` URI to bytes.
     pub fn downloadFile(self: *Client, allocator: std.mem.Allocator, mxc_uri: []const u8) ![]u8 {
         const prefix = "mxc://";
         if (!std.mem.startsWith(u8, mxc_uri, prefix)) return error.InvalidMxcUri;
@@ -272,11 +234,7 @@ pub const Client = struct {
     }
 
     /// Fetches a single event by id — Matrix doesn't inline the replied-to
-    /// event's sender/body the way Telegram's `reply_to_message` does, so
-    /// resolving a reply's target (for `reply_to_is_me`/`reply_to_text`)
-    /// needs this extra round trip. Only called when an inbound message
-    /// actually carries an `m.in_reply_to` relation (see
-    /// `MatrixConnector.pollFn`), not on every message.
+    /// event's sender/body the way Telegram's `reply_to_message` does.
     pub fn getEvent(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_id: []const u8) !json.Parsed(types.RoomEvent) {
         const encoded_room = try encodeSegment(allocator, room_id);
         defer allocator.free(encoded_room);
@@ -293,12 +251,8 @@ pub const Client = struct {
         return json.parseFromSlice(types.RoomEvent, allocator, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
     }
 
-    /// True if `room_id` has an `m.room.encryption` state event — 404 (no
-    /// such state event) means the room is plaintext, matching how
-    /// `getPinnedEvents` treats a 404 as "nothing there" rather than an
-    /// error. Checked once per send by `platform/matrix/connector.zig`'s
-    /// `MatrixConnector.sendEvent` to decide whether to Megolm-wrap the
-    /// outgoing content.
+    /// True if `room_id` has an `m.room.encryption` state event — 404 (no such
+    /// state event) means the room is plaintext.
     pub fn isRoomEncrypted(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) !bool {
         const encoded_room = try encodeSegment(allocator, room_id);
         defer allocator.free(encoded_room);
@@ -315,13 +269,8 @@ pub const Client = struct {
         return true;
     }
 
-    /// `m.room.name` for `room_id`, or `null` when the room has none set
-    /// (a 1:1 DM usually doesn't) or the server refuses the read. Same
-    /// state-endpoint shape as `isRoomEncrypted` above.
-    ///
-    /// Callers must cache: this is a real HTTP round trip, and it exists so
-    /// a Matrix room can be shown by name instead of by raw `!abc:server`
-    /// id — see `matrix.zig`'s `roomTitle`.
+    /// `m.room.name` for `room_id`, or `null` when the room has none set (a 1:1
+    /// DM usually doesn't) or the server refuses the read.
     pub fn roomName(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) !?[]const u8 {
         const encoded_room = try encodeSegment(allocator, room_id);
         defer allocator.free(encoded_room);
@@ -346,12 +295,7 @@ pub const Client = struct {
         return try allocator.dupe(u8, name);
     }
 
-    /// Currently-joined member user ids for `room_id` — needed to know
-    /// whose devices a freshly-created (or expanding) outbound Megolm
-    /// session's key must be shared with. A dedicated GET rather than
-    /// reading `m.room.member` state off `/sync`: warden doesn't track full
-    /// room membership locally, and this is only called on a send into an
-    /// encrypted room, not on every poll cycle.
+    /// Currently-joined member user ids for `room_id`.
     pub fn joinedMembers(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) ![]const []const u8 {
         const encoded_room = try encodeSegment(allocator, room_id);
         defer allocator.free(encoded_room);
@@ -374,13 +318,8 @@ pub const Client = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    /// `POST /keys/query` for every device of each of `user_ids` — returned
-    /// as a raw `json.Value` (shape:
-    /// `{"device_keys":{"@user:server":{"DEVICEID":{"keys":{"curve25519:DEVICEID":"..."},...}}}}`)
-    /// rather than a typed struct: `crypto.zig`'s
-    /// `State.shareWithNewDevices` is the only caller, and it only ever
-    /// walks this one shape once per send — not worth a dedicated type for
-    /// a single call site, same reasoning as `getPowerLevels`.
+    /// `POST /keys/query` for every device of each of `user_ids` — returned as a
+    /// raw `json.Value`.
     pub fn queryKeys(self: *Client, allocator: std.mem.Allocator, user_ids: []const []const u8) !json.Parsed(json.Value) {
         const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/keys/query", .{self.homeserver_url});
         defer allocator.free(url);
@@ -404,13 +343,7 @@ pub const Client = struct {
     }
 
     /// `POST /keys/claim` for one `signed_curve25519` one-time key from
-    /// `device_id`, returning the claimed key's base64 value — needed to
-    /// `olm.Session.createOutbound` a fresh per-device Olm session before a
-    /// room key can be shared with a device warden has never talked to
-    /// before. The claimed key's own signature isn't verified here (no
-    /// device-verification UI exists at all yet — trust-on-first-use,
-    /// same simplification scope already accepted for the rest of tonight's
-    /// E2EE work).
+    /// `device_id`, returning the claimed key's base64 value.
     pub fn claimOneTimeKey(self: *Client, allocator: std.mem.Allocator, user_id: []const u8, device_id: []const u8) ![]const u8 {
         const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/keys/claim", .{self.homeserver_url});
         defer allocator.free(url);
@@ -452,14 +385,8 @@ pub const Client = struct {
         return allocator.dupe(u8, key_val.string);
     }
 
-    /// `PUT /sendToDevice/{eventType}/{txn}` addressed to a single
-    /// `(user_id, device_id)` — used to Olm-encrypt and deliver an
-    /// `m.room_key` to exactly the device that needs it. Matrix's
-    /// `/sendToDevice` supports batching many recipients into one call, but
-    /// warden's key-sharing loop (`crypto.zig`'s
-    /// `State.shareWithNewDevices`) already needs a separate Olm-encrypt
-    /// step per device anyway, so there's no batching win being left behind
-    /// by sending one at a time here.
+    /// `PUT /sendToDevice/{eventType}/{txn}` addressed to a single `(user_id,
+    /// device_id)`.
     pub fn sendToDevice(self: *Client, allocator: std.mem.Allocator, event_type: []const u8, user_id: []const u8, device_id: []const u8, content: json.Value) !void {
         const encoded_type = try encodeSegment(allocator, event_type);
         defer allocator.free(encoded_type);
@@ -468,13 +395,8 @@ pub const Client = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/_matrix/client/v3/sendToDevice/{s}/{s}", .{ self.homeserver_url, encoded_type, txn });
         defer allocator.free(url);
 
-        // Each `.deinit()` only frees this function's own wrapper map
-        // storage, not `content` itself — that's the caller's, freed
-        // separately (e.g. `crypto.zig`'s `sendVerificationEvent` owns
-        // `content` via its own `parsed.deinit()`). Found live via a test
-        // that — for the first time — actually exercised a real (if
-        // failing) call through this function: previously nothing ever
-        // freed these on *any* path, success included.
+        // Each `.deinit()` only frees this function's own wrapper map storage, not
+        // `content` itself.
         var device_obj: json.Value = .{ .object = .empty };
         defer device_obj.object.deinit(allocator);
         try device_obj.object.put(allocator, device_id, content);
@@ -525,13 +447,10 @@ pub const Client = struct {
         return self.callAction(allocator, room_id, "unban", user_id, null);
     }
 
-    /// Matrix's default moderator threshold — `m.room.power_levels`'
-    /// `state_default` defaults to 50 when the room doesn't override it (a
-    /// plain member defaults to `users_default`, normally 0).
+    /// Matrix's default moderator threshold.
     const moderator_power_level: i64 = 50;
-    /// Below `events_default` (normally 0) so a muted user's own messages
-    /// are rejected by the homeserver, mirroring Telegram's
-    /// `restrictChatMember`.
+    /// Below `events_default` (normally 0) so a muted user's own messages are
+    /// rejected by the homeserver, mirroring Telegram's `restrictChatMember`.
     const muted_power_level: i64 = -1;
     const ordinary_power_level: i64 = 0;
 
@@ -542,12 +461,7 @@ pub const Client = struct {
     }
 
     /// Fetches the room's power-levels state event as a raw `json.Value` —
-    /// deliberately not a fully-typed struct: `events`/`notifications` and
-    /// similar sub-objects have their own dynamic keys warden never reads,
-    /// and a PUT of this state event must resend the *entire* content
-    /// (Matrix state events are replace-whole-content, not a patch), so
-    /// round-tripping through `json.Value` preserves whatever the room
-    /// already had configured instead of silently dropping it.
+    /// deliberately not a fully-typed struct.
     fn getPowerLevels(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) !json.Parsed(json.Value) {
         const url = try self.powerLevelsUrl(allocator, room_id);
         defer allocator.free(url);
@@ -597,15 +511,8 @@ pub const Client = struct {
         return self.setUserPowerLevel(allocator, room_id, user_id, ordinary_power_level);
     }
 
-    /// Matrix's power-level equivalent of Telegram's `promoteChatMember` —
-    /// bumps `user_id` to the room's moderator threshold. Unlike
-    /// Telegram's granular permission bits, Matrix power levels are a
-    /// single scalar gating every privileged action at or below it, so
-    /// there's no equivalent of withholding "can_promote_members"
-    /// specifically — a promoted moderator here *can* set other users'
-    /// power levels up to their own. `/promote` staying owner-gated (see
-    /// `group_admin.zig`) is what actually prevents runaway
-    /// self-promotion chains, not anything at this layer.
+    /// Matrix's power-level equivalent of Telegram's `promoteChatMember` — bumps
+    /// `user_id` to the room's moderator threshold.
     pub fn promoteUser(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, user_id: []const u8) !void {
         return self.setUserPowerLevel(allocator, room_id, user_id, moderator_power_level);
     }
@@ -615,9 +522,7 @@ pub const Client = struct {
     }
 
     /// True if `user_id`'s power level in `room_id` meets or exceeds the
-    /// moderator threshold — the live source of truth `group_admin.zig`
-    /// gates moderation commands on, same role as
-    /// `platform/telegram/client.zig`'s `isChatAdmin`.
+    /// moderator threshold.
     pub fn isRoomModerator(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, user_id: []const u8) !bool {
         var parsed = try self.getPowerLevels(allocator, room_id);
         defer parsed.deinit();
@@ -682,10 +587,7 @@ pub const Client = struct {
     }
 
     /// PUTs a single-field room state event (`m.room.name`/`m.room.topic`/
-    /// `m.room.avatar`) — unlike `m.room.power_levels`, each of these has
-    /// exactly one meaningful key, so a plain PUT of `{field: value}`
-    /// replaces the whole content correctly with no read-modify-write
-    /// needed first.
+    /// `m.room.avatar`).
     fn putSingleFieldState(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_type: []const u8, field: []const u8, value: []const u8) !void {
         const encoded_room = try encodeSegment(allocator, room_id);
         defer allocator.free(encoded_room);
@@ -705,7 +607,7 @@ pub const Client = struct {
         defer allocator.free(body);
     }
 
-    /// `/title` (ROADMAP.md's Phase 22) — `m.room.name`.
+    /// `/title` — `m.room.name`.
     pub fn setRoomName(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, name: []const u8) !void {
         return self.putSingleFieldState(allocator, room_id, "m.room.name", "name", name);
     }
@@ -716,28 +618,22 @@ pub const Client = struct {
         return self.putSingleFieldState(allocator, room_id, "m.room.topic", "topic", topic);
     }
 
-    /// `/photo` — uploads the image, then points `m.room.avatar` at the
-    /// resulting `mxc://` uri, same upload-then-reference shape
-    /// `sendMedia` already uses for messages.
+    /// `/photo` — uploads the image, then points `m.room.avatar` at the resulting
+    /// `mxc://` uri.
     pub fn setRoomAvatar(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, image_bytes: []const u8, content_type: []const u8) !void {
         const uri = try self.uploadMedia(allocator, image_bytes, content_type, "avatar");
         defer allocator.free(uri);
         return self.putSingleFieldState(allocator, room_id, "m.room.avatar", "url", uri);
     }
 
-    /// `/photo remove` — clears `m.room.avatar`'s `url` rather than
-    /// removing the state event (Matrix has no delete-state-event
-    /// operation Bot-API-style; an empty `url` is how clients render "no
-    /// avatar").
+    /// `/photo remove` — clears `m.room.avatar`'s `url` rather than removing the
+    /// state event (Matrix has no delete-state-event operation Bot-API-style; an
+    /// empty `url` is how clients render "no avatar").
     pub fn removeRoomAvatar(self: *Client, allocator: std.mem.Allocator, room_id: []const u8) !void {
         return self.putSingleFieldState(allocator, room_id, "m.room.avatar", "url", "");
     }
 
-    /// Adds `event_id` to the room's pinned list if it isn't already there
-    /// — Matrix supports pinning several messages at once, unlike
-    /// Telegram's single pinned message, but appending (not replacing) is
-    /// the closer match to Telegram's `pinChatMessage` behavior from a
-    /// command's point of view ("pin this one too").
+    /// Adds `event_id` to the room's pinned list if it isn't already there.
     pub fn pinMessage(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_id: []const u8) !void {
         const existing = try self.getPinnedEvents(allocator, room_id);
         defer allocator.free(existing);
@@ -751,8 +647,8 @@ pub const Client = struct {
     }
 
     /// `event_id` null clears every pin (matches Telegram's `unpinMessage`
-    /// semantics when no specific message is targeted); otherwise removes
-    /// just that one.
+    /// semantics when no specific message is targeted); otherwise removes just
+    /// that one.
     pub fn unpinMessage(self: *Client, allocator: std.mem.Allocator, room_id: []const u8, event_id: ?[]const u8) !void {
         const id = event_id orelse return self.putPinnedEvents(allocator, room_id, &.{});
 

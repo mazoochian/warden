@@ -1,22 +1,16 @@
-//! Request plumbing shared by every Instagram private-API endpoint: the
-//! per-session Android device identity, the header set that makes requests
-//! look like the real app, the `signed_body` HMAC-signing convention, and a
-//! minimal cookie jar (`std.http.Client` in this Zig version has no
-//! built-in one). Built on `src/http_util.zig`'s existing helpers rather
-//! than a parallel HTTP stack.
+//! Request plumbing shared by every Instagram private-API endpoint: the per-
+//! session Android device identity, the header set that makes requests look
+//! like the real app, the `signed_body` HMAC-signing convention, and a
+//! minimal cookie jar (`std.http.Client` in this Zig version has no built-in
+//! one).
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const log = @import("../../log.zig").scoped("instagram");
 
-/// A v4 (random) UUID, formatted lowercase with hyphens
-/// ("xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"). Instagram's login/device
-/// identifiers (`phone_id`, `uuid`, `advertising_id`) are all plain UUIDs;
-/// there's no existing UUID helper elsewhere in this codebase to reuse.
-/// Randomness comes from the runtime's entropy source (`std.Io.random`),
-/// matching this codebase's existing convention (e.g. `../matrix/olm.zig`'s
-/// `fillRandom`) rather than a module-level CSPRNG.
+/// A v4 (random) UUID, formatted lowercase with hyphens ("xxxxxxxx-xxxx-4xxx-
+/// yxxx-xxxxxxxxxxxx").
 pub fn randomUuidV4(io: Io, buf: *[36]u8) []const u8 {
     var bytes: [16]u8 = undefined;
     io.random(&bytes);
@@ -41,12 +35,7 @@ pub fn randomAndroidDeviceId(io: Io, buf: *[24]u8) []const u8 {
     }) catch unreachable;
 }
 
-/// A single, consistent Android device identity for one Instagram session
-/// — generated once at first login (`auth.zig`) and persisted
-/// (`session.zig`), never regenerated per-request or per-poll:
-/// a real Android app doesn't change device fingerprints between requests,
-/// and looking consistent is part of not tripping Instagram's automation
-/// detection (see the plan's `policy.zig` rationale).
+/// A single, consistent Android device identity for one Instagram session.
 pub const DeviceProfile = struct {
     android_device_id: []const u8,
     phone_id: []const u8,
@@ -85,21 +74,7 @@ pub const DeviceProfile = struct {
 };
 
 /// Protocol constants Instagram's private API expects but rotates
-/// periodically without notice (the shared HMAC signing key, the app's own
-/// declared version, its numeric app id, ...). These are reverse-engineered
-/// values maintained by long-lived open-source interop projects (e.g.
-/// instagrapi's `constants.py`), not anything Instagram publishes.
-///
-/// The defaults below are this implementation's best-effort current values
-/// — sourced from public knowledge at implementation time, NOT independently
-/// verified against Instagram's live servers or a freshly-cloned library
-/// (this development environment has no network access to fetch either).
-/// They may already be stale. If login or requests start failing with an
-/// unexpected-signature or unsupported-app-version error, get current
-/// values from a maintained library's source and override these via
-/// `InstagramConfig`, not by editing these defaults — that's exactly why
-/// every field here is a plain overridable value, not a hardcoded literal
-/// baked into the signing/header-building code.
+/// periodically without notice.
 pub const RotatingConstants = struct {
     sig_key: []const u8 = "9193488027538fd3450b83b7d05286d4ca9599a0f7eeed90d8c85925698a05f",
     sig_key_version: []const u8 = "4",
@@ -108,25 +83,13 @@ pub const RotatingConstants = struct {
     app_version: []const u8 = "269.0.0.18.75",
     app_version_code: []const u8 = "314665256",
     /// The RSA public key id/DER-bytes-as-base64 Instagram's login endpoint
-    /// expects `enc_password` to be encrypted under. Unlike the other
-    /// fields above, this ships with NO usable default (Instagram serves
-    /// this dynamically per-request, normally via response headers on a
-    /// bootstrap call -- reading those wasn't wireable in this environment
-    /// without live network access to confirm the exact header names/shape,
-    /// see `auth.zig`'s `fetchPasswordPublicKey`). A real login attempt
-    /// needs this populated via `WARDEN_INSTAGRAM_PASSWORD_KEY_ID`/
-    /// `_PASSWORD_PUBKEY_DER_B64` (sourced from a current maintained
-    /// library, or captured from the real header values with a packet
-    /// capture / proxy against the actual Android app) before `/iglogin
-    /// start` can succeed -- login fails loudly (a clear rejection, not a
-    /// hang) with this left empty.
+    /// expects `enc_password` to be encrypted under.
     password_encryption_key_id: []const u8 = "",
     password_encryption_pubkey_der_b64: []const u8 = "",
 };
 
 /// `"Instagram {app_version} Android (...)"` — the private API's User-Agent
-/// format, documented consistently across independent public interop
-/// sources. Caller owns and frees the returned string.
+/// format, documented consistently across independent public interop sources.
 pub fn buildUserAgent(allocator: std.mem.Allocator, profile: DeviceProfile, constants: RotatingConstants) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -146,19 +109,14 @@ pub fn buildUserAgent(allocator: std.mem.Allocator, profile: DeviceProfile, cons
     );
 }
 
-/// Percent-encodes every byte outside RFC 3986's unreserved set
-/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`) — used for the JSON payload
-/// half of `signedBody`'s `application/x-www-form-urlencoded` body.
+/// Percent-encodes every byte outside RFC 3986's unreserved set (`ALPHA /
+/// DIGIT / "-" / "." / "_" / "~"`).
 fn isUnreservedFormChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
 }
 
 /// Builds Instagram's `signed_body=<hex hmac>.<url-encoded json>&
-/// ig_sig_key_version=<version>` POST body: an HMAC-SHA256 of the raw JSON
-/// payload (hex-encoded, not base64 — Instagram's convention, unlike this
-/// codebase's own `api/auth.zig` HMAC usage which is base64url), followed
-/// by the percent-encoded payload itself. Caller owns and frees the
-/// returned string.
+/// ig_sig_key_version=<version>` POST body.
 pub fn signedBody(allocator: std.mem.Allocator, sig_key: []const u8, sig_key_version: []const u8, payload_json: []const u8) ![]const u8 {
     var mac: [HmacSha256.mac_length]u8 = undefined;
     HmacSha256.create(&mac, payload_json, sig_key);
@@ -173,10 +131,8 @@ pub fn signedBody(allocator: std.mem.Allocator, sig_key: []const u8, sig_key_ver
     return std.fmt.allocPrint(allocator, "signed_body={s}.{s}&ig_sig_key_version={s}", .{ &mac_hex, encoded_payload_owned, sig_key_version });
 }
 
-/// Minimal cookie jar: `std.http.Client` (this Zig version) has no
-/// built-in one, so this owns the small set of cookies the private API's
-/// login/session lifecycle actually needs (`sessionid`, `ds_user_id`,
-/// `csrftoken`, `mid`, plus anything else a `Set-Cookie` response sends).
+/// Minimal cookie jar: `std.http.Client` (this Zig version) has no built-in
+/// one.
 pub const CookieJar = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMapUnmanaged([]const u8) = .{},
@@ -198,11 +154,8 @@ pub const CookieJar = struct {
         return self.map.get(name);
     }
 
-    /// Sets a cookie directly (not from a `Set-Cookie` header) -- takes
-    /// ownership of both `name` and `value`, which must already be
-    /// allocator-owned by `self.allocator`. Used by `auth.zig`'s
-    /// `restoreSession` to seed the jar from a persisted session without a
-    /// network round trip.
+    /// Sets a cookie directly (not from a `Set-Cookie` header) -- takes ownership
+    /// of both `name` and `value`.
     pub fn putOwned(self: *CookieJar, name: []const u8, value: []const u8) !void {
         if (self.map.fetchRemove(name)) |old| {
             self.allocator.free(old.key);
@@ -213,12 +166,7 @@ pub const CookieJar = struct {
         try self.map.put(self.allocator, name_owned, value);
     }
 
-    /// Parses every `Set-Cookie` header out of a raw HTTP response head
-    /// (`std.http.Client.Response.Head.iterateHeaders()`'s output — a
-    /// simple `name`/`value` pair per header, so this only reads the
-    /// `name=value` prefix before the first `;` and ignores cookie
-    /// attributes like `Path`/`Expires`/`Secure`, which this jar has no
-    /// use for since every request always resends every stored cookie).
+    /// Parses every `Set-Cookie` header out of a raw HTTP response head (.
     pub fn updateFromHeaders(self: *CookieJar, headers: std.http.HeaderIterator) !void {
         var it = headers;
         while (it.next()) |header| {
@@ -259,12 +207,7 @@ pub const CookieJar = struct {
     }
 };
 
-/// Base URL for Instagram's private mobile-app API. Reverse-engineered, same
-/// caveat as `RotatingConstants` -- if this host ever changes, it'll show up
-/// as every request failing with a connection/DNS error, not a signature
-/// error, so it's a plain constant rather than another `RotatingConstants`
-/// field (those are all about a *signature* Instagram silently rejects, a
-/// different failure mode than "wrong host entirely").
+/// Base URL for Instagram's private mobile-app API.
 pub const base_url = "https://i.instagram.com/api/v1";
 
 pub const RequestError = error{
@@ -278,17 +221,7 @@ pub const Response = struct {
 };
 
 /// One authenticated (or pre-auth, e.g. the login call itself) request to
-/// Instagram's private API: builds the standard header set (User-Agent,
-/// X-IG-*, Cookie from `jar`), sends `body` (already `signed_body=...`-
-/// encoded for a POST, or empty for a GET), and updates `jar` from whatever
-/// `Set-Cookie` headers come back -- every call site (`auth.zig`, `direct.zig`,
-/// `media.zig`) goes through this rather than `http_util.zig`'s helpers,
-/// since those discard response headers entirely and cookie capture is
-/// required on every request, not just login.
-///
-/// Low-level `client.request`/`receiveHead` plumbing (same shape as
-/// `http_util.zig`'s `postJsonSSEOnce`), not `std.http.Client.fetch`, because
-/// `fetch`'s `FetchResult` has no way to read back response headers at all.
+/// Instagram's private API.
 pub fn request(
     io: Io,
     allocator: std.mem.Allocator,
@@ -369,9 +302,7 @@ pub fn request(
     return .{ .status = response.head.status, .body = try out.toOwnedSlice() };
 }
 
-/// `signedBody`'s `POST`-with-payload convenience over `request` above --
-/// the shape every write-side private-API call (`login`, `direct_send`, ...)
-/// uses.
+/// `signedBody`'s `POST`-with-payload convenience over `request` above.
 pub fn signedPost(
     io: Io,
     allocator: std.mem.Allocator,

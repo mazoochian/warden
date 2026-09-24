@@ -1,10 +1,8 @@
 const std = @import("std");
 const PgPool = @import("pool.zig").PgPool;
 
-/// Everything `platform/instagram/session.zig` needs to resume a logged-in session
-/// without re-authenticating -- device identity plus session cookies. See
-/// `0047_instagram_sessions.sql`'s doc comment for why this is a single
-/// fixed-id row (one personal account per deployment, not multi-tenant).
+/// Everything `platform/instagram/session.zig` needs to resume a logged-in
+/// session without re-authenticating -- device identity plus session cookies.
 pub const StoredSession = struct {
     ig_username: []const u8,
     ig_user_id: []const u8,
@@ -45,9 +43,7 @@ pub fn loadSession(pool: *PgPool, allocator: std.mem.Allocator) ?StoredSession {
     };
 }
 
-/// Upserts the single session row -- called once right after a successful
-/// login, and again whenever the session cookies rotate (Instagram reissues
-/// `sessionid` periodically even without a fresh login).
+/// Upserts the single session row.
 pub fn saveSession(pool: *PgPool, session: StoredSession) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -82,10 +78,8 @@ pub fn saveSession(pool: *PgPool, session: StoredSession) !void {
     _ = try stmt.step();
 }
 
-/// `/iglogin logout` -- clears the persisted session so the next login
-/// starts fresh server-side too (the device profile is intentionally NOT
-/// cleared by this alone; see `platform/instagram/session.zig`'s `logOut`, which
-/// decides whether to keep or regenerate the device identity).
+/// `/iglogin logout` -- clears the persisted session so the next login starts
+/// fresh server-side too.
 pub fn clearSession(pool: *PgPool) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -95,9 +89,7 @@ pub fn clearSession(pool: *PgPool) !void {
     _ = try stmt.step();
 }
 
-/// Last-seen-item timestamp for `thread_id`, or 0 if never recorded (so the
-/// very first poll of a thread treats every item in it as new -- same
-/// "0 means never" convention as `chat_settings.getLastDigestTs`).
+/// Last-seen-item timestamp for `thread_id`, or 0 if never recorded.
 pub fn getThreadWatermark(pool: *PgPool, thread_id: []const u8) i64 {
     const db = pool.acquire() catch return 0;
     defer pool.release(db);
