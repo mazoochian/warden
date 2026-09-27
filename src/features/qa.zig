@@ -135,6 +135,109 @@ fn answerMaxTokens(max_answer_len: usize) u32 {
     return thinking_token_reserve +| answer_tokens;
 }
 
+/// Operator-chosen reply length (`WARDEN_LLM_REPLY_LENGTH`), e.g. "1 paragraph",
+/// "80 words", "300 tokens". Words and paragraphs are a prompt instruction the
+/// user can override by asking for more; tokens is also a hard `max_tokens` cap.
+pub const ReplyLength = struct {
+    amount: u32,
+    unit: Unit,
+
+    pub const Unit = enum { tokens, words, paragraphs };
+
+    pub const max_amount: u32 = 100_000;
+
+    /// `null` for "off" (empty, "0", "off", "none"): no reply-length rule, the
+    /// platform limit alone applies.
+    pub fn parse(raw: []const u8) error{InvalidReplyLength}!?ReplyLength {
+        const trimmed = std.mem.trim(u8, raw, " \t");
+        if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "0") or
+            std.ascii.eqlIgnoreCase(trimmed, "off") or std.ascii.eqlIgnoreCase(trimmed, "none")) return null;
+
+        var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const amount_text = it.next() orelse return error.InvalidReplyLength;
+        const unit_text = it.next() orelse return error.InvalidReplyLength;
+        if (it.next() != null) return error.InvalidReplyLength;
+
+        const amount = std.fmt.parseInt(u32, amount_text, 10) catch return error.InvalidReplyLength;
+        if (amount == 0 or amount > max_amount) return error.InvalidReplyLength;
+        const unit: Unit = if (unitIs(unit_text, "token"))
+            .tokens
+        else if (unitIs(unit_text, "word"))
+            .words
+        else if (unitIs(unit_text, "paragraph"))
+            .paragraphs
+        else
+            return error.InvalidReplyLength;
+        return .{ .amount = amount, .unit = unit };
+    }
+
+    /// Accepts the singular or plural form, case-insensitively.
+    fn unitIs(text: []const u8, singular: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(text, singular)) return true;
+        return text.len == singular.len + 1 and (text[text.len - 1] | 0x20) == 's' and
+            std.ascii.eqlIgnoreCase(text[0..singular.len], singular);
+    }
+
+    /// The prompt sentence describing this limit to the model.
+    fn instruction(self: ReplyLength, allocator: std.mem.Allocator) ![]const u8 {
+        return switch (self.unit) {
+            .tokens => std.fmt.allocPrint(
+                allocator,
+                "keep every reply within about {d} tokens (roughly {d} words). This is a hard cap — output past it is cut off — so finish well inside it rather than starting something long.",
+                .{ self.amount, self.amount * 3 / 4 },
+            ),
+            .words => std.fmt.allocPrint(
+                allocator,
+                "keep replies to at most about {d} words. Only go longer when the user explicitly asks for detail, a list or something long-form, or the task inherently needs it (translating or rewriting a text they gave you).",
+                .{self.amount},
+            ),
+            .paragraphs => std.fmt.allocPrint(
+                allocator,
+                "keep replies to at most {d} short paragraph{s}. Only go longer when the user explicitly asks for detail, a list or something long-form, or the task inherently needs it (translating or rewriting a text they gave you).",
+                .{ self.amount, if (self.amount == 1) "" else "s" },
+            ),
+        };
+    }
+};
+
+/// The two knobs that bound an answer's length.
+pub const LengthLimits = struct {
+    /// `WARDEN_LLM_MAX_TOKENS`: a flat `max_tokens` ceiling.
+    max_tokens_override: ?u32 = null,
+    reply_length: ?ReplyLength = null,
+};
+
+/// `max_tokens` for one request: the tighter of the flat override and a
+/// token-unit reply length, else the platform-derived budget.
+fn effectiveMaxTokens(limits: LengthLimits, max_answer_len: usize) u32 {
+    var cap: ?u32 = limits.max_tokens_override;
+    if (limits.reply_length) |rl| if (rl.unit == .tokens) {
+        cap = if (cap) |c| @min(c, rl.amount) else rl.amount;
+    };
+    return cap orelse answerMaxTokens(max_answer_len);
+}
+
+/// The "Length budget" paragraph appended to the system prompt. The platform
+/// limit is stated as a ceiling only: phrased as a target ("keep replies under
+/// 4096 characters") models read it as licence to write several paragraphs.
+fn lengthBudgetLine(allocator: std.mem.Allocator, limits: LengthLimits, max_answer_len: usize) ![]const u8 {
+    const target = if (limits.reply_length) |rl|
+        try rl.instruction(allocator)
+    else
+        "follow the Style guidance above — short and direct unless the user asks for more.";
+
+    const ceiling_chars = if (limits.max_tokens_override) |t|
+        @min(max_answer_len, @as(usize, t) * min_chars_per_token)
+    else
+        max_answer_len;
+
+    return std.fmt.allocPrint(
+        allocator,
+        "Length budget: {s} Separately, this platform can't send a single message over {d} characters; that is a technical ceiling, not a length to aim for. If an answer genuinely has to exceed it, it's sent as a file automatically, so finish your answer rather than truncating it awkwardly.",
+        .{ target, ceiling_chars },
+    );
+}
+
 /// Identifies who's actually sending *this* turn's question — deliberately
 /// separate from the "who: text" tags in `recentFormatted`'s history.
 pub const Asker = struct {
@@ -165,7 +268,7 @@ pub fn answer(
     show_thinking: bool,
     vision_enabled: bool,
     documents_enabled: bool,
-    max_tokens_override: ?u32,
+    length_limits: LengthLimits,
     history_window: i64,
     /// Retries per model call on a transient failure — see
     /// `toolcall.callProviderWithRetry`.
@@ -204,20 +307,12 @@ pub fn answer(
             .{ context, asker_line, question },
         );
 
-    const effective_max_tokens = max_tokens_override orelse answerMaxTokens(max_answer_len);
+    const effective_max_tokens = effectiveMaxTokens(length_limits, max_answer_len);
 
-    // When a flat `max_tokens_override` is active (a deployment tuned for short,
-    // cheap answers).
-    const length_hint_chars = if (max_tokens_override) |t|
-        @min(max_answer_len, @as(usize, t) * min_chars_per_token)
-    else
-        max_answer_len;
-
-    // A hard file-fallback exists for whatever slips through.
     const system_with_budget = try std.fmt.allocPrint(
         allocator,
-        "{s}\n\nLength budget: keep replies under {d} characters when at all possible — that's the active platform's message-size limit. If the answer genuinely needs to be longer (e.g. the user asked for something long-form), that's fine: anything over the limit is sent as a file attachment automatically, so don't refuse or truncate awkwardly instead of finishing your answer.{s}",
-        .{ system_prompt orelse default_system_prompt, length_hint_chars, try renderToolList(allocator, tool_defs) },
+        "{s}\n\n{s}{s}",
+        .{ system_prompt orelse default_system_prompt, try lengthBudgetLine(allocator, length_limits, max_answer_len), try renderToolList(allocator, tool_defs) },
     );
 
     return toolcall.runDetailed(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, vision_enabled, documents_enabled, effective_max_tokens, max_retries);
@@ -228,6 +323,48 @@ test "answerMaxTokens reserves a thinking budget on top of the answer's own char
     // is (4096/3)=1365 tokens, plus the fixed thinking reserve.
     try std.testing.expectEqual(@as(u32, 4000 + 1365), answerMaxTokens(4096));
     try std.testing.expectEqual(@as(u32, 4000 + 0), answerMaxTokens(0));
+}
+
+test "ReplyLength.parse accepts amount + unit, singular or plural, and treats off/0/empty as no limit" {
+    const R = ReplyLength;
+    try std.testing.expectEqual(R{ .amount = 1, .unit = .paragraphs }, (try R.parse("1 paragraph")).?);
+    try std.testing.expectEqual(R{ .amount = 3, .unit = .paragraphs }, (try R.parse("  3 Paragraphs ")).?);
+    try std.testing.expectEqual(R{ .amount = 80, .unit = .words }, (try R.parse("80 words")).?);
+    try std.testing.expectEqual(R{ .amount = 300, .unit = .tokens }, (try R.parse("300 TOKENS")).?);
+    try std.testing.expectEqual(@as(?R, null), try R.parse(""));
+    try std.testing.expectEqual(@as(?R, null), try R.parse("0"));
+    try std.testing.expectEqual(@as(?R, null), try R.parse("off"));
+    try std.testing.expectError(error.InvalidReplyLength, R.parse("300"));
+    try std.testing.expectError(error.InvalidReplyLength, R.parse("0 words"));
+    try std.testing.expectError(error.InvalidReplyLength, R.parse("-5 words"));
+    try std.testing.expectError(error.InvalidReplyLength, R.parse("5 sentences"));
+    try std.testing.expectError(error.InvalidReplyLength, R.parse("5 words please"));
+    try std.testing.expectError(error.InvalidReplyLength, R.parse("5 wordss"));
+    try std.testing.expectError(error.InvalidReplyLength, R.parse("100001 tokens"));
+}
+
+test "effectiveMaxTokens: a token-unit reply length caps max_tokens; words/paragraphs keep the platform budget" {
+    try std.testing.expectEqual(answerMaxTokens(4096), effectiveMaxTokens(.{}, 4096));
+    try std.testing.expectEqual(answerMaxTokens(4096), effectiveMaxTokens(.{ .reply_length = .{ .amount = 2, .unit = .paragraphs } }, 4096));
+    try std.testing.expectEqual(@as(u32, 300), effectiveMaxTokens(.{ .reply_length = .{ .amount = 300, .unit = .tokens } }, 4096));
+    try std.testing.expectEqual(@as(u32, 200), effectiveMaxTokens(.{ .max_tokens_override = 200, .reply_length = .{ .amount = 300, .unit = .tokens } }, 4096));
+    try std.testing.expectEqual(@as(u32, 250), effectiveMaxTokens(.{ .max_tokens_override = 900, .reply_length = .{ .amount = 250, .unit = .tokens } }, 4096));
+}
+
+test "lengthBudgetLine states the reply length as the target and the platform limit only as a ceiling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const line = try lengthBudgetLine(a, .{ .reply_length = .{ .amount = 1, .unit = .paragraphs } }, 4096);
+    try std.testing.expect(std.mem.indexOf(u8, line, "at most 1 short paragraph.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "4096 characters; that is a technical ceiling, not a length to aim for") != null);
+
+    const words = try lengthBudgetLine(a, .{ .reply_length = .{ .amount = 80, .unit = .words } }, 4096);
+    try std.testing.expect(std.mem.indexOf(u8, words, "at most about 80 words") != null);
+
+    const unset = try lengthBudgetLine(a, .{}, 4096);
+    try std.testing.expect(std.mem.indexOf(u8, unset, "follow the Style guidance") != null);
 }
 
 test "renderToolList lists each enabled tool by name with the head of its description" {

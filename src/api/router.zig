@@ -19,6 +19,7 @@ const iface = @import("../platform/interface.zig");
 const telegram_user_platform = @import("../platform/telegram/user_connector.zig");
 const chat_summary = @import("../features/chat_summary.zig");
 const curated_feed = @import("../features/curated_feed.zig");
+const qa = @import("../features/qa.zig");
 const feed_store = @import("../store/feed.zig");
 const tool_registry = @import("../tools/registry.zig");
 const chats_store = @import("../store/chats.zig");
@@ -951,6 +952,7 @@ fn defaultForKnownKey(a: std.mem.Allocator, config: *const config_mod.Config, ke
     if (std.mem.eql(u8, key, "WARDEN_LLM_SHOW_THINKING")) return std.fmt.allocPrint(a, "{}", .{config.llm_show_thinking});
     if (std.mem.eql(u8, key, "WARDEN_LLM_STREAMING")) return std.fmt.allocPrint(a, "{}", .{config.llm_streaming});
     if (std.mem.eql(u8, key, "WARDEN_LLM_MAX_TOKENS")) return std.fmt.allocPrint(a, "{d}", .{config.llm_max_tokens_override orelse 0});
+    if (std.mem.eql(u8, key, "WARDEN_LLM_REPLY_LENGTH")) return a.dupe(u8, config.llm_reply_length);
     if (std.mem.eql(u8, key, "WARDEN_LLM_HISTORY_MESSAGES")) return std.fmt.allocPrint(a, "{d}", .{config.llm_history_messages});
     if (std.mem.eql(u8, key, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES")) return std.fmt.allocPrint(a, "{}", .{config.skip_trivial_messages});
     if (std.mem.eql(u8, key, "WARDEN_LLM_MAX_RETRIES")) return std.fmt.allocPrint(a, "{d}", .{config.llm_max_retries});
@@ -988,6 +990,12 @@ fn handleAdminSetConfig(ctx: *const ServerContext, request: *http.Server.Request
     };
     if (!valid) {
         return respondError(request, .bad_request, "bad_request", "value doesn't match this key's expected type");
+    }
+
+    if (std.mem.eql(u8, key, "WARDEN_LLM_REPLY_LENGTH")) {
+        _ = qa.ReplyLength.parse(body.value) catch {
+            return respondError(request, .bad_request, "bad_request", "must be \"<number> tokens|words|paragraphs\" (e.g. \"2 paragraphs\") or \"off\"");
+        };
     }
 
     // WARDEN_LLM_PROVIDER specifically: only a provider that actually has
@@ -5086,6 +5094,7 @@ test "defaultForKnownKey formats every known key's env-sourced default" {
         .{ .key = "WARDEN_LLM_SHOW_THINKING", .expected = "false" },
         .{ .key = "WARDEN_LLM_STREAMING", .expected = "true" },
         .{ .key = "WARDEN_LLM_MAX_TOKENS", .expected = "0" },
+        .{ .key = "WARDEN_LLM_REPLY_LENGTH", .expected = "1 paragraph" },
         .{ .key = "WARDEN_LLM_HISTORY_MESSAGES", .expected = "20" },
         .{ .key = "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", .expected = "true" },
         .{ .key = "WARDEN_LLM_PROVIDER", .expected = "anthropic" },
