@@ -137,6 +137,15 @@ full disk took Postgres down: monitor → alert → prune/resample → sleep.
   flood mark.
 - `/storage status|autopilot on|off|cleanup messages|resample|tmp` is the
   manual surface and always works.
+- A zero result says why: prune reports its cutoff and the oldest stored
+  message (with the 180-day default nothing qualifies until the history is
+  that old), the tmp sweep reports files kept for being under 24 h, and a
+  bot-wide resample counts chats whose summary failed — all failed and
+  nothing compacted is an error (`502 summary_failed` on the API), not
+  "0 from 0 chats".
+- Summaries (resample, daily digest, `/summary`) get the same 4000-token
+  reasoning reserve as Q&A on top of their 1024-token answer budget; a
+  reasoning model used to spend the flat 1024 thinking and return nothing.
 
 ## Reply autonomy and drafts (`features/reply_drafts.zig`)
 

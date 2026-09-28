@@ -17,6 +17,11 @@ const system_prompt =
 
 const history_window = 300;
 
+/// Visible summary budget plus the reasoning reserve: at a flat 1024 a
+/// reasoning model routinely spent it all thinking, and every summary (daily
+/// digest, /summary, Storage Sense resample) came back empty.
+const summary_max_tokens: u32 = toolcall.thinking_token_reserve + 1024;
+
 /// Local (non-LLM) stats + an LLM-written summary of recent discussion,
 /// grounded in this chat's own logged history.
 pub fn generate(provider: llm.Provider, allocator: std.mem.Allocator, ctx: registry.ToolContext, pool: *PgPool, chat_id: i64) ![]const u8 {
@@ -47,7 +52,7 @@ pub fn summarizeHistory(provider: llm.Provider, allocator: std.mem.Allocator, ct
         .{history},
     ) catch return "";
 
-    return toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, 1024, default_max_retries) catch |err| blk: {
+    return toolcall.run(provider, allocator, ctx, system_prompt, prompt, &.{}, .{}, false, false, false, false, summary_max_tokens, default_max_retries) catch |err| blk: {
         std.log.err("digest: llm summary failed: {t}", .{err});
         break :blk "";
     };

@@ -1201,7 +1201,13 @@ fn handleAdminStorageCleanupTmp(ctx: *const ServerContext, request: *http.Server
         return respondError(request, .internal_server_error, "internal", "failed to sweep tmp");
     };
     audit_log.record(ctx.pool, account_id, null, "storage.cleanup.tmp", null, null);
-    return respondJson(ctx, request, .ok, .{ .files_deleted = result.files_deleted, .bytes_freed = result.bytes_freed });
+    return respondJson(ctx, request, .ok, .{
+        .files_deleted = result.files_deleted,
+        .bytes_freed = result.bytes_freed,
+        .files_kept = result.files_kept,
+        .bytes_kept = result.bytes_kept,
+        .max_age_seconds = storage_sense.tmp_sweep_max_age_seconds,
+    });
 }
 
 const CleanupMessagesBody = struct {
@@ -1253,7 +1259,16 @@ fn handleAdminStorageCleanupMessages(ctx: *const ServerContext, request: *http.S
         return respondError(request, .internal_server_error, "internal", "failed to prune");
     };
     audit_log.record(ctx.pool, account_id, null, "storage.cleanup.messages", null, null);
-    return respondJson(ctx, request, .ok, .{ .rows_deleted = result.rows_deleted, .chats_affected = result.chats_affected });
+    // What's left, so "0 deleted" can be told apart from a broken prune: with
+    // the default 180-day age nothing qualifies until the history is that old.
+    const oldest_ts = messages_store.oldestTs(ctx.pool, body.chat_id) catch null;
+    return respondJson(ctx, request, .ok, .{
+        .rows_deleted = result.rows_deleted,
+        .chats_affected = result.chats_affected,
+        .chats_failed = result.chats_failed,
+        .cutoff_ts = cutoff_ts,
+        .oldest_ts = oldest_ts,
+    });
 }
 
 const CleanupResampleBody = struct { chat_id: ?i64 = null };
@@ -1278,7 +1293,15 @@ fn handleAdminStorageCleanupResample(ctx: *const ServerContext, request: *http.S
         return respondError(request, .internal_server_error, "internal", "failed to resample");
     };
     audit_log.record(ctx.pool, account_id, null, "storage.cleanup.resample", null, null);
-    return respondJson(ctx, request, .ok, .{ .messages_compacted = result.messages_compacted, .chats_affected = result.chats_affected });
+    if (result.chats_failed > 0 and result.messages_compacted == 0) {
+        const message = try std.fmt.allocPrint(arena, "summarizing failed for {d} chat(s) ({t}) -- check the LLM provider and the server log", .{ result.chats_failed, result.last_error orelse error.SummaryFailed });
+        return respondError(request, .bad_gateway, "summary_failed", message);
+    }
+    return respondJson(ctx, request, .ok, .{
+        .messages_compacted = result.messages_compacted,
+        .chats_affected = result.chats_affected,
+        .chats_failed = result.chats_failed,
+    });
 }
 
 // ---------------------------------------------------------------------------
