@@ -84,6 +84,14 @@ pub fn findI64(rows: []const KV, key: []const u8, default: i64) i64 {
     return default;
 }
 
+/// The raw value, borrowed from `rows`.
+pub fn findString(rows: []const KV, key: []const u8, default: []const u8) []const u8 {
+    for (rows) |row| {
+        if (std.mem.eql(u8, row.key, key)) return row.value;
+    }
+    return default;
+}
+
 pub fn set(pool: *PgPool, key: []const u8, value: []const u8, updated_by: i64) !void {
     const db = try pool.acquire();
     defer pool.release(db);
@@ -128,6 +136,9 @@ pub const known_keys = [_]KnownKey{
     .{ .key = "WARDEN_LLM_SHOW_THINKING", .label = "Show LLM thinking by default", .kind = .bool },
     .{ .key = "WARDEN_LLM_STREAMING", .label = "Stream LLM responses", .kind = .bool },
     .{ .key = "WARDEN_LLM_MAX_TOKENS", .label = "LLM max tokens override (0 = none)", .kind = .i64 },
+    // "<n> tokens|words|paragraphs" or "off"; validated on write by
+    // `qa.ReplyLength.parse`.
+    .{ .key = "WARDEN_LLM_REPLY_LENGTH", .label = "LLM reply length (e.g. \"1 paragraph\", \"80 words\", \"300 tokens\", \"off\")", .kind = .string },
     .{ .key = "WARDEN_LLM_HISTORY_MESSAGES", .label = "LLM conversation history window", .kind = .i64 },
     .{ .key = "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", .label = "Skip LLM call for trivial messages", .kind = .bool },
     // Clamped to 0-10 when read back (see main.zig's resolveLlmDynamicSettings).
