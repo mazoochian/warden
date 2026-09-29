@@ -101,7 +101,12 @@ pub fn classify(used_pct: f64, low_pct: i64, high_pct: i64, flood_pct: i64) Wate
     return .normal;
 }
 
-pub const PruneResult = struct { chats_affected: usize = 0, rows_deleted: i64 = 0 };
+pub const PruneResult = struct {
+    chats_affected: usize = 0,
+    rows_deleted: i64 = 0,
+    /// Chats whose delete errored (logged); the rest were still pruned.
+    chats_failed: usize = 0,
+};
 
 /// Deletes messages older than `cutoff_ts` in `chat_id`, or across every
 /// known chat when `chat_id` is `null`.
@@ -121,6 +126,7 @@ pub fn pruneOldMessages(pool: *PgPool, allocator: std.mem.Allocator, chat_id: ?i
     for (refs) |ref| {
         const deleted = messages.deleteOlderThan(pool, ref.id, cutoff_ts) catch |err| {
             std.log.warn("storage_sense: prune failed for chat {d}: {t}", .{ ref.id, err });
+            result.chats_failed += 1;
             continue;
         };
         if (deleted > 0) result.chats_affected += 1;
@@ -129,7 +135,14 @@ pub fn pruneOldMessages(pool: *PgPool, allocator: std.mem.Allocator, chat_id: ?i
     return result;
 }
 
-pub const ResampleResult = struct { chats_affected: usize = 0, messages_compacted: i64 = 0 };
+pub const ResampleResult = struct {
+    chats_affected: usize = 0,
+    messages_compacted: i64 = 0,
+    /// Chats whose batch couldn't be summarized (logged). Callers must
+    /// surface this: "0 compacted" alone reads as "nothing to do".
+    chats_failed: usize = 0,
+    last_error: ?anyerror = null,
+};
 
 /// Platform-agnostic identity `resampleOldMessages` attributes every
 /// synthetic summary row to.
@@ -170,6 +183,8 @@ pub fn resampleOldMessages(pool: *PgPool, allocator: std.mem.Allocator, io: Io, 
     for (refs) |ref| {
         const compacted = resampleOneChat(pool, allocator, io, llm_provider, ref.id, batch_size, system_identity_id) catch |err| {
             std.log.warn("storage_sense: resample failed for chat {d}: {t}", .{ ref.id, err });
+            result.chats_failed += 1;
+            result.last_error = err;
             continue;
         };
         if (compacted > 0) result.chats_affected += 1;
@@ -178,7 +193,13 @@ pub fn resampleOldMessages(pool: *PgPool, allocator: std.mem.Allocator, io: Io, 
     return result;
 }
 
-pub const SweepResult = struct { files_deleted: usize = 0, bytes_freed: u64 = 0 };
+pub const SweepResult = struct {
+    files_deleted: usize = 0,
+    bytes_freed: u64 = 0,
+    /// Files left alone because they're newer than the age threshold.
+    files_kept: usize = 0,
+    bytes_kept: u64 = 0,
+};
 
 /// Deletes every file directly under `tmp_dir` whose mtime is older than
 /// `older_than_seconds`.
@@ -195,7 +216,11 @@ pub fn sweepTmpDir(io: Io, allocator: std.mem.Allocator, tmp_dir: []const u8, ol
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         const stat = dir.statFile(io, entry.name, .{}) catch continue;
-        if (now - stat.mtime.toSeconds() < older_than_seconds) continue;
+        if (now - stat.mtime.toSeconds() < older_than_seconds) {
+            result.files_kept += 1;
+            result.bytes_kept += stat.size;
+            continue;
+        }
         dir.deleteFile(io, entry.name) catch |err| {
             std.log.warn("storage_sense: couldn't delete stale tmp file '{s}': {t}", .{ entry.name, err });
             continue;
@@ -500,9 +525,59 @@ test "sweepTmpDir deletes only files older than the threshold" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = fresh_path, .data = "still in use" });
     const untouched = try sweepTmpDir(io, a, dir_path, 1_000_000);
     try testing.expectEqual(@as(usize, 0), untouched.files_deleted);
+    try testing.expectEqual(@as(usize, 1), untouched.files_kept);
+    try testing.expectEqual(@as(u64, "still in use".len), untouched.bytes_kept);
 }
 
 test "sweepTmpDir on a missing directory is a no-op, not an error" {
     const swept = try sweepTmpDir(testing.io, testing.allocator, "data/tmp/storage_sense_does_not_exist", 0);
     try testing.expectEqual(@as(usize, 0), swept.files_deleted);
+}
+
+/// Answers every call with `reply`; `.thinking` models a reasoning model that
+/// ran out of tokens before writing anything visible.
+const StubProvider = struct {
+    reply: enum { text, thinking },
+
+    fn provider(self: *StubProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn };
+
+    fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        _ = request;
+        const self: *StubProvider = @ptrCast(@alignCast(ptr));
+        return switch (self.reply) {
+            .text => .{ .content = try allocator.dupe(llm.ContentBlock, &.{.{ .text = "a summary" }}), .stop_reason = .end_turn },
+            .thinking => .{ .content = try allocator.dupe(llm.ContentBlock, &.{.{ .thinking = .{ .text = "...", .field = .reasoning_content } }}), .stop_reason = .max_tokens },
+        };
+    }
+};
+
+test "resampleOldMessages across every chat counts a failed summary instead of reporting nothing to do" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPoolT.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const chat = try chats.upsertChat(&pool, .telegram, "-100", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    var i: i64 = 0;
+    while (i < 30) : (i += 1) try messages.insert(&pool, chat, alice, null, "hello", 1000 + i);
+
+    var failing = StubProvider{ .reply = .thinking };
+    const failed = try resampleOldMessages(&pool, a, testing.io, failing.provider(), null, 200);
+    try testing.expectEqual(@as(i64, 0), failed.messages_compacted);
+    try testing.expectEqual(@as(usize, 1), failed.chats_failed);
+    try testing.expectEqual(@as(?anyerror, error.SummaryFailed), failed.last_error);
+
+    var working = StubProvider{ .reply = .text };
+    const ok = try resampleOldMessages(&pool, a, testing.io, working.provider(), null, 200);
+    try testing.expectEqual(@as(i64, 30), ok.messages_compacted);
+    try testing.expectEqual(@as(usize, 1), ok.chats_affected);
+    try testing.expectEqual(@as(usize, 0), ok.chats_failed);
 }

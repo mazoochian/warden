@@ -5657,7 +5657,16 @@ fn handleStorageCleanupMessages(
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't prune, try again.");
         return;
     };
-    const reply_text = std.fmt.allocPrint(a, "Pruned {d} messages from chat {d}.", .{ result.rows_deleted, target.chat_id }) catch return;
+    const reply_text = if (result.rows_deleted > 0)
+        std.fmt.allocPrint(a, "Pruned {d} messages from chat {d}.", .{ result.rows_deleted, target.chat_id }) catch return
+    else if (messages.oldestTs(pool, target.chat_id) catch null) |oldest|
+        std.fmt.allocPrint(a, "Nothing to prune in chat {d}: the cutoff is {s} but its oldest message is from {s}. Use --before YYYY-MM-DD for a later cutoff.", .{
+            target.chat_id,
+            civil_time.formatDate(a, civil_time.localFromUnix(cutoff_ts, 0), .ymd),
+            civil_time.formatDate(a, civil_time.localFromUnix(oldest, 0), .ymd),
+        }) catch return
+    else
+        std.fmt.allocPrint(a, "Nothing to prune in chat {d}: it has no stored messages.", .{target.chat_id}) catch return;
     connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
 }
 
@@ -5698,7 +5707,7 @@ fn handleStorageCleanupTmp(connector: iface.Connector, a: std.mem.Allocator, con
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't sweep tmp, try again.");
         return;
     };
-    const reply_text = std.fmt.allocPrint(a, "Swept {d} stale files ({d} bytes freed) from {s}.", .{ result.files_deleted, result.bytes_freed, config.tmp_dir }) catch return;
+    const reply_text = std.fmt.allocPrint(a, "Swept {d} stale files ({d} bytes freed) from {s}; kept {d} files newer than {d}h ({d} bytes).", .{ result.files_deleted, result.bytes_freed, config.tmp_dir, result.files_kept, @divTrunc(storage_sense.tmp_sweep_max_age_seconds, 3600), result.bytes_kept }) catch return;
     connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
 }
 

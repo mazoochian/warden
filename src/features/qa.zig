@@ -118,9 +118,7 @@ fn descriptionHead(description: []const u8) []const u8 {
     return std.mem.trimEnd(u8, description[0..end], " ");
 }
 
-/// Reserved token budget for a reasoning model's `<think>...</think>` phase,
-/// on top of whatever the visible answer itself needs.
-const thinking_token_reserve: u32 = 4000;
+const thinking_token_reserve = toolcall.thinking_token_reserve;
 
 /// Deliberately conservative (fewer characters per token than most real-world
 /// English text averages) so the *answer* portion of the budget is never the

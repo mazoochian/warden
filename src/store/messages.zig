@@ -75,6 +75,22 @@ pub fn deleteOlderThan(pool: *PgPool, chat_id: i64, cutoff_ts: i64) !i64 {
     return count;
 }
 
+/// Unix seconds of the oldest stored message in `chat_id` (every chat when
+/// `null`), or `null` if there are none.
+pub fn oldestTs(pool: *PgPool, chat_id: ?i64) !?i64 {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare(
+        \\SELECT EXTRACT(EPOCH FROM MIN(ts))::BIGINT FROM messages WHERE $1::BIGINT IS NULL OR chat_id = $1;
+    );
+    defer stmt.finalize();
+    if (chat_id) |id| stmt.bindInt64(1, id) else stmt.bindNull(1);
+    if (!try stmt.step()) return null;
+    if (stmt.columnIsNull(0)) return null;
+    return stmt.columnInt64(0);
+}
+
 pub const SummaryBatch = struct {
     /// Oldest-first "who: text" lines, the same shape `recentFormatted`
     /// produces — fed straight into `digest.summarizeHistory`.
@@ -411,6 +427,24 @@ test "hasAny is false for a chat with no messages, true once one is inserted, sc
     try insert(&pool, chat1, alice, "1", "hi", 1000);
     try testing.expect(hasAny(&pool, chat1));
     try testing.expect(!hasAny(&pool, chat2));
+}
+
+test "oldestTs is scoped per chat, spans every chat for null, and is null with no messages" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const chat2 = try chats.upsertChat(&pool, .telegram, "2", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    try testing.expectEqual(@as(?i64, null), try oldestTs(&pool, null));
+
+    try insert(&pool, chat1, alice, "1", "newer", 5000);
+    try insert(&pool, chat2, alice, "2", "older", 2000);
+    try testing.expectEqual(@as(?i64, 5000), try oldestTs(&pool, chat1));
+    try testing.expectEqual(@as(?i64, 2000), try oldestTs(&pool, null));
 }
 
 test "insert/recentFormatted/pruneKeepLast scoped correctly per chat" {
