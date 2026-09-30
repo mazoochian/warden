@@ -69,7 +69,8 @@ pub fn assemble(
 
     const history = messages.recentFormatted(pool, allocator, chat_id, history_window) catch "";
     if (history.len > 0) {
-        try w.print("## Recent chat history\n{s}\n", .{truncateTail(history, budget.session_chars)});
+        const trimmed = try truncateTail(allocator, history, budget.session_chars);
+        try w.print("## Recent chat history\n{s}\n", .{trimmed});
     }
 
     return buf.writer.buffered();
@@ -209,8 +210,14 @@ fn truncateHead(text: []const u8, max_chars: usize) []const u8 {
 }
 
 /// Drops whole lines from the front of `text` until what's left fits in
-/// `max_chars`.
-fn truncateTail(text: []const u8, max_chars: usize) []const u8 {
+/// `max_chars`, then re-attaches the nearest dropped "-- Weekday YYYY-MM-DD
+/// --" marker line (see `messages.zig`'s `appendDayMarker`) if the cut fell
+/// after one. Without this, a heavily truncated multi-day window could start
+/// mid-day with no time anchor at all -- the whole point of the markers.
+/// This can push the result slightly over `max_chars` (by one marker line);
+/// that's an accepted tradeoff since these budgets are a heuristic, not a
+/// hard API limit.
+fn truncateTail(allocator: std.mem.Allocator, text: []const u8, max_chars: usize) ![]const u8 {
     if (text.len <= max_chars) return text;
     var rest = text;
     while (rest.len > max_chars) {
@@ -220,7 +227,16 @@ fn truncateTail(text: []const u8, max_chars: usize) []const u8 {
         };
         rest = rest[nl + 1 ..];
     }
-    return rest;
+    if (std.mem.startsWith(u8, rest, "-- ")) return rest;
+
+    const dropped = text[0 .. text.len - rest.len];
+    var last_marker: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, dropped, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "-- ")) last_marker = line;
+    }
+    const marker = last_marker orelse return rest;
+    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ marker, rest });
 }
 
 const testing = std.testing;
@@ -237,10 +253,25 @@ fn testVector(hot_index: usize) [embedding_dimensions]f32 {
 }
 
 test "truncateTail drops leading lines until the text fits, never cutting mid-line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
     const text = "line one\nline two\nline three\n";
-    const out = truncateTail(text, 11);
+    const out = try truncateTail(arena.allocator(), text, 11);
     try testing.expectEqualStrings("line three\n", out);
     try testing.expect(out.len <= 11);
+}
+
+test "truncateTail re-attaches the nearest dropped day marker instead of leaving a truncated window unanchored" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const text = "-- Monday 2026-09-21 --\nalice: old stuff\nalice: more old stuff\n-- Tuesday 2026-09-22 --\nalice: fresher\nalice: freshest\n";
+    // Small enough that a naive line-drop would cut past the Tuesday marker
+    // too, leaving "alice: fresher\nalice: freshest\n" with no date at all.
+    const out = try truncateTail(arena.allocator(), text, 20);
+    try testing.expect(std.mem.startsWith(u8, out, "-- Tuesday 2026-09-22 --\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "freshest") != null);
 }
 
 test "assemble renders pinned facts, chat history, and a header with no embeddings client configured" {
@@ -262,6 +293,7 @@ test "assemble renders pinned facts, chat history, and a header with no embeddin
     try testing.expect(std.mem.indexOf(u8, out, "## About Alice (stable)") != null);
     try testing.expect(std.mem.indexOf(u8, out, "prefers concise answers") != null);
     try testing.expect(std.mem.indexOf(u8, out, "## Recent chat history") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "-- Thursday 1970-01-01 --") != null);
     try testing.expect(std.mem.indexOf(u8, out, "hello there") != null);
     // No embeddings client -> no ranked/tentative/digest sections, even
     // though there's a fact -- must not crash or fabricate a query vector.
@@ -306,5 +338,10 @@ test "assemble caps the recent-chat-history section at its budget, keeping the n
     tiny_budget.session_chars = 200;
     const out = try assemble(&pool, a, null, chat1, alice, "Alice", "hi", 100_000, 50, tiny_budget);
     const history_start = std.mem.indexOf(u8, out, "## Recent chat history\n").? + "## Recent chat history\n".len;
-    try testing.expect(out.len - history_start <= tiny_budget.session_chars + 1);
+    // The budget itself is respected within one reattached day-marker line's
+    // worth of slack -- see `truncateTail`'s doc comment for why a truncated
+    // window is allowed to slightly overshoot rather than lose its date.
+    const marker = "-- Thursday 1970-01-01 --";
+    try testing.expect(out.len - history_start <= tiny_budget.session_chars + marker.len + 2);
+    try testing.expect(std.mem.startsWith(u8, out[history_start..], marker));
 }

@@ -138,6 +138,52 @@ the model asks for, never subject to the `WARDEN_LLM_PROVIDER` hot swap.
 an embeddings endpoint made "remembering" silently impossible: the model
 agreed and nothing was stored.
 
+**Day markers, not per-line timestamps, in raw history (2026-09-29).**
+`formatLine`'s "who: text" lines carried no time signal at all beyond the
+single "Today is ..." header, so once a chat's history window spanned more
+than a day or two the model couldn't tell recent lines from old ones —
+diagnosed as the main driver of quality drift as the DB grows. A marker per
+day boundary is O(days spanned) rather than O(messages), and cheaper than
+timestamping every line on top of the already-verbose `[used: ...]`
+tool-trace lines. `truncateTail` re-attaches the nearest dropped marker
+(scanning the text it just cropped, not structured data) if the char-budget
+cut fell after one, accepting a small bounded overshoot rather than let a
+truncated window start mid-day with no anchor.
+
+**Backlog compaction into `daily_digests` runs on its own schedule, not
+folded into the disk-pressure ladder (2026-09-29).** `storage_sense.tick`'s
+resample only fires once disk usage crosses the low watermark, so on any
+host with headroom `daily_digests` — the layer `context_assembly.zig`'s
+"Relevant history" section actually reads — stayed empty indefinitely, and
+old raw history just got silently dropped by the per-turn char budget with
+nothing to remember it by. `tickBacklog` triggers per chat once its
+non-summary backlog exceeds `history_window * multiplier`, on its own
+interval, because disk health and context quality are different concerns
+with different natural cadences. Compaction still collapses the raw
+`messages` rows via `is_summary` too (bounded storage); the `daily_digests`
+write happens alongside it with the same LLM-written summary, using a
+zero vector when no embeddings client is configured so the digest still
+surfaces via the recency floor even though it can't be similarity-ranked.
+
+**Tentative facts auto-expire the same way `/memory forget` does
+(2026-09-29).** An unconfirmed "mentioned once" fact had no age-based exit
+— only explicit supersession removed it — so a wrong or stale guess could
+occupy the tentative-facts context slot forever.
+`facts.autoRetireStaleTentative` reuses `forget`'s retire+tombstone
+mechanics (never a hard delete) in bulk, swept from `tickBacklog` alongside
+backlog compaction.
+
+**Token budgets stay character-based; a real count is a calibration check,
+not a rewrite (2026-09-29).** `context_assembly.zig`'s per-section budgets
+already bound prompt size cheaply; there's no tokenizer anywhere else in
+the codebase to replace them with. `qa.calibrateTokenBudget` instead
+cross-checks the heuristic against Anthropic's real
+`/v1/messages/count_tokens` once a prompt is large enough to matter, and
+only logs — it never blocks or resizes the actual request. Exposed as an
+optional `Provider.countTokens` vtable slot (`null` for providers that
+don't implement it, `openai_compat` included) rather than a required one,
+so this stays additive.
+
 ## Web API and identities
 
 **"My …" views scope by every identity the account is (2026-09-19).**

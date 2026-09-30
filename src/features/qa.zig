@@ -135,6 +135,42 @@ fn answerMaxTokens(max_answer_len: usize) u32 {
     return thinking_token_reserve +| answer_tokens;
 }
 
+/// Only worth the extra round trip once the assembled prompt is already
+/// large enough that a char/token heuristic's error margin could matter --
+/// most turns are far under this and skip calibration entirely.
+const token_calibration_char_threshold: usize = 20_000;
+
+/// Best-effort, non-blocking cross-check of `context_assembly.zig`'s
+/// char-based budgets against a real input-token count -- there's no actual
+/// tokenizer anywhere else in this codebase, so this is the only place drift
+/// between "chars we budgeted" and "tokens the model actually sees" would
+/// ever surface. Never alters or delays the real request:
+/// `Provider.countTokens` returns `null` for any provider that doesn't
+/// implement it (only Anthropic's Messages API does today), and any error
+/// is swallowed.
+fn calibrateTokenBudget(provider: llm.Provider, allocator: std.mem.Allocator, system_prompt_text: []const u8, user_content: []const u8) void {
+    const heuristic_chars = system_prompt_text.len + user_content.len;
+    if (heuristic_chars < token_calibration_char_threshold) return;
+
+    const request: llm.ChatRequest = .{
+        .system = system_prompt_text,
+        .messages = &.{.{ .role = .user, .content = &.{.{ .text = user_content }} }},
+    };
+    const real_tokens = (provider.countTokens(allocator, request) catch |err| {
+        std.log.debug("qa: token calibration unavailable: {t}", .{err});
+        return;
+    }) orelse return;
+
+    // `min_chars_per_token` is deliberately conservative (fewer chars per
+    // token than typical English), so it should normally over-estimate --
+    // only a *higher* real count than that estimate is the actual risk (a
+    // request landing closer to the model's context ceiling than budgeted).
+    const heuristic_tokens = heuristic_chars / min_chars_per_token;
+    if (real_tokens > heuristic_tokens) {
+        std.log.warn("qa: real input tokens ({d}) exceeded the char-based estimate ({d} tokens from {d} chars) -- context budgets may need retuning", .{ real_tokens, heuristic_tokens, heuristic_chars });
+    }
+}
+
 /// Identifies who's actually sending *this* turn's question — deliberately
 /// separate from the "who: text" tags in `recentFormatted`'s history.
 pub const Asker = struct {
@@ -220,6 +256,8 @@ pub fn answer(
         .{ system_prompt orelse default_system_prompt, length_hint_chars, try renderToolList(allocator, tool_defs) },
     );
 
+    calibrateTokenBudget(provider, allocator, system_with_budget, user_content);
+
     return toolcall.runDetailed(provider, allocator, ctx, system_with_budget, user_content, tool_defs, progress, stream, show_thinking, vision_enabled, documents_enabled, effective_max_tokens, max_retries);
 }
 
@@ -228,6 +266,48 @@ test "answerMaxTokens reserves a thinking budget on top of the answer's own char
     // is (4096/3)=1365 tokens, plus the fixed thinking reserve.
     try std.testing.expectEqual(@as(u32, 4000 + 1365), answerMaxTokens(4096));
     try std.testing.expectEqual(@as(u32, 4000 + 0), answerMaxTokens(0));
+}
+
+test "calibrateTokenBudget skips the provider call entirely under the char threshold" {
+    const PoisonProvider = struct {
+        fn provider(self: *@This()) llm.Provider {
+            return .{ .ptr = self, .vtable = &vt };
+        }
+        const vt: llm.Provider.VTable = .{ .chat = chat, .countTokens = countTokens };
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+            _ = ptr;
+            _ = allocator;
+            _ = request;
+            return error.ShouldNotBeCalled;
+        }
+        fn countTokens(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!u32 {
+            _ = ptr;
+            _ = allocator;
+            _ = request;
+            return error.ShouldNotBeCalled;
+        }
+    };
+    var poison = PoisonProvider{};
+    calibrateTokenBudget(poison.provider(), std.testing.allocator, "short system", "short question");
+}
+
+test "calibrateTokenBudget calls the provider once the prompt is over threshold, and tolerates no countTokens support" {
+    const big = "x" ** (token_calibration_char_threshold + 1);
+    const NoCountProvider = struct {
+        fn provider(self: *@This()) llm.Provider {
+            return .{ .ptr = self, .vtable = &vt };
+        }
+        const vt: llm.Provider.VTable = .{ .chat = chat };
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+            _ = ptr;
+            _ = allocator;
+            _ = request;
+            return .{ .content = &.{}, .stop_reason = .end_turn };
+        }
+    };
+    var no_count = NoCountProvider{};
+    // Must not crash even though this provider has no countTokens slot.
+    calibrateTokenBudget(no_count.provider(), std.testing.allocator, big, "question");
 }
 
 test "renderToolList lists each enabled tool by name with the head of its description" {

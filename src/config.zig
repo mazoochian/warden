@@ -230,6 +230,14 @@ pub const Config = struct {
     /// Off by default -- gates the ladder's destructive actions (prune, resample,
     /// sleep mode).
     storage_sense_autopilot_enabled: bool = false,
+    /// Backlog-triggered compaction (`storage_sense.tickBacklog`) -- routine,
+    /// independent of disk pressure: a chat compacts once its non-summary
+    /// message count exceeds `llm_history_messages * backlog_multiplier`.
+    storage_sense_backlog_multiplier: i64 = default_storage_sense_backlog_multiplier,
+    storage_sense_backlog_interval_seconds: i64 = default_storage_sense_backlog_interval_seconds,
+    /// Unconfirmed ("mentioned once") facts older than this auto-retire --
+    /// see `facts.autoRetireStaleTentative`.
+    facts_tentative_max_age_days: i64 = default_facts_tentative_max_age_days,
 
     pub const LoadError = error{ MissingBotToken, MissingLlmConfig, MissingPostgresDsn, BadSystemPromptFile, ApiEnabledWithoutSessionSecret } || std.mem.Allocator.Error;
 
@@ -438,6 +446,18 @@ pub const Config = struct {
         else
             default_storage_sense_resample_batch_size;
         const storage_sense_autopilot_enabled = parseBoolEnv(env, "WARDEN_STORAGE_SENSE_AUTOPILOT_ENABLED", false);
+        const storage_sense_backlog_multiplier: i64 = if (env.get("WARDEN_STORAGE_SENSE_BACKLOG_MULTIPLIER")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_storage_sense_backlog_multiplier
+        else
+            default_storage_sense_backlog_multiplier;
+        const storage_sense_backlog_interval_seconds: i64 = if (env.get("WARDEN_STORAGE_SENSE_BACKLOG_INTERVAL_SECONDS")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_storage_sense_backlog_interval_seconds
+        else
+            default_storage_sense_backlog_interval_seconds;
+        const facts_tentative_max_age_days: i64 = if (env.get("WARDEN_FACTS_TENTATIVE_MAX_AGE_DAYS")) |raw|
+            std.fmt.parseInt(i64, raw, 10) catch default_facts_tentative_max_age_days
+        else
+            default_facts_tentative_max_age_days;
 
         return .{
             .telegram_bot_token = telegram_bot_token,
@@ -489,6 +509,9 @@ pub const Config = struct {
             .storage_sense_prune_age_days = storage_sense_prune_age_days,
             .storage_sense_resample_batch_size = storage_sense_resample_batch_size,
             .storage_sense_autopilot_enabled = storage_sense_autopilot_enabled,
+            .storage_sense_backlog_multiplier = storage_sense_backlog_multiplier,
+            .storage_sense_backlog_interval_seconds = storage_sense_backlog_interval_seconds,
+            .facts_tentative_max_age_days = facts_tentative_max_age_days,
         };
     }
 
@@ -774,4 +797,7 @@ pub const Config = struct {
     pub const default_storage_sense_resume_margin_pct: i64 = 3;
     pub const default_storage_sense_prune_age_days: i64 = 180;
     pub const default_storage_sense_resample_batch_size: i64 = 200;
+    pub const default_storage_sense_backlog_multiplier: i64 = 2;
+    pub const default_storage_sense_backlog_interval_seconds: i64 = 3600;
+    pub const default_facts_tentative_max_age_days: i64 = 30;
 };

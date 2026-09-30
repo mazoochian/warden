@@ -10,10 +10,14 @@ const digest = @import("digest.zig");
 const registry = @import("../tools/registry.zig");
 const iface = @import("../platform/interface.zig");
 const config_mod = @import("../config.zig");
+const civil_time = @import("../text/civil_time.zig");
+const embeddings = @import("../llm/embeddings.zig");
 const PgPool = @import("../store/pool.zig").PgPool;
 const messages = @import("../store/messages.zig");
 const chats = @import("../store/chats.zig");
 const identities = @import("../store/identities.zig");
+const facts = @import("../store/facts.zig");
+const daily_digests = @import("../store/daily_digests.zig");
 const dynamic_config = @import("../store/dynamic_config.zig");
 
 pub const low_watermark_key = "WARDEN_STORAGE_SENSE_LOW_WATERMARK_PCT";
@@ -23,6 +27,9 @@ pub const resume_margin_key = "WARDEN_STORAGE_SENSE_RESUME_MARGIN_PCT";
 pub const prune_age_days_key = "WARDEN_STORAGE_SENSE_PRUNE_AGE_DAYS";
 pub const resample_batch_size_key = "WARDEN_STORAGE_SENSE_RESAMPLE_BATCH_SIZE";
 pub const autopilot_enabled_key = "WARDEN_STORAGE_SENSE_AUTOPILOT_ENABLED";
+pub const backlog_multiplier_key = "WARDEN_STORAGE_SENSE_BACKLOG_MULTIPLIER";
+pub const backlog_interval_key = "WARDEN_STORAGE_SENSE_BACKLOG_INTERVAL_SECONDS";
+pub const facts_tentative_max_age_days_key = "WARDEN_FACTS_TENTATIVE_MAX_AGE_DAYS";
 
 /// Runtime bookkeeping, not an owner tunable -- deliberately left out of
 /// `dynamic_config.known_keys` (see that file's own comment on these three).
@@ -30,6 +37,7 @@ const last_high_alert_ts_key = "WARDEN_STORAGE_SENSE_LAST_HIGH_ALERT_TS";
 const sleep_active_key = "WARDEN_STORAGE_SENSE_SLEEP_ACTIVE";
 const sleep_entered_ts_key = "WARDEN_STORAGE_SENSE_SLEEP_ENTERED_TS";
 const last_tmp_sweep_ts_key = "WARDEN_STORAGE_SENSE_LAST_TMP_SWEEP_TS";
+const last_backlog_compact_ts_key = "WARDEN_STORAGE_SENSE_LAST_BACKLOG_COMPACT_TS";
 
 /// How long between daily high-watermark owner alerts.
 const high_alert_interval_seconds: i64 = 24 * 60 * 60;
@@ -135,9 +143,36 @@ pub const ResampleResult = struct { chats_affected: usize = 0, messages_compacte
 /// synthetic summary row to.
 const system_identity_native_id = "warden_storage_sense";
 
+/// An all-zero placeholder for `daily_digests.upsert`'s `NOT NULL embedding`
+/// column when no embeddings client is configured -- keeps the digest
+/// visible via `daily_digests.mostRecent`'s recency floor even though it'll
+/// never win a similarity-ranked match, the same "ranked recall degrades,
+/// recency recall doesn't" tradeoff `context_assembly.zig` already makes.
+const zero_embedding: [embeddings.embedding_dimensions]f32 = @splat(0);
+
+/// Best-effort write into the episodic layer `context_assembly.zig` actually
+/// reads -- failure here must not undo the already-committed
+/// `messages.replaceRangeWithSummary` collapse above it.
+fn writeDailyDigest(pool: *PgPool, allocator: std.mem.Allocator, embeddings_client: ?*embeddings.EmbeddingsClient, chat_id: i64, batch: messages.SummaryBatch, summary: []const u8) void {
+    const embedding: []const f32 = blk: {
+        const client = embeddings_client orelse break :blk &zero_embedding;
+        break :blk client.embed(allocator, summary) catch |err| {
+            std.log.warn("storage_sense: embed failed for chat {d} digest: {t}", .{ chat_id, err });
+            break :blk &zero_embedding;
+        };
+    };
+    const c = civil_time.localFromUnix(batch.newest_ts, 0);
+    const weekday = civil_time.weekdayName(civil_time.weekdayFromDays(@divFloor(batch.newest_ts, 86400)));
+    _ = daily_digests.upsert(pool, allocator, chat_id, c.year, c.month, c.day, weekday, summary, batch.min_id, batch.max_id, embedding) catch |err| {
+        std.log.warn("storage_sense: daily_digests upsert failed for chat {d}: {t}", .{ chat_id, err });
+    };
+}
+
 /// Compacts the oldest batch of `chat_id`'s non-summary messages into one
-/// LLM-written summary via `digest.summarizeHistory`.
-fn resampleOneChat(pool: *PgPool, allocator: std.mem.Allocator, io: Io, llm_provider: llm.Provider, chat_id: i64, batch_size: i64, system_identity_id: i64) !i64 {
+/// LLM-written summary via `digest.summarizeHistory`, both collapsing them
+/// in place (`messages.replaceRangeWithSummary`) and writing the summary into
+/// `daily_digests` for the local day the batch's newest message falls on.
+fn resampleOneChat(pool: *PgPool, allocator: std.mem.Allocator, io: Io, llm_provider: llm.Provider, embeddings_client: ?*embeddings.EmbeddingsClient, chat_id: i64, batch_size: i64, system_identity_id: i64) !i64 {
     const batch = try messages.oldestBatchForSummary(pool, allocator, chat_id, batch_size) orelse return 0;
     if (batch.count < min_batch_for_resample) return 0;
 
@@ -146,17 +181,18 @@ fn resampleOneChat(pool: *PgPool, allocator: std.mem.Allocator, io: Io, llm_prov
     if (summary.len == 0) return error.SummaryFailed;
 
     try messages.replaceRangeWithSummary(pool, chat_id, system_identity_id, batch.min_id, batch.max_id, summary, batch.newest_ts);
+    writeDailyDigest(pool, allocator, embeddings_client, chat_id, batch, summary);
     return @intCast(batch.count);
 }
 
 /// See `resampleOneChat` for the per-chat mechanics; `chat_id = null` runs it
 /// across every known chat (the ladder's use).
-pub fn resampleOldMessages(pool: *PgPool, allocator: std.mem.Allocator, io: Io, llm_provider: llm.Provider, chat_id: ?i64, batch_size: i64) !ResampleResult {
+pub fn resampleOldMessages(pool: *PgPool, allocator: std.mem.Allocator, io: Io, llm_provider: llm.Provider, embeddings_client: ?*embeddings.EmbeddingsClient, chat_id: ?i64, batch_size: i64) !ResampleResult {
     const now = Io.Timestamp.now(io, .real).toSeconds();
     const system_identity_id = try identities.getOrCreateMinimal(pool, .telegram, system_identity_native_id, "Warden", null, true, now);
 
     if (chat_id) |id| {
-        const compacted = try resampleOneChat(pool, allocator, io, llm_provider, id, batch_size, system_identity_id);
+        const compacted = try resampleOneChat(pool, allocator, io, llm_provider, embeddings_client, id, batch_size, system_identity_id);
         return .{ .chats_affected = if (compacted > 0) 1 else 0, .messages_compacted = compacted };
     }
 
@@ -168,7 +204,7 @@ pub fn resampleOldMessages(pool: *PgPool, allocator: std.mem.Allocator, io: Io, 
 
     var result: ResampleResult = .{};
     for (refs) |ref| {
-        const compacted = resampleOneChat(pool, allocator, io, llm_provider, ref.id, batch_size, system_identity_id) catch |err| {
+        const compacted = resampleOneChat(pool, allocator, io, llm_provider, embeddings_client, ref.id, batch_size, system_identity_id) catch |err| {
             std.log.warn("storage_sense: resample failed for chat {d}: {t}", .{ ref.id, err });
             continue;
         };
@@ -176,6 +212,94 @@ pub fn resampleOldMessages(pool: *PgPool, allocator: std.mem.Allocator, io: Io, 
         result.messages_compacted += compacted;
     }
     return result;
+}
+
+pub const BacklogResult = struct { chats_affected: usize = 0, messages_compacted: i64 = 0 };
+
+/// Chat-scoped backlog trigger, independent of disk pressure: compacts a
+/// chat once its non-summary message count exceeds
+/// `history_window * multiplier`. Complements `tick`'s disk-pressure ladder
+/// -- on a host with plenty of headroom that ladder never fires, so without
+/// this `daily_digests` stays empty and old raw history just accumulates
+/// until the per-turn char budget in `context_assembly.zig` silently drops
+/// it from a given answer with nothing to remember it by.
+pub fn compactBacklog(
+    pool: *PgPool,
+    allocator: std.mem.Allocator,
+    io: Io,
+    llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
+    history_window: i64,
+    multiplier: i64,
+    batch_size: i64,
+) !BacklogResult {
+    const now = Io.Timestamp.now(io, .real).toSeconds();
+    const system_identity_id = try identities.getOrCreateMinimal(pool, .telegram, system_identity_native_id, "Warden", null, true, now);
+    const threshold = history_window * multiplier;
+
+    const refs = try chats.listAll(pool, allocator);
+    defer {
+        for (refs) |r| allocator.free(r.native_chat_id);
+        allocator.free(refs);
+    }
+
+    var result: BacklogResult = .{};
+    for (refs) |ref| {
+        const count = messages.countNonSummary(pool, ref.id) catch |err| {
+            std.log.warn("storage_sense: backlog count failed for chat {d}: {t}", .{ ref.id, err });
+            continue;
+        };
+        if (count <= threshold) continue;
+        const compacted = resampleOneChat(pool, allocator, io, llm_provider, embeddings_client, ref.id, batch_size, system_identity_id) catch |err| {
+            std.log.warn("storage_sense: backlog compaction failed for chat {d}: {t}", .{ ref.id, err });
+            continue;
+        };
+        if (compacted > 0) result.chats_affected += 1;
+        result.messages_compacted += compacted;
+    }
+    return result;
+}
+
+/// Runs `compactBacklog` plus `facts.autoRetireStaleTentative`, gated by its
+/// own interval (`backlog_interval_key`) independent of `tick`'s disk
+/// watermark -- deliberately not folded into `tick` itself: disk health and
+/// context quality are different concerns with different natural cadences,
+/// and conflating them would muddy both. Called once per scheduler tick from
+/// `main.zig`, right after `tick`.
+pub fn tickBacklog(
+    gpa: std.mem.Allocator,
+    io: Io,
+    config: *const config_mod.Config,
+    pool: *PgPool,
+    llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
+    owner_identity_id: i64,
+    now: i64,
+) void {
+    const interval = dynamic_config.getI64(pool, gpa, backlog_interval_key, config.storage_sense_backlog_interval_seconds);
+    const last = dynamic_config.getI64(pool, gpa, last_backlog_compact_ts_key, 0);
+    if (now - last < interval) return;
+    setInt(pool, last_backlog_compact_ts_key, now, owner_identity_id);
+
+    const multiplier = dynamic_config.getI64(pool, gpa, backlog_multiplier_key, config.storage_sense_backlog_multiplier);
+    const history_window = dynamic_config.getI64(pool, gpa, "WARDEN_LLM_HISTORY_MESSAGES", config.llm_history_messages);
+    const batch_size = dynamic_config.getI64(pool, gpa, resample_batch_size_key, config.storage_sense_resample_batch_size);
+    const result = compactBacklog(pool, gpa, io, llm_provider, embeddings_client, history_window, multiplier, batch_size) catch |err| blk: {
+        std.log.warn("storage_sense: tickBacklog compaction failed: {t}", .{err});
+        break :blk BacklogResult{};
+    };
+    if (result.messages_compacted > 0) {
+        std.log.info("storage_sense: backlog-compacted {d} messages across {d} chats", .{ result.messages_compacted, result.chats_affected });
+    }
+
+    const max_age_days = dynamic_config.getI64(pool, gpa, facts_tentative_max_age_days_key, config.facts_tentative_max_age_days);
+    const retired = facts.autoRetireStaleTentative(pool, gpa, now, max_age_days * 86400) catch |err| blk: {
+        std.log.warn("storage_sense: tentative-fact auto-retire failed: {t}", .{err});
+        break :blk 0;
+    };
+    if (retired > 0) {
+        std.log.info("storage_sense: auto-retired {d} stale tentative fact(s)", .{retired});
+    }
 }
 
 pub const SweepResult = struct { files_deleted: usize = 0, bytes_freed: u64 = 0 };
@@ -247,6 +371,7 @@ pub fn tick(
     config: *const config_mod.Config,
     pool: *PgPool,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     owner_notify: iface.Connector,
     owner_native_id: []const u8,
     owner_identity_id: i64,
@@ -311,7 +436,7 @@ pub fn tick(
         }
 
         const batch_size = dynamic_config.getI64(pool, gpa, resample_batch_size_key, config.storage_sense_resample_batch_size);
-        const resample_result = resampleOldMessages(pool, gpa, io, llm_provider, null, batch_size) catch |err| blk: {
+        const resample_result = resampleOldMessages(pool, gpa, io, llm_provider, embeddings_client, null, batch_size) catch |err| blk: {
             std.log.warn("storage_sense: ladder resample failed: {t}", .{err});
             break :blk ResampleResult{};
         };
@@ -474,6 +599,83 @@ test "pruneOldMessages across every chat, and scoped to one chat" {
     const across_all = try pruneOldMessages(&pool, a, null, 2000);
     try testing.expectEqual(@as(i64, 1), across_all.rows_deleted); // only chat2's row was left to prune
     try testing.expectEqual(@as(usize, 1), across_all.chats_affected);
+}
+
+/// Records nothing, just answers with a fixed sentence -- `digest.zig`'s own
+/// tests use the same shape.
+const StubProvider = struct {
+    answer: []const u8 = "They discussed something mundane.",
+
+    fn provider(self: *StubProvider) llm.Provider {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+    const vt: llm.Provider.VTable = .{ .chat = chat };
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+        _ = request;
+        const self: *StubProvider = @ptrCast(@alignCast(ptr));
+        const blocks = try allocator.alloc(llm.ContentBlock, 1);
+        blocks[0] = .{ .text = self.answer };
+        return .{ .content = blocks, .stop_reason = .end_turn };
+    }
+};
+
+test "resampleOldMessages compacts a chat's oldest batch and also writes a daily_digests row for it" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPoolT.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+    var i: i64 = 0;
+    while (i < 25) : (i += 1) {
+        try messages.insert(&pool, chat1, alice, null, "chatting away", 1000 + i);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var stub = StubProvider{};
+    const result = try resampleOldMessages(&pool, a, testing.io, stub.provider(), null, chat1, 25);
+    try testing.expectEqual(@as(usize, 1), result.chats_affected);
+    try testing.expectEqual(@as(i64, 25), result.messages_compacted);
+
+    try testing.expect(try daily_digests.hasAny(&pool, chat1));
+    const recent = try daily_digests.mostRecent(&pool, a, chat1, 5);
+    try testing.expectEqual(@as(usize, 1), recent.len);
+    try testing.expectEqualStrings(stub.answer, recent[0].summary);
+}
+
+test "compactBacklog only compacts chats whose non-summary count exceeds the threshold" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPoolT.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    // Over threshold (history_window=10, multiplier=2 -> compacts past 20).
+    const busy = try chats.upsertChat(&pool, .telegram, "1", null, null);
+    // Under threshold -- left alone.
+    const quiet = try chats.upsertChat(&pool, .telegram, "2", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram, "1", "alice", null, false, 1000);
+
+    var i: i64 = 0;
+    while (i < 25) : (i += 1) try messages.insert(&pool, busy, alice, null, "busy chat filler", 1000 + i);
+    i = 0;
+    while (i < 5) : (i += 1) try messages.insert(&pool, quiet, alice, null, "quiet chat filler", 1000 + i);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var stub = StubProvider{};
+    const result = try compactBacklog(&pool, a, testing.io, stub.provider(), null, 10, 2, 25);
+    try testing.expectEqual(@as(usize, 1), result.chats_affected);
+    try testing.expectEqual(@as(i64, 25), result.messages_compacted);
+
+    try testing.expect(try daily_digests.hasAny(&pool, busy));
+    try testing.expect(!try daily_digests.hasAny(&pool, quiet));
+    try testing.expectEqual(@as(i64, 5), try messages.countNonSummary(&pool, quiet));
 }
 
 test "sweepTmpDir deletes only files older than the threshold" {

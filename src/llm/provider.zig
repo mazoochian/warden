@@ -161,6 +161,12 @@ pub const Provider = struct {
         chat: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest) anyerror!ChatResponse,
         /// Optional streaming variant.
         chatStream: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest, sink: StreamSink) anyerror!ChatResponse = null,
+        /// Optional real input-token count for `request` as constructed
+        /// (ignoring `max_tokens`/streaming, neither of which affects input
+        /// size) -- only Anthropic's Messages API exposes this today.
+        /// `Provider.countTokens` returns `null`, not an error, when the
+        /// active provider doesn't implement it.
+        countTokens: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest) anyerror!u32 = null,
     };
 
     pub fn chat(self: Provider, allocator: std.mem.Allocator, request: ChatRequest) !ChatResponse {
@@ -174,6 +180,11 @@ pub const Provider = struct {
             return response;
         };
         return f(self.ptr, allocator, request, sink);
+    }
+
+    pub fn countTokens(self: Provider, allocator: std.mem.Allocator, request: ChatRequest) !?u32 {
+        const f = self.vtable.countTokens orelse return null;
+        return try f(self.ptr, allocator, request);
     }
 };
 
@@ -262,6 +273,48 @@ test "Provider.chatStream falls back to chat() plus one final sink.report() when
     try testing.expectEqualStrings("hello", try textOf(a, response.content));
     try testing.expectEqual(@as(usize, 1), recorder.reports.items.len);
     try testing.expectEqualStrings("hello", recorder.reports.items[0]);
+}
+
+test "Provider.countTokens returns null when the active provider doesn't implement it, the real count otherwise" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const NoCountProvider = struct {
+        fn provider(self: *@This()) Provider {
+            return .{ .ptr = self, .vtable = &vt };
+        }
+        const vt: Provider.VTable = .{ .chat = chatFn };
+        fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest) anyerror!ChatResponse {
+            _ = ptr;
+            _ = allocator;
+            _ = request;
+            return .{ .content = &.{}, .stop_reason = .end_turn };
+        }
+    };
+    var no_count = NoCountProvider{};
+    try testing.expectEqual(@as(?u32, null), try no_count.provider().countTokens(a, .{ .messages = &.{} }));
+
+    const CountingProvider = struct {
+        fn provider(self: *@This()) Provider {
+            return .{ .ptr = self, .vtable = &vt };
+        }
+        const vt: Provider.VTable = .{ .chat = chatFn, .countTokens = countTokensFn };
+        fn chatFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest) anyerror!ChatResponse {
+            _ = ptr;
+            _ = allocator;
+            _ = request;
+            return .{ .content = &.{}, .stop_reason = .end_turn };
+        }
+        fn countTokensFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: ChatRequest) anyerror!u32 {
+            _ = ptr;
+            _ = allocator;
+            _ = request;
+            return 42;
+        }
+    };
+    var counting = CountingProvider{};
+    try testing.expectEqual(@as(?u32, 42), try counting.provider().countTokens(a, .{ .messages = &.{} }));
 }
 
 test "textWithThinkingOf renders thinking ahead of the text; textOf leaves it out" {

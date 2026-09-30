@@ -2,6 +2,7 @@ const std = @import("std");
 const Db = @import("db.zig").Db;
 const Stmt = @import("db.zig").Stmt;
 const PgPool = @import("pool.zig").PgPool;
+const civil_time = @import("../text/civil_time.zig");
 
 /// Whether `chat_id` has ever had a single message recorded.
 pub fn hasAny(pool: *PgPool, chat_id: i64) bool {
@@ -12,6 +13,19 @@ pub fn hasAny(pool: *PgPool, chat_id: i64) bool {
     defer stmt.finalize();
     stmt.bindInt64(1, chat_id);
     return (stmt.step() catch return false);
+}
+
+/// How many non-summary rows `chat_id` still has -- `storage_sense.zig`'s
+/// `tickBacklog` compacts a chat once this exceeds its backlog threshold.
+pub fn countNonSummary(pool: *PgPool, chat_id: i64) !i64 {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    var stmt = try db.prepare("SELECT count(*) FROM messages WHERE chat_id = $1 AND is_summary = false;");
+    defer stmt.finalize();
+    stmt.bindInt64(1, chat_id);
+    _ = try stmt.step();
+    return stmt.columnInt64(0);
 }
 
 /// Inserts one message row, scoped to `chat_id`/`identity_id` (the internal
@@ -109,11 +123,13 @@ pub fn oldestBatchForSummary(pool: *PgPool, allocator: std.mem.Allocator, chat_i
     var max_id: i64 = 0;
     var newest_ts: i64 = 0;
     var count: usize = 0;
+    var prev_day: ?i64 = null;
     while (try stmt.step()) {
         const id = stmt.columnInt64(0);
         if (count == 0) min_id = id;
         max_id = id;
         newest_ts = stmt.columnInt64(3);
+        try appendDayMarker(allocator, &lines, newest_ts, &prev_day);
         try lines.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ stmt.columnText(1), stmt.columnText(2) }));
         count += 1;
     }
@@ -171,14 +187,44 @@ fn formatLine(allocator: std.mem.Allocator, who: []const u8, text: []const u8, i
     return std.fmt.allocPrint(allocator, "{s}: {s}", .{ who, text });
 }
 
+/// Appends a "-- Weekday YYYY-MM-DD --" marker line to `lines` whenever
+/// `ts`'s local (UTC) calendar day differs from `prev_day` -- including the
+/// very first call, so history never starts unanchored. Without this, a
+/// truncated or long-spanning window carries no time signal beyond the
+/// single "Today is ..." header `context_assembly.zig` renders once per
+/// turn, and the model can't tell a week-old line from a fresh one.
+fn appendDayMarker(allocator: std.mem.Allocator, lines: *std.ArrayList([]const u8), ts: i64, prev_day: *?i64) !void {
+    const day = @divFloor(ts, 86400);
+    if (prev_day.* != null and prev_day.*.? == day) return;
+    prev_day.* = day;
+    try lines.append(allocator, try std.fmt.allocPrint(allocator, "-- {s} {s} --", .{
+        civil_time.weekdayName(civil_time.weekdayFromDays(day)),
+        civil_time.formatDate(allocator, civil_time.localFromUnix(ts, 0), .ymd),
+    }));
+}
+
+const FormattedRow = struct { who: []const u8, text: []const u8, is_summary: bool, tool_trace: ?[]const u8, ts: i64 };
+
+/// Renders rows (oldest first) as day-marked "who: text" lines -- shared by
+/// `recentFormatted` and `recentSinceFormatted`.
+fn formatRows(allocator: std.mem.Allocator, rows: []const FormattedRow) ![]const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var prev_day: ?i64 = null;
+    for (rows) |r| {
+        try appendDayMarker(allocator, &lines, r.ts, &prev_day);
+        try lines.append(allocator, try formatLine(allocator, r.who, r.text, r.is_summary, r.tool_trace));
+    }
+    return std.mem.join(allocator, "\n", lines.items);
+}
+
 /// Renders the most recent `limit` messages in `chat_id` (oldest first) as
-/// "who.
+/// day-marked "who: text" lines.
 pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, limit: i64) ![]const u8 {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary, m.tool_trace
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary, m.tool_trace, EXTRACT(EPOCH FROM m.ts)::BIGINT
         \\FROM messages m JOIN identities i ON i.id = m.identity_id
         \\WHERE m.chat_id = $1 AND m.text IS NOT NULL
         \\ORDER BY m.id DESC LIMIT $2;
@@ -187,22 +233,29 @@ pub fn recentFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64
     stmt.bindInt64(1, chat_id);
     stmt.bindInt64(2, limit);
 
-    var lines: std.ArrayList([]const u8) = .empty;
+    var rows: std.ArrayList(FormattedRow) = .empty;
     while (try stmt.step()) {
-        try lines.append(allocator, try formatLine(allocator, stmt.columnText(0), stmt.columnText(1), stmt.columnBool(2), if (stmt.columnIsNull(3)) null else stmt.columnText(3)));
+        try rows.append(allocator, .{
+            .who = stmt.columnText(0),
+            .text = stmt.columnText(1),
+            .is_summary = stmt.columnBool(2),
+            .tool_trace = if (stmt.columnIsNull(3)) null else stmt.columnText(3),
+            .ts = stmt.columnInt64(4),
+        });
     }
-    std.mem.reverse([]const u8, lines.items); // rows came back newest-first
-    return std.mem.join(allocator, "\n", lines.items);
+    std.mem.reverse(FormattedRow, rows.items); // rows came back newest-first
+    return formatRows(allocator, rows.items);
 }
 
-/// Same "who: text" formatting as `recentFormatted`, but windowed by wall-
-/// clock time (`since_ts`, unix seconds) rather than a flat row count.
+/// Same day-marked "who: text" formatting as `recentFormatted`, but windowed
+/// by wall-clock time (`since_ts`, unix seconds) rather than a flat row
+/// count.
 pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id: i64, since_ts: i64, limit: i64) ![]const u8 {
     const db = try pool.acquire();
     defer pool.release(db);
 
     var stmt = try db.prepare(
-        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary, m.tool_trace
+        \\SELECT COALESCE(i.username, NULLIF(i.display_name, ''), 'unknown'), m.text, m.is_summary, m.tool_trace, EXTRACT(EPOCH FROM m.ts)::BIGINT
         \\FROM messages m JOIN identities i ON i.id = m.identity_id
         \\WHERE m.chat_id = $1 AND m.text IS NOT NULL AND m.ts >= to_timestamp($2)
         \\ORDER BY m.id DESC LIMIT $3;
@@ -212,12 +265,18 @@ pub fn recentSinceFormatted(pool: *PgPool, allocator: std.mem.Allocator, chat_id
     stmt.bindInt64(2, since_ts);
     stmt.bindInt64(3, limit);
 
-    var lines: std.ArrayList([]const u8) = .empty;
+    var rows: std.ArrayList(FormattedRow) = .empty;
     while (try stmt.step()) {
-        try lines.append(allocator, try formatLine(allocator, stmt.columnText(0), stmt.columnText(1), stmt.columnBool(2), if (stmt.columnIsNull(3)) null else stmt.columnText(3)));
+        try rows.append(allocator, .{
+            .who = stmt.columnText(0),
+            .text = stmt.columnText(1),
+            .is_summary = stmt.columnBool(2),
+            .tool_trace = if (stmt.columnIsNull(3)) null else stmt.columnText(3),
+            .ts = stmt.columnInt64(4),
+        });
     }
-    std.mem.reverse([]const u8, lines.items); // rows came back newest-first
-    return std.mem.join(allocator, "\n", lines.items);
+    std.mem.reverse(FormattedRow, rows.items); // rows came back newest-first
+    return formatRows(allocator, rows.items);
 }
 
 pub const HistoryRow = struct {
@@ -413,6 +472,34 @@ test "hasAny is false for a chat with no messages, true once one is inserted, sc
     try testing.expect(!hasAny(&pool, chat2));
 }
 
+test "countNonSummary counts only non-summary rows, scoped per chat" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const chat1 = try chats.upsertChat(&pool, .telegram_user, "1", null, null);
+    const chat2 = try chats.upsertChat(&pool, .telegram_user, "2", null, null);
+    const alice = try identities.getOrCreateMinimal(&pool, .telegram_user, "1", "alice", null, false, 1000);
+    const warden = try identities.getOrCreateMinimal(&pool, .telegram_user, "warden_system", "Warden", null, true, 1000);
+
+    try insert(&pool, chat1, alice, "1", "first", 1000);
+    try insert(&pool, chat1, alice, "2", "second", 1001);
+    try insert(&pool, chat1, alice, "3", "third", 1002);
+    try insert(&pool, chat2, alice, "4", "unrelated", 1000);
+
+    try testing.expectEqual(@as(i64, 3), try countNonSummary(&pool, chat1));
+    try testing.expectEqual(@as(i64, 1), try countNonSummary(&pool, chat2));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const batch = (try oldestBatchForSummary(&pool, a, chat1, 2)) orelse return error.TestExpectedValue;
+    try replaceRangeWithSummary(&pool, chat1, warden, batch.min_id, batch.max_id, "Summarized.", batch.newest_ts);
+
+    try testing.expectEqual(@as(i64, 1), try countNonSummary(&pool, chat1));
+}
+
 test "insert/recentFormatted/pruneKeepLast scoped correctly per chat" {
     var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
     defer db.close();
@@ -445,23 +532,25 @@ test "insert/recentFormatted/pruneKeepLast scoped correctly per chat" {
     defer arena.deinit();
     const a = arena.allocator();
 
+    const day_marker = "-- Thursday 1970-01-01 --\n";
+
     const history = try recentFormatted(&pool, a, chat1, 10);
-    try testing.expectEqualStrings("alice: hi\nalice: again", history);
+    try testing.expectEqualStrings(day_marker ++ "alice: hi\nalice: again", history);
 
     // A separate chat must not see chat1's messages (per-chat isolation).
     const history2 = try recentFormatted(&pool, a, chat2, 10);
-    try testing.expectEqualStrings("Carol: unrelated", history2);
+    try testing.expectEqualStrings(day_marker ++ "Carol: unrelated", history2);
 
     // The bot's own reply carries what it did; an empty trace renders like
     // no trace at all.
     try insertWithTrace(&pool, chat2, carol, "4", "12°C in Berlin", 1003, "weather({\"location\":\"Berlin\"}) -> 12°C");
     try insertWithTrace(&pool, chat2, carol, "5", "plain", 1004, "");
     const traced = try recentFormatted(&pool, a, chat2, 10);
-    try testing.expectEqualStrings("Carol: unrelated\nCarol: [used: weather({\"location\":\"Berlin\"}) -> 12°C] 12°C in Berlin\nCarol: plain", traced);
+    try testing.expectEqualStrings(day_marker ++ "Carol: unrelated\nCarol: [used: weather({\"location\":\"Berlin\"}) -> 12°C] 12°C in Berlin\nCarol: plain", traced);
 
     try pruneKeepLast(&pool, chat1, 1);
     const pruned = try recentFormatted(&pool, a, chat1, 10);
-    try testing.expectEqualStrings("alice: again", pruned);
+    try testing.expectEqualStrings(day_marker ++ "alice: again", pruned);
 }
 
 test "recentRows returns unformatted rows oldest-first, with native_message_id carried through" {
@@ -539,11 +628,13 @@ test "recentSinceFormatted windows by timestamp, respects the row limit, and ret
     defer arena.deinit();
     const a = arena.allocator();
 
+    const day_marker = "-- Thursday 1970-01-01 --\n";
+
     const windowed = try recentSinceFormatted(&pool, a, chat1, 1000, 100);
-    try testing.expectEqualStrings("alice: in window one\nalice: in window two", windowed);
+    try testing.expectEqualStrings(day_marker ++ "alice: in window one\nalice: in window two", windowed);
 
     const capped = try recentSinceFormatted(&pool, a, chat1, 1000, 1);
-    try testing.expectEqualStrings("alice: in window two", capped);
+    try testing.expectEqualStrings(day_marker ++ "alice: in window two", capped);
 
     const nothing_before_anything = try recentSinceFormatted(&pool, a, chat1, 9999, 100);
     try testing.expectEqualStrings("", nothing_before_anything);
@@ -710,12 +801,14 @@ test "deleteOlderThan removes only messages before the cutoff, scoped to one cha
     defer arena.deinit();
     const a = arena.allocator();
 
+    const day_marker = "-- Thursday 1970-01-01 --\n";
+
     const left = try recentFormatted(&pool, a, chat1, 10);
-    try testing.expectEqualStrings("alice: recent", left);
+    try testing.expectEqualStrings(day_marker ++ "alice: recent", left);
 
     // A different chat's messages older than the same cutoff are untouched.
     const other = try recentFormatted(&pool, a, chat2, 10);
-    try testing.expectEqualStrings("alice: unrelated chat, also old", other);
+    try testing.expectEqualStrings(day_marker ++ "alice: unrelated chat, also old", other);
 }
 
 test "oldestBatchForSummary returns the oldest non-summary messages as an id range, null once nothing's left" {
@@ -736,7 +829,7 @@ test "oldestBatchForSummary returns the oldest non-summary messages as an id ran
     const a = arena.allocator();
 
     const batch = (try oldestBatchForSummary(&pool, a, chat1, 2)) orelse return error.TestExpectedValue;
-    try testing.expectEqualStrings("alice: first\nalice: second", batch.text);
+    try testing.expectEqualStrings("-- Thursday 1970-01-01 --\nalice: first\nalice: second", batch.text);
     try testing.expectEqual(@as(usize, 2), batch.count);
     try testing.expectEqual(@as(i64, 1001), batch.newest_ts);
 
@@ -765,5 +858,5 @@ test "replaceRangeWithSummary atomically swaps an id range for one is_summary ro
     try replaceRangeWithSummary(&pool, chat1, warden, batch.min_id, batch.max_id, "They discussed the first two things.", batch.newest_ts);
 
     const history = try recentFormatted(&pool, a, chat1, 10);
-    try testing.expectEqualStrings("summary: They discussed the first two things.\nalice: third, kept", history);
+    try testing.expectEqualStrings("-- Thursday 1970-01-01 --\nsummary: They discussed the first two things.\nalice: third, kept", history);
 }

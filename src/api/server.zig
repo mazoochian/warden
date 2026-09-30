@@ -11,6 +11,7 @@ const telegram_user_platform = @import("../platform/telegram/user_connector.zig"
 const reply_drafts = @import("../features/reply_drafts.zig");
 const bot_view = @import("bot_view.zig");
 const llm = @import("../llm/provider.zig");
+const embeddings = @import("../llm/embeddings.zig");
 const rate_limit = @import("rate_limit.zig");
 const router = @import("router.zig");
 const log = @import("../log.zig").scoped("api");
@@ -38,6 +39,10 @@ pub const ServerContext = struct {
     /// chats/summarize` endpoint (see `router.zig`'s `handleTelegramUser
     /// SummarizeChat`).
     llm_provider: ?llm.Provider = null,
+    /// Needed by `router.zig`'s `handleAdminStorageCleanupResample` to also
+    /// populate `daily_digests`, same as the `/storage cleanup resample`
+    /// command path -- `null` when `WARDEN_EMBEDDINGS_URL` isn't set.
+    embeddings_client: ?*embeddings.EmbeddingsClient = null,
     pending_drafts: ?*reply_drafts.PendingDrafts = null,
 };
 
