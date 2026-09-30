@@ -45,8 +45,14 @@ The context block, under hard character budgets per section:
    retrieved.
 3. Ranked/recent daily digests of this chat (`daily_digests`).
 4. Recent chat history: the last `WARDEN_LLM_HISTORY_MESSAGES` rows as
-   `who: text` lines. The bot's own lines carry `[used: tool(args) ->
-   result; ...]` when tools ran (see "Tool traces").
+   `who: text` lines, prefixed with a `-- Weekday YYYY-MM-DD --` marker
+   whenever the local day changes (`messages.appendDayMarker`) — including
+   before the very first line, so a window that's been truncated to fit its
+   character budget still opens with a real date rather than an undated
+   wall of text. `truncateTail` re-attaches the nearest dropped marker if
+   the cut fell after one, at the cost of a small, bounded overshoot past
+   the budget. The bot's own lines carry `[used: tool(args) -> result;
+   ...]` when tools ran (see "Tool traces").
 
 Ranking uses an embedding of the question when `WARDEN_EMBEDDINGS_URL` is
 configured, otherwise the keyword/recency/salience terms alone.
@@ -66,7 +72,12 @@ spend part of it thinking, so a tight token cap can produce empty replies.
 `max_tokens` = the tighter of `WARDEN_LLM_MAX_TOKENS` and a token-unit
 reply length when either is set; otherwise a 4000-token reserve for
 reasoning models' chain of thought plus `platform_limit / 3` for the
-visible answer.
+visible answer. All of `context_assembly.zig`'s budgets are character-based,
+not a real token count — `qa.calibrateTokenBudget` cross-checks that
+estimate against Anthropic's `/v1/messages/count_tokens`
+(`Provider.countTokens`, `null` for providers that don't implement it) once
+a prompt is large enough to matter, logging a warning rather than blocking
+the request if the real count runs ahead of the estimate.
 
 ## The tool loop (`llm/toolcall.zig`)
 

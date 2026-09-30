@@ -154,6 +154,11 @@ pub const known_keys = [_]KnownKey{
     .{ .key = "WARDEN_STORAGE_SENSE_PRUNE_AGE_DAYS", .label = "Storage sense: prune messages older than this many days", .kind = .i64 },
     .{ .key = "WARDEN_STORAGE_SENSE_RESAMPLE_BATCH_SIZE", .label = "Storage sense: messages compacted per resample batch", .kind = .i64 },
     .{ .key = "WARDEN_STORAGE_SENSE_AUTOPILOT_ENABLED", .label = "Storage sense: autopilot (automatic cleanup + sleep mode)", .kind = .bool },
+    // Routine backlog compaction -- independent of disk pressure, see
+    // `storage_sense.tickBacklog`.
+    .{ .key = "WARDEN_STORAGE_SENSE_BACKLOG_MULTIPLIER", .label = "Storage sense: backlog compaction threshold (x history window)", .kind = .i64 },
+    .{ .key = "WARDEN_STORAGE_SENSE_BACKLOG_INTERVAL_SECONDS", .label = "Storage sense: minimum seconds between backlog compaction passes", .kind = .i64 },
+    .{ .key = "WARDEN_FACTS_TENTATIVE_MAX_AGE_DAYS", .label = "Auto-retire unconfirmed tentative facts after this many days", .kind = .i64 },
 };
 
 pub fn findKnownKey(key: []const u8) ?KnownKey {

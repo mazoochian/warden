@@ -716,6 +716,7 @@ pub fn main(init: std.process.Init) !void {
             .bot_view_send_limiter = &bot_view_send_limiter,
             .telegram_user = if (telegram_user_adapter) |*t| t else null,
             .llm_provider = llm_provider,
+            .embeddings_client = embeddings_client,
             .pending_drafts = &pending_drafts,
         };
         if (std.Thread.spawn(.{}, apiServerThread, .{ api_ctx, port, config.api_workers })) |thread| {
@@ -739,7 +740,11 @@ pub fn main(init: std.process.Init) !void {
         if (storage_owner_native_id) |onid| {
             if (feature_flags.isEnabled(&pool, "storage_sense_monitor")) {
                 if (resolveOwnerIdentityId(&pool, &config, now)) |owner_identity_id| {
-                    storage_sense.tick(gpa, io, &config, &pool, llm_provider, owner_notify_connector, onid, owner_identity_id, now);
+                    storage_sense.tick(gpa, io, &config, &pool, llm_provider, embeddings_client, owner_notify_connector, onid, owner_identity_id, now);
+                    // Routine backlog compaction, independent of disk pressure -- see
+                    // `storage_sense.tickBacklog`'s own doc comment for why this isn't
+                    // folded into `tick` above.
+                    storage_sense.tickBacklog(gpa, io, &config, &pool, llm_provider, embeddings_client, owner_identity_id, now);
                 } else |err| {
                     log.warn("storage sense: couldn't resolve owner identity, skipping this tick: {t}", .{err});
                 }
@@ -2426,7 +2431,7 @@ fn handleMessage(
     } else if (std.mem.eql(u8, text, "/storage") or std.mem.startsWith(u8, text, "/storage ")) {
         // Hidden, owner-only; reserved so `/alias` can't shadow it.
         if (!is_owner) return false;
-        handleStorageCommand(connector, a, config, pool, io, llm_provider, chat_id, identity_id, msg, text, now);
+        handleStorageCommand(connector, a, config, pool, io, llm_provider, embeddings_client, chat_id, identity_id, msg, text, now);
     } else if (std.mem.eql(u8, text, "/whois") or std.mem.startsWith(u8, text, "/whois ")) {
         if (!auth.isOwnerOrBotAdmin(config, connector.platform(), msg.user_id, is_bot_admin)) return false;
         handleWhoisCommand(connector, a, config, pool, now, msg, text);
@@ -5537,6 +5542,7 @@ fn handleStorageCommand(
     pool: *store_pool.PgPool,
     io: Io,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     chat_id: i64,
     identity_id: i64,
     msg: iface.Message,
@@ -5577,7 +5583,7 @@ fn handleStorageCommand(
     }
 
     if (std.mem.startsWith(u8, rest, "cleanup")) {
-        handleStorageCleanupCommand(connector, a, config, pool, io, llm_provider, chat_id, msg, std.mem.trim(u8, rest["cleanup".len..], " "), now);
+        handleStorageCleanupCommand(connector, a, config, pool, io, llm_provider, embeddings_client, chat_id, msg, std.mem.trim(u8, rest["cleanup".len..], " "), now);
         return;
     }
 
@@ -5591,6 +5597,7 @@ fn handleStorageCleanupCommand(
     pool: *store_pool.PgPool,
     io: Io,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     chat_id: i64,
     msg: iface.Message,
     rest: []const u8,
@@ -5601,7 +5608,7 @@ fn handleStorageCleanupCommand(
     if (std.mem.startsWith(u8, rest, "messages")) {
         handleStorageCleanupMessages(connector, a, config, pool, chat_id, msg, std.mem.trim(u8, rest["messages".len..], " "), now);
     } else if (std.mem.startsWith(u8, rest, "resample")) {
-        handleStorageCleanupResample(connector, a, config, pool, io, llm_provider, chat_id, msg, std.mem.trim(u8, rest["resample".len..], " "));
+        handleStorageCleanupResample(connector, a, config, pool, io, llm_provider, embeddings_client, chat_id, msg, std.mem.trim(u8, rest["resample".len..], " "));
     } else if (std.mem.eql(u8, rest, "tmp")) {
         handleStorageCleanupTmp(connector, a, config, io, msg);
     } else {
@@ -5688,6 +5695,7 @@ fn handleStorageCleanupResample(
     pool: *store_pool.PgPool,
     io: Io,
     llm_provider: llm.Provider,
+    embeddings_client: ?*embeddings.EmbeddingsClient,
     chat_id: i64,
     msg: iface.Message,
     rest: []const u8,
@@ -5700,7 +5708,7 @@ fn handleStorageCleanupResample(
         };
     }
     const batch_size = dynamic_config.getI64(pool, a, storage_sense.resample_batch_size_key, config.storage_sense_resample_batch_size);
-    const result = storage_sense.resampleOldMessages(pool, a, io, llm_provider, target_chat_id, batch_size) catch |err| {
+    const result = storage_sense.resampleOldMessages(pool, a, io, llm_provider, embeddings_client, target_chat_id, batch_size) catch |err| {
         log.err("storage: cleanup resample failed for chat {d}: {t}", .{ target_chat_id, err });
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't resample, try again.");
         return;

@@ -19,7 +19,7 @@ pub const DynamicLlmProvider = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn };
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn, .countTokens = countTokensFn };
 
     fn resolve(self: *DynamicLlmProvider, allocator: std.mem.Allocator) llm.Provider {
         const name = dynamic_config.getString(self.pool, allocator, "WARDEN_LLM_PROVIDER", self.default_provider_name) catch return self.fallback;
@@ -38,6 +38,16 @@ pub const DynamicLlmProvider = struct {
     fn chatStreamFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest, sink: llm.StreamSink) anyerror!llm.ChatResponse {
         const self: *DynamicLlmProvider = @ptrCast(@alignCast(ptr));
         return self.resolve(allocator).chatStream(allocator, request, sink);
+    }
+
+    /// Delegates to whichever provider `resolve` picks -- an error (not
+    /// `null`) when that one doesn't implement counting either, since this
+    /// slot's signature can't itself return the "unsupported" `null`
+    /// `llm.Provider.countTokens` normally would. Callers already treat any
+    /// error here as "no count available" (see `qa.zig`).
+    fn countTokensFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!u32 {
+        const self: *DynamicLlmProvider = @ptrCast(@alignCast(ptr));
+        return (try self.resolve(allocator).countTokens(allocator, request)) orelse error.CountTokensUnsupported;
     }
 };
 
@@ -89,6 +99,48 @@ test "resolve picks the dynamic_config override, falls back to the startup defau
 
     const after = try wrapper.provider().chat(a, .{ .messages = &.{} });
     try testing.expectEqualStrings("openai_compat", textOf(after));
+}
+
+test "countTokensFn delegates to whichever provider resolve picks, erroring when that one has no counting support" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const CountingProvider = struct {
+        fn provider(self: *@This()) llm.Provider {
+            return .{ .ptr = self, .vtable = &vt };
+        }
+        const vt: llm.Provider.VTable = .{ .chat = chat, .countTokens = countTokens };
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!llm.ChatResponse {
+            _ = ptr;
+            _ = allocator;
+            _ = request;
+            return .{ .content = &.{}, .stop_reason = .end_turn };
+        }
+        fn countTokens(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!u32 {
+            _ = ptr;
+            _ = allocator;
+            _ = request;
+            return 123;
+        }
+    };
+    var counting = CountingProvider{};
+
+    var wrapper = DynamicLlmProvider{
+        .pool = &pool,
+        .anthropic = counting.provider(),
+        .openai_compat = testProviderTag("openai_compat"), // no countTokens
+        .fallback = counting.provider(),
+        .default_provider_name = "anthropic",
+    };
+
+    try testing.expectEqual(@as(?u32, 123), try wrapper.provider().countTokens(a, .{ .messages = &.{} }));
+
+    const owner = try identities.getOrCreateMinimal(&pool, .telegram, "1", "owner", null, false, 1000);
+    try dynamic_config.set(&pool, "WARDEN_LLM_PROVIDER", "openai_compat", owner);
+    try testing.expectError(error.CountTokensUnsupported, wrapper.provider().countTokens(a, .{ .messages = &.{} }));
 }
 
 test "resolve falls back when the requested provider was never configured" {

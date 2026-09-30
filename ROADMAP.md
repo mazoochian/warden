@@ -827,16 +827,17 @@ planned in detail, listed so they aren't forgotten.
   addressing) and risks false-positive moderation in real groups; revisit
   only if a real need shows up.
 - **History-aware context downsampling/summarization** — added
-  2026-07-26: every LLM call currently sends the last `WARDEN_LLM_HISTORY_MESSAGES`
-  raw "who: text" lines verbatim (see `qa.zig`'s `recentFormatted` call),
-  no compression at all. A real upgrade path once the current flat window
-  stops being "good enough": periodically collapse older history into a
-  running per-chat digest/summary (reusing the existing `/digest` feature's
-  summarization machinery as a starting point) so the prompt sends "recent
-  raw messages + a compressed summary of everything older" instead of a
-  strictly bigger raw window. Needs a real design pass (when to
-  regenerate the summary, how stale it's allowed to get, cost of the
-  summarization call itself) before starting — not a quick patch.
+  2026-07-26, **done 2026-09-29**: `storage_sense.tickBacklog` now
+  periodically collapses a chat's oldest raw messages into a `daily_digests`
+  summary (reusing `digest.summarizeHistory`) once its non-summary backlog
+  exceeds `WARDEN_LLM_HISTORY_MESSAGES * WARDEN_STORAGE_SENSE_BACKLOG_MULTIPLIER`,
+  independent of the disk-pressure ladder — see `docs/decisions.md`'s
+  "Backlog compaction..." entry for the design-pass answers (regeneration
+  trigger, staleness, cost). Raw history lines also gained
+  `-- Weekday YYYY-MM-DD --` day markers so a long or truncated window
+  still carries a real time anchor (`docs/decisions.md`'s "Day markers..."
+  entry) — the actual mechanism behind the reported quality-drift symptom,
+  more than raw prompt size.
 - **ML/embedding-based trivial-message classifier** — added 2026-07-26:
   `features/trivial_reply.zig`'s regex-based greeting/ack matcher (see
   its module doc) is a deliberately simple v1 (fixed phrase list, whole-

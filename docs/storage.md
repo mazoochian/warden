@@ -63,9 +63,19 @@ backfilled when later seen so `@username` targeting works.
 
 `messages` is pruned per chat to the last `WARDEN_RETENTION_MESSAGES` rows
 on every insert. Storage Sense (features.md) can additionally prune by age
-and replace old spans with `is_summary` rows. Inbound messages are recorded
-for every sender before any access check; a button press or reaction is
-not recorded.
+and replace old spans with `is_summary` rows, both under disk pressure and
+— separately — on its own routine backlog-size trigger
+(`storage_sense.tickBacklog`), which is what actually keeps `daily_digests`
+populated on a host that never hits the disk watermark. Inbound messages
+are recorded for every sender before any access check; a button press or
+reaction is not recorded.
+
+`messages.recentFormatted`/`recentSinceFormatted` prefix a
+`-- Weekday YYYY-MM-DD --` marker line whenever the local day changes
+(including before the first line), so the raw history block passed to the
+LLM always carries a real time anchor beyond the one "Today is ..." header
+— otherwise a long-spanning or heavily truncated window reads as an undated
+wall of text.
 
 ## Chats the bot has left
 

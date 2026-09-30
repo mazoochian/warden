@@ -1296,7 +1296,7 @@ fn handleAdminStorageCleanupResample(ctx: *const ServerContext, request: *http.S
     const body = (try readJsonBodyLeaky(request, arena, CleanupResampleBody, 128)) orelse return;
     const batch_size = dynamic_config.getI64(ctx.pool, arena, storage_sense.resample_batch_size_key, ctx.config.storage_sense_resample_batch_size);
 
-    const result = storage_sense.resampleOldMessages(ctx.pool, arena, ctx.io, provider, body.chat_id, batch_size) catch |err| {
+    const result = storage_sense.resampleOldMessages(ctx.pool, arena, ctx.io, provider, ctx.embeddings_client, body.chat_id, batch_size) catch |err| {
         log.err("admin-storage-cleanup-resample: failed: {t}", .{err});
         return respondError(request, .internal_server_error, "internal", "failed to resample");
     };

@@ -162,6 +162,62 @@ pub fn forget(pool: *PgPool, id: i64) !void {
     try db.exec("COMMIT;");
 }
 
+/// Auto-retires unconfirmed ("mentioned once") tentative facts whose
+/// `valid_from` is older than `now - max_age_seconds` -- same retire+
+/// tombstone mechanics as `forget`, just swept in bulk on a schedule
+/// (`storage_sense.tickBacklog`) instead of triggered by an explicit
+/// `/memory forget`. Without this, a wrong or stale one-off guess would
+/// occupy the tentative-facts context slot forever. Returns how many were
+/// retired.
+pub fn autoRetireStaleTentative(pool: *PgPool, allocator: std.mem.Allocator, now: i64, max_age_seconds: i64) !i64 {
+    const db = try pool.acquire();
+    defer pool.release(db);
+
+    const Row = struct { id: i64, identity_id: i64, statement: []const u8 };
+    var rows: std.ArrayList(Row) = .empty;
+    defer {
+        for (rows.items) |r| allocator.free(r.statement);
+        rows.deinit(allocator);
+    }
+    {
+        var select = try db.prepare(
+            \\SELECT id, identity_id, statement FROM facts
+            \\WHERE status = 'tentative' AND confirmations <= 1 AND valid_from < to_timestamp($1);
+        );
+        defer select.finalize();
+        select.bindInt64(1, now - max_age_seconds);
+        while (try select.step()) {
+            try rows.append(allocator, .{
+                .id = select.columnInt64(0),
+                .identity_id = select.columnInt64(1),
+                .statement = try allocator.dupe(u8, select.columnText(2)),
+            });
+        }
+    }
+    if (rows.items.len == 0) return 0;
+
+    try db.exec("BEGIN;");
+    errdefer db.exec("ROLLBACK;") catch |err| {
+        std.log.err("facts: rollback failed after an autoRetireStaleTentative error: {t}", .{err});
+    };
+
+    for (rows.items) |r| {
+        var retire = try db.prepare("UPDATE facts SET status = 'retired', valid_to = now() WHERE id = $1;");
+        retire.bindInt64(1, r.id);
+        _ = try retire.step();
+        retire.finalize();
+
+        var tomb = try db.prepare("INSERT INTO fact_tombstones (identity_id, pattern, reason, created_at) VALUES ($1, $2, 'auto-expired: unconfirmed after max age', now());");
+        tomb.bindInt64(1, r.identity_id);
+        tomb.bindText(2, r.statement);
+        _ = try tomb.step();
+        tomb.finalize();
+    }
+
+    try db.exec("COMMIT;");
+    return @intCast(rows.items.len);
+}
+
 /// Cheap existence check `qa.zig`/`context_assembly.zig` use to skip the
 /// embed-and-search round trip entirely for an identity with zero active
 /// facts ever recorded — so someone who's never used this feature never pays
@@ -559,4 +615,79 @@ test "ranking works with no query vector, and with rows that have no embedding" 
         a.free(with_vector);
     }
     try testing.expectEqual(@as(usize, 1), with_vector.len);
+}
+
+test "autoRetireStaleTentative retires only unconfirmed tentative facts past the age cutoff, tombstoned" {
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+    const a = testing.allocator;
+
+    const alice = try testIdentity(&pool, "1");
+    const conn = try pool.acquire();
+
+    // Old and unconfirmed -- should auto-retire.
+    const stale_vec = try embeddings.formatVectorLiteral(a, &testVector(0));
+    defer a.free(stale_vec);
+    var stale = try conn.prepare(
+        \\INSERT INTO facts (identity_id, scope, predicate, object, statement, valid_from, recorded_at, last_confirmed_at, status, confirmations, embedding)
+        \\VALUES ($1, 'project', 'considering', 'Dagster', 'Considered switching to Dagster', to_timestamp(1000), to_timestamp(1000), to_timestamp(1000), 'tentative', 1, $2);
+    );
+    stale.bindInt64(1, alice);
+    stale.bindText(2, stale_vec);
+    _ = try stale.step();
+    stale.finalize();
+
+    // Old but confirmed multiple times -- must survive.
+    const confirmed_vec = try embeddings.formatVectorLiteral(a, &testVector(1));
+    defer a.free(confirmed_vec);
+    var confirmed = try conn.prepare(
+        \\INSERT INTO facts (identity_id, scope, predicate, object, statement, valid_from, recorded_at, last_confirmed_at, status, confirmations, embedding)
+        \\VALUES ($1, 'preference', 'likes', 'coffee', 'Likes coffee', to_timestamp(1000), to_timestamp(1000), to_timestamp(1000), 'tentative', 3, $2);
+    );
+    confirmed.bindInt64(1, alice);
+    confirmed.bindText(2, confirmed_vec);
+    _ = try confirmed.step();
+    confirmed.finalize();
+
+    // Unconfirmed but recent -- must survive.
+    const fresh_vec = try embeddings.formatVectorLiteral(a, &testVector(2));
+    defer a.free(fresh_vec);
+    var fresh = try conn.prepare(
+        \\INSERT INTO facts (identity_id, scope, predicate, object, statement, valid_from, recorded_at, last_confirmed_at, status, confirmations, embedding)
+        \\VALUES ($1, 'project', 'considering', 'Nix', 'Considered switching to Nix', to_timestamp(3_025_000), to_timestamp(3_025_000), to_timestamp(3_025_000), 'tentative', 1, $2);
+    );
+    fresh.bindInt64(1, alice);
+    fresh.bindText(2, fresh_vec);
+    _ = try fresh.step();
+    fresh.finalize();
+    pool.release(conn);
+
+    // "now" is ~40 days past the stale/confirmed facts' valid_from (1000)
+    // but only ~5 days past the fresh one's -- against a 30-day cutoff, only
+    // the stale-and-unconfirmed fact should be retired.
+    const now: i64 = 3_457_000;
+    const max_age_seconds: i64 = 30 * 86400;
+    const retired = try autoRetireStaleTentative(&pool, a, now, max_age_seconds);
+    try testing.expectEqual(@as(i64, 1), retired);
+
+    const remaining = try rankedTentative(&pool, a, alice, null, "", 10, now);
+    defer {
+        for (remaining) |f| {
+            a.free(f.statement);
+            a.free(f.status);
+        }
+        a.free(remaining);
+    }
+    try testing.expectEqual(@as(usize, 2), remaining.len);
+    for (remaining) |f| try testing.expect(!std.mem.eql(u8, f.statement, "Considered switching to Dagster"));
+
+    const conn2 = try pool.acquire();
+    defer pool.release(conn2);
+    var tomb_stmt = try conn2.prepare("SELECT reason FROM fact_tombstones WHERE identity_id = $1;");
+    defer tomb_stmt.finalize();
+    tomb_stmt.bindInt64(1, alice);
+    try testing.expect(try tomb_stmt.step());
+    try testing.expectEqualStrings("auto-expired: unconfirmed after max age", tomb_stmt.columnText(0));
 }

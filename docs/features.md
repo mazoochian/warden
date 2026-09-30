@@ -41,7 +41,8 @@ remove a watch.
   model call. Weather failures drop the section, never the briefing.
 - **Daily digests for memory** (`store/daily_digests.zig`) are the
   per-chat episodic memory the context assembler ranks; distinct from the
-  user-facing `/digest`.
+  user-facing `/digest`. Populated by `storage_sense.tickBacklog`'s routine
+  compaction (see Storage Sense below), not just the disk-pressure ladder.
 - `/summary [hours]` and the `catch_me_up` tool summarise a window of the
   chat's own history on demand.
 
@@ -61,6 +62,12 @@ to the model only in a small "may be stale" set. Ranking is hybrid
 (embedding similarity when `WARDEN_EMBEDDINGS_URL` is set, plus keyword,
 recency and salience). Memory works without an embeddings endpoint —
 a startup notice says which mode is active. `/memory list|forget`.
+Unconfirmed tentative facts (`confirmations <= 1`) older than
+`WARDEN_FACTS_TENTATIVE_MAX_AGE_DAYS` (30) auto-retire the same way
+`/memory forget` does — status `retired` plus a `fact_tombstones` row, never
+a hard delete (`facts.autoRetireStaleTentative`, run from
+`storage_sense.tickBacklog`) — so a wrong or stale one-off guess doesn't
+occupy that context slot forever.
 
 ## Keyword alerts, welcome messages, polls, announcements
 
@@ -146,6 +153,18 @@ full disk took Postgres down: monitor → alert → prune/resample → sleep.
 - Summaries (resample, daily digest, `/summary`) get the same 4000-token
   reasoning reserve as Q&A on top of their 1024-token answer budget; a
   reasoning model used to spend the flat 1024 thinking and return nothing.
+- **Backlog compaction** (`storage_sense.tickBacklog`) is a *separate*,
+  routine pass — not gated by any watermark, since disk health and context
+  quality are different concerns with different cadences. Once a chat's
+  non-summary message count exceeds `WARDEN_LLM_HISTORY_MESSAGES *
+  WARDEN_STORAGE_SENSE_BACKLOG_MULTIPLIER` (default 2x), its oldest batch is
+  compacted the same way the disk ladder's resample does, but this is the
+  path that actually keeps `daily_digests` populated on a host that never
+  hits the low watermark — without it that table (and the "Relevant history
+  in this chat" context section it feeds) stays empty indefinitely. Runs at
+  most every `WARDEN_STORAGE_SENSE_BACKLOG_INTERVAL_SECONDS` (1h) and also
+  sweeps stale tentative facts (see Long-term memory above) on the same
+  cadence.
 
 ## Reply autonomy and drafts (`features/reply_drafts.zig`)
 

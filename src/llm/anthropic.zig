@@ -43,9 +43,10 @@ pub const AnthropicProvider = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn };
+    const vtable: llm.Provider.VTable = .{ .chat = chatFn, .chatStream = chatStreamFn, .countTokens = countTokensFn };
 
     const anthropic_url = "https://api.anthropic.com/v1/messages";
+    const count_tokens_url = "https://api.anthropic.com/v1/messages/count_tokens";
 
     fn authHeaders(self: *const AnthropicProvider) [2]http.Header {
         return .{
@@ -120,7 +121,59 @@ pub const AnthropicProvider = struct {
             .stop_reason = state.stop_reason,
         };
     }
+
+    /// `qa.zig`'s token-budget calibration: a real input-token count from
+    /// `/v1/messages/count_tokens`, the same request shape minus
+    /// `max_tokens`/`stream` (neither affects input size, and the endpoint
+    /// doesn't generate a response).
+    fn countTokensFn(ptr: *anyopaque, allocator: std.mem.Allocator, request: llm.ChatRequest) anyerror!u32 {
+        const self: *AnthropicProvider = @ptrCast(@alignCast(ptr));
+        const payload = try buildCountTokensPayload(allocator, self, request);
+        const headers = self.authHeaders();
+
+        const body = try http_util.postJsonWithTimeout(
+            &self.http_client,
+            allocator,
+            count_tokens_url,
+            &headers,
+            payload,
+            http_util.llm_timeout_ns,
+        );
+        defer allocator.free(body);
+
+        const CountResponse = struct { input_tokens: u32 = 0, @"error": ?ApiError = null };
+        var parsed = try json.parseFromSlice(CountResponse, allocator, body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.@"error") |err| {
+            log.err("anthropic count_tokens api error: {s}: {s}", .{ err.type, err.message });
+            return error.AnthropicApiError;
+        }
+        return parsed.value.input_tokens;
+    }
 };
+
+/// Same `model`/`system`/`messages`/`tools` shape `buildPayload` sends, minus
+/// the generation-only fields `count_tokens` doesn't take.
+fn buildCountTokensPayload(allocator: std.mem.Allocator, self: *const AnthropicProvider, request: llm.ChatRequest) ![]const u8 {
+    var payload_writer: Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+    const w = &payload_writer.writer;
+
+    try w.writeAll("{\"model\":");
+    try json.Stringify.value(self.model, .{}, w);
+    if (request.system) |system| {
+        try w.writeAll(",\"system\":");
+        try json.Stringify.value(system, .{}, w);
+    }
+    try w.writeAll(",\"messages\":");
+    try writeMessages(w, request.messages);
+    if (request.tools.len > 0) {
+        try w.writeAll(",\"tools\":");
+        try writeTools(allocator, w, request.tools);
+    }
+    try w.writeByte('}');
+    return allocator.dupe(u8, w.buffered());
+}
 
 fn elapsedMs(io: Io, started: Io.Timestamp) i64 {
     return @intCast(@divTrunc(Io.Timestamp.now(io, .real).toNanoseconds() - started.toNanoseconds(), std.time.ns_per_ms));
@@ -444,6 +497,41 @@ test "parses the api error shape" {
     try testing.expect(parsed.value.@"error" != null);
     try testing.expectEqualStrings("authentication_error", parsed.value.@"error".?.type);
     try testing.expectEqualStrings("invalid x-api-key", parsed.value.@"error".?.message);
+}
+
+test "buildCountTokensPayload omits max_tokens/stream but keeps model/system/messages" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var provider = AnthropicProvider.init(a, testing.io, "test-key", "claude-test");
+    defer provider.deinit();
+
+    const payload = try buildCountTokensPayload(a, &provider, .{
+        .system = "be terse",
+        .messages = &.{.{ .role = .user, .content = &.{.{ .text = "hi" }} }},
+        .max_tokens = 999,
+    });
+
+    var parsed = try json.parseFromSlice(json.Value, a, payload, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("claude-test", obj.get("model").?.string);
+    try testing.expectEqualStrings("be terse", obj.get("system").?.string);
+    try testing.expectEqual(@as(usize, 1), obj.get("messages").?.array.items.len);
+    try testing.expect(obj.get("max_tokens") == null);
+    try testing.expect(obj.get("stream") == null);
+}
+
+test "parses a count_tokens response" {
+    const body =
+        \\{"input_tokens":2095}
+    ;
+    const CountResponse = struct { input_tokens: u32 = 0, @"error": ?ApiError = null };
+    var parsed = try json.parseFromSlice(CountResponse, testing.allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u32, 2095), parsed.value.input_tokens);
+    try testing.expect(parsed.value.@"error" == null);
 }
 
 test "writeContentBlocks/writeMessages/writeTools produce valid embedded JSON" {
