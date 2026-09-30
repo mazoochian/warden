@@ -22,9 +22,8 @@ then the owner-only gate (access-control.md).
 ## Building the prompt (`features/qa.zig`)
 
 System prompt = the per-chat persona if set, else `WARDEN_SYSTEM_PROMPT`,
-else `default_system_prompt`; followed by a length budget line (the active
-platform's message limit, or `max_tokens × 3` chars when a flat
-`WARDEN_LLM_MAX_TOKENS` is set); followed by a **generated tool list** —
+else `default_system_prompt`; followed by a length budget line; followed
+by a **generated tool list** —
 one line per tool actually enabled for this chat, with the head of its
 description. The list is generated per request so it can never drift from
 what is callable; when asked what it can do, the model is told to answer
@@ -58,14 +57,27 @@ The context block, under hard character budgets per section:
 Ranking uses an embedding of the question when `WARDEN_EMBEDDINGS_URL` is
 configured, otherwise the keyword/recency/salience terms alone.
 
-`max_tokens` = a 4000-token reserve for reasoning models' chain of thought
-plus `platform_limit / 3` for the visible answer, unless overridden. All of
-`context_assembly.zig`'s budgets are character-based, not a real token
-count — `qa.calibrateTokenBudget` cross-checks that estimate against
-Anthropic's `/v1/messages/count_tokens` (`Provider.countTokens`, `null` for
-providers that don't implement it) once a prompt is large enough to matter,
-logging a warning rather than blocking the request if the real count runs
-ahead of the estimate.
+**Reply length.** The length budget line states the target from
+`WARDEN_LLM_REPLY_LENGTH` (`qa.ReplyLength`: `"<n> paragraphs"`,
+`"<n> words"`, `"<n> tokens"` or `"off"`; default `1 paragraph`), then the
+platform's message limit explicitly as a ceiling "not a length to aim
+for". Before this setting existed the line only said "keep replies under
+4096 characters", which models read as a target and answered with three
+or four paragraphs regardless of the Style section asking for one.
+Paragraphs and words are instructions the user can override by asking for
+detail (translations and rewrites of a given text are exempt too); tokens
+is also a hard `max_tokens` cap on the whole output — reasoning models
+spend part of it thinking, so a tight token cap can produce empty replies.
+
+`max_tokens` = the tighter of `WARDEN_LLM_MAX_TOKENS` and a token-unit
+reply length when either is set; otherwise a 4000-token reserve for
+reasoning models' chain of thought plus `platform_limit / 3` for the
+visible answer. All of `context_assembly.zig`'s budgets are character-based,
+not a real token count — `qa.calibrateTokenBudget` cross-checks that
+estimate against Anthropic's `/v1/messages/count_tokens`
+(`Provider.countTokens`, `null` for providers that don't implement it) once
+a prompt is large enough to matter, logging a warning rather than blocking
+the request if the real count runs ahead of the estimate.
 
 ## The tool loop (`llm/toolcall.zig`)
 

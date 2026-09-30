@@ -8,6 +8,11 @@ const attachment_content = @import("attachment_content.zig");
 /// can't loop forever burning tokens.
 const max_iterations = 6;
 
+/// Headroom on top of a request's visible-answer budget for a reasoning
+/// model's chain of thought. Without it, a small `max_tokens` is spent
+/// entirely on thinking and the reply comes back empty.
+pub const thinking_token_reserve: u32 = 4000;
+
 /// Lets a caller observe what a `run` call is doing while it's in flight.
 pub const Progress = struct {
     ptr: *anyopaque = undefined,

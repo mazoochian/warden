@@ -184,6 +184,9 @@ pub const Config = struct {
     /// reserve) with a flat ceiling instead — for keeping a deployment's answers
     /// short and its token spend predictable regardless of platform limits.
     llm_max_tokens_override: ?u32 = null,
+    /// How long answers should be, as "<n> tokens|words|paragraphs" or "off" —
+    /// parsed by `qa.ReplyLength.parse`.
+    llm_reply_length: []const u8 = default_llm_reply_length,
     /// How many recent chat messages `qa.zig` sends verbatim as context on every
     /// LLM call.
     llm_history_messages: i64 = default_llm_history_messages,
@@ -393,6 +396,7 @@ pub const Config = struct {
             std.fmt.parseInt(u32, raw, 10) catch null
         else
             null;
+        const llm_reply_length = env.get("WARDEN_LLM_REPLY_LENGTH") orelse default_llm_reply_length;
         const llm_history_messages: i64 = if (env.get("WARDEN_LLM_HISTORY_MESSAGES")) |raw|
             std.fmt.parseInt(i64, raw, 10) catch default_llm_history_messages
         else
@@ -490,6 +494,7 @@ pub const Config = struct {
             .llm_vision_enabled = llm_vision_enabled,
             .llm_documents_enabled = llm_documents_enabled,
             .llm_max_tokens_override = llm_max_tokens_override,
+            .llm_reply_length = llm_reply_length,
             .llm_history_messages = llm_history_messages,
             .llm_max_retries = llm_max_retries,
             .skip_trivial_messages = skip_trivial_messages,
@@ -780,6 +785,8 @@ pub const Config = struct {
     /// Unchanged from the hardcoded value `qa.zig` used before this was
     /// configurable.
     pub const default_llm_history_messages: i64 = 200;
+    /// Matches the system prompt's own "one short paragraph" style rule.
+    pub const default_llm_reply_length: []const u8 = "1 paragraph";
     /// Retries per model call on a *transient* failure (see `llm/toolcall.zig`'s
     /// `isRetryable`).
     pub const default_llm_max_retries: i64 = 3;

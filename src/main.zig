@@ -1743,7 +1743,7 @@ const LlmDynamicSettings = struct {
     owner_only: bool,
     show_thinking: bool,
     streaming: bool,
-    max_tokens_override: ?u32,
+    length_limits: qa.LengthLimits,
     history_messages: i64,
     skip_trivial_messages: bool,
     vision_enabled: bool,
@@ -1768,11 +1768,22 @@ fn resolveLlmDynamicSettings(pool: *store_pool.PgPool, a: std.mem.Allocator, con
     const max_tokens_default: i64 = if (config.llm_max_tokens_override) |v| v else 0;
     const max_tokens_raw = dynamic_config.findI64(rows, "WARDEN_LLM_MAX_TOKENS", max_tokens_default);
 
+    // An unparseable value (only possible via the env var; the API validates
+    // writes) falls back to the built-in default rather than to no limit.
+    const reply_length_raw = dynamic_config.findString(rows, "WARDEN_LLM_REPLY_LENGTH", config.llm_reply_length);
+    const reply_length = qa.ReplyLength.parse(reply_length_raw) catch blk: {
+        log.warn("llm: ignoring invalid WARDEN_LLM_REPLY_LENGTH \"{s}\"", .{reply_length_raw});
+        break :blk qa.ReplyLength.parse(config_mod.Config.default_llm_reply_length) catch unreachable;
+    };
+
     return .{
         .owner_only = dynamic_config.findBool(rows, "WARDEN_LLM_OWNER_ONLY", config.llm_owner_only),
         .show_thinking = dynamic_config.findBool(rows, "WARDEN_LLM_SHOW_THINKING", config.llm_show_thinking),
         .streaming = dynamic_config.findBool(rows, "WARDEN_LLM_STREAMING", config.llm_streaming),
-        .max_tokens_override = if (max_tokens_raw > 0) @intCast(max_tokens_raw) else null,
+        .length_limits = .{
+            .max_tokens_override = if (max_tokens_raw > 0) @intCast(@min(max_tokens_raw, std.math.maxInt(u32))) else null,
+            .reply_length = reply_length,
+        },
         .history_messages = dynamic_config.findI64(rows, "WARDEN_LLM_HISTORY_MESSAGES", config.llm_history_messages),
         .skip_trivial_messages = dynamic_config.findBool(rows, "WARDEN_LLM_SKIP_TRIVIAL_MESSAGES", config.skip_trivial_messages),
         .vision_enabled = dynamic_config.findBool(rows, "WARDEN_LLM_VISION", config.llm_vision_enabled),
@@ -1851,7 +1862,7 @@ fn handleModeCommand(
         .native_id = msg.user_id,
     };
     const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries, in_flight);
+    replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, question, null, null, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.length_limits, dyn.history_messages, dyn.max_retries, in_flight);
 }
 
 test "splitModeArgs splits a leading modifier token from the rest, falling back to reply_to_text" {
@@ -2710,7 +2721,7 @@ fn handleMessage(
             .native_id = msg.user_id,
         };
         const retention_messages = dynamic_config.getI64(pool, a, "WARDEN_RETENTION_MESSAGES", config.retention_messages);
-        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries, in_flight);
+        replyWithAnswer(connector, a, pool, chat_id, identity_id, llm_provider, embeddings_client, tool_ctx, tools, system_prompt, io, now, retention_messages, max_message_len, msg.chat_id, msg.message_id, asker, resolved.text, replied_to, resolved.placeholder_id, dyn.streaming, show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.length_limits, dyn.history_messages, dyn.max_retries, in_flight);
     }
     return false;
 }
@@ -4888,7 +4899,7 @@ fn handleTelegramUserAutoReply(
             .native_id = msg.user_id,
         };
         const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
-        const result = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.max_tokens_override, dyn.history_messages, dyn.max_retries) catch |err| {
+        const result = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, identity_id, system_prompt, max_message_len, asker, text, null, .{}, false, dyn.show_thinking, dyn.vision_enabled, dyn.documents_enabled, dyn.length_limits, dyn.history_messages, dyn.max_retries) catch |err| {
             log.err("reply_autonomy: qa.answer failed for chat {s}: {t}", .{ msg.chat_id, err });
             return;
         };
@@ -5664,7 +5675,16 @@ fn handleStorageCleanupMessages(
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't prune, try again.");
         return;
     };
-    const reply_text = std.fmt.allocPrint(a, "Pruned {d} messages from chat {d}.", .{ result.rows_deleted, target.chat_id }) catch return;
+    const reply_text = if (result.rows_deleted > 0)
+        std.fmt.allocPrint(a, "Pruned {d} messages from chat {d}.", .{ result.rows_deleted, target.chat_id }) catch return
+    else if (messages.oldestTs(pool, target.chat_id) catch null) |oldest|
+        std.fmt.allocPrint(a, "Nothing to prune in chat {d}: the cutoff is {s} but its oldest message is from {s}. Use --before YYYY-MM-DD for a later cutoff.", .{
+            target.chat_id,
+            civil_time.formatDate(a, civil_time.localFromUnix(cutoff_ts, 0), .ymd),
+            civil_time.formatDate(a, civil_time.localFromUnix(oldest, 0), .ymd),
+        }) catch return
+    else
+        std.fmt.allocPrint(a, "Nothing to prune in chat {d}: it has no stored messages.", .{target.chat_id}) catch return;
     connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
 }
 
@@ -5706,7 +5726,7 @@ fn handleStorageCleanupTmp(connector: iface.Connector, a: std.mem.Allocator, con
         reply(connector, a, msg.chat_id, msg.message_id, "Couldn't sweep tmp, try again.");
         return;
     };
-    const reply_text = std.fmt.allocPrint(a, "Swept {d} stale files ({d} bytes freed) from {s}.", .{ result.files_deleted, result.bytes_freed, config.tmp_dir }) catch return;
+    const reply_text = std.fmt.allocPrint(a, "Swept {d} stale files ({d} bytes freed) from {s}; kept {d} files newer than {d}h ({d} bytes).", .{ result.files_deleted, result.bytes_freed, config.tmp_dir, result.files_kept, @divTrunc(storage_sense.tmp_sweep_max_age_seconds, 3600), result.bytes_kept }) catch return;
     connector.sendMessage(a, msg.chat_id, reply_text, msg.message_id);
 }
 
@@ -9027,7 +9047,7 @@ fn replyWithAnswer(
     show_thinking: bool,
     vision_enabled: bool,
     documents_enabled: bool,
-    max_tokens_override: ?u32,
+    length_limits: qa.LengthLimits,
     history_window: i64,
     /// Retries per model call on a transient failure — see
     /// `toolcall.callProviderWithRetry`.
@@ -9068,7 +9088,7 @@ fn replyWithAnswer(
 
     log.info("qa: calling the model for chat {s}", .{native_chat_id});
     const enabled_tools = filterEnabledTools(pool, a, tool_ctx, tools);
-    const result_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, max_tokens_override, history_window, max_retries);
+    const result_or_err = qa.answer(llm_provider, embeddings_client, a, tool_ctx, enabled_tools, pool, chat_id, asker_identity_id, system_prompt, max_message_len, asker, question, replied_to, progress, stream, show_thinking, vision_enabled, documents_enabled, length_limits, history_window, max_retries);
 
     // Stop the ticker before touching the placeholder ourselves.
     if (state) |s| {
