@@ -19,6 +19,9 @@ pub fn build(b: *std.Build) void {
     // libolm (Matrix E2E encryption, see src/platform/matrix/olm.zig) — same
     // reasoning/shape as the pq linkage above.
     exe_mod.linkSystemLibrary("olm", .{});
+    // libomemo-c (XMPP OMEMO, see src/platform/xmpp/omemo/signal.zig) — also
+    // bound with hand-written `extern fn`s, so only the library is needed.
+    exe_mod.linkSystemLibrary("omemo-c", .{});
     // TDLib's JSON client (src/platform/telegram/user_connector.zig) — same
     // library-path reasoning as pq above, plus an explicit *include* path
     // this one actually needs and pq/olm don't: those two have no

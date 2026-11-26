@@ -240,6 +240,17 @@ initialised by another client (Element) uploads keys nobody validates.
 read per poll reconnected every ~8 idle seconds and leaked a thread and
 socket each time.
 
+**XMPP OMEMO: legacy 0.3 via libomemo-c (2026-11-26).** The clients the
+owner uses (Conversations, Monocles) speak `eu.siacs.conversations.axolotl`;
+OMEMO 2 support is still patchy, so 0.3 is the one that interoperates.
+libomemo-c is the maintained libsignal-protocol-c fork packaged by Fedora
+and Alpine; implementing the Double Ratchet/X3DH by hand was rejected. It
+is **GPLv3**, which binds the distributed binary/image. It's bound with
+hand-written `extern fn`s, like libolm; std.crypto is the crypto provider.
+Trust is TOFU (no fingerprint-verification UI exists on chat platforms);
+a changed key is refused rather than silently accepted. Replies to an
+OMEMO chat are never downgraded to plaintext on failure.
+
 **TDLib: never mark messages read automatically.** Only `/tdsummary` and
 `summarize_unread_chat` do so deliberately.
 

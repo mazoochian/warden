@@ -211,6 +211,7 @@ const reserved_command_names_extra = [_][]const u8{
     "tdlogin",  "tdlogout",    "iglogin",     "sendas",     "tdsend",
     "tdchats",  "tdsearch",    "tdsummary",   "autonomy",   "drafts",
     "approve",  "discard",     "slowmode",    "permission", "tag",
+    "omemo",
 };
 
 /// True if `name` (no leading slash) is a real built-in command -- checked
@@ -347,6 +348,8 @@ const help_text_admin =
     \\
     \\Owner only
     \\/scraper -- configure the web-scraping backend
+    \\/omemo [reset <device id>] -- (XMPP) the bot's OMEMO fingerprint and
+    \\  your devices; reset forgets a device whose key changed
     \\/tdlogin -- connect Warden to your personal Telegram account
     \\/sendas <chat id> <text> -- send a message through your personal account
     \\/tdchats -- list your personal account's chats and their ids
@@ -494,6 +497,10 @@ pub fn main(init: std.process.Init) !void {
             log.fatal("postgres: schema migration failed: {t}", .{err});
         };
     }
+
+    if (xmpp_adapter) |*x| if (config.xmpp.?.omemo_key) |key| {
+        x.enableOmemo(&pool, key) catch |err| log.err("xmpp: OMEMO stays off, setup failed: {t}", .{err});
+    };
 
     // Same "only join the list when configured" shape as every other
     // connector above.
@@ -9817,6 +9824,12 @@ test {
     _ = @import("platform/xmpp/xml.zig");
     _ = @import("platform/xmpp/types.zig");
     _ = @import("platform/xmpp/client.zig");
+    _ = @import("platform/xmpp/stanza.zig");
+    _ = @import("platform/xmpp/media.zig");
+    _ = @import("platform/xmpp/sm.zig");
+    _ = @import("platform/xmpp/omemo/provider.zig");
+    _ = @import("platform/xmpp/omemo/engine.zig");
+    _ = @import("store/omemo.zig");
     _ = @import("domain/xmpp_profile.zig");
     _ = @import("domain/instagram_profile.zig");
     _ = @import("platform/instagram/crypto.zig");
