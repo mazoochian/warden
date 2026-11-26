@@ -54,6 +54,9 @@ pub const XmppConfig = struct {
     /// equivalent "just works once added to a group" step.
     muc_rooms: []const []const u8,
     tls_mode: XmppTlsMode = .self_signed,
+    /// `WARDEN_XMPP_OMEMO_KEY`: seals the OMEMO keys at rest. Null leaves
+    /// OMEMO off.
+    omemo_key: ?[]const u8 = null,
 };
 
 /// TDLib (personal-account) connector config — the owner's own Telegram
@@ -613,6 +616,7 @@ pub const Config = struct {
             .password = pw,
             .muc_rooms = try muc_rooms.toOwnedSlice(arena),
             .tls_mode = tls_mode,
+            .omemo_key = nonEmpty(env.get("WARDEN_XMPP_OMEMO_KEY")),
         };
     }
 

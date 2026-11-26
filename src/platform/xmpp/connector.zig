@@ -13,6 +13,10 @@ const XmppProfile = @import("../../domain/xmpp_profile.zig").XmppProfile;
 const log = @import("../../log.zig").scoped("xmpp");
 const llm = @import("../../llm/provider.zig");
 const http_util = @import("../../http_util.zig");
+const omemo = @import("omemo/engine.zig");
+const omemo_store = @import("../../store/omemo.zig");
+const PgPool = @import("../../store/pool.zig").PgPool;
+const test_support = @import("../../store/test_support.zig");
 
 /// How long a single `pollFn` cycle waits for a stanza before returning an
 /// empty slice.
@@ -33,6 +37,9 @@ const iq_check_interval_ns: u64 = 25 * std.time.ns_per_ms;
 /// How many of our own recently sent message ids are remembered, for
 /// recognizing MUC reflections, replies to the bot, and retractions.
 const recent_capacity = 512;
+
+/// How long a peer's fetched OMEMO device list is reused.
+const device_cache_seconds: i64 = 10 * 60;
 
 /// How `platform/xmpp/client.zig`'s `startTls` verifies the server's
 /// certificate.
@@ -133,6 +140,16 @@ pub const XmppConnector = struct {
     upload_mu: Io.Mutex = .init,
     upload_jid: ?[]u8 = null,
     upload_max_size: ?u64 = null,
+    /// Set by `enableOmemo`; 1:1 chats then go encrypted when the peer's do.
+    omemo: ?*omemo.Engine = null,
+    /// Set by `ensureConnected`; the poll thread then publishes our device.
+    omemo_publish_due: bool = false,
+    /// The thread `pollFn` runs on, which `request` must never block.
+    poll_thread: std.atomic.Value(std.Thread.Id) = .init(0),
+    /// Peers' OMEMO device ids, keyed by bare JID (under `state_mu`).
+    device_cache: std.StringHashMapUnmanaged(CachedDevices) = .empty,
+
+    const CachedDevices = struct { ids: []i32, fetched_at: i64 };
 
     const Occupant = struct {
         /// Owned copies of XEP-0045's affiliation ("owner"/"admin"/
@@ -187,6 +204,13 @@ pub const XmppConnector = struct {
         self.pending_iqs.deinit(self.allocator);
         if (self.upload_jid) |j| self.allocator.free(j);
         self.http_client.deinit();
+        var dc = self.device_cache.iterator();
+        while (dc.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.ids);
+        }
+        self.device_cache.deinit(self.allocator);
+        if (self.omemo) |e| e.deinit();
 
         if (self.ca_bundle_loaded) self.ca_bundle.deinit(self.allocator);
     }
@@ -291,6 +315,7 @@ pub const XmppConnector = struct {
         self.bound_jid = try self.allocator.dupe(u8, client.bound_jid.?);
         self.clearRoomState();
         self.resetUploadService();
+        self.omemo_publish_due = self.omemo != null;
         {
             self.client_mu.lockUncancelable(self.io);
             defer self.client_mu.unlock(self.io);
@@ -373,6 +398,7 @@ pub const XmppConnector = struct {
     /// `error.IqError`. Never call from the poll thread: it is the one that
     /// reads the reply.
     pub fn request(self: *XmppConnector, allocator: std.mem.Allocator, kind: []const u8, to: ?[]const u8, payload: []const u8) !xml.ParsedElement {
+        if (std.Thread.getCurrentId() == self.poll_thread.load(.acquire)) return error.RequestFromPollThread;
         const id = try self.newId(allocator);
         defer allocator.free(id);
 
@@ -507,6 +533,11 @@ pub const XmppConnector = struct {
             return &.{};
         };
         const client = self.client.?;
+        self.poll_thread.store(std.Thread.getCurrentId(), .release);
+        if (self.omemo_publish_due) {
+            self.omemo_publish_due = false;
+            self.spawnOmemoPublish(true);
+        }
 
         if (self.read_shared == null) {
             const shared = try self.allocator.create(ReadShared);
@@ -599,6 +630,8 @@ pub const XmppConnector = struct {
         stanza.ns_reply,
         stanza.ns_oob,
         stanza.ns_retract,
+        omemo.devicelist_node,
+        omemo.devicelist_node ++ "+notify",
     };
 
     /// Replies to a server-initiated `<iq type='get'/'set'>` — RFC 6120 §8.2.3
@@ -798,17 +831,35 @@ pub const XmppConnector = struct {
         const user_id = if (is_group) (real_jid orelse msg.from) else chat_id;
         const sender_domain: ?[]const u8 = if (is_group) (if (real_jid) |j| domainPart(j) else null) else domainPart(chat_id);
 
-        var text: ?[]const u8 = msg.body;
+        var body: ?[]const u8 = msg.body;
+        var oob_url = ext.oob_url;
+        if (ext.encrypted) |enc| {
+            if (is_group) {
+                log.info("ignoring an OMEMO-encrypted message in {s}: rooms aren't supported", .{chat_id});
+                return &.{};
+            }
+            body = (try self.decryptInbound(allocator, chat_id, enc)) orelse return &.{};
+            // An OOB element outside the encryption isn't covered by it.
+            oob_url = null;
+        } else if (!is_group and msg.body != null) {
+            self.noteChatEncryption(chat_id, false);
+        }
+
+        var text: ?[]const u8 = body;
         var attachment: ?iface.Attachment = null;
-        if (ext.oob_url orelse soleUrl(msg.body)) |url| {
+        if (oob_url orelse soleUrl(body)) |url| {
             attachment = try self.attachmentFor(allocator, url, sender_domain);
             if (attachment != null) {
-                if (msg.body) |b| if (std.mem.eql(u8, std.mem.trim(u8, b, " \t\r\n"), url)) {
+                if (body) |b| if (std.mem.eql(u8, std.mem.trim(u8, b, " \t\r\n"), url)) {
                     text = null;
                 };
             }
         }
         if ((text == null or text.?.len == 0) and attachment == null) return &.{};
+        if (!is_group and self.omemo != null and text != null and isOmemoCommand(text.?)) {
+            self.spawnOmemoCommand(chat_id, text.?);
+            return &.{};
+        }
 
         const display_name = if (is_group) (nick orelse chat_id) else chat_id;
         // XMPP MUC has no wire-level "@mention" concept (unlike Telegram's
@@ -885,7 +936,8 @@ pub const XmppConnector = struct {
     /// the sender's own server or ours.
     fn attachmentFor(self: *XmppConnector, allocator: std.mem.Allocator, url: []const u8, sender_domain: ?[]const u8) !?iface.Attachment {
         const plain_http_ok = self.tls_mode == .insecure and std.ascii.startsWithIgnoreCase(url, "http://");
-        if (!media.isHttpsUrl(url) and !plain_http_ok) return null;
+        const aesgcm_ok = self.omemo != null and media.isAesgcmUrl(url);
+        if (!media.isHttpsUrl(url) and !plain_http_ok and !aesgcm_ok) return null;
         var host_buf: [256]u8 = undefined;
         const host = media.urlHost(&host_buf, url) orelse return null;
         const allowed = media.hostBelongsTo(host, self.domain) or
@@ -950,18 +1002,31 @@ pub const XmppConnector = struct {
     /// `allocator`).
     fn sendOut(self: *XmppConnector, allocator: std.mem.Allocator, chat_id: []const u8, opts: SendOpts) ![]const u8 {
         const is_group = self.isJoinedRoom(chat_id);
+        var encrypted: ?[]u8 = null;
+        defer if (encrypted) |e| allocator.free(e);
+        if (!is_group and opts.retract_id == null and self.chatIsEncrypted(chat_id)) {
+            if (opts.body) |b| {
+                encrypted = self.encryptFor(allocator, chat_id, b) catch |err| {
+                    log.warn("not sending to {s}: OMEMO encryption failed: {t}", .{ chat_id, err });
+                    self.sendPlainNotice(allocator, chat_id, "🔒 I couldn't encrypt my reply to you, so I didn't send it. Make sure your client trusts my OMEMO device.");
+                    return error.OmemoEncryptFailed;
+                };
+            }
+        }
         const id = try self.newId(allocator);
         errdefer allocator.free(id);
         const bytes = try stanza.messageToOwned(allocator, .{
             .to = chat_id,
             .kind = if (is_group) "groupchat" else "chat",
             .id = id,
-            .body = opts.body,
+            .body = if (encrypted != null) null else opts.body,
             .replace_id = opts.replace_id,
             // Threading every 1:1 answer under its prompt is just noise.
             .reply_to_id = if (is_group) opts.reply_to_id else null,
-            .oob_url = opts.oob_url,
+            // An OOB link would leak the file's location past the encryption.
+            .oob_url = if (encrypted != null) null else opts.oob_url,
             .retract_id = opts.retract_id,
+            .encrypted_xml = encrypted,
         });
         defer allocator.free(bytes);
         try self.send(bytes);
@@ -1045,6 +1110,339 @@ pub const XmppConnector = struct {
         reply.deinit();
     }
 
+    // --- OMEMO -------------------------------------------------------------
+
+    /// Turns OMEMO on: loads or creates the bot's device. Call once, before
+    /// polling starts.
+    pub fn enableOmemo(self: *XmppConnector, pool: *PgPool, secret: []const u8) !void {
+        const jid = try std.fmt.allocPrint(self.allocator, "{s}@{s}", .{ self.jid_user, self.domain });
+        defer self.allocator.free(jid);
+        const engine = try omemo.Engine.init(self.allocator, self.io, pool, secret, jid);
+        self.omemo = engine;
+        const fp = try engine.fingerprint(self.allocator);
+        defer self.allocator.free(fp);
+        log.notice("OMEMO device {d}, fingerprint {s}", .{ engine.device_id, fp });
+    }
+
+    /// Publishing waits on IQ replies, so it runs off the poll thread.
+    fn spawnOmemoPublish(self: *XmppConnector, with_devicelist: bool) void {
+        const t = std.Thread.spawn(.{}, publishOmemoThread, .{ self, with_devicelist }) catch |err| {
+            log.warn("failed to start OMEMO publishing: {t}", .{err});
+            return;
+        };
+        t.detach();
+    }
+
+    fn publishOmemoThread(self: *XmppConnector, with_devicelist: bool) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (with_devicelist) self.publishDeviceList(a) catch |err| log.warn("failed to publish our OMEMO device list: {t}", .{err});
+        self.publishBundle(a) catch |err| log.warn("failed to publish our OMEMO bundle: {t}", .{err});
+    }
+
+    const ns_pubsub = "http://jabber.org/protocol/pubsub";
+    const open_access_options = "<publish-options><x xmlns='jabber:x:data' type='submit'>" ++
+        "<field var='FORM_TYPE' type='hidden'><value>http://jabber.org/protocol/pubsub#publish-options</value></field>" ++
+        "<field var='pubsub#access_model'><value>open</value></field></x></publish-options>";
+
+    /// Publishes `payload` as item `current` of our own PEP `node`, readable
+    /// by anyone (peers fetch our bundle before they've added us).
+    fn pepPublish(self: *XmppConnector, a: std.mem.Allocator, node: []const u8, payload: []const u8) !void {
+        const with_opts = try std.fmt.allocPrint(a, "<pubsub xmlns='" ++ ns_pubsub ++ "'><publish node='{s}'><item id='current'>{s}</item></publish>" ++ open_access_options ++ "</pubsub>", .{ node, payload });
+        if (self.request(a, "set", null, with_opts)) |reply| {
+            var r = reply;
+            r.deinit();
+            return;
+        } else |err| if (err != error.IqError) return err;
+        // Servers without publish-options support.
+        const plain = try std.fmt.allocPrint(a, "<pubsub xmlns='" ++ ns_pubsub ++ "'><publish node='{s}'><item id='current'>{s}</item></publish></pubsub>", .{ node, payload });
+        var r = try self.request(a, "set", null, plain);
+        r.deinit();
+    }
+
+    /// `jid` null means our own account.
+    fn fetchDeviceIds(self: *XmppConnector, a: std.mem.Allocator, jid: ?[]const u8) ![]i32 {
+        var reply = self.request(a, "get", jid, "<pubsub xmlns='" ++ ns_pubsub ++ "'><items node='" ++ omemo.devicelist_node ++ "'/></pubsub>") catch |err| {
+            // No such node: the account has never published an OMEMO device.
+            if (err == error.IqError) return &.{};
+            return err;
+        };
+        defer reply.deinit();
+        const list = omemo.pubsubPayload(reply.element, "list") orelse return &.{};
+        return omemo.parseDeviceList(a, list);
+    }
+
+    fn publishDeviceList(self: *XmppConnector, a: std.mem.Allocator) !void {
+        const engine = self.omemo orelse return;
+        const own: i32 = @intCast(engine.device_id);
+        const ids = try self.fetchDeviceIds(a, null);
+        for (ids) |id| if (id == own) return;
+
+        var out: Io.Writer.Allocating = .init(a);
+        try out.writer.writeAll("<list xmlns='" ++ omemo.ns ++ "'>");
+        for (ids) |id| try out.writer.print("<device id='{d}'/>", .{id});
+        try out.writer.print("<device id='{d}'/></list>", .{own});
+        try self.pepPublish(a, omemo.devicelist_node, out.writer.buffered());
+        log.info("added OMEMO device {d} to our device list", .{own});
+    }
+
+    fn publishBundle(self: *XmppConnector, a: std.mem.Allocator) !void {
+        const engine = self.omemo orelse return;
+        const bundle = try engine.bundleXml(a);
+        const node = try std.fmt.allocPrint(a, omemo.bundles_node_prefix ++ "{d}", .{engine.device_id});
+        try self.pepPublish(a, node, bundle);
+        log.info("published OMEMO bundle for device {d}", .{engine.device_id});
+    }
+
+    /// A peer's device ids (copied into `a`), from cache when fresh.
+    fn peerDevices(self: *XmppConnector, a: std.mem.Allocator, jid: []const u8) ![]i32 {
+        const now = Io.Timestamp.now(self.io, .real).toSeconds();
+        {
+            self.state_mu.lockUncancelable(self.io);
+            defer self.state_mu.unlock(self.io);
+            if (self.device_cache.get(jid)) |c| {
+                if (now - c.fetched_at < device_cache_seconds) return a.dupe(i32, c.ids);
+            }
+        }
+        const ids = try self.fetchDeviceIds(a, jid);
+        const owned_ids = try self.allocator.dupe(i32, ids);
+        errdefer self.allocator.free(owned_ids);
+        self.state_mu.lockUncancelable(self.io);
+        defer self.state_mu.unlock(self.io);
+        if (self.device_cache.fetchRemove(jid)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value.ids);
+        }
+        const key = try self.allocator.dupe(u8, jid);
+        errdefer self.allocator.free(key);
+        try self.device_cache.put(self.allocator, key, .{ .ids = owned_ids, .fetched_at = now });
+        return ids;
+    }
+
+    fn forgetPeerDevices(self: *XmppConnector, jid: []const u8) void {
+        self.state_mu.lockUncancelable(self.io);
+        defer self.state_mu.unlock(self.io);
+        if (self.device_cache.fetchRemove(jid)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value.ids);
+        }
+    }
+
+    /// A message from a device we didn't know about means our cached list
+    /// is stale.
+    fn noteDeviceSeen(self: *XmppConnector, jid: []const u8, device_id: i32) void {
+        const stale = blk: {
+            self.state_mu.lockUncancelable(self.io);
+            defer self.state_mu.unlock(self.io);
+            const c = self.device_cache.get(jid) orelse break :blk false;
+            for (c.ids) |id| if (id == device_id) break :blk false;
+            break :blk true;
+        };
+        if (stale) self.forgetPeerDevices(jid);
+    }
+
+    fn ensureSession(self: *XmppConnector, a: std.mem.Allocator, engine: *omemo.Engine, jid: []const u8, device_id: i32) !void {
+        if (engine.hasSession(jid, device_id)) return;
+        const payload = try std.fmt.allocPrint(a, "<pubsub xmlns='" ++ ns_pubsub ++ "'><items node='" ++ omemo.bundles_node_prefix ++ "{d}' max_items='1'/></pubsub>", .{device_id});
+        var reply = try self.request(a, "get", jid, payload);
+        defer reply.deinit();
+        const bundle = omemo.pubsubPayload(reply.element, "bundle") orelse return error.NoBundle;
+        try engine.processBundle(jid, device_id, bundle);
+    }
+
+    /// The `<encrypted>` element carrying `body` to every device of `jid`.
+    fn encryptFor(self: *XmppConnector, allocator: std.mem.Allocator, jid: []const u8, body: []const u8) ![]u8 {
+        const engine = self.omemo orelse return error.OmemoOff;
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const ids = try self.peerDevices(a, jid);
+            var targets: std.ArrayList(omemo.Target) = .empty;
+            for (ids) |id| {
+                self.ensureSession(a, engine, jid, id) catch |err| {
+                    log.warn("no OMEMO session with {s} device {d}: {t}", .{ jid, id, err });
+                    continue;
+                };
+                try targets.append(a, .{ .jid = jid, .device_id = id });
+            }
+            return engine.encrypt(allocator, targets.items, body) catch |err| {
+                // One retry with a freshly fetched device list.
+                if (err == error.NoSessions and attempt == 0) {
+                    self.forgetPeerDevices(jid);
+                    continue;
+                }
+                return err;
+            };
+        }
+    }
+
+    /// Decrypts an inbound 1:1 OMEMO message; null when there's nothing to
+    /// hand on (key transport, or a failure already reported to the sender).
+    fn decryptInbound(self: *XmppConnector, allocator: std.mem.Allocator, chat_id: []const u8, enc: xml.Element) !?[]const u8 {
+        const engine = self.omemo orelse {
+            self.sendPlainNotice(allocator, chat_id, "🔒 I can't read OMEMO-encrypted messages on this server. Please turn encryption off for this chat.");
+            return null;
+        };
+        const d = engine.decrypt(allocator, chat_id, enc) catch |err| {
+            log.warn("failed to decrypt an OMEMO message from {s}: {t}", .{ chat_id, err });
+            const has_payload = enc.child("payload") != null;
+            if (err == error.NotEncryptedForThisDevice) {
+                if (has_payload) {
+                    const notice = std.fmt.allocPrint(allocator, "🔒 That message wasn't encrypted for my device ({d}). Your client may not have my device yet — please trust it and send again.", .{engine.device_id}) catch return null;
+                    self.sendPlainNotice(allocator, chat_id, notice);
+                }
+            } else if (err != error.DuplicateMessage and has_payload) {
+                const notice = std.fmt.allocPrint(allocator, "🔒 I couldn't decrypt that message ({t}).", .{err}) catch return null;
+                self.sendPlainNotice(allocator, chat_id, notice);
+            }
+            return null;
+        };
+        if (engine.takeRepublishNeeded()) self.spawnOmemoPublish(false);
+        self.noteDeviceSeen(chat_id, d.sender_device);
+        self.noteChatEncryption(chat_id, true);
+        return d.plaintext;
+    }
+
+    fn isOmemoCommand(text: []const u8) bool {
+        const t = std.mem.trim(u8, text, " \t\r\n");
+        return std.mem.eql(u8, t, "/omemo") or std.mem.startsWith(u8, t, "/omemo ");
+    }
+
+    /// `/omemo` answers may need IQs (device lists), so they run off the
+    /// poll thread.
+    fn spawnOmemoCommand(self: *XmppConnector, chat_id: []const u8, text: []const u8) void {
+        const jid = self.allocator.dupe(u8, chat_id) catch return;
+        const args = self.allocator.dupe(u8, std.mem.trim(u8, std.mem.trim(u8, text, " \t\r\n")["/omemo".len..], " \t")) catch {
+            self.allocator.free(jid);
+            return;
+        };
+        const t = std.Thread.spawn(.{}, omemoCommandThread, .{ self, jid, args }) catch {
+            self.allocator.free(jid);
+            self.allocator.free(args);
+            return;
+        };
+        t.detach();
+    }
+
+    fn omemoCommandThread(self: *XmppConnector, jid: []u8, args: []u8) void {
+        defer self.allocator.free(jid);
+        defer self.allocator.free(args);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const reply = self.omemoCommandReply(a, jid, args) catch |err| std.fmt.allocPrint(a, "/omemo failed: {t}", .{err}) catch return;
+        const id = self.sendOut(a, jid, .{ .body = reply }) catch return;
+        _ = id;
+    }
+
+    /// `/omemo` shows our fingerprint and the sender's devices;
+    /// `/omemo reset <device id>` forgets one of the sender's devices so a
+    /// reinstalled client's new key is accepted.
+    fn omemoCommandReply(self: *XmppConnector, a: std.mem.Allocator, jid: []const u8, args: []const u8) ![]const u8 {
+        const engine = self.omemo orelse return error.OmemoOff;
+        if (std.mem.startsWith(u8, args, "reset")) {
+            const id_text = std.mem.trim(u8, args["reset".len..], " \t");
+            const device_id = std.fmt.parseInt(i32, id_text, 10) catch return "Usage: /omemo reset <device id>";
+            try omemo_store.resetDevice(engine.pool, engine.own_jid, jid, device_id);
+            self.forgetPeerDevices(jid);
+            return std.fmt.allocPrint(a, "Forgot your device {d}. Its key will be trusted again the next time it writes to me.", .{device_id});
+        }
+        if (args.len > 0) return "Usage: /omemo, or /omemo reset <device id>";
+
+        var out: Io.Writer.Allocating = .init(a);
+        const w = &out.writer;
+        try w.print("My OMEMO device: {d}\nFingerprint: {s}\n\nYour devices:", .{ engine.device_id, try engine.fingerprint(a) });
+        const known = try omemo_store.listIdentities(engine.pool, a, engine.own_jid, jid);
+        self.forgetPeerDevices(jid);
+        const published = self.peerDevices(a, jid) catch &.{};
+        for (published) |id| {
+            const fp: []const u8 = for (known) |k| {
+                if (k.device_id == id) break try omemo.Engine.formatFingerprint(a, try omemo.decodeB64(a, k.identity_key));
+            } else "(not seen yet)";
+            try w.print("\n• {d}: {s}", .{ id, fp });
+        }
+        if (published.len == 0) try w.writeAll("\n(none published)");
+        return out.toOwnedSlice();
+    }
+
+    fn chatIsEncrypted(self: *XmppConnector, jid: []const u8) bool {
+        const engine = self.omemo orelse return false;
+        return omemo_store.isChatEncrypted(engine.pool, engine.own_jid, jid) catch false;
+    }
+
+    /// Mirrors the peer: encrypted when their last message was.
+    fn noteChatEncryption(self: *XmppConnector, jid: []const u8, encrypted: bool) void {
+        const engine = self.omemo orelse return;
+        if (self.chatIsEncrypted(jid) == encrypted) return;
+        omemo_store.setChatEncrypted(engine.pool, engine.own_jid, jid, encrypted) catch |err| {
+            log.warn("failed to record OMEMO state for {s}: {t}", .{ jid, err });
+            return;
+        };
+        log.info("{s} is now {s}", .{ jid, if (encrypted) "OMEMO-encrypted" else "plaintext" });
+    }
+
+    /// An unencrypted 1:1 notice that never goes through OMEMO (safe from
+    /// the poll thread).
+    fn sendPlainNotice(self: *XmppConnector, allocator: std.mem.Allocator, chat_id: []const u8, text: []const u8) void {
+        const id = self.newId(allocator) catch return;
+        defer allocator.free(id);
+        const bytes = stanza.messageToOwned(allocator, .{ .to = chat_id, .kind = "chat", .id = id, .body = text }) catch return;
+        defer allocator.free(bytes);
+        self.send(bytes) catch |err| log.warn("failed to send a notice to {s}: {t}", .{ chat_id, err });
+    }
+
+    /// XEP-0454: AES-256-GCM over the file, key and IV in the URL fragment.
+    fn uploadEncrypted(self: *XmppConnector, allocator: std.mem.Allocator, bytes: []const u8, file_name: []const u8) ![]const u8 {
+        var key: [32]u8 = undefined;
+        var iv: [12]u8 = undefined;
+        self.io.random(&key);
+        self.io.random(&iv);
+        defer std.crypto.secureZero(u8, &key);
+        const sealed = try allocator.alloc(u8, bytes.len + 16);
+        defer allocator.free(sealed);
+        std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(sealed[0..bytes.len], sealed[bytes.len..][0..16], bytes, "", iv, key);
+        const url = try self.upload(allocator, sealed, file_name, "application/octet-stream");
+        defer allocator.free(url);
+        const rest = if (std.mem.indexOf(u8, url, "://")) |i| url[i + 3 ..] else return error.MalformedUploadSlot;
+        const iv_hex = std.fmt.bytesToHex(iv, .lower);
+        const key_hex = std.fmt.bytesToHex(key, .lower);
+        return std.fmt.allocPrint(allocator, "aesgcm://{s}#{s}{s}", .{ rest, &iv_hex, &key_hex });
+    }
+
+    fn downloadEncrypted(self: *XmppConnector, allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+        const hash = std.mem.lastIndexOfScalar(u8, url, '#') orelse return error.MalformedAesgcmUrl;
+        const frag = url[hash + 1 ..];
+        // 12-byte IV + 32-byte key; the 16-byte-IV legacy form isn't GCM-standard.
+        if (frag.len != 88) return error.UnsupportedAesgcmUrl;
+        var iv: [12]u8 = undefined;
+        var key: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&iv, frag[0..24]) catch return error.MalformedAesgcmUrl;
+        _ = std.fmt.hexToBytes(&key, frag[24..88]) catch return error.MalformedAesgcmUrl;
+        defer std.crypto.secureZero(u8, &key);
+        const rest = url["aesgcm://".len..hash];
+
+        // aesgcm:// stands for https://; only the insecure (test) mode also
+        // reaches plain-HTTP upload services.
+        const https_url = try std.fmt.allocPrint(allocator, "https://{s}", .{rest});
+        defer allocator.free(https_url);
+        const data = if (self.tls_mode == .insecure) blk: {
+            const http_url = try std.fmt.allocPrint(allocator, "http://{s}", .{rest});
+            defer allocator.free(http_url);
+            break :blk http_util.get(&self.http_client, allocator, http_url) catch
+                try http_util.get(&self.http_client, allocator, https_url);
+        } else try http_util.get(&self.http_client, allocator, https_url);
+        defer allocator.free(data);
+        if (data.len < 16) return error.MalformedEncryptedFile;
+        const n = data.len - 16;
+        const out = try allocator.alloc(u8, n);
+        errdefer allocator.free(out);
+        std.crypto.aead.aes_gcm.Aes256Gcm.decrypt(out, data[0..n], data[n..][0..16].*, "", iv, key) catch return error.FileAuthenticationFailed;
+        return out;
+    }
+
     fn resetUploadService(self: *XmppConnector) void {
         self.upload_mu.lockUncancelable(self.io);
         defer self.upload_mu.unlock(self.io);
@@ -1125,7 +1523,8 @@ pub const XmppConnector = struct {
     /// Uploads a file and shares its link, then the caption as its own
     /// message. Failures are reported in the chat, since the caller can't.
     fn shareFile(self: *XmppConnector, allocator: std.mem.Allocator, chat_id: []const u8, bytes: []const u8, file_name: []const u8, content_type: []const u8, caption: ?[]const u8) void {
-        const url = self.upload(allocator, bytes, file_name, content_type) catch |err| {
+        const encrypt = !self.isJoinedRoom(chat_id) and self.chatIsEncrypted(chat_id);
+        const url = (if (encrypt) self.uploadEncrypted(allocator, bytes, file_name) else self.upload(allocator, bytes, file_name, content_type)) catch |err| {
             log.warn("failed to upload {s} ({d} bytes) for {s}: {t}", .{ file_name, bytes.len, chat_id, err });
             const notice = std.fmt.allocPrint(allocator, "⚠️ Couldn't send {s}: {t}", .{ file_name, err }) catch return;
             defer allocator.free(notice);
@@ -1168,6 +1567,7 @@ pub const XmppConnector = struct {
     /// `file_id` is the shared URL (see `attachmentFor`).
     fn downloadFileFn(ptr: *anyopaque, allocator: std.mem.Allocator, file_id: []const u8) anyerror![]u8 {
         const self: *XmppConnector = @ptrCast(@alignCast(ptr));
+        if (media.isAesgcmUrl(file_id)) return self.downloadEncrypted(allocator, file_id);
         const plain_http_ok = self.tls_mode == .insecure and std.ascii.startsWithIgnoreCase(file_id, "http://");
         if (!media.isHttpsUrl(file_id) and !plain_http_ok) return error.UnsupportedUrl;
         return http_util.get(&self.http_client, allocator, file_id);
@@ -1674,18 +2074,41 @@ const LiveEnv = struct {
 };
 
 /// Polls `conn` on its own thread (so `request` replies get routed) until
-/// `stop` is set.
+/// `stop` is set, keeping every message it maps.
 const PollDriver = struct {
     conn: *XmppConnector,
     stop: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    mu: Io.Mutex = .init,
+    received: std.ArrayList(iface.Message) = .empty,
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
 
     fn run(self: *PollDriver) void {
         while (!self.stop.load(.acquire)) {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            _ = self.conn.connector().poll(arena.allocator()) catch {};
+            const msgs = self.conn.connector().poll(arena.allocator()) catch continue;
+            self.mu.lockUncancelable(testing.io);
+            defer self.mu.unlock(testing.io);
+            for (msgs) |m| {
+                const copy = m.dupe(self.arena.allocator()) catch continue;
+                self.received.append(self.arena.allocator(), copy) catch {};
+            }
         }
+    }
+
+    /// Waits up to `seconds` for a received message satisfying `pred`.
+    fn await(self: *PollDriver, seconds: u64, ctx: anytype, comptime pred: fn (@TypeOf(ctx), iface.Message) bool) !iface.Message {
+        var waited: u64 = 0;
+        while (waited < seconds * 10) : (waited += 1) {
+            {
+                self.mu.lockUncancelable(testing.io);
+                defer self.mu.unlock(testing.io);
+                for (self.received.items) |m| if (pred(ctx, m)) return m;
+            }
+            Io.sleep(testing.io, .fromMilliseconds(100), .awake) catch {};
+        }
+        return error.TestExpectedMessageNeverArrived;
     }
 
     fn start(self: *PollDriver) !void {
@@ -1748,4 +2171,74 @@ test "live: sendDocument uploads via XEP-0363 and the peer downloads the same by
     try testing.expectEqualStrings("notes.txt", file_msg.attachment.?.file_name.?);
     const got = try peer.connector().downloadFile(arena, file_msg.attachment.?.file_id);
     try testing.expectEqualStrings(payload, got);
+}
+
+fn textIs(want: []const u8, m: iface.Message) bool {
+    return m.text != null and std.mem.eql(u8, m.text.?, want);
+}
+
+// Bot and peer, both with OMEMO, on the live server: devices get published
+// over PEP, sessions are built from fetched bundles, and text plus an
+// aesgcm:// file travel encrypted in both directions.
+test "live: OMEMO messages and files between two connectors" {
+    const env = LiveEnv.get() orelse return error.SkipZigTest;
+    var db = try test_support.openTestDb(testing.allocator) orelse return error.SkipZigTest;
+    defer db.close();
+    var pool = try PgPool.wrapForTest(testing.allocator, testing.io, &db);
+    defer pool.deinitTestWrap();
+
+    const pa = std.heap.page_allocator;
+    var bot = XmppConnector.init(pa, testing.io, env.host, env.port, env.domain, "test", "testpass123", &.{}, .insecure);
+    defer bot.deinit();
+    var peer = XmppConnector.init(pa, testing.io, env.host, env.port, env.domain, "peer", "testpass123", &.{}, .insecure);
+    defer peer.deinit();
+    try bot.enableOmemo(&pool, "bot-test-key");
+    try peer.enableOmemo(&pool, "peer-test-key");
+
+    var bot_driver: PollDriver = .{ .conn = &bot };
+    var peer_driver: PollDriver = .{ .conn = &peer };
+    try bot_driver.start();
+    defer bot_driver.finish();
+    try peer_driver.start();
+    defer peer_driver.finish();
+
+    var arena_state = std.heap.ArenaAllocator.init(pa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const peer_jid = try std.fmt.allocPrint(a, "peer@{s}", .{env.domain});
+    const bot_jid = try std.fmt.allocPrint(a, "test@{s}", .{env.domain});
+
+    // Both sides publish asynchronously after connecting; wait until the
+    // bot can see the peer's current device (earlier runs leave stale ones).
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        bot.forgetPeerDevices(peer_jid);
+        if (bot.client != null and peer.client != null) {
+            const ids = bot.peerDevices(a, peer_jid) catch &.{};
+            if (std.mem.indexOfScalar(i32, ids, @intCast(peer.omemo.?.device_id)) != null) break;
+        }
+        Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
+    }
+    // The peer's bundle publish may trail its device list slightly.
+    Io.sleep(testing.io, .fromMilliseconds(500), .awake) catch {};
+
+    try omemo_store.setChatEncrypted(&pool, bot.omemo.?.own_jid, peer_jid, true);
+    bot.connector().sendMessage(a, peer_jid, "secret hello", null);
+    const got = try peer_driver.await(15, @as([]const u8, "secret hello"), textIs);
+    try testing.expectEqualStrings(bot_jid, got.user_id);
+    // Receiving it encrypted switched the peer's side of the chat to OMEMO.
+    try testing.expect(peer.chatIsEncrypted(bot_jid));
+
+    peer.connector().sendMessage(a, bot_jid, "secret reply", null);
+    _ = try bot_driver.await(15, @as([]const u8, "secret reply"), textIs);
+
+    const payload = "encrypted file body\n";
+    bot.connector().sendDocument(a, peer_jid, payload, "secret.txt", null);
+    const file_msg = try peer_driver.await(15, {}, struct {
+        fn f(_: void, m: iface.Message) bool {
+            return m.attachment != null and std.mem.startsWith(u8, m.attachment.?.file_id, "aesgcm://");
+        }
+    }.f);
+    const downloaded = try peer.connector().downloadFile(a, file_msg.attachment.?.file_id);
+    try testing.expectEqualStrings(payload, downloaded);
 }

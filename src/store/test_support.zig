@@ -21,7 +21,8 @@ fn truncateAll(db: *Db) !void {
         \\  accounts, oauth_providers, management_room_bindings, notes,
         \\  facts, fact_tombstones, daily_digests, period_rollups, retrieval_log,
         \\  instagram_sessions, instagram_thread_watermarks, reply_drafts, feed_sources,
-        \\  feed_settings
+        \\  feed_settings, omemo_device, omemo_prekeys, omemo_signed_prekeys, omemo_sessions,
+        \\  omemo_identities, omemo_chats
         \\  RESTART IDENTITY CASCADE;
     );
     // `feed_settings` holds a single seeded row (id = 1) rather than a row per

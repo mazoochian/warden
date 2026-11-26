@@ -24,7 +24,7 @@ RUN for i in 1 2 3 4 5; do apk add --no-cache \
         -X https://dl-cdn.alpinelinux.org/alpine/edge/main \
         -X https://dl-cdn.alpinelinux.org/alpine/edge/community \
         -X https://dl-cdn.alpinelinux.org/alpine/edge/testing \
-        curl xz postgresql-dev olm-dev telegram-tdlib-dev && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+        curl xz postgresql-dev olm-dev libomemo-c-dev telegram-tdlib-dev && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && curl -fSL --retry 5 --retry-delay 2 --retry-all-errors -o /tmp/zig.tar.xz \
        "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
     && tar -xJf /tmp/zig.tar.xz -C /opt \
@@ -72,7 +72,8 @@ RUN cd piechart && npm ci --omit=dev
 # then chromium --headless --print-to-pdf) rather than pulling in a whole
 # separate LaTeX toolchain just for that one direction. `olm` is the runtime
 # half of Matrix E2E encryption's libolm binding (see src/platform/matrix/olm.zig) —
-# `olm-dev` above is the build-time headers/import-lib half. `yt-dlp` backs
+# `olm-dev` above is the build-time headers/import-lib half; `libomemo-c` /
+# `libomemo-c-dev` are the same pair for XMPP OMEMO. `yt-dlp` backs
 # ROADMAP.md's Phase 25 auto-download feature (src/features/video_download.zig).
 # ---------------------------------------------------------------------------
 FROM node:22-alpine
@@ -82,7 +83,7 @@ RUN for i in 1 2 3 4 5; do apk add --no-cache \
         -X https://dl-cdn.alpinelinux.org/alpine/edge/main \
         -X https://dl-cdn.alpinelinux.org/alpine/edge/community \
         -X https://dl-cdn.alpinelinux.org/alpine/edge/testing \
-        chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq olm telegram-tdlib pandoc poppler-utils imagemagick ffmpeg yt-dlp && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
+        chromium font-noto font-noto-arabic fontconfig ca-certificates tzdata libpq olm libomemo-c telegram-tdlib pandoc poppler-utils imagemagick ffmpeg yt-dlp && break || { [ "$i" = 5 ] && exit 1; sleep 5; }; done \
     && test -x /usr/bin/chromium-browser
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
     PUPPETEER_SKIP_DOWNLOAD=true

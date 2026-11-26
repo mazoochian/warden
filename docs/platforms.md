@@ -8,16 +8,16 @@ Capability matrix (✓ implemented, ~ partial, — not available):
 
 | Capability | Telegram bot | Matrix | XMPP | Telegram user | Instagram |
 |---|---|---|---|---|---|
-| Receive/send text | ✓ | ✓ (plaintext + E2EE) | ✓ (1:1 + MUC) | ✓ | ✓ (DMs) |
-| Edit / delete messages | ✓ | ✓ | — | — | — |
-| Photos / documents | ✓ | ✓ (unencrypted media only) | — | — | ~ |
+| Receive/send text | ✓ | ✓ (plaintext + E2EE) | ✓ (1:1 + MUC; OMEMO in 1:1) | ✓ | ✓ (DMs) |
+| Edit / delete messages | ✓ | ✓ | ✓ | — | — |
+| Photos / documents | ✓ | ✓ (unencrypted media only) | ✓ (HTTP upload; aesgcm:// in OMEMO chats) | — | ~ |
 | Buttons / choice prompts | ✓ inline keyboards | ~ reactions | — | — | — |
 | Moderation (mute/kick/ban/promote/pin) | ✓ | ✓ | ✓ (MUC roles/affiliations) | — | — |
 | `/permission` bitmask | ✓ | ~ (write only) | — | — | — |
 | Is-admin check | ✓ | ✓ | ✓ | — | — |
 | Slow mode enforcement | ✓ | ✓ | — | — | — |
 | Commands menu (`setCommands`) | ✓ | — | — | — | — |
-| Voice/attachment download | ✓ | ✓ | — | — | — |
+| Voice/attachment download | ✓ | ✓ | ✓ | — | — |
 
 ## Telegram Bot API (`platform/telegram/`)
 
@@ -126,8 +126,40 @@ the inbound extensions.
   sender's own server (their domain or a subdomain) or ours count — a
   stranger can't make the bot fetch arbitrary hosts. Plain `http://` is
   accepted only with `WARDEN_XMPP_TLS_MODE=insecure`.
-- Moderation maps to MUC roles/affiliations (XEP-0045 §9). No OMEMO, no
+- Moderation maps to MUC roles/affiliations (XEP-0045 §9). No
   `/permission` bitmask, no `/tag`, no room title/photo.
+- **OMEMO** (legacy 0.3, `eu.siacs.conversations.axolotl` — what
+  Conversations, Monocles, Dino and Gajim speak), on when
+  `WARDEN_XMPP_OMEMO_KEY` is set. `omemo/engine.zig` drives libomemo-c
+  (`omemo/signal.zig` bindings, `omemo/provider.zig` crypto on
+  std.crypto); all state lives in Postgres (`store/omemo.zig`, scoped by
+  the bot's JID), every key and session sealed with AES-256-GCM under a
+  key derived from `WARDEN_XMPP_OMEMO_KEY`. Losing that key means a new
+  device.
+  - After each connect a worker thread adds our device to the PEP device
+    list (if missing) and publishes the bundle with `access_model=open`
+    (retrying without publish-options); 100 pre-keys, topped up and
+    republished when one is consumed.
+  - Per 1:1 chat the bot mirrors the peer: an encrypted message switches
+    the chat to OMEMO, a plaintext one switches it back
+    (`omemo_chats`). Replies to an OMEMO chat go to every device the peer
+    publishes (device lists cached 10 min, refetched when an unknown
+    device writes); sessions are built from fetched bundles. If nothing
+    can be encrypted the reply is withheld and a plaintext notice says so
+    — never a silent plaintext fallback.
+  - Trust is TOFU: the first identity key seen for a device is stored;
+    a different key for that device is refused. `/omemo` (1:1, handled in
+    the connector) shows the bot's fingerprint and the sender's devices;
+    `/omemo reset <device id>` forgets one so a reinstalled client is
+    accepted again.
+  - Files in OMEMO chats are encrypted (XEP-0454: AES-256-GCM, 12-byte
+    IV + key in the `aesgcm://` fragment) and shared in the encrypted
+    body, never as OOB. Inbound `aesgcm://` links are downloaded and
+    decrypted the same way.
+  - Encrypted room (MUC) messages are ignored: OMEMO in rooms needs
+    non-anonymous rooms and per-member device fan-out, not implemented.
+  - Undecryptable messages get a plaintext notice (not addressed to our
+    device, or a failure); duplicates are dropped silently.
 - `WARDEN_XMPP_TLS_MODE` controls certificate verification for
   self-hosted servers; use `bundle` against a server with a CA-issued
   certificate.
