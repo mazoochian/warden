@@ -126,6 +126,21 @@ the inbound extensions.
   sender's own server (their domain or a subdomain) or ours count — a
   stranger can't make the bot fetch arbitrary hosts. Plain `http://` is
   accepted only with `WARDEN_XMPP_TLS_MODE=insecure`.
+- **Stream management (XEP-0198)**, when the server offers it. `<enable
+  resume='true'/>` goes out right after bind; every stanza sent from then
+  on is queued (`sm.zig`) until the server's `<a h/>` acknowledges it, and
+  each outgoing message is followed by an `<r/>`. Server `<r/>`s are
+  answered with our inbound count. On reconnect the bot first tries
+  `<resume/>`: on success, rooms, presence and the bound resource carry
+  over and everything unacknowledged is resent as-is. If the server
+  refuses, a new session is bound and only the unacknowledged
+  `<message>`s are resent (old IQs and presences are meaningless).
+  Messages sent while disconnected from a resumable session are queued
+  (cap 500) instead of dropped. A dropped connection is torn down
+  without `</stream:stream>`, which would end the session server-side.
+  While idle, keepalives are `<r/>`s; one unanswered for 45 s shuts the
+  socket so a half-dead TCP connection is noticed and resumed instead of
+  silently swallowing messages.
 - Moderation maps to MUC roles/affiliations (XEP-0045 §9). No
   `/permission` bitmask, no `/tag`, no room title/photo.
 - **OMEMO** (legacy 0.3, `eu.siacs.conversations.axolotl` — what

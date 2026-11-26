@@ -9826,6 +9826,7 @@ test {
     _ = @import("platform/xmpp/client.zig");
     _ = @import("platform/xmpp/stanza.zig");
     _ = @import("platform/xmpp/media.zig");
+    _ = @import("platform/xmpp/sm.zig");
     _ = @import("platform/xmpp/omemo/provider.zig");
     _ = @import("platform/xmpp/omemo/engine.zig");
     _ = @import("store/omemo.zig");

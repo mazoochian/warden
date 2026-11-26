@@ -12,7 +12,7 @@ modules_enabled = {
     "roster"; "saslauth"; "tls"; "disco";
     "carbons"; "pep"; "private"; "blocklist"; "vcard4"; "vcard_legacy";
     "version"; "uptime"; "time"; "ping";
-    "admin_adhoc";
+    "admin_adhoc"; "smacks";
 }
 
 allow_registration = false
@@ -42,6 +42,8 @@ pidfile = "/var/run/prosody/prosody.pid"
 -- HTTP File Upload (XEP-0363) for the connector's file-sharing tests. Plain
 -- HTTP on 5280, so the live tests run with WARDEN_XMPP_TLS_MODE=insecure.
 http_ports = { 5280 }
+-- 13.0 listens on loopback only by default, which the published port can't reach.
+http_interfaces = { "*", "::" }
 https_ports = { }
 http_external_url = "http://localhost:5280/"
 

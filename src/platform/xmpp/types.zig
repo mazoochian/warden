@@ -15,6 +15,8 @@ pub const StreamFeatures = struct {
     mechanisms: []const []const u8,
     bind: bool,
     session: bool,
+    /// XEP-0198 stream management offered.
+    sm: bool = false,
 
     pub fn fromElement(allocator: std.mem.Allocator, el: xml.Element) !StreamFeatures {
         var mechanisms: std.ArrayList([]const u8) = .empty;
@@ -31,6 +33,7 @@ pub const StreamFeatures = struct {
             .mechanisms = try mechanisms.toOwnedSlice(allocator),
             .bind = el.child("bind") != null,
             .session = el.child("session") != null,
+            .sm = el.child("sm") != null,
         };
     }
 

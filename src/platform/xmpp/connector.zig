@@ -14,6 +14,7 @@ const log = @import("../../log.zig").scoped("xmpp");
 const llm = @import("../../llm/provider.zig");
 const http_util = @import("../../http_util.zig");
 const omemo = @import("omemo/engine.zig");
+const sm_mod = @import("sm.zig");
 const omemo_store = @import("../../store/omemo.zig");
 const PgPool = @import("../../store/pool.zig").PgPool;
 const test_support = @import("../../store/test_support.zig");
@@ -37,6 +38,10 @@ const iq_check_interval_ns: u64 = 25 * std.time.ns_per_ms;
 /// How many of our own recently sent message ids are remembered, for
 /// recognizing MUC reflections, replies to the bot, and retractions.
 const recent_capacity = 512;
+
+/// An `<r/>` unanswered this long means the socket is dead; drop it so the
+/// session gets resumed on a fresh one.
+const ack_timeout_seconds: i64 = 45;
 
 /// How long a peer's fetched OMEMO device list is reused.
 const device_cache_seconds: i64 = 10 * 60;
@@ -146,6 +151,10 @@ pub const XmppConnector = struct {
     omemo_publish_due: bool = false,
     /// The thread `pollFn` runs on, which `request` must never block.
     poll_thread: std.atomic.Value(std.Thread.Id) = .init(0),
+    /// XEP-0198 counters and unacknowledged stanzas, kept across reconnects.
+    sm: sm_mod.StreamMgmt,
+    /// Successful stream resumptions so far.
+    resumes: u32 = 0,
     /// Peers' OMEMO device ids, keyed by bare JID (under `state_mu`).
     device_cache: std.StringHashMapUnmanaged(CachedDevices) = .empty,
 
@@ -184,6 +193,7 @@ pub const XmppConnector = struct {
             .tls_mode = tls_mode,
             .occupants = std.StringHashMap(Occupant).init(allocator),
             .http_client = .{ .allocator = allocator, .io = io },
+            .sm = .init(allocator, io),
         };
     }
 
@@ -211,6 +221,7 @@ pub const XmppConnector = struct {
         }
         self.device_cache.deinit(self.allocator);
         if (self.omemo) |e| e.deinit();
+        self.sm.deinit();
 
         if (self.ca_bundle_loaded) self.ca_bundle.deinit(self.allocator);
     }
@@ -303,9 +314,38 @@ pub const XmppConnector = struct {
             for (features3.mechanisms) |m| allocator.free(m);
             allocator.free(features3.mechanisms);
         }
+        client.sm = &self.sm;
+
+        // XEP-0198: pick the previous session back up when we can — rooms,
+        // presence and the bound resource all survive, and whatever the
+        // server never got is resent.
+        var carried: [][]u8 = &.{};
+        defer {
+            for (carried) |b| self.allocator.free(b);
+            self.allocator.free(carried);
+        }
+        if (features3.sm) if (try self.sm.resumeId(allocator)) |previd| {
+            defer allocator.free(previd);
+            switch (try client.resumeStream(allocator, previd, self.sm.inboundCount())) {
+                .resumed => |h| {
+                    try self.publishResumed(client, h);
+                    return;
+                },
+                .failed => |h| {
+                    log.info("stream resumption refused, starting a new session", .{});
+                    carried = try self.sm.abandonSession(h);
+                },
+            }
+        };
+        if (carried.len == 0 and self.sm.queued() > 0) carried = try self.sm.abandonSession(null);
 
         const jid = try client.bindResource(allocator, self.resource, features3.session);
         allocator.free(jid); // `client.bound_jid` already holds its own copy.
+
+        if (features3.sm) {
+            self.sm.beginSession();
+            try client.sendUncounted(sm_mod.enable_xml);
+        }
 
         // Initial presence: without it the server never routes MUC/1:1
         // presence-dependent traffic or offline messages to this resource.
@@ -316,11 +356,6 @@ pub const XmppConnector = struct {
         self.clearRoomState();
         self.resetUploadService();
         self.omemo_publish_due = self.omemo != null;
-        {
-            self.client_mu.lockUncancelable(self.io);
-            defer self.client_mu.unlock(self.io);
-            self.client = client;
-        }
         self.last_activity_unix = Io.Timestamp.now(self.io, .real).toSeconds();
 
         for (self.muc_rooms) |room| {
@@ -334,7 +369,31 @@ pub const XmppConnector = struct {
             self.joined_rooms.append(self.allocator, dup) catch self.allocator.free(dup);
         }
 
+        {
+            self.client_mu.lockUncancelable(self.io);
+            defer self.client_mu.unlock(self.io);
+            // Messages the old session never confirmed, ahead of anything new.
+            for (carried) |b| try client.sendStanza(b);
+            self.client = client;
+        }
+        if (carried.len > 0) log.info("resent {d} unacknowledged message(s) from the previous session", .{carried.len});
+
         log.notice("connected as {s}", .{self.bound_jid.?});
+    }
+
+    /// Resumption succeeded: resend what the server missed and go live
+    /// with the old session's rooms and resource.
+    fn publishResumed(self: *XmppConnector, client: *raw.Client, h: u32) !void {
+        self.client_mu.lockUncancelable(self.io);
+        defer self.client_mu.unlock(self.io);
+        // Held across the resend so no worker's new stanza lands in between.
+        const rest = self.sm.resumed(h);
+        for (rest) |b| try client.sendUncounted(b);
+        if (rest.len > 0) try client.sendUncounted(sm_mod.request_xml);
+        self.client = client;
+        self.resumes += 1;
+        self.last_activity_unix = Io.Timestamp.now(self.io, .real).toSeconds();
+        log.notice("resumed the stream as {s}, resent {d} stanza(s)", .{ self.bound_jid orelse "?", rest.len });
     }
 
     /// Drops the live connection after a read error; every waiting
@@ -343,7 +402,10 @@ pub const XmppConnector = struct {
         {
             self.client_mu.lockUncancelable(self.io);
             defer self.client_mu.unlock(self.io);
-            if (self.client) |c| c.close();
+            self.sm.onDisconnect();
+            // A closing tag would end the session server-side; keep it
+            // resumable instead.
+            if (self.client) |c| c.deinit();
             self.client = null;
         }
         self.failAllPending();
@@ -382,7 +444,11 @@ pub const XmppConnector = struct {
     fn send(self: *XmppConnector, bytes: []const u8) !void {
         self.client_mu.lockUncancelable(self.io);
         defer self.client_mu.unlock(self.io);
-        const client = self.client orelse return error.NotConnected;
+        const client = self.client orelse {
+            // Delivered when the session is resumed (or carried to a new one).
+            if (self.sm.queueOffline(bytes)) return;
+            return error.NotConnected;
+        };
         try client.sendStanza(bytes);
     }
 
@@ -579,6 +645,15 @@ pub const XmppConnector = struct {
         defer if (!handed_off) parsed.deinit();
         self.last_activity_unix = Io.Timestamp.now(self.io, .real).toSeconds();
 
+        const name = parsed.element.name;
+        if (std.mem.eql(u8, parsed.element.attr("xmlns") orelse "", sm_mod.ns)) {
+            self.handleSmElement(client, parsed.element);
+            return &.{};
+        }
+        if (std.mem.eql(u8, name, "message") or std.mem.eql(u8, name, "presence") or std.mem.eql(u8, name, "iq")) {
+            self.sm.countInbound();
+        }
+
         if (std.mem.eql(u8, parsed.element.name, "presence")) {
             const chat_left = self.handlePresence(allocator, parsed.element) catch |err| blk: {
                 log.warn("failed to handle presence: {t}", .{err});
@@ -610,10 +685,44 @@ pub const XmppConnector = struct {
         };
     }
 
+    fn handleSmElement(self: *XmppConnector, client: *raw.Client, el: xml.Element) void {
+        if (std.mem.eql(u8, el.name, "r")) {
+            var buf: [64]u8 = undefined;
+            const a = std.fmt.bufPrint(&buf, "<a xmlns='" ++ sm_mod.ns ++ "' h='{d}'/>", .{self.sm.inboundCount()}) catch return;
+            client.sendUncounted(a) catch |err| log.warn("failed to answer an ack request: {t}", .{err});
+        } else if (std.mem.eql(u8, el.name, "a")) {
+            const h = std.fmt.parseInt(u32, el.attr("h") orelse "", 10) catch return;
+            self.sm.handleAck(h);
+        } else if (std.mem.eql(u8, el.name, "enabled")) {
+            const resumable = std.mem.eql(u8, el.attr("resume") orelse "", "true") or std.mem.eql(u8, el.attr("resume") orelse "", "1");
+            self.sm.onEnabled(if (resumable) el.attr("id") else null);
+            log.info("stream management enabled{s}", .{if (resumable) " (resumable)" else ""});
+        } else if (std.mem.eql(u8, el.name, "failed")) {
+            log.info("server refused stream management", .{});
+            self.sm.onEnableFailed();
+        }
+    }
+
     fn maybeSendKeepalive(self: *XmppConnector) void {
         const client = self.client orelse return;
         const now = Io.Timestamp.now(self.io, .real).toSeconds();
+        if (self.sm.ackOverdueSeconds() > ack_timeout_seconds) {
+            log.warn("no stream-management ack for {d}s, reconnecting", .{ack_timeout_seconds});
+            // Fails the outstanding read, which drops and resumes as usual.
+            client.shutdown();
+            return;
+        }
         if (now - self.last_activity_unix < keepalive_idle_seconds) return;
+        if (self.sm.enabledNow()) {
+            // An ack request doubles as a liveness probe.
+            client.sendUncounted(sm_mod.request_xml) catch |err| {
+                log.warn("keepalive send failed: {t}", .{err});
+                return;
+            };
+            self.sm.noteRequestSent();
+            self.last_activity_unix = now;
+            return;
+        }
         client.sendKeepalive() catch |err| {
             log.warn("keepalive send failed: {t}", .{err});
             return;
@@ -2241,4 +2350,51 @@ test "live: OMEMO messages and files between two connectors" {
     }.f);
     const downloaded = try peer.connector().downloadFile(a, file_msg.attachment.?.file_id);
     try testing.expectEqualStrings(payload, downloaded);
+}
+
+// Kill the bot's socket mid-session, send while it's down, and check the
+// session is resumed (XEP-0198) and both messages reach the peer.
+test "live: a dropped stream is resumed and queued messages are delivered" {
+    const env = LiveEnv.get() orelse return error.SkipZigTest;
+    const pa = std.heap.page_allocator;
+    var bot = XmppConnector.init(pa, testing.io, env.host, env.port, env.domain, "test", "testpass123", &.{}, .insecure);
+    defer bot.deinit();
+    var peer = XmppConnector.init(pa, testing.io, env.host, env.port, env.domain, "peer", "testpass123", &.{}, .insecure);
+    defer peer.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(pa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const peer_jid = try std.fmt.allocPrint(a, "peer@{s}", .{env.domain});
+
+    var peer_driver: PollDriver = .{ .conn = &peer };
+    try peer_driver.start();
+    defer peer_driver.finish();
+
+    {
+        var bot_driver: PollDriver = .{ .conn = &bot };
+        try bot_driver.start();
+        defer bot_driver.finish();
+        var tries: usize = 0;
+        while (tries < 50 and !(bot.sm.enabledNow() and bot.sm.resume_id != null)) : (tries += 1) {
+            Io.sleep(testing.io, .fromMilliseconds(100), .awake) catch {};
+        }
+        try testing.expect(bot.sm.resume_id != null);
+        bot.connector().sendMessage(a, peer_jid, "before the drop", null);
+        _ = try peer_driver.await(10, @as([]const u8, "before the drop"), textIs);
+    }
+    const jid_before = try a.dupe(u8, bot.bound_jid.?);
+
+    // The driver left a read outstanding; failing it drops the connection.
+    bot.client.?.shutdown();
+    _ = try bot.connector().poll(a);
+    try testing.expect(bot.client == null);
+    bot.connector().sendMessage(a, peer_jid, "while it was down", null);
+    try testing.expectEqual(@as(usize, 1), bot.sm.queued());
+
+    var bot_driver: PollDriver = .{ .conn = &bot };
+    try bot_driver.start();
+    defer bot_driver.finish();
+    _ = try peer_driver.await(15, @as([]const u8, "while it was down"), textIs);
+    try testing.expectEqual(@as(u32, 1), bot.resumes);
+    try testing.expectEqualStrings(jid_before, bot.bound_jid.?);
 }

@@ -3,6 +3,7 @@ const Io = std.Io;
 
 const xml = @import("xml.zig");
 const types = @import("types.zig");
+const sm_mod = @import("sm.zig");
 
 /// The raw-socket and TLS-record buffers are all sized to
 /// `std.crypto.tls.Client.min_buffer_len`.
@@ -34,6 +35,9 @@ pub const Client = struct {
     /// Serializes writers: worker threads send while the poll thread sends
     /// keepalives and IQ replies.
     write_mu: Io.Mutex = .init,
+    /// XEP-0198 state, owned by the connector; stanzas sent while it is
+    /// recording are queued until acknowledged.
+    sm: ?*sm_mod.StreamMgmt = null,
 
     /// Opens a TCP connection to `host:port` — a plain hostname/IP the socket
     /// actually dials.
@@ -92,9 +96,52 @@ pub const Client = struct {
     fn sendRaw(self: *Client, bytes: []const u8) !void {
         self.write_mu.lockUncancelable(self.io);
         defer self.write_mu.unlock(self.io);
+        // Queued before the write: if the write fails, a resumed stream resends it.
+        const request_ack = if (self.sm) |s| s.recordSent(bytes) else false;
+        try self.writer.writeAll(bytes);
+        if (request_ack) try self.writer.writeAll(sm_mod.request_xml);
+        try self.writer.flush();
+        try self.stream_writer.interface.flush();
+    }
+
+    /// Writes without stream-management accounting (acks, and resending
+    /// stanzas already queued).
+    pub fn sendUncounted(self: *Client, bytes: []const u8) !void {
+        self.write_mu.lockUncancelable(self.io);
+        defer self.write_mu.unlock(self.io);
         try self.writer.writeAll(bytes);
         try self.writer.flush();
         try self.stream_writer.interface.flush();
+    }
+
+    /// Unblocks a pending `readElement` with an error, without freeing
+    /// anything (the reading thread still holds this client).
+    pub fn shutdown(self: *Client) void {
+        self.stream.shutdown(self.io, .both) catch {};
+    }
+
+    pub const ResumeOutcome = union(enum) {
+        /// The server's count of stanzas it received from us.
+        resumed: u32,
+        /// `h` when the server included it.
+        failed: ?u32,
+    };
+
+    /// XEP-0198 §5: resumes session `previd`, telling the server we
+    /// handled `h` of its stanzas. Call after SASL, instead of binding.
+    pub fn resumeStream(self: *Client, allocator: std.mem.Allocator, previd: []const u8, h: u32) !ResumeOutcome {
+        var out: Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        try out.writer.print("<resume xmlns='" ++ sm_mod.ns ++ "' h='{d}' previd='", .{h});
+        try xml.writeEscapedAttr(&out.writer, previd);
+        try out.writer.writeAll("'/>");
+        try self.sendUncounted(out.writer.buffered());
+
+        var reply = try self.readElement(allocator);
+        defer reply.deinit();
+        const server_h: ?u32 = if (reply.element.attr("h")) |v| std.fmt.parseInt(u32, v, 10) catch null else null;
+        if (std.mem.eql(u8, reply.element.name, "resumed")) return .{ .resumed = server_h orelse return error.MalformedResumed };
+        return .{ .failed = server_h };
     }
 
     /// Reads one complete top-level element off `self.reader`, blocking (via
