@@ -44,7 +44,10 @@ failures that produces look like real regressions in unrelated modules.
 
 ## Live tests
 
-XMPP connector tests run only with `WARDEN_TEST_XMPP_HOST` set. Matrix
+XMPP connector tests run only with `WARDEN_TEST_XMPP_HOST` set, against
+`examples/prosody` (accounts `test` and `peer`, password `testpass123`,
+created with `prosodyctl adduser`). Its upload component serves plain HTTP
+on 5280, so the upload test runs the connector in `insecure` TLS mode. Matrix
 E2EE has no automated live test — verify against a real client after any
 crypto change. The web API tests spin up a real server on a random port.
 

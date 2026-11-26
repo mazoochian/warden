@@ -26,3 +26,4 @@ services:
     # reach it during development from outside the compose network too.
     ports:
       - "5222:5222"
+      - "5280:5280"

@@ -39,9 +39,19 @@ log = {
 
 pidfile = "/var/run/prosody/prosody.pid"
 
+-- HTTP File Upload (XEP-0363) for the connector's file-sharing tests. Plain
+-- HTTP on 5280, so the live tests run with WARDEN_XMPP_TLS_MODE=insecure.
+http_ports = { 5280 }
+https_ports = { }
+http_external_url = "http://localhost:5280/"
+
 VirtualHost "localhost"
 
 Component "conference.localhost" "muc"
     modules_enabled = { "muc_mam" }
     restrict_room_creation = false
     name = "warden test MUC"
+
+Component "upload.localhost" "http_file_share"
+    http_file_share_size_limit = 16 * 1024 * 1024
+    http_host = "localhost"

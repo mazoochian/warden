@@ -30,7 +30,10 @@ pub const Client = struct {
     bound_jid: ?[]const u8 = null,
     /// Source of `id` attributes for `setMucRole`/`setMucAffiliation`/
     /// `replyIqResult`/`replyIqUnsupported` — those are fire-and-forget.
-    iq_counter: u32 = 0,
+    iq_counter: std.atomic.Value(u32) = .init(0),
+    /// Serializes writers: worker threads send while the poll thread sends
+    /// keepalives and IQ replies.
+    write_mu: Io.Mutex = .init,
 
     /// Opens a TCP connection to `host:port` — a plain hostname/IP the socket
     /// actually dials.
@@ -87,6 +90,8 @@ pub const Client = struct {
 
     /// `self.writer.flush()` alone is not enough once TLS is active.
     fn sendRaw(self: *Client, bytes: []const u8) !void {
+        self.write_mu.lockUncancelable(self.io);
+        defer self.write_mu.unlock(self.io);
         try self.writer.writeAll(bytes);
         try self.writer.flush();
         try self.stream_writer.interface.flush();
@@ -243,8 +248,13 @@ pub const Client = struct {
     }
 
     fn nextIqId(self: *Client, allocator: std.mem.Allocator) ![]const u8 {
-        self.iq_counter += 1;
-        return std.fmt.allocPrint(allocator, "wia{d}", .{self.iq_counter});
+        const n = self.iq_counter.fetchAdd(1, .monotonic) + 1;
+        return std.fmt.allocPrint(allocator, "wia{d}", .{n});
+    }
+
+    /// Sends one already-serialized stanza.
+    pub fn sendStanza(self: *Client, bytes: []const u8) !void {
+        try self.sendRaw(bytes);
     }
 
     fn b64Encode(allocator: std.mem.Allocator, data: []const u8) ![]u8 {

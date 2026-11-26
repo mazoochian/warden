@@ -82,20 +82,55 @@ against a real client.
 ## XMPP (`platform/xmpp/`)
 
 Persistent socket rather than HTTP: `ensureConnected` drives
-connect → STARTTLS → SASL (SCRAM-SHA-256 / SHA-1 / PLAIN) → bind → MUC
-join lazily on first poll and after any loss. `xml.zig` is a small
-streaming parser (CDATA, both quote styles, the five standard entities).
+connect → STARTTLS → SASL (SCRAM-SHA-256 / SHA-1 / PLAIN) → bind →
+initial presence → MUC join lazily on first poll and after any loss.
+`xml.zig` is a small streaming parser (CDATA, both quote styles, the five
+standard entities); `stanza.zig` builds outbound `<message>`s and reads
+the inbound extensions.
 
 - One background read outlives poll timeouts: an idle poll must not tear
   the connection down (an earlier version reconnected every ~8 s on quiet
   servers and leaked a thread + socket each time).
+- **IQ request/response.** `XmppConnector.request` sends an IQ and waits
+  (15 s) for the reply, which the poll thread hands over by id. Only
+  worker threads may call it — the poll thread is the one reading the
+  reply. A reply from a sender other than the one queried is ignored.
+  Writes are serialized (`Client.write_mu`), and the client pointer is
+  swapped only under `client_mu`.
 - Every server-initiated `<iq type='get'/'set'>` gets a reply: XEP-0199
-  ping → result, anything else → `feature-not-implemented` (spec-compliant
-  and enough to prove liveness).
+  ping → result, disco#info → our identity and features, anything else →
+  `feature-not-implemented`.
+- **Message ids.** Every message carries a random `id` and a matching
+  XEP-0359 origin-id, so `sendMessageReturningId` returns it and
+  `editMessage` sends an XEP-0308 correction of it (always naming the
+  *original* id). `deleteMessage` retracts our own messages (XEP-0424,
+  both the current and the fastening-based form, plus fallback body); in a
+  room it names the stanza-id the room stamped on our reflection.
+  Someone else's room message is moderated (XEP-0425 `:1`, falling back
+  to `:0`), which needs moderator standing and server support.
+- **Replies.** Inbound XEP-0461 replies set `reply_to_message_id`, and
+  `reply_to_is_me` when they target one of our recent ids. Outbound
+  answers carry a reply reference in rooms only (in 1:1 it is noise).
+- **Rooms.** The bot's own reflected messages are dropped. A room
+  sender's `user_id` is their real bare JID when the room discloses it
+  (so the owner is recognized in rooms), else the occupant JID;
+  moderation accepts either. Room history replayed on join (`<delay>`) is
+  skipped; 1:1 offline messages are not. Inbound corrections are ignored
+  rather than re-processed.
+- **Files.** Sending uses HTTP File Upload (XEP-0363): the upload
+  component is discovered via disco on first use per connection, the
+  file is PUT to the slot, and the GET URL is shared as body + XEP-0066
+  OOB, with the caption as a following message. Inbound, an OOB URL (or a
+  body that is just a URL) becomes an `Attachment` whose `file_id` is the
+  URL, classified by extension (m4a/ogg/opus → voice). Only links on the
+  sender's own server (their domain or a subdomain) or ours count — a
+  stranger can't make the bot fetch arbitrary hosts. Plain `http://` is
+  accepted only with `WARDEN_XMPP_TLS_MODE=insecure`.
 - Moderation maps to MUC roles/affiliations (XEP-0045 §9). No OMEMO, no
-  file transfer, no `/permission` bitmask, no `/tag`, no message deletion.
+  `/permission` bitmask, no `/tag`, no room title/photo.
 - `WARDEN_XMPP_TLS_MODE` controls certificate verification for
-  self-hosted servers.
+  self-hosted servers; use `bundle` against a server with a CA-issued
+  certificate.
 
 ## Personal Telegram account (`platform/telegram/user_connector.zig`)
 

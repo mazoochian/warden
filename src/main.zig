@@ -9817,6 +9817,8 @@ test {
     _ = @import("platform/xmpp/xml.zig");
     _ = @import("platform/xmpp/types.zig");
     _ = @import("platform/xmpp/client.zig");
+    _ = @import("platform/xmpp/stanza.zig");
+    _ = @import("platform/xmpp/media.zig");
     _ = @import("domain/xmpp_profile.zig");
     _ = @import("domain/instagram_profile.zig");
     _ = @import("platform/instagram/crypto.zig");

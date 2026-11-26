@@ -26,7 +26,7 @@ chronological development log.
 # Platforms
 - **Telegram** — the primary target; everything works here.
 - **Matrix** — plaintext and end-to-end encrypted rooms, auto-joins on invite.
-- **XMPP** — MUC moderation with SCRAM auth; no OMEMO or file transfer.
+- **XMPP** — MUC moderation with SCRAM auth, message edits/retractions/replies, file sharing over HTTP File Upload; no OMEMO yet.
 
 Supported AI providers: Anthropic, and anything OpenAI-compatible (Ollama,
 llama.cpp, OpenRouter, ...).

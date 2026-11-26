@@ -350,6 +350,49 @@ fn postRawOnce(
     return response_writer.toOwnedSlice();
 }
 
+/// `postRaw` with `PUT` — XMPP HTTP File Upload (XEP-0363) slots.
+pub fn putRaw(
+    client: *http.Client,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    content_type: []const u8,
+    extra_headers: []const http.Header,
+    payload: []const u8,
+) ![]u8 {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        return putRawOnce(client, allocator, url, content_type, extra_headers, payload) catch |err| {
+            if (attempt + 1 >= max_attempts or !isTransient(err)) return err;
+            try backoff(client, attempt);
+            continue;
+        };
+    }
+}
+
+fn putRawOnce(
+    client: *http.Client,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    content_type: []const u8,
+    extra_headers: []const http.Header,
+    payload: []const u8,
+) ![]u8 {
+    var response_writer: Io.Writer.Allocating = .init(allocator);
+    errdefer response_writer.deinit();
+
+    const result = try fetchWithTimeout(client, .{
+        .location = .{ .url = url },
+        .method = .PUT,
+        .payload = payload,
+        .extra_headers = extra_headers,
+        .headers = .{ .content_type = .{ .override = content_type } },
+        .keep_alive = false,
+        .response_writer = &response_writer.writer,
+    }, default_timeout_ns);
+    try checkStatus("PUT", url, result.status, response_writer.writer.buffered());
+    return response_writer.toOwnedSlice();
+}
+
 /// Like `postJson`, but with `PUT` — Matrix's `/send`/`/state` endpoints use
 /// PUT.
 pub fn putJson(
